@@ -313,7 +313,7 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
 
     main_window = driver.current_window_handle
     before_handles = set(driver.window_handles)
-    js_click(driver, "_btnOpenWin")
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "_btnOpenWin"))).click()
     WebDriverWait(driver, 10).until(lambda d: len(set(d.window_handles) - before_handles) == 1)
     popup_window = (set(driver.window_handles) - before_handles).pop()
     driver.switch_to.window(popup_window)
@@ -329,20 +329,32 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
               }
               return {id: '', name: String(item || '').trim()};
             }).filter(x => x.id || x.name);
-            const checks = Array.from(document.querySelectorAll('input[name="_chkUser"]'));
+            const checks = Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]'));
             const selected = [];
             const missing = [];
+            const candidates = checks.map(el => ({
+              value: String(el.value || ''),
+              rowText: String(el.closest('tr')?.innerText || el.parentElement?.innerText || '')
+            }));
 
             for (const target of targets) {
               const box = checks.find(el => {
                 const parts = String(el.value || '').split(',');
                 const id = parts[0].trim();
                 const personName = parts.slice(1).join(',').trim();
+                const rowText = String(el.closest('tr')?.innerText || el.parentElement?.innerText || '');
                 return (target.id && id === target.id) ||
-                       (target.name && (personName === target.name || personName.includes(target.name) || target.name.includes(personName)));
+                       (target.name && (
+                         personName === target.name ||
+                         personName.includes(target.name) ||
+                         target.name.includes(personName) ||
+                         rowText.includes(target.name)
+                       ));
               });
               if (box) {
                 box.checked = true;
+                box.dispatchEvent(new Event('click', {bubbles: true}));
+                box.dispatchEvent(new Event('change', {bubbles: true}));
                 selected.push(box.value);
               } else {
                 missing.push(target.name || target.id);
@@ -351,9 +363,13 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
 
             if (missing.length === 0 && selected.length > 0) {
               if (typeof sureOK === 'function') sureOK();
-              else document.getElementById('_btnSure').click();
+              else {
+                const sure = document.getElementById('_btnSure') ||
+                  Array.from(document.querySelectorAll('input, button')).find(el => /確定|選取|帶入|OK/i.test([el.id, el.name, el.value, el.innerText].map(x => String(x || '')).join(' ')));
+                if (sure) sure.click();
+              }
             }
-            return {ok: missing.length === 0 && selected.length > 0, selected, missing};
+            return {ok: missing.length === 0 && selected.length > 0, selected, missing, candidates};
             """,
             people,
         )
@@ -368,12 +384,14 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
         return {
           hidManId: document.getElementById('_hidManId')?.value || '',
           areMan: document.getElementById('_areMan')?.value || '',
+          txtMan: document.getElementById('_txtMan')?.value || '',
+          txtTitle: document.getElementById('_txtTitle')?.value || '',
           pcnt: document.getElementById('_txtPcnt')?.value || ''
         };
         """
     )
     result.update(verify)
-    result["ok"] = bool(result.get("ok") and verify.get("hidManId") and verify.get("areMan"))
+    result["ok"] = bool(result.get("ok") and ((verify.get("hidManId") and verify.get("areMan")) or verify.get("txtMan")))
     return result
 
 
@@ -733,6 +751,8 @@ def fill_entry_log_form_for_test(
         },
     )
     people_result = set_entry_people(driver, [person], fallback_popup=True)
+    if not people_result.get("ok"):
+        raise RuntimeError("entry people selection failed: " + json.dumps(people_result, ensure_ascii=False))
     outin_result = driver.execute_script(
         """
         const values = arguments[0];
