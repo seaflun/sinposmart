@@ -365,6 +365,189 @@ def set_work_people(driver: webdriver.Chrome, people: list[Any], fallback_popup:
     return set_form_people(driver, people, fallback_popup)
 
 
+def control_snapshot(driver: webdriver.Chrome) -> list[dict[str, Any]]:
+    return driver.execute_script(
+        """
+        return Array.from(document.querySelectorAll('input, select, textarea, button')).map(el => ({
+          tag: el.tagName.toLowerCase(),
+          type: el.type || '',
+          id: el.id || '',
+          name: el.name || '',
+          value: el.value || '',
+          text: el.innerText || el.options?.[el.selectedIndex]?.text || '',
+          options: el.tagName.toLowerCase() === 'select'
+            ? Array.from(el.options || []).map(opt => ({value: opt.value, text: opt.text}))
+            : []
+        }));
+        """
+    )
+
+
+def click_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
+    return driver.execute_script(
+        """
+        const controls = Array.from(document.querySelectorAll('input, button, a'));
+        const target = controls.find(el => {
+          const text = [el.id, el.name, el.value, el.title, el.innerText]
+            .map(x => String(x || '')).join(' ');
+          return /新增|加入|Add|Insert|New|Create/i.test(text);
+        });
+        if (!target) return {ok: false, reason: 'insert control not found'};
+        const before = location.href;
+        target.click();
+        return {
+          ok: true,
+          id: target.id || '',
+          name: target.name || '',
+          value: target.value || '',
+          text: target.innerText || '',
+          before
+        };
+        """
+    )
+
+
+def click_save_control(driver: webdriver.Chrome) -> dict[str, Any]:
+    return driver.execute_script(
+        """
+        const controls = Array.from(document.querySelectorAll('input, button, a'));
+        const target = controls.find(el => {
+          const text = [el.id, el.name, el.value, el.title, el.innerText]
+            .map(x => String(x || '')).join(' ');
+          return /儲存|存檔|確定|送出|Save|Submit/i.test(text);
+        });
+        if (!target) return {ok: false, reason: 'save control not found'};
+        target.click();
+        return {
+          ok: true,
+          id: target.id || '',
+          name: target.name || '',
+          value: target.value || '',
+          text: target.innerText || ''
+        };
+        """
+    )
+
+
+def fill_work_log_form_for_test(
+    driver: webdriver.Chrome,
+    action: dict[str, Any],
+    staff: dict[str, dict[str, str]],
+    target_roc_date: str,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Fill the work-log form. Save only when explicitly requested."""
+
+    fields = action.get("fields", {})
+    time_value = fields.get("工作時間", action.get("time", "00:00"))
+    hour, minute = time_value.split(":", 1)
+    people = [
+        {
+            "id": staff.get(str(no), {}).get("user_id", ""),
+            "name": staff.get(str(no), {}).get("name", str(no)),
+        }
+        for no in fields.get("服勤人員", [])
+    ]
+
+    open_ap(driver, WORK_LOG_AP)
+    time.sleep(1)
+    before_controls = control_snapshot(driver)
+    insert_result = click_insert_control(driver)
+    time.sleep(2)
+
+    fill_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+
+        function visibleControls() {
+          return Array.from(document.querySelectorAll('input, select, textarea'));
+        }
+        function setControl(el, value) {
+          if (!el) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const option = Array.from(el.options || []).find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim() ||
+              String(opt.text || '').includes(String(value).trim())
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            const el = document.getElementById(id);
+            if (setControl(el, value)) return true;
+          }
+          return false;
+        }
+        function byOptionText(value) {
+          const el = visibleControls().find(control =>
+            control.tagName.toLowerCase() === 'select' &&
+            Array.from(control.options || []).some(opt => String(opt.text || '').includes(value))
+          );
+          return setControl(el, value);
+        }
+        function byNearbyText(label, value, preferTextarea = false) {
+          const labels = Array.from(document.querySelectorAll('td, th, label, span, div'));
+          const node = labels.find(el => String(el.innerText || '').replace(/\\s+/g, '').includes(label));
+          if (!node) return false;
+          let cursor = node;
+          for (let depth = 0; depth < 4 && cursor; depth += 1, cursor = cursor.parentElement) {
+            const controls = Array.from(cursor.querySelectorAll('input, select, textarea'));
+            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
+            for (const control of candidates) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          return false;
+        }
+
+        if (!byIds(['_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
+        if (!byIds(['_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
+        if (!byIds(['_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
+        if (!byIds(['_selETIMEH', '_selETimeH'], values.hour)) result.missing.push('end_hour');
+        if (!byIds(['_selETIMEM', '_selETimeM'], values.minute)) result.missing.push('end_minute');
+        if (!byOptionText(values.item)) result.missing.push('item');
+        if (values.reason && !byNearbyText('事由', values.reason)) result.missing.push('reason');
+        if (!byNearbyText('工作概述', values.description, true)) result.missing.push('description');
+        if (!byNearbyText('處理情形', values.status, true)) result.missing.push('status');
+        return result;
+        """,
+        {
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "item": fields.get("勤務項目", ""),
+            "reason": fields.get("事由", ""),
+            "description": fields.get("工作概述", ""),
+            "status": fields.get("處理情形", ""),
+        },
+    )
+
+    people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
+    save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
+    if save:
+        time.sleep(2)
+    after_controls = control_snapshot(driver)
+    return {
+        "ok": True,
+        "insert": insert_result,
+        "fill": fill_result,
+        "people": people_result,
+        "save": save_result,
+        "before_controls": before_controls,
+        "after_controls": after_controls,
+    }
+
+
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     wait = WebDriverWait(driver, 20)
     driver.get(f"{BASE_URL}/login119")

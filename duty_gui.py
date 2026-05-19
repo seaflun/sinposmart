@@ -36,6 +36,7 @@ from compare_rehearsal_records import (
 from duty_rehearsal import (
     ENTRY_LOG_AP,
     WORK_LOG_AP,
+    fill_work_log_form_for_test,
     login,
     parse_roc_date,
     planned_actions,
@@ -335,6 +336,7 @@ class DutyGui(tk.Tk):
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
         ttk.Button(controls, text="提前記錄", style="Accent.TButton", command=self.early_execute_selected).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="填表儲存", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
         self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12)
@@ -1007,6 +1009,63 @@ class DutyGui(tk.Tk):
         self.executed_due.add(index)
         self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.actions[index])}")
         self.refresh_duty_tasks()
+
+    def save_selected_work_log_test(self) -> None:
+        selection = self.duty_tree.selection()
+        if not selection:
+            messagebox.showinfo("填表儲存", "請先選擇一筆工作紀錄任務。")
+            return
+        iid = selection[0]
+        if not str(iid).startswith("duty-"):
+            return
+        index = int(str(iid).split("-", 1)[1])
+        action = self.actions[index]
+        if action.get("kind") != "work_log":
+            messagebox.showwarning("類型不符", "目前只支援工作紀錄簿測試儲存。")
+            return
+        if not self.session or not self.session.verified:
+            messagebox.showwarning("尚未登入", "請先登入後再測試儲存。")
+            return
+        if not messagebox.askyesno("確認儲存", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+            return
+        self.duty_status_text.set(f"正在填表儲存：{self.duty_action_summary(action)}")
+        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session), daemon=True).start()
+
+    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession) -> None:
+        driver = None
+        result_path = Path(f"work_log_form_test_{datetime.now():%Y%m%d_%H%M%S}.json")
+        try:
+            options = Options()
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-popup-blocking")
+            driver = webdriver.Chrome(options=options)
+            login(driver, session.user_id, session.password)
+            result = fill_work_log_form_for_test(
+                driver,
+                action,
+                self.staff,
+                self.data.get("target_date") or today_roc_date(),
+                save=True,
+            )
+            result["action_index"] = index
+            result["action"] = action
+            result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            error = str(exc)
+            self.after(0, lambda: self._save_work_log_failed(error))
+            return
+        finally:
+            if driver:
+                driver.quit()
+        self.after(0, lambda: self._save_work_log_succeeded(index, result_path))
+
+    def _save_work_log_succeeded(self, index: int, result_path: Path) -> None:
+        self.executed_due.add(index)
+        self.duty_status_text.set(f"已送出儲存測試，結果：{result_path.name}")
+        self.refresh_duty_tasks()
+
+    def _save_work_log_failed(self, error: str) -> None:
+        self.duty_status_text.set(f"填表儲存失敗：{error}")
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session

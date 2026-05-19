@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 duty_trigger_log.jsonl
+work_log_form_test_*.json
 .env
 *.log
 .DS_Store
