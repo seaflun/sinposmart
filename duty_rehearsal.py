@@ -1103,6 +1103,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
               const cols = {};
               for (let i = 1; i < Math.min(header.length, row.length); i++) {
                 const key = (header[i] || '').replace(/\\s+/g, '');
+                if (key === '檢核欄') continue;
                 if (key) cols[key] = row[i] || '';
               }
               result.rows.push({slot, columns: cols});
@@ -1147,7 +1148,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         rows=[
             DutyRow(
                 slot=row["slot"],
-                columns={key: nums(value) for key, value in row["columns"].items()},
+                columns={key: nums(value) for key, value in row["columns"].items() if key != "檢核欄"},
             )
             for row in data.get("rows", [])
         ],
@@ -1709,12 +1710,13 @@ def planned_actions(
                 fields={
                     "工作時間": "11:10",
                     "勤務項目": "其他",
+                    "事由": "無線電試話",
                     "工作概述": radio_test_description(),
                     "處理情形": radio_test_status(),
                     "服勤人員": [radio_actor],
                 },
-                source="無線電測試",
-                duplicate_key=f"work:{target}:1110:無線電測試:{radio_actor}",
+                source="無線電試話",
+                duplicate_key=f"work:{target}:1110:無線電試話:{radio_actor}",
             )
         )
 

@@ -137,6 +137,8 @@ class DutyGui(tk.Tk):
         self.session: LoginSession | None = None
         self.executed_due: set[int] = set()
         self.submitting_indices: set[int] = set()
+        self.submit_queue: list[tuple[int, dict[str, Any], bool, bool, bool]] = []
+        self.submit_worker_running = False
         self.review_widgets: list[tk.Widget] = []
         self.duty_widgets: list[tk.Widget] = []
         self.login_form_widgets: list[tk.Widget] = []
@@ -929,6 +931,8 @@ class DutyGui(tk.Tk):
     def clear_login(self) -> None:
         self.session = None
         self.submitting_indices.clear()
+        self.submit_queue.clear()
+        self.submit_worker_running = False
         self.password.set("")
         self.logout_cleared = True
         self.login_status.set("已清除登入狀態。")
@@ -1149,6 +1153,17 @@ class DutyGui(tk.Tk):
         submit_kind = "出入" if action.get("kind") == "entry_log" else "工作"
         if confirm and save and not messagebox.askyesno("確認提前登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
+        self.submitting_indices.add(index)
+        self.submit_queue.append((index, action, save, visible, notify))
+        self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
+        self.refresh_duty_tasks()
+        self.start_next_submit_job()
+
+    def start_next_submit_job(self) -> None:
+        if self.submit_worker_running or not self.submit_queue or not self.session:
+            return
+        index, action, save, visible, notify = self.submit_queue.pop(0)
+        self.submit_worker_running = True
         prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
         result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
         started_result = {
@@ -1162,7 +1177,6 @@ class DutyGui(tk.Tk):
             "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.submitting_indices.add(index)
         self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
         self.refresh_duty_tasks()
         threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path, save, visible, notify), daemon=True).start()
@@ -1211,6 +1225,7 @@ class DutyGui(tk.Tk):
 
     def _save_work_log_succeeded(self, index: int, result_path: Path, notify: bool) -> None:
         self.submitting_indices.discard(index)
+        self.submit_worker_running = False
         self.executed_due.add(index)
         self.duty_action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
         self.duty_status_text.set("已提前登打")
@@ -1220,13 +1235,16 @@ class DutyGui(tk.Tk):
             self.refresh_comparison_background(self.duty_data["target_date"], "early-submit")
         self.refresh_duty_tasks()
         self.refresh_tasks()
+        self.start_next_submit_job()
 
     def _save_work_log_failed(self, index: int, error: str, result_path: Path, notify: bool) -> None:
         self.submitting_indices.discard(index)
+        self.submit_worker_running = False
         self.duty_status_text.set(f"提前登打失敗：{error}，結果：{result_path.name}")
         if notify:
             messagebox.showerror("提前登打失敗", f"{error}\n\n結果檔：{result_path.name}")
         self.refresh_duty_tasks()
+        self.start_next_submit_job()
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session
@@ -1421,6 +1439,8 @@ class DutyGui(tk.Tk):
 
     def action_summary(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
+        if action.get("source") in ("無線電試話", "無線電測試"):
+            return "其他/無線電試話"
         if action.get("kind") == "entry_log":
             return f"{fields.get('出或入', '')} / {fields.get('領用事由及地點', '')}"
         item = fields.get("勤務項目", "")
