@@ -329,7 +329,7 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
           }
           return {id: '', name: String(item || '').trim(), dutyNo: ''};
         }).filter(x => x.id || x.name || x.dutyNo);
-        const checks = Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]'));
+        const checks = Array.from(document.querySelectorAll('input[name="_chkUser"]'));
         const selected = [];
         const missing = [];
         const candidates = checks.map(el => ({
@@ -348,7 +348,7 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
             const cells = Array.from(row?.children || []).map(cell => String(cell.innerText || '').trim());
             return (target.id && id === target.id) ||
                    (target.dutyNo && cells.some(text => text === target.dutyNo)) ||
-                   (target.name && (
+                   (target.name && personName && (
                      personName === target.name ||
                      personName.includes(target.name) ||
                      target.name.includes(personName) ||
@@ -691,7 +691,8 @@ def fill_entry_log_form_for_test(
     open_ap(driver, ENTRY_LOG_AP)
     time.sleep(1)
     before_controls = control_snapshot(driver)
-    insert_result = click_insert_control(driver)
+    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH'));")
+    insert_result = {"ok": True, "skipped": True, "reason": "entry form already open"} if form_ready else click_insert_control(driver)
     time.sleep(2)
 
     fill_result = driver.execute_script(
@@ -864,7 +865,8 @@ def open_entry_log_form_for_manual(driver: webdriver.Chrome) -> dict[str, Any]:
     open_ap(driver, ENTRY_LOG_AP)
     time.sleep(1)
     before_controls = control_snapshot(driver)
-    insert_result = click_insert_control(driver)
+    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH'));")
+    insert_result = {"ok": True, "skipped": True, "reason": "entry form already open"} if form_ready else click_insert_control(driver)
     time.sleep(2)
     after_controls = control_snapshot(driver)
     return {
@@ -897,7 +899,8 @@ def inspect_entry_log_format(
     open_ap(driver, ENTRY_LOG_AP)
     time.sleep(1)
     before_controls = control_snapshot(driver)
-    insert_result = click_insert_control(driver)
+    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH'));")
+    insert_result = {"ok": True, "skipped": True, "reason": "entry form already open"} if form_ready else click_insert_control(driver)
     time.sleep(2)
     main_before_popup = control_snapshot(driver)
     fill_result = driver.execute_script(
