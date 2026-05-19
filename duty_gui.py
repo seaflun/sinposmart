@@ -144,6 +144,7 @@ class DutyGui(tk.Tk):
         self.comparison_completed_hours: set[str] = set()
         self.logout_cleared = False
         self.login_running = False
+        self.login_attempt_id = 0
 
         self._build_layout()
         if DEFAULT_PREVIEW.exists():
@@ -614,12 +615,15 @@ class DutyGui(tk.Tk):
             return
 
         self.login_running = True
+        self.login_attempt_id += 1
+        attempt_id = self.login_attempt_id
         self.set_login_buttons_enabled(False)
         self.login_status.set("測試登入中...")
-        thread = threading.Thread(target=self._verify_login_worker, args=(user_id, password), daemon=True)
+        self.after(45000, lambda value=attempt_id: self._login_timed_out(value))
+        thread = threading.Thread(target=self._verify_login_worker, args=(attempt_id, user_id, password), daemon=True)
         thread.start()
 
-    def _verify_login_worker(self, user_id: str, password: str) -> None:
+    def _verify_login_worker(self, attempt_id: int, user_id: str, password: str) -> None:
         driver = None
         try:
             options = Options()
@@ -627,17 +631,18 @@ class DutyGui(tk.Tk):
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
             login(driver, user_id, password)
             actor_no, actor_name = self.identify_logged_in_actor(driver)
             if not actor_no:
                 raise RuntimeError("帳號或密碼可能錯誤，或登入後頁面沒有顯示可辨識的姓名。")
         except Exception as exc:
-            self.after(0, lambda: self._login_failed(str(exc)))
+            self.after(0, lambda value=attempt_id, error=str(exc): self._login_failed(value, error))
             return
         finally:
             if driver:
                 driver.quit()
-        self.after(0, lambda: self._login_succeeded(actor_no, user_id, password))
+        self.after(0, lambda value=attempt_id: self._login_succeeded(value, actor_no, user_id, password))
 
     def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
         target_date = parse_roc_date(target_roc_date)
@@ -835,7 +840,9 @@ class DutyGui(tk.Tk):
             """
         ) or ""
 
-    def _login_succeeded(self, actor_no: str, user_id: str, password: str) -> None:
+    def _login_succeeded(self, attempt_id: int, actor_no: str, user_id: str, password: str) -> None:
+        if attempt_id != self.login_attempt_id:
+            return
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
@@ -857,12 +864,26 @@ class DutyGui(tk.Tk):
             self.login_status.set(f"已登入：{self.person_label(actor_no)}，找不到今日排程檔，登入未執行系統查詢。")
             self.refresh_comparison_background(today_roc_date(), "login")
 
-    def _login_failed(self, error: str) -> None:
+    def _login_failed(self, attempt_id: int, error: str) -> None:
+        if attempt_id != self.login_attempt_id:
+            return
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = None
         self.login_status.set(f"登入失敗：{error}")
         messagebox.showerror("登入失敗", error)
+        self.update_login_panel()
+        self.refresh_tasks()
+
+    def _login_timed_out(self, attempt_id: int) -> None:
+        if attempt_id != self.login_attempt_id or not self.login_running:
+            return
+        self.login_running = False
+        self.login_attempt_id += 1
+        self.set_login_buttons_enabled(True)
+        self.session = None
+        self.login_status.set("登入逾時：請確認帳號密碼或勤務系統是否有回應。")
+        messagebox.showerror("登入逾時", "登入超過 45 秒沒有完成，已恢復登入按鈕。")
         self.update_login_panel()
         self.refresh_tasks()
 
