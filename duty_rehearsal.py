@@ -510,6 +510,23 @@ def click_save_control(driver: webdriver.Chrome) -> dict[str, Any]:
     )
 
 
+def click_entry_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
+    return driver.execute_script(
+        """
+        const target = document.getElementById('_btnInsert');
+        if (!target) return {ok: false, reason: 'entry insert control not found'};
+        target.click();
+        return {
+          ok: true,
+          id: target.id || '',
+          name: target.name || '',
+          value: target.value || '',
+          text: target.innerText || ''
+        };
+        """
+    )
+
+
 def fill_work_log_form_for_test(
     driver: webdriver.Chrome,
     action: dict[str, Any],
@@ -758,19 +775,23 @@ def fill_entry_log_form_for_test(
         if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
         if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
         if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        if (!byIds(['_areMemo', '_txtReason', '_txtReasonPlace', '_txtPlace'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由', values.reason)) result.missing.push('reason');
+        if (!byIds(['_selList3'], values.duty_item)) result.missing.push('duty_item');
+        if (typeof changeSelList4 === 'function') changeSelList4();
         return result;
         """,
         {
             "date": target_roc_date,
             "hour": hour,
             "minute": minute,
-            "reason": fields.get("領用事由及地點", ""),
+            "duty_item": fields.get("勤務項目", "值班(宿)"),
         },
     )
     people_result = set_entry_people(driver, [person], fallback_popup=True)
     if not people_result.get("ok"):
         raise RuntimeError("entry people selection failed: " + json.dumps(people_result, ensure_ascii=False))
+    selected_people = people_result.get("selected") or []
+    selected_value = str((selected_people[0] or {}).get("value", "")) if selected_people else ""
+    selected_user_id = selected_value.split(",", 1)[0].strip() or people_result.get("hidManId", "")
     outin_result = driver.execute_script(
         """
         const values = arguments[0];
@@ -831,19 +852,27 @@ def fill_entry_log_form_for_test(
           return false;
         }
 
+        if (!byIds(['_selMan'], values.man)) result.missing.push('man');
+        byIds(['_txtMan'], values.man_name);
+        byIds(['_selTitle'], values.title);
+        byIds(['_txtTitle'], values.title_text);
         if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
         if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
         if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
         """,
         {
+            "man": f"{selected_user_id},0" if selected_user_id else "",
+            "man_name": person["name"],
+            "title": "0",
+            "title_text": "隊員",
             "outin": fields.get("出或入", ""),
             "radio": fields.get("手提無線電編號", ""),
             "returned": fields.get("是否歸還", ""),
         },
     )
 
-    save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
+    save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}
     if save:
         time.sleep(2)
     after_controls = control_snapshot(driver)
