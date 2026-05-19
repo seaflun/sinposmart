@@ -588,6 +588,126 @@ def fill_work_log_form_for_test(
     }
 
 
+def fill_entry_log_form_for_test(
+    driver: webdriver.Chrome,
+    action: dict[str, Any],
+    staff: dict[str, dict[str, str]],
+    target_roc_date: str,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Fill the entry-log form. Save only when explicitly requested."""
+
+    fields = action.get("fields", {})
+    time_value = fields.get("系統寫入時間", fields.get("登打時間", action.get("time", "00:00")))
+    hour, minute = time_value.split(":", 1)
+    target_no = str(action.get("target", ""))
+    person = {
+        "id": staff.get(target_no, {}).get("user_id", ""),
+        "name": staff.get(target_no, {}).get("name", target_no),
+    }
+
+    open_ap(driver, ENTRY_LOG_AP)
+    time.sleep(1)
+    before_controls = control_snapshot(driver)
+    insert_result = click_insert_control(driver)
+    time.sleep(2)
+
+    fill_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+        const used = new Set();
+
+        function controls() {
+          return Array.from(document.querySelectorAll('input, select, textarea'));
+        }
+        function setControl(el, value) {
+          if (!el) return false;
+          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
+          if (used.has(key)) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const option = Array.from(el.options || []).find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim() ||
+              String(opt.text || '').includes(String(value).trim())
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          used.add(key);
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            if (setControl(document.getElementById(id), value)) return true;
+          }
+          return false;
+        }
+        function byOptionText(value) {
+          const el = controls().find(control =>
+            control.tagName.toLowerCase() === 'select' &&
+            Array.from(control.options || []).some(opt => String(opt.text || '').trim() === String(value).trim())
+          );
+          return setControl(el, value);
+        }
+        function byNearbyText(label, value) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const candidates = cells.slice(labelIndex + 1).flatMap(cell =>
+              Array.from(cell.querySelectorAll('input, select, textarea'))
+            );
+            for (const control of candidates) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          return false;
+        }
+
+        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
+        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
+        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
+        if (!byIds(['_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
+        if (!byIds(['_txtReason', '_txtReasonPlace', '_txtPlace'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由', values.reason)) result.missing.push('reason');
+        if (values.radio && !byIds(['_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
+        if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
+        return result;
+        """,
+        {
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "outin": fields.get("出或入", ""),
+            "reason": fields.get("領用事由及地點", ""),
+            "radio": fields.get("手提無線電編號", ""),
+            "returned": fields.get("是否歸還", ""),
+        },
+    )
+
+    people_result = set_entry_people(driver, [person], fallback_popup=True)
+    save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
+    if save:
+        time.sleep(2)
+    after_controls = control_snapshot(driver)
+    return {
+        "ok": True,
+        "insert": insert_result,
+        "fill": fill_result,
+        "people": people_result,
+        "save": save_result,
+        "before_controls": before_controls,
+        "after_controls": after_controls,
+    }
+
+
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     wait = WebDriverWait(driver, 20)
     driver.get(f"{BASE_URL}/login119")
@@ -999,6 +1119,7 @@ def radio_test_status() -> str:
 def training_template(topic: str, time_range: str, instructor: str) -> tuple[str, str]:
     description = "\n".join(
         [
+            topic,
             f"一、時間：{time_range}",
             "二、地點：分隊駐地",
             f"三、教官：{instructor}",
@@ -1009,6 +1130,7 @@ def training_template(topic: str, time_range: str, instructor: str) -> tuple[str
     if topic == "環境整理":
         description = "\n".join(
             [
+                topic,
                 f"一、時間：{time_range}",
                 "二、地點：分隊駐地",
                 f"三、教官：{instructor}",

@@ -36,6 +36,7 @@ from compare_rehearsal_records import (
 from duty_rehearsal import (
     ENTRY_LOG_AP,
     WORK_LOG_AP,
+    fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
     login,
     parse_roc_date,
@@ -1022,15 +1023,16 @@ class DutyGui(tk.Tk):
             return
         index = int(str(iid).split("-", 1)[1])
         action = self.actions[index]
-        if action.get("kind") != "work_log":
-            messagebox.showwarning("類型不符", "目前只支援工作紀錄簿測試儲存。")
+        if action.get("kind") not in ("work_log", "entry_log"):
+            messagebox.showwarning("類型不符", "目前只支援工作紀錄簿與出入登記提前登打。")
             return
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再提前登打。")
             return
         if not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
-        result_path = Path(f"work_log_form_test_{datetime.now():%Y%m%d_%H%M%S}.json")
+        prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
+        result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
         started_result = {
             "stage": "started",
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1051,13 +1053,11 @@ class DutyGui(tk.Tk):
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
-            result = fill_work_log_form_for_test(
-                driver,
-                action,
-                self.staff,
-                self.data.get("target_date") or today_roc_date(),
-                save=True,
-            )
+            target_date = self.data.get("target_date") or today_roc_date()
+            if action.get("kind") == "entry_log":
+                result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=True)
+            else:
+                result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=True)
             result["stage"] = "submitted"
             result["action_index"] = index
             result["action"] = action
