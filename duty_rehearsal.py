@@ -1775,8 +1775,11 @@ def planned_actions(
 
     if tomorrow:
         next_target = target + timedelta(days=1)
+        next_morning_sources = {"今日在勤且昨日未在勤", "昨日在勤且今日未在勤", "值班交接"}
         for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
-            if action.time != "08:00" or action.source != "值班交接":
+            if action.source not in next_morning_sources:
+                continue
+            if action.time not in ("07:55", "08:00", "08:05"):
                 continue
             action.date_offset = 1
             actions.append(action)
