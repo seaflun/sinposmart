@@ -528,15 +528,13 @@ def fill_work_log_form_for_test(
           return false;
         }
 
-        if (!byIds(['_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
-        if (!byIds(['_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
-        if (!byIds(['_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        if (!byIds(['_selETIMEH', '_selETimeH'], values.hour)) result.missing.push('end_hour');
-        if (!byIds(['_selETIMEM', '_selETimeM'], values.minute)) result.missing.push('end_minute');
+        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
+        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
+        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
+        byIds(['_selETIMEH', '_selETimeH'], values.hour);
+        byIds(['_selETIMEM', '_selETimeM'], values.minute);
         if (!byOptionText(values.item)) result.missing.push('item');
         if (values.reason && !byNearbyText('事由', values.reason)) result.missing.push('reason');
-        if (!byNearbyText('工作概述', values.description, true)) result.missing.push('description');
-        if (!byNearbyText('處理情形', values.status, true)) result.missing.push('status');
         return result;
         """,
         {
@@ -549,6 +547,30 @@ def fill_work_log_form_for_test(
             "status": fields.get("處理情形", ""),
         },
     )
+    time.sleep(1)
+    content_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+        function setDirect(id, value) {
+          const el = document.getElementById(id);
+          if (!el) return false;
+          el.value = value;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        if (!setDirect('_areDescription', values.description)) result.missing.push('description');
+        if (!setDirect('_areStatus', values.status)) result.missing.push('status');
+        return result;
+        """,
+        {
+            "description": fields.get("工作概述", ""),
+            "status": fields.get("處理情形", ""),
+        },
+    )
+    fill_result["content"] = content_result
 
     people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
