@@ -1351,9 +1351,40 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
     return blocks
 
 
+def external_columns(row: DutyRow) -> dict[str, list[str]]:
+    ignore = {"值班", "救護", "備勤", "休息", "檢核欄"}
+    return {column: values for column, values in row.columns.items() if column not in ignore}
+
+
+def has_external_duty(row: DutyRow | None, no: str) -> bool:
+    if not row:
+        return False
+    return any(no in values for values in external_columns(row).values())
+
+
+def adjacent_rest_start(sheet: DutySheet, no: str, start: int) -> int:
+    probe = start - 1
+    block_start = start
+    while probe >= 0:
+        row = row_for_hour(sheet, probe)
+        if not row or no not in row.columns.get("休息", []):
+            break
+        row_start = slot_start(row.slot)
+        if row_start is None:
+            break
+        block_start = row_start
+        probe = row_start - 1
+    return block_start
+
+
+def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | None) -> bool:
+    before = row_for_hour(sheet, start - 1) if start > 0 else None
+    after = row_for_hour(sheet, end) if end is not None and end < 24 else None
+    return has_external_duty(before, no) or has_external_duty(after, no)
+
+
 def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None, int]]:
     blocks: list[tuple[str, str, int, int | None, int]] = []
-    ignore = {"值班", "救護", "備勤", "休息", "檢核欄"}
     active: dict[tuple[str, str], int] = {}
     ordered_rows = sorted(sheet.rows, key=lambda item: slot_start(item.slot) if slot_start(item.slot) is not None else -1)
     for row in ordered_rows:
@@ -1362,15 +1393,15 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
         if start is None or end is None:
             continue
         current: set[tuple[str, str]] = set()
-        for column, values in row.columns.items():
-            if column in ignore:
-                continue
+        for column, values in external_columns(row).items():
             for no in values:
                 current.add((column, no))
-                active.setdefault((column, no), start)
+                active.setdefault((column, no), adjacent_rest_start(sheet, no, start))
         for key in list(active.keys()):
             if key not in current:
                 duty_name, no = key
+                if no in row.columns.get("休息", []):
+                    continue
                 block_start = active.pop(key)
                 block_end = start
                 if block_end == 8 and next_sheet and no in people_at(next_sheet, 8, duty_name):
@@ -1545,6 +1576,10 @@ def entry_actor_at(today: DutySheet, yesterday: DutySheet | None, hour: int, min
     return duty_actor_at(today, yesterday, hour, minute)
 
 
+def next_morning_entry_actor(today: DutySheet, hour: int) -> str:
+    return (people_at(today, 22, "值班") or people_at(today, hour, "值班") or [""])[0]
+
+
 def planned_actions(
     today: DutySheet,
     yesterday: DutySheet | None,
@@ -1622,11 +1657,16 @@ def planned_actions(
     for no, start, end in rest_blocks(today, tomorrow):
         if no not in today_on or (start == 8 and no not in yesterday_on):
             continue
+        if rest_is_external_route(today, no, start, end):
+            continue
+        start_offset = 1 if start < 8 else 0
+        end_offset = 1 if end is not None and end <= 8 else 0
+        start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{start:02d}:00",
-                actor=entry_actor_at(today, yesterday, start, 0),
+                actor=start_actor,
                 target=no,
                 fields={
                     "登打時間": f"{start:02d}:00",
@@ -1638,15 +1678,17 @@ def planned_actions(
                 },
                 source="休息簽出",
                 duplicate_key=f"entry:{target}:{start}:out:{no}:休息",
+                date_offset=start_offset,
             )
         )
         if end is None:
             continue
+        end_actor = next_morning_entry_actor(today, end) if end_offset else entry_actor_at(today, yesterday, end, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{end:02d}:00",
-                actor=entry_actor_at(today, yesterday, end, 0),
+                actor=end_actor,
                 target=no,
                 fields={
                     "登打時間": f"{end:02d}:00",
@@ -1658,17 +1700,20 @@ def planned_actions(
                 },
                 source="休息結束",
                 duplicate_key=f"entry:{target}:{end}:in:{no}:返隊",
+                date_offset=end_offset,
             )
         )
 
     # External duty sign-out/sign-in. Sign-out is entered by the duty desk
     # covering the external duty start; sign-in is entered near the duty end.
     for duty_name, no, start, end, end_offset in external_duty_blocks(today, tomorrow):
+        start_offset = 1 if start < 8 else 0
+        start_actor = next_morning_entry_actor(today, start) if start_offset else duty_actor_at(today, yesterday, start, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{start:02d}:00",
-                actor=duty_actor_at(today, yesterday, start, 0),
+                actor=start_actor,
                 target=no,
                 fields={
                     "登打時間": f"{start:02d}:00",
@@ -1680,15 +1725,19 @@ def planned_actions(
                 },
                 source="外勤簽出",
                 duplicate_key=f"entry:{target}:{start}:out:{no}:{duty_name}",
+                date_offset=start_offset,
             )
         )
         if end is None:
             continue
+        if end_offset == 0 and end is not None and end <= 8:
+            end_offset = 1
+        end_actor = next_morning_entry_actor(today, end) if end_offset else duty_actor_at(today, yesterday, max(end - 1, 0), 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{end:02d}:00",
-                actor=duty_actor_at(today, yesterday, max(end - 1, 0), 0),
+                actor=end_actor,
                 target=no,
                 fields={
                     "登打時間": f"{end:02d}:00",

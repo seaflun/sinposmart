@@ -352,7 +352,7 @@ class DutyGui(tk.Tk):
         self.early_submit_button.pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
-        self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12)
+        self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12, selectmode="extended")
         headings = {
             "time": "時間",
             "summary": "當班任務",
@@ -1168,20 +1168,30 @@ class DutyGui(tk.Tk):
     def start_submit_selected(self, save: bool, visible: bool) -> None:
         selection = self.duty_tree.selection()
         if not selection:
-            messagebox.showinfo("提前登打", "請先選擇一筆工作紀錄任務。")
+            messagebox.showinfo("提前登打", "請先選擇一筆或多筆工作紀錄任務。")
             return
-        iid = selection[0]
-        if not str(iid).startswith("duty-"):
-            return
-        index = int(str(iid).split("-", 1)[1])
-        action = self.duty_actions[index]
-        if action.get("kind") not in ("work_log", "entry_log"):
+        selected_actions: list[tuple[int, dict[str, Any]]] = []
+        for iid in selection:
+            if not str(iid).startswith("duty-"):
+                continue
+            index = int(str(iid).split("-", 1)[1])
+            action = self.duty_actions[index]
+            if action.get("kind") in ("work_log", "entry_log"):
+                selected_actions.append((index, action))
+        if not selected_actions:
             messagebox.showwarning("類型不符", "目前只支援工作紀錄簿與出入登記提前登打。")
             return
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再提前登打。")
             return
-        self.submit_duty_action(index, action, save=save, visible=visible, confirm=True, notify=True)
+        summaries = "\n".join(f"- {self.duty_action_summary(action)}" for _, action in selected_actions[:8])
+        if len(selected_actions) > 8:
+            summaries += f"\n...另 {len(selected_actions) - 8} 筆"
+        if save and not messagebox.askyesno("確認提前登打", f"將登打勤務系統 {len(selected_actions)} 筆：\n{summaries}\n\n確定要繼續？"):
+            return
+        for index, action in selected_actions:
+            self.submit_duty_action(index, action, save=save, visible=visible, confirm=False, notify=False)
+        self.duty_status_text.set(f"已加入提前登打佇列：{len(selected_actions)} 筆")
 
     def submit_duty_action(self, index: int, action: dict[str, Any], save: bool, visible: bool, confirm: bool, notify: bool) -> None:
         if not self.session or not self.session.verified:
