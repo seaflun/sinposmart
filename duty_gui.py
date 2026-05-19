@@ -40,6 +40,7 @@ from duty_rehearsal import (
     fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
     login,
+    open_entry_log_form_for_manual,
     parse_roc_date,
     planned_actions,
     query_cases,
@@ -1112,11 +1113,13 @@ class DutyGui(tk.Tk):
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
             target_date = self.data.get("target_date") or today_roc_date()
-            if action.get("kind") == "entry_log":
+            if visible and action.get("kind") == "entry_log":
+                result = open_entry_log_form_for_manual(driver)
+            elif action.get("kind") == "entry_log":
                 result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=save)
             else:
                 result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=save)
-            result["stage"] = "submitted" if save else "filled_visible"
+            result["stage"] = "submitted" if save else ("manual_visible" if action.get("kind") == "entry_log" else "filled_visible")
             result["action_index"] = index
             result["action"] = action
             result["updated_at"] = datetime.now().isoformat(timespec="seconds")

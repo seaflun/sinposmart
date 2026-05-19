@@ -731,6 +731,24 @@ def fill_entry_log_form_for_test(
     }
 
 
+def open_entry_log_form_for_manual(driver: webdriver.Chrome) -> dict[str, Any]:
+    """Open a blank entry-log insert form for manual field inspection."""
+
+    open_ap(driver, ENTRY_LOG_AP)
+    time.sleep(1)
+    before_controls = control_snapshot(driver)
+    insert_result = click_insert_control(driver)
+    time.sleep(2)
+    after_controls = control_snapshot(driver)
+    return {
+        "ok": True,
+        "insert": insert_result,
+        "before_controls": before_controls,
+        "after_controls": after_controls,
+        "save": {"ok": False, "skipped": True},
+    }
+
+
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     wait = WebDriverWait(driver, 20)
     driver.get(f"{BASE_URL}/login119")
