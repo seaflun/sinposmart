@@ -335,8 +335,8 @@ class DutyGui(tk.Tk):
         controls = ttk.Frame(panel)
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
-        ttk.Button(controls, text="提前記錄", style="Accent.TButton", command=self.early_execute_selected).pack(side=tk.RIGHT, padx=(0, 8))
-        ttk.Button(controls, text="填表儲存", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="只記錄不送出", style="Soft.TButton", command=self.early_execute_selected).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="正式儲存測試", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
         self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12)
@@ -1018,7 +1018,7 @@ class DutyGui(tk.Tk):
     def save_selected_work_log_test(self) -> None:
         selection = self.duty_tree.selection()
         if not selection:
-            messagebox.showinfo("填表儲存", "請先選擇一筆工作紀錄任務。")
+            messagebox.showinfo("正式儲存測試", "請先選擇一筆工作紀錄任務。")
             return
         iid = selection[0]
         if not str(iid).startswith("duty-"):
@@ -1031,14 +1031,23 @@ class DutyGui(tk.Tk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再測試儲存。")
             return
-        if not messagebox.askyesno("確認儲存", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        if not messagebox.askyesno("確認正式儲存", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
-        self.duty_status_text.set(f"正在填表儲存：{self.duty_action_summary(action)}")
-        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session), daemon=True).start()
-
-    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession) -> None:
-        driver = None
         result_path = Path(f"work_log_form_test_{datetime.now():%Y%m%d_%H%M%S}.json")
+        started_result = {
+            "stage": "started",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "action_index": index,
+            "action": action,
+            "user_id": self.session.user_id,
+            "summary": self.duty_action_summary(action),
+        }
+        result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.duty_status_text.set(f"已開始正式儲存測試：{self.duty_action_summary(action)}")
+        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path), daemon=True).start()
+
+    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path) -> None:
+        driver = None
         try:
             options = Options()
             options.add_argument("--headless=new")
@@ -1052,12 +1061,22 @@ class DutyGui(tk.Tk):
                 self.data.get("target_date") or today_roc_date(),
                 save=True,
             )
+            result["stage"] = "submitted"
             result["action_index"] = index
             result["action"] = action
+            result["updated_at"] = datetime.now().isoformat(timespec="seconds")
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             error = str(exc)
-            self.after(0, lambda: self._save_work_log_failed(error))
+            failure_result = {
+                "stage": "failed",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "action_index": index,
+                "action": action,
+                "error": error,
+            }
+            result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.after(0, lambda: self._save_work_log_failed(error, result_path))
             return
         finally:
             if driver:
@@ -1069,8 +1088,8 @@ class DutyGui(tk.Tk):
         self.duty_status_text.set(f"已送出儲存測試，結果：{result_path.name}")
         self.refresh_duty_tasks()
 
-    def _save_work_log_failed(self, error: str) -> None:
-        self.duty_status_text.set(f"填表儲存失敗：{error}")
+    def _save_work_log_failed(self, error: str, result_path: Path) -> None:
+        self.duty_status_text.set(f"正式儲存測試失敗：{error}，結果：{result_path.name}")
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session
