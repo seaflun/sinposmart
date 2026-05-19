@@ -554,32 +554,30 @@ class DutyGui(tk.Tk):
             fields = action.get("fields", {})
             if action.get("kind") == "entry_log":
                 reason = fields.get("領用事由及地點", "")
-                if is_future_action(target_date, action):
+                exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
+                near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
+                if exact:
+                    result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
+                elif is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
+                elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
+                    result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
+                elif near:
+                    result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
+                elif reason in ("到勤", "退勤", "休息後退勤"):
+                    result[index] = {"compare": "需補登", "group": "todo", "matched": []}
+                elif action.get("source", "").startswith("外勤"):
+                    result[index] = {"compare": "人工確認", "group": "review", "matched": []}
                 else:
-                    exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
-                    near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
-                    if exact:
-                        result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
-                    elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
-                        result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
-                    elif near:
-                        result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
-                    elif reason in ("到勤", "退勤", "休息後退勤"):
-                        result[index] = {"compare": "需補登", "group": "todo", "matched": []}
-                    elif action.get("source", "").startswith("外勤"):
-                        result[index] = {"compare": "人工確認", "group": "review", "matched": []}
-                    else:
-                        result[index] = {"compare": "未找到", "group": "todo", "matched": []}
+                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
             else:
-                if is_future_action(target_date, action):
+                matches = find_work_matches(work_rows, target_date, self.staff, action)
+                if matches:
+                    result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
+                elif is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                 else:
-                    matches = find_work_matches(work_rows, target_date, self.staff, action)
-                    if matches:
-                        result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
-                    else:
-                        result[index] = {"compare": "未找到", "group": "todo", "matched": []}
+                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
 
         for index, action in enumerate(data.get("actions", [])):
             # A matching external record under a different name means the planned
@@ -949,7 +947,7 @@ class DutyGui(tk.Tk):
                 status = "已存在"
                 tag = "triggered"
             elif index in self.executed_due:
-                status = "已記錄"
+                status = "已提前登打"
                 tag = "triggered"
             else:
                 status = "到點待執行" if minutes <= now_min else "等待"
@@ -1084,9 +1082,13 @@ class DutyGui(tk.Tk):
 
     def _save_work_log_succeeded(self, index: int, result_path: Path) -> None:
         self.executed_due.add(index)
+        self.action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
         self.duty_status_text.set(f"已提前登打，結果：{result_path.name}")
         messagebox.showinfo("提前登打", f"已提前登打。\n結果檔：{result_path.name}")
+        if self.data.get("target_date"):
+            self.refresh_comparison_background(self.data["target_date"], "early-submit")
         self.refresh_duty_tasks()
+        self.refresh_tasks()
 
     def _save_work_log_failed(self, error: str, result_path: Path) -> None:
         self.duty_status_text.set(f"提前登打失敗：{error}，結果：{result_path.name}")

@@ -204,12 +204,12 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
     critical_missing: list[str] = []
     external_missing: list[str] = []
     for action in [a for a in data["actions"] if a["kind"] == "entry_log"]:
-        if is_future_action(target_date, action):
-            lines.append(f"[尚未到點] {summarize_entry(action, staff)}")
-            continue
         exact = find_entry_matches(entry_rows, target_date, staff, action, allow_near=False)
         if exact:
             lines.append(f"[已存在] {summarize_entry(action, staff)}")
+            continue
+        if is_future_action(target_date, action):
+            lines.append(f"[尚未到點] {summarize_entry(action, staff)}")
             continue
         if is_possible_handoff_adjustment(entry_rows, target_date, staff, action):
             lines.append(f"[可能臨時調整] {summarize_entry(action, staff)}")
@@ -240,12 +240,11 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
     )
     work_missing = 0
     for action in [a for a in data["actions"] if a["kind"] == "work_log"]:
-        if is_future_action(target_date, action):
-            lines.append(f"[尚未到點] {summarize_work(action, staff)}")
-            continue
         matches = find_work_matches(work_rows, target_date, staff, action)
         if matches:
             lines.append(f"[已存在] {summarize_work(action, staff)}")
+        elif is_future_action(target_date, action):
+            lines.append(f"[尚未到點] {summarize_work(action, staff)}")
         else:
             work_missing += 1
             lines.append(f"[未找到] {summarize_work(action, staff)}")
