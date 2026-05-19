@@ -83,15 +83,16 @@ def is_handoff_entry(action: dict[str, Any]) -> bool:
 
 
 def has_value_rows_at_time(rows: list[str], target_date: str, time_value: str) -> bool:
-    return any(row_has_time(row, target_date, time_value) and "值班(宿)" in row for row in rows)
+    return any(row_has_time(row, target_date, time_value) and ("值班" in row or "值退" in row) for row in rows)
 
 
-def has_same_person_value_record(rows: list[str], staff: dict[str, dict[str, str]], action: dict[str, Any]) -> bool:
+def has_same_person_value_record(rows: list[str], target_date: str, staff: dict[str, dict[str, str]], action: dict[str, Any]) -> bool:
     target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
     outin = action.get("fields", {}).get("出或入", "")
+    system_time = action.get("fields", {}).get("系統寫入時間", action.get("time", ""))
     if not target_name or outin not in ("值班", "值退"):
         return False
-    return any(target_name in row and outin in row and "值班(宿)" in row for row in rows)
+    return any(target_name in row and outin in row and row_has_time(row, target_date, system_time) for row in rows)
 
 
 def is_possible_handoff_adjustment(
@@ -100,7 +101,9 @@ def is_possible_handoff_adjustment(
     staff: dict[str, dict[str, str]],
     action: dict[str, Any],
 ) -> bool:
-    return is_handoff_entry(action)
+    fields = action.get("fields", {})
+    time_value = fields.get("系統寫入時間", action.get("time", ""))
+    return is_handoff_entry(action) and has_value_rows_at_time(rows, target_date, time_value)
 
 
 def find_entry_matches(
@@ -116,6 +119,7 @@ def find_entry_matches(
     reason = fields.get("領用事由及地點", "")
     system_time = fields.get("系統寫入時間", action["time"])
     strict_time = outin in ("值班", "值退")
+    external_entry = str(action.get("source", "")).startswith("外勤")
     matches = []
     for row in rows:
         c = clean(row)
@@ -126,8 +130,9 @@ def find_entry_matches(
         if strict_time:
             if not row_has_time(row, target_date, system_time, allow_near=allow_near):
                 continue
-            if "值班(宿)" not in row:
-                continue
+        if external_entry and row_has_time(row, target_date, system_time, allow_near=allow_near):
+            matches.append(row)
+            continue
         tokens = reason_tokens(reason)
         if tokens and reason not in ("到勤", "退勤", "休息後退勤", "休息", "返隊", "值班", "值退"):
             if not all(token in c for token in tokens):

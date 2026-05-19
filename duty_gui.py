@@ -267,12 +267,12 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "compare": 120,
-            "execute_time": 80,
-            "actor": 70,
-            "target": 110,
-            "kind": 80,
-            "summary": 240,
+            "compare": 96,
+            "execute_time": 72,
+            "actor": 58,
+            "target": 86,
+            "kind": 48,
+            "summary": 210,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
@@ -619,7 +619,7 @@ class DutyGui(tk.Tk):
         self.login_attempt_id += 1
         attempt_id = self.login_attempt_id
         self.set_login_buttons_enabled(False)
-        self.login_status.set("測試登入中...")
+        self.login_status.set("登入中...")
         self.after(45000, lambda value=attempt_id: self._login_timed_out(value))
         thread = threading.Thread(target=self._verify_login_worker, args=(attempt_id, user_id, password), daemon=True)
         thread.start()
