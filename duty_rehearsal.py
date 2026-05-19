@@ -403,7 +403,9 @@ def set_form_people(driver: webdriver.Chrome, people: list[Any], fallback_popup:
 
 
 def set_entry_people(driver: webdriver.Chrome, names: list[str], fallback_popup: bool = True) -> dict[str, Any]:
-    return set_form_people(driver, names, fallback_popup)
+    result = select_people_via_popup(driver, names)
+    result["method"] = "popup"
+    return result
 
 
 def set_work_people(driver: webdriver.Chrome, people: list[Any], fallback_popup: bool = True) -> dict[str, Any]:
