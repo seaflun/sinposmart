@@ -640,7 +640,7 @@ class DutyGui(tk.Tk):
         target_roc_date = today_roc_date()
         key = f"{target_roc_date}-{slot_label}"
         self.snapshot_running = True
-        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}")
+        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，正在更新 {target_roc_date} 資料...")
 
         def worker() -> None:
             driver = None
@@ -668,11 +668,11 @@ class DutyGui(tk.Tk):
         if path.exists():
             self.preview_path.set(str(path))
             self.load_preview(path)
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}")
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，已更新今日資料。")
 
     def _snapshot_failed(self, actor_no: str, error: str) -> None:
         self.snapshot_running = False
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}")
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，更新今日資料失敗：{error}")
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
         texts = [self.page_identity_text(driver)]
@@ -712,12 +712,14 @@ class DutyGui(tk.Tk):
         self.login_status.set(f"已登入：{self.person_label(actor_no)}")
         self.actor_no.set(actor_no)
         self.password.set("")
+        self.audit_date.set(today_roc_date())
         if self.simple_mode.get():
             self.filter_actor.set(True)
             self.status_filter.set("可執行")
         self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
+        self.refresh_snapshot_background("login")
 
     def _login_failed(self, error: str) -> None:
         self.session = None
