@@ -99,7 +99,7 @@ class LoginSession:
 class DutyGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("勤務自動化控制台")
+        self.title("勤務自動化控制台 - 值班模式")
         self.geometry("420x620")
         self.minsize(380, 540)
 
@@ -271,16 +271,16 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "compare": 72,
+            "compare": 110,
             "execute_time": 74,
             "actor": 64,
-            "target": 76,
+            "target": 120,
             "kind": 54,
-            "summary": 180,
+            "summary": 298,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], minwidth=widths[col], stretch=False, anchor=tk.W)
+            self.tree.column(col, width=widths[col], minwidth=widths[col], stretch=col in ("compare", "target", "summary"), anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.review_widgets.append(self.tree)
         self.tree.tag_configure("todo", background="#fff1f2", foreground="#7f1d1d")
@@ -312,14 +312,14 @@ class DutyGui(tk.Tk):
 
         time_panel = tk.Frame(panel, bg="#0f172a", highlightbackground="#0f172a", highlightthickness=1)
         time_panel.pack(fill=tk.X)
-        tk.Label(time_panel, textvariable=self.date_text, bg="#0f172a", fg="#cbd5e1", font=("Microsoft JhengHei UI", 12, "bold")).pack(anchor=tk.CENTER, pady=(10, 0))
-        tk.Label(time_panel, textvariable=self.time_text, bg="#0f172a", fg="#ffffff", font=("Microsoft JhengHei UI", 28, "bold")).pack(anchor=tk.CENTER, pady=(0, 10))
+        tk.Label(time_panel, textvariable=self.date_text, bg="#0f172a", fg="#cbd5e1", font=("Microsoft JhengHei UI", 14, "bold")).pack(anchor=tk.CENTER, pady=(10, 0))
+        tk.Label(time_panel, textvariable=self.time_text, bg="#0f172a", fg="#ffffff", font=("Microsoft JhengHei UI", 32, "bold")).pack(anchor=tk.CENTER, pady=(0, 10))
 
         login_card = tk.Frame(panel, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
         login_card.pack(fill=tk.X, pady=(10, 0))
         login_panel = tk.Frame(login_card, bg="#eff6ff")
         login_panel.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
-        tk.Label(login_panel, text="消防勤務管理系統登入", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei UI", 12, "bold")).pack(anchor=tk.W)
+        tk.Label(login_panel, text="消防勤務管理系統", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei UI", 12, "bold")).pack(anchor=tk.W)
         self.user_label = tk.Label(login_panel, text="帳號", bg="#eff6ff", fg="#64748b", font=("Microsoft JhengHei UI", 9))
         self.user_label.pack(anchor=tk.W, pady=(8, 2))
         self.user_entry = ttk.Entry(login_panel, textvariable=self.user_id, width=28)
@@ -580,12 +580,13 @@ class DutyGui(tk.Tk):
             fields = action.get("fields", {})
             if action.get("kind") == "entry_log":
                 reason = fields.get("領用事由及地點", "")
+                if is_future_action(target_date, action):
+                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
+                    continue
                 exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
                 near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
                 if exact:
                     result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
-                elif is_future_action(target_date, action):
-                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                 elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
                     result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
                 elif near:
@@ -597,11 +598,12 @@ class DutyGui(tk.Tk):
                 else:
                     result[index] = {"compare": "未找到", "group": "todo", "matched": []}
             else:
+                if is_future_action(target_date, action):
+                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
+                    continue
                 matches = find_work_matches(work_rows, target_date, self.staff, action)
                 if matches:
                     result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
-                elif is_future_action(target_date, action):
-                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                 else:
                     result[index] = {"compare": "未找到", "group": "todo", "matched": []}
 
@@ -744,7 +746,7 @@ class DutyGui(tk.Tk):
         session = self.session
         key = f"schedule-{target_roc_date}-{slot_label}"
         self.snapshot_running = True
-        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，正在建立 {target_roc_date} 排程...")
+        self.set_logged_in_status(session.actor_no)
 
         def worker() -> None:
             driver = None
@@ -772,11 +774,11 @@ class DutyGui(tk.Tk):
         if path.exists():
             self.preview_path.set(str(path))
             self.load_preview(path, update_duty=False)
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，已建立排程資料。")
+        self.set_logged_in_status(actor_no)
 
     def _schedule_failed(self, actor_no: str, error: str) -> None:
         self.snapshot_running = False
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，建立排程失敗：{error}")
+        self.set_logged_in_status(actor_no)
 
     def check_hourly_comparison(self) -> None:
         try:
@@ -795,7 +797,7 @@ class DutyGui(tk.Tk):
         session = self.session
         key = f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
         self.comparison_running = True
-        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，背景比對 {target_roc_date}...")
+        self.set_logged_in_status(session.actor_no)
 
         def worker() -> None:
             driver = None
@@ -826,11 +828,11 @@ class DutyGui(tk.Tk):
         if path.exists() and self.duty_data.get("target_date") == target_roc_date:
             self.duty_action_compare = self.build_comparison(self.duty_data)
             self.refresh_duty_tasks()
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，背景比對已更新。")
+        self.set_logged_in_status(actor_no)
 
     def _comparison_failed(self, actor_no: str, error: str) -> None:
         self.comparison_running = False
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，背景比對失敗：{error}")
+        self.set_logged_in_status(actor_no)
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
         texts = [self.page_identity_text(driver)]
@@ -871,7 +873,7 @@ class DutyGui(tk.Tk):
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}")
+        self.set_logged_in_status(actor_no)
         self.actor_no.set(actor_no)
         self.password.set("")
         self.logout_cleared = False
@@ -882,12 +884,12 @@ class DutyGui(tk.Tk):
         self.update_login_panel()
         self.ensure_tomorrow_schedule_background("login")
         if self.load_today_preview_if_available():
-            self.login_status.set(f"已登入：{self.person_label(actor_no)}，已載入今日資料。")
+            self.set_logged_in_status(actor_no)
             self.refresh_comparison_background(self.data.get("target_date") or today_roc_date(), "login")
         else:
             self.refresh_tasks()
             self.refresh_duty_tasks()
-            self.login_status.set(f"已登入：{self.person_label(actor_no)}，找不到今日排程檔，登入未執行系統查詢。")
+            self.set_logged_in_status(actor_no)
             self.refresh_comparison_background(today_roc_date(), "login")
 
     def _login_failed(self, attempt_id: int, error: str) -> None:
@@ -912,6 +914,17 @@ class DutyGui(tk.Tk):
         messagebox.showerror("登入逾時", "登入超過 45 秒沒有完成，已恢復登入按鈕。")
         self.update_login_panel()
         self.refresh_tasks()
+
+    def login_person_label(self, number: str) -> str:
+        info = self.duty_staff.get(str(number), {}) or self.staff.get(str(number), {})
+        name = info.get("name", "")
+        role = info.get("role", "")
+        if name and role:
+            return f"{name}({role})"
+        return name or self.person_label(number)
+
+    def set_logged_in_status(self, actor_no: str) -> None:
+        self.login_status.set(f"已登入：{self.login_person_label(actor_no)}")
 
     def clear_login(self) -> None:
         self.session = None
@@ -981,7 +994,8 @@ class DutyGui(tk.Tk):
 
     def tick_clock(self) -> None:
         now = datetime.now()
-        self.date_text.set(f"{now.year}/{now.month:02d}/{now.day:02d}")
+        weekdays = "一二三四五六日"
+        self.date_text.set(f"{now.year}/{now.month:02d}/{now.day:02d} ({weekdays[now.weekday()]})")
         self.time_text.set(now.strftime("%H:%M:%S"))
         if self.simple_mode.get():
             self.refresh_duty_tasks()
@@ -1248,14 +1262,14 @@ class DutyGui(tk.Tk):
             self.filter_actor.set(True)
             if self.status_filter.get() in ("需處理", "全部", "已存在", "時間近似", "人工確認", "等待本人登入"):
                 self.status_filter.set("可執行")
-            self.title("勤務自動化控制台 - 值班人員")
+            self.title("勤務自動化控制台 - 值班模式")
             self.duty_widgets[0].pack(fill=tk.BOTH, expand=True)
         else:
             self.geometry("780x650")
             self.minsize(720, 560)
             self.filter_actor.set(False)
             self.status_filter.set("需處理")
-            self.title("勤務自動化控制台 - 幹部審查")
+            self.title("勤務自動化控制台 - 審核模式")
             if self.data.get("target_date"):
                 self.audit_date.set(self.data["target_date"])
             self.tools_frame.pack(fill=tk.X, pady=(0, 10))

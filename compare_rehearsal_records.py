@@ -61,6 +61,8 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
 def is_future_action(target_date: str, action: dict[str, Any]) -> bool:
     now = datetime.now()
     today_roc = f"{now.year - 1911:03d}{now.month:02d}{now.day:02d}"
+    if target_date > today_roc:
+        return True
     if target_date != today_roc:
         return False
     fields = action.get("fields", {})
