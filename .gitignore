@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+duty_trigger_log.jsonl
+.env
+*.log
+.DS_Store
+Thumbs.db
