@@ -658,7 +658,6 @@ def fill_entry_log_form_for_test(
     before_controls = control_snapshot(driver)
     insert_result = click_insert_control(driver)
     time.sleep(2)
-    people_result = set_entry_people(driver, [person], fallback_popup=True)
 
     fill_result = driver.execute_script(
         """
@@ -723,18 +722,84 @@ def fill_entry_log_form_for_test(
         if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
         if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
         if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
         if (!byIds(['_areMemo', '_txtReason', '_txtReasonPlace', '_txtPlace'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由', values.reason)) result.missing.push('reason');
-        if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
-        if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
         """,
         {
             "date": target_roc_date,
             "hour": hour,
             "minute": minute,
-            "outin": fields.get("出或入", ""),
             "reason": fields.get("領用事由及地點", ""),
+        },
+    )
+    people_result = set_entry_people(driver, [person], fallback_popup=True)
+    outin_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+        const used = new Set();
+
+        function controls() {
+          return Array.from(document.querySelectorAll('input, select, textarea'));
+        }
+        function setControl(el, value) {
+          if (!el) return false;
+          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
+          if (used.has(key)) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const option = Array.from(el.options || []).find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim() ||
+              String(opt.text || '').includes(String(value).trim())
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          used.add(key);
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            if (setControl(document.getElementById(id), value)) return true;
+          }
+          return false;
+        }
+        function byOptionText(value) {
+          const el = controls().find(control =>
+            control.tagName.toLowerCase() === 'select' &&
+            Array.from(control.options || []).some(opt => String(opt.text || '').trim() === String(value).trim())
+          );
+          return setControl(el, value);
+        }
+        function byNearbyText(label, value) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const candidates = cells.slice(labelIndex + 1).flatMap(cell =>
+              Array.from(cell.querySelectorAll('input, select, textarea'))
+            );
+            for (const control of candidates) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          return false;
+        }
+
+        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
+        if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
+        if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
+        return result;
+        """,
+        {
+            "outin": fields.get("出或入", ""),
             "radio": fields.get("手提無線電編號", ""),
             "returned": fields.get("是否歸還", ""),
         },
@@ -748,6 +813,7 @@ def fill_entry_log_form_for_test(
         "ok": True,
         "insert": insert_result,
         "fill": fill_result,
+        "outin": outin_result,
         "people": people_result,
         "save": save_result,
         "before_controls": before_controls,
