@@ -125,12 +125,17 @@ def find_entry_matches(
         c = clean(row)
         if target_name and target_name not in row:
             continue
-        if outin and outin not in row:
+        outin_match = not outin or outin in row
+        if external_entry and outin == "出" and "簽出" in row:
+            outin_match = True
+        if external_entry and outin == "入" and "簽入" in row:
+            outin_match = True
+        if not outin_match:
             continue
         if strict_time:
             if not row_has_time(row, target_date, system_time, allow_near=allow_near):
                 continue
-        if external_entry and row_has_time(row, target_date, system_time, allow_near=allow_near):
+        if external_entry and row_has_time(row, target_date, system_time, allow_near=True):
             matches.append(row)
             continue
         tokens = reason_tokens(reason)

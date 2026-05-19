@@ -267,12 +267,12 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "compare": 96,
-            "execute_time": 72,
-            "actor": 58,
-            "target": 86,
-            "kind": 48,
-            "summary": 210,
+            "compare": 64,
+            "execute_time": 48,
+            "actor": 40,
+            "target": 58,
+            "kind": 32,
+            "summary": 140,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
@@ -706,13 +706,14 @@ class DutyGui(tk.Tk):
     def check_scheduled_snapshot(self) -> None:
         try:
             now = datetime.now()
-            if now.hour == 22 and now.minute < 10:
+            if now.hour in (18, 20, 22) and now.minute < 10:
                 target_roc_date = roc_date_after(today_roc_date(), 1)
-                key = f"schedule-{target_roc_date}-2200"
+                slot_label = f"{now.hour:02d}00"
+                key = f"schedule-{target_roc_date}-{slot_label}"
                 if schedule_path(target_roc_date).exists():
                     self.snapshot_completed_slots.add(key)
                 elif key not in self.snapshot_completed_slots:
-                    self.refresh_schedule_background(target_roc_date, "2200")
+                    self.refresh_schedule_background(target_roc_date, slot_label)
         finally:
             self.after(30000, self.check_scheduled_snapshot)
 
@@ -1107,7 +1108,8 @@ class DutyGui(tk.Tk):
             return
         if index in self.submitting_indices:
             return
-        if confirm and save and not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        submit_kind = "出入" if action.get("kind") == "entry_log" else "工作"
+        if confirm and save and not messagebox.askyesno("確認提前登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
         prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
         result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
@@ -1173,9 +1175,9 @@ class DutyGui(tk.Tk):
         self.submitting_indices.discard(index)
         self.executed_due.add(index)
         self.action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
-        self.duty_status_text.set(f"已提前登打，結果：{result_path.name}")
+        self.duty_status_text.set("已提前登打")
         if notify:
-            messagebox.showinfo("提前登打", f"已提前登打。\n結果檔：{result_path.name}")
+            messagebox.showinfo("提前登打", "已提前登打。")
         if self.data.get("target_date"):
             self.refresh_comparison_background(self.data["target_date"], "early-submit")
         self.refresh_duty_tasks()
@@ -1391,7 +1393,8 @@ class DutyGui(tk.Tk):
     def duty_action_summary(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
         if action.get("source") == "在隊訓練":
-            return fields.get("訓練項目") or self.action_summary(action)
+            topic = fields.get("訓練項目") or self.action_summary(action)
+            return f"在隊訓練｜{topic}"
         if action.get("kind") == "entry_log":
             return f"{self.action_summary(action)}｜{self.target_short_label(action)}"
         return f"{self.action_summary(action)}｜{self.target_short_label(action)}"
