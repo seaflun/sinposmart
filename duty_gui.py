@@ -276,7 +276,7 @@ class DutyGui(tk.Tk):
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor=tk.W)
+            self.tree.column(col, width=widths[col], minwidth=widths[col], stretch=False, anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.review_widgets.append(self.tree)
         self.tree.tag_configure("todo", background="#fff1f2", foreground="#7f1d1d")
@@ -373,10 +373,11 @@ class DutyGui(tk.Tk):
 
     def available_audit_dates(self) -> list[str]:
         values = set()
+        max_value = roc_date_after(today_roc_date(), 1)
         paths = list(Path.cwd().glob("schedule_output_*.json")) + list(Path.cwd().glob("rehearsal_output_*.json"))
         for path in sorted(paths):
             value = path.stem.rsplit("_", 1)[-1]
-            if len(value) == 7 and value.isdigit():
+            if len(value) == 7 and value.isdigit() and value <= max_value:
                 values.add(value)
         return sorted(values) or [today_roc_date()]
 
@@ -389,7 +390,8 @@ class DutyGui(tk.Tk):
         day = int(value[5:7])
 
         shifted = date(year, month, day) + timedelta(days=days)
-        self.audit_date.set(f"{shifted.year - 1911:03d}{shifted.month:02d}{shifted.day:02d}")
+        shifted_value = f"{shifted.year - 1911:03d}{shifted.month:02d}{shifted.day:02d}"
+        self.audit_date.set(min(shifted_value, roc_date_after(today_roc_date(), 1)))
         self.load_audit_date()
 
     def show_audit_calendar(self) -> None:
@@ -438,9 +440,12 @@ class DutyGui(tk.Tk):
                 col = offset % 7
                 d = date(month_date.year, month_date.month, day_no)
                 roc = f"{d.year - 1911:03d}{d.month:02d}{d.day:02d}"
-                ttk.Button(container, text=str(day_no), width=4, command=lambda value=roc: choose(value)).grid(row=row, column=col, padx=2, pady=2)
+                state = tk.NORMAL if roc <= roc_date_after(today_roc_date(), 1) else tk.DISABLED
+                ttk.Button(container, text=str(day_no), width=4, state=state, command=lambda value=roc: choose(value)).grid(row=row, column=col, padx=2, pady=2)
 
         def choose(value: str) -> None:
+            if value > roc_date_after(today_roc_date(), 1):
+                return
             self.audit_date.set(value)
             popup.destroy()
             self.load_audit_date()
@@ -521,6 +526,11 @@ class DutyGui(tk.Tk):
         value = "".join(ch for ch in self.audit_date.get() if ch.isdigit())
         if len(value) != 7:
             messagebox.showwarning("日期格式錯誤", "請輸入民國日期，例如 1150518。")
+            return
+        max_value = roc_date_after(today_roc_date(), 1)
+        if value > max_value:
+            self.audit_date.set(max_value)
+            messagebox.showwarning("日期超出範圍", f"最多只能選到 {max_value}。")
             return
         path = schedule_path(value)
         if not path.exists():
@@ -706,16 +716,18 @@ class DutyGui(tk.Tk):
     def check_scheduled_snapshot(self) -> None:
         try:
             now = datetime.now()
-            if now.hour in (18, 20, 22) and now.minute < 10:
-                target_roc_date = roc_date_after(today_roc_date(), 1)
-                slot_label = f"{now.hour:02d}00"
-                key = f"schedule-{target_roc_date}-{slot_label}"
-                if schedule_path(target_roc_date).exists():
-                    self.snapshot_completed_slots.add(key)
-                elif key not in self.snapshot_completed_slots:
-                    self.refresh_schedule_background(target_roc_date, slot_label)
+            if 18 <= now.hour < 24:
+                self.ensure_tomorrow_schedule_background(f"{now.hour:02d}{now.minute:02d}")
         finally:
             self.after(30000, self.check_scheduled_snapshot)
+
+    def ensure_tomorrow_schedule_background(self, slot_label: str) -> None:
+        target_roc_date = roc_date_after(today_roc_date(), 1)
+        key = f"schedule-{target_roc_date}-{slot_label}"
+        if schedule_path(target_roc_date).exists():
+            self.snapshot_completed_slots.add(key)
+        elif key not in self.snapshot_completed_slots:
+            self.refresh_schedule_background(target_roc_date, slot_label)
 
     def refresh_schedule_background(self, target_roc_date: str, slot_label: str) -> None:
         if self.snapshot_running or not (self.session and self.session.verified):
@@ -857,6 +869,7 @@ class DutyGui(tk.Tk):
             self.filter_actor.set(True)
             self.status_filter.set("可執行")
         self.update_login_panel()
+        self.ensure_tomorrow_schedule_background("login")
         if self.load_today_preview_if_available():
             self.login_status.set(f"已登入：{self.person_label(actor_no)}，已載入今日資料。")
             self.refresh_comparison_background(self.data.get("target_date") or today_roc_date(), "login")

@@ -44,7 +44,7 @@ def flatten_rows(rows: list[list[str]], target_date: str) -> list[str]:
     return out
 
 
-def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool = False) -> bool:
+def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool = False, near_minutes: int = 5) -> bool:
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     if f"{roc_slash} {time_value}" in row or f"{target_date}\n{time_value}" in row:
         return True
@@ -53,7 +53,7 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
     target_min = int(time_value[:2]) * 60 + int(time_value[3:])
     for match in re.finditer(rf"{re.escape(roc_slash)}\s+(\d{{2}}):(\d{{2}})", row):
         actual_min = int(match.group(1)) * 60 + int(match.group(2))
-        if abs(actual_min - target_min) <= 5:
+        if abs(actual_min - target_min) <= near_minutes:
             return True
     return False
 
@@ -135,8 +135,9 @@ def find_entry_matches(
         if strict_time:
             if not row_has_time(row, target_date, system_time, allow_near=allow_near):
                 continue
-        if external_entry and row_has_time(row, target_date, system_time, allow_near=True):
-            matches.append(row)
+        if external_entry:
+            if row_has_time(row, target_date, system_time, allow_near=True, near_minutes=120):
+                matches.append(row)
             continue
         tokens = reason_tokens(reason)
         if tokens and reason not in ("到勤", "退勤", "休息後退勤", "休息", "返隊", "值班", "值退"):
