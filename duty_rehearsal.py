@@ -459,12 +459,15 @@ def fill_work_log_form_for_test(
         """
         const values = arguments[0];
         const result = {set: [], missing: []};
+        const used = new Set();
 
         function visibleControls() {
           return Array.from(document.querySelectorAll('input, select, textarea'));
         }
         function setControl(el, value) {
           if (!el) return false;
+          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
+          if (used.has(key)) return false;
           if (el.tagName.toLowerCase() === 'select') {
             const option = Array.from(el.options || []).find(opt =>
               String(opt.text || '').trim() === String(value).trim() ||
@@ -478,6 +481,7 @@ def fill_work_log_form_for_test(
           }
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
+          used.add(key);
           result.set.push({id: el.id || '', name: el.name || '', value});
           return true;
         }
@@ -496,12 +500,26 @@ def fill_work_log_form_for_test(
           return setControl(el, value);
         }
         function byNearbyText(label, value, preferTextarea = false) {
-          const labels = Array.from(document.querySelectorAll('td, th, label, span, div'));
-          const node = labels.find(el => String(el.innerText || '').replace(/\\s+/g, '').includes(label));
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const controlsOf = root => Array.from(root.querySelectorAll('input, select, textarea'));
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const targetCells = cells.slice(labelIndex + 1);
+            const controls = targetCells.flatMap(controlsOf);
+            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
+            for (const control of candidates) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          const labels = Array.from(document.querySelectorAll('td, th, label, span'));
+          const node = labels.find(el => normalize(el.innerText).includes(label));
           if (!node) return false;
-          let cursor = node;
-          for (let depth = 0; depth < 4 && cursor; depth += 1, cursor = cursor.parentElement) {
-            const controls = Array.from(cursor.querySelectorAll('input, select, textarea'));
+          let cursor = node.parentElement;
+          for (let depth = 0; depth < 3 && cursor; depth += 1, cursor = cursor.parentElement) {
+            const controls = controlsOf(cursor);
             const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
             for (const control of candidates) {
               if (setControl(control, value)) return true;

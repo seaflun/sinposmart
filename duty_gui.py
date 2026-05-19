@@ -1086,10 +1086,12 @@ class DutyGui(tk.Tk):
     def _save_work_log_succeeded(self, index: int, result_path: Path) -> None:
         self.executed_due.add(index)
         self.duty_status_text.set(f"已送出儲存測試，結果：{result_path.name}")
+        messagebox.showinfo("正式儲存測試", f"已送出儲存測試。\n結果檔：{result_path.name}")
         self.refresh_duty_tasks()
 
     def _save_work_log_failed(self, error: str, result_path: Path) -> None:
         self.duty_status_text.set(f"正式儲存測試失敗：{error}，結果：{result_path.name}")
+        messagebox.showerror("正式儲存測試失敗", f"{error}\n\n結果檔：{result_path.name}")
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session
