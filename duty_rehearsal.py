@@ -786,6 +786,7 @@ def fill_entry_log_form_for_test(
             "duty_item": fields.get("勤務項目", "值班(宿)"),
         },
     )
+    time.sleep(1)
     people_result = set_entry_people(driver, [person], fallback_popup=True)
     if not people_result.get("ok"):
         raise RuntimeError("entry people selection failed: " + json.dumps(people_result, ensure_ascii=False))
@@ -856,7 +857,8 @@ def fill_entry_log_form_for_test(
         byIds(['_txtMan'], values.man_name);
         byIds(['_selTitle'], values.title);
         byIds(['_txtTitle'], values.title_text);
-        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
+        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin_value || values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
+        if (values.outin_text && document.getElementById('_selIsout')?.value !== values.outin_value) result.missing.push('outin_confirm');
         if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
         if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
@@ -867,10 +869,13 @@ def fill_entry_log_form_for_test(
             "title": "0",
             "title_text": "隊員",
             "outin": fields.get("出或入", ""),
+            "outin_text": fields.get("出或入", ""),
+            "outin_value": "I3" if fields.get("出或入", "") == "值退" else "",
             "radio": fields.get("手提無線電編號", ""),
             "returned": fields.get("是否歸還", ""),
         },
     )
+    time.sleep(1)
 
     save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}
     if save:
