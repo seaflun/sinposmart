@@ -7,14 +7,13 @@ This GUI is intentionally conservative:
 - each duty member can test-login with their own credentials;
 - credentials stay in memory only;
 
-- no duty record is submitted from this GUI yet.
+- duty records can be submitted manually or when a logged-in task reaches its time.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-import time
 import tkinter as tk
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -39,7 +38,6 @@ from duty_rehearsal import (
     WORK_LOG_AP,
     fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
-    inspect_entry_log_format,
     login,
     parse_roc_date,
     planned_actions,
@@ -134,6 +132,7 @@ class DutyGui(tk.Tk):
         self.action_compare: dict[int, dict[str, Any]] = {}
         self.session: LoginSession | None = None
         self.executed_due: set[int] = set()
+        self.submitting_indices: set[int] = set()
         self.review_widgets: list[tk.Widget] = []
         self.duty_widgets: list[tk.Widget] = []
         self.login_form_widgets: list[tk.Widget] = []
@@ -340,9 +339,10 @@ class DutyGui(tk.Tk):
 
         controls = ttk.Frame(panel)
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
-        ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
-        ttk.Button(controls, text="可視填表", style="Soft.TButton", command=self.visible_fill_selected).pack(side=tk.RIGHT, padx=(0, 8))
-        ttk.Button(controls, text="提前登打", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
+        self.audit_mode_button = ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式"))
+        self.audit_mode_button.pack(side=tk.RIGHT)
+        self.early_submit_button = ttk.Button(controls, text="提前登打", style="Accent.TButton", command=self.save_selected_work_log_test)
+        self.early_submit_button.pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
         self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12)
@@ -890,6 +890,7 @@ class DutyGui(tk.Tk):
 
     def clear_login(self) -> None:
         self.session = None
+        self.submitting_indices.clear()
         self.password.set("")
         self.logout_cleared = True
         self.login_status.set("已清除登入狀態。")
@@ -907,6 +908,7 @@ class DutyGui(tk.Tk):
                 widget.pack_forget()
             if not self.logout_button.winfo_manager():
                 self.logout_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.set_duty_action_buttons_visible(True)
         else:
             if not self.user_label.winfo_manager():
                 self.user_label.pack(anchor=tk.W, pady=(12, 2), before=self.button_row)
@@ -919,7 +921,20 @@ class DutyGui(tk.Tk):
             if not self.login_button.winfo_manager():
                 self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True, before=self.logout_button)
             self.logout_button.pack_forget()
+            self.set_duty_action_buttons_visible(False)
         self.set_login_buttons_enabled(not self.login_running)
+
+    def set_duty_action_buttons_visible(self, visible: bool) -> None:
+        if not hasattr(self, "audit_mode_button") or not hasattr(self, "early_submit_button"):
+            return
+        if visible:
+            if not self.audit_mode_button.winfo_manager():
+                self.audit_mode_button.pack(side=tk.RIGHT)
+            if not self.early_submit_button.winfo_manager():
+                self.early_submit_button.pack(side=tk.RIGHT, padx=(0, 8))
+        else:
+            self.audit_mode_button.pack_forget()
+            self.early_submit_button.pack_forget()
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -988,7 +1003,10 @@ class DutyGui(tk.Tk):
             if next_item is None and minutes >= now_min:
                 next_item = action
             compare = self.action_compare.get(index, {})
-            if compare.get("group") == "done":
+            if index in self.submitting_indices:
+                status = "正在登打"
+                tag = "ready"
+            elif compare.get("group") == "done":
                 status = "已存在"
                 tag = "triggered"
             elif index in self.executed_due:
@@ -1021,7 +1039,10 @@ class DutyGui(tk.Tk):
         else:
             self.next_task_text.set("今日目前沒有未完成的當班任務")
         if self.session and self.session.verified:
-            self.duty_status_text.set("登入有效；到點後會記錄待接線任務。")
+            if self.submitting_indices:
+                self.duty_status_text.set("正在登打")
+            else:
+                self.duty_status_text.set("登入有效；到點後會自動登打。")
         elif self.logout_cleared:
             self.duty_status_text.set("")
         else:
@@ -1032,13 +1053,14 @@ class DutyGui(tk.Tk):
             return
         now_min = now.hour * 60 + now.minute
         for index in self.duty_task_indices():
-            if index in self.executed_due:
+            if index in self.executed_due or index in self.submitting_indices:
                 continue
             action = self.actions[index]
-            if self.action_minutes(action) <= now_min:
+            if action.get("kind") not in ("work_log", "entry_log"):
+                continue
+            if self.action_minutes(action) == now_min:
                 self.log_trigger(index, action, "due")
-                self.executed_due.add(index)
-                self.duty_status_text.set(f"已記錄待接線：{self.action_summary(action)}")
+                self.submit_duty_action(index, action, save=True, visible=False, confirm=False, notify=False)
 
     def early_execute_selected(self) -> None:
         selection = self.duty_tree.selection()
@@ -1060,9 +1082,6 @@ class DutyGui(tk.Tk):
     def save_selected_work_log_test(self) -> None:
         self.start_submit_selected(save=True, visible=False)
 
-    def visible_fill_selected(self) -> None:
-        self.start_submit_selected(save=False, visible=True)
-
     def start_submit_selected(self, save: bool, visible: bool) -> None:
         selection = self.duty_tree.selection()
         if not selection:
@@ -1079,12 +1098,18 @@ class DutyGui(tk.Tk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再提前登打。")
             return
-        if save and not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        self.submit_duty_action(index, action, save=save, visible=visible, confirm=True, notify=True)
+
+    def submit_duty_action(self, index: int, action: dict[str, Any], save: bool, visible: bool, confirm: bool, notify: bool) -> None:
+        if not self.session or not self.session.verified:
             return
-        if visible:
-            prefix = "visible_entry_log_fill_test" if action.get("kind") == "entry_log" else "visible_work_log_fill_test"
-        else:
-            prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
+        if action.get("kind") not in ("work_log", "entry_log"):
+            return
+        if index in self.submitting_indices:
+            return
+        if confirm and save and not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+            return
+        prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
         result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
         started_result = {
             "stage": "started",
@@ -1097,11 +1122,12 @@ class DutyGui(tk.Tk):
             "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        label = "可視填表" if visible else "提前登打"
-        self.duty_status_text.set(f"已開始{label}：{self.duty_action_summary(action)}")
-        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path, save, visible), daemon=True).start()
+        self.submitting_indices.add(index)
+        self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
+        self.refresh_duty_tasks()
+        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path, save, visible, notify), daemon=True).start()
 
-    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path, save: bool, visible: bool) -> None:
+    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path, save: bool, visible: bool, notify: bool) -> None:
         driver = None
         try:
             options = Options()
@@ -1113,23 +1139,17 @@ class DutyGui(tk.Tk):
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
             target_date = self.data.get("target_date") or today_roc_date()
-            if visible and action.get("kind") == "entry_log":
-                result = inspect_entry_log_format(driver, action, self.staff, target_date)
-            elif action.get("kind") == "entry_log":
+            if action.get("kind") == "entry_log":
                 result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=save)
             else:
                 result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=save)
-            result["stage"] = "submitted" if save else ("manual_visible" if action.get("kind") == "entry_log" else "filled_visible")
+            result["stage"] = "submitted" if save else "filled"
             result["action_index"] = index
             result["action"] = action
             result["updated_at"] = datetime.now().isoformat(timespec="seconds")
             result["save"] = save
             result["visible"] = visible
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            if visible:
-                self.after(0, lambda: self._visible_fill_succeeded(result_path))
-                time.sleep(600)
-                return
         except Exception as exc:
             error = str(exc)
             failure_result = {
@@ -1142,30 +1162,31 @@ class DutyGui(tk.Tk):
                 "visible": visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.after(0, lambda: self._save_work_log_failed(error, result_path))
+            self.after(0, lambda: self._save_work_log_failed(index, error, result_path, notify))
             return
         finally:
             if driver:
                 driver.quit()
-        self.after(0, lambda: self._save_work_log_succeeded(index, result_path))
+        self.after(0, lambda: self._save_work_log_succeeded(index, result_path, notify))
 
-    def _save_work_log_succeeded(self, index: int, result_path: Path) -> None:
+    def _save_work_log_succeeded(self, index: int, result_path: Path, notify: bool) -> None:
+        self.submitting_indices.discard(index)
         self.executed_due.add(index)
         self.action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
         self.duty_status_text.set(f"已提前登打，結果：{result_path.name}")
-        messagebox.showinfo("提前登打", f"已提前登打。\n結果檔：{result_path.name}")
+        if notify:
+            messagebox.showinfo("提前登打", f"已提前登打。\n結果檔：{result_path.name}")
         if self.data.get("target_date"):
             self.refresh_comparison_background(self.data["target_date"], "early-submit")
         self.refresh_duty_tasks()
         self.refresh_tasks()
 
-    def _visible_fill_succeeded(self, result_path: Path) -> None:
-        self.duty_status_text.set(f"已完成可視填表，結果：{result_path.name}")
-        messagebox.showinfo("可視填表", f"已填表但未儲存。\nChrome 視窗會保留約 10 分鐘。\n結果檔：{result_path.name}")
-
-    def _save_work_log_failed(self, error: str, result_path: Path) -> None:
+    def _save_work_log_failed(self, index: int, error: str, result_path: Path, notify: bool) -> None:
+        self.submitting_indices.discard(index)
         self.duty_status_text.set(f"提前登打失敗：{error}，結果：{result_path.name}")
-        messagebox.showerror("提前登打失敗", f"{error}\n\n結果檔：{result_path.name}")
+        if notify:
+            messagebox.showerror("提前登打失敗", f"{error}\n\n結果檔：{result_path.name}")
+        self.refresh_duty_tasks()
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session
