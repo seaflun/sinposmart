@@ -931,6 +931,7 @@ class DutyGui(tk.Tk):
     def refresh_duty_tasks(self) -> None:
         if not hasattr(self, "duty_tree"):
             return
+        selected = set(self.duty_tree.selection())
         self.duty_tree.delete(*self.duty_tree.get_children())
         if self.logout_cleared and not (self.session and self.session.verified):
             self.next_task_text.set("下一項任務：-")
@@ -967,6 +968,10 @@ class DutyGui(tk.Tk):
                 ),
                 tags=(tag,),
             )
+        kept_selection = [iid for iid in selected if self.duty_tree.exists(iid)]
+        if kept_selection:
+            self.duty_tree.selection_set(kept_selection)
+            self.duty_tree.focus(kept_selection[0])
         if next_item:
             next_min = self.action_minutes(next_item)
             delta = max(0, next_min - now_min)
