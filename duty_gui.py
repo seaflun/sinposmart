@@ -336,7 +336,6 @@ class DutyGui(tk.Tk):
         controls = ttk.Frame(panel)
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
-        ttk.Button(controls, text="只記錄不送出", style="Soft.TButton", command=self.early_execute_selected).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Button(controls, text="可視填表測試", style="Soft.TButton", command=self.visible_fill_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Button(controls, text="正式儲存測試", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
 
