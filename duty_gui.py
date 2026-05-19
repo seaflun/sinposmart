@@ -236,6 +236,7 @@ class DutyGui(tk.Tk):
             width=8,
             state="readonly",
         ).pack(side=tk.LEFT)
+        ttk.Label(tools, textvariable=self.status_text).pack(side=tk.RIGHT)
         self.status_filter.trace_add("write", lambda *_: self.refresh_tasks())
         self.kind_filter.trace_add("write", lambda *_: self.refresh_tasks())
 
@@ -243,7 +244,6 @@ class DutyGui(tk.Tk):
         ttk.Button(self.audit_bottom_frame, text="值班模式", command=lambda: self.switch_mode("值班模式")).pack(side=tk.RIGHT)
 
         columns = (
-            "status",
             "compare",
             "execute_time",
             "actor",
@@ -253,7 +253,6 @@ class DutyGui(tk.Tk):
         )
         self.tree = ttk.Treeview(root, columns=columns, show="headings", height=22)
         headings = {
-            "status": "狀態",
             "compare": "比對",
             "execute_time": "登打時間",
             "actor": "登打人",
@@ -262,7 +261,6 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "status": 110,
             "compare": 120,
             "execute_time": 80,
             "actor": 70,
@@ -841,10 +839,12 @@ class DutyGui(tk.Tk):
         self.update_login_panel()
         if self.load_today_preview_if_available():
             self.login_status.set(f"已登入：{self.person_label(actor_no)}，已載入今日資料。")
+            self.refresh_comparison_background(self.data.get("target_date") or today_roc_date(), "login")
         else:
             self.refresh_tasks()
             self.refresh_duty_tasks()
             self.login_status.set(f"已登入：{self.person_label(actor_no)}，找不到今日排程檔，登入未執行系統查詢。")
+            self.refresh_comparison_background(today_roc_date(), "login")
 
     def _login_failed(self, error: str) -> None:
         self.session = None
@@ -1093,7 +1093,6 @@ class DutyGui(tk.Tk):
                 tk.END,
                 iid=str(index),
                 values=(
-                    run_status,
                     compare.get("compare", ""),
                     execute_time,
                     self.person_short_label(actor),
