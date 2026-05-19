@@ -218,21 +218,22 @@ def set_people_direct(driver: webdriver.Chrome, people: list[Any]) -> dict[str, 
         function collectPeople() {
           const people = [];
           const seen = new Set();
-          function push(id, name) {
+          function push(id, name, title = '') {
             id = String(id || '').trim();
             name = String(name || '').trim();
+            title = String(title || '').trim();
             if (!id || !name) return;
             const key = id + ':' + name;
             if (seen.has(key)) return;
             seen.add(key);
-            people.push({id, name});
+            people.push({id, name, title});
           }
 
           const selMan = document.getElementById('_selMan');
           if (selMan) {
             Array.from(selMan.options || []).forEach(opt => {
-              const id = String(opt.value || '').split(',')[0].trim();
-              push(id, opt.text);
+              const parts = String(opt.value || '').split(',');
+              push(parts[0], opt.text, parts[1]);
             });
           }
 
@@ -240,7 +241,7 @@ def set_people_direct(driver: webdriver.Chrome, people: list[Any]) -> dict[str, 
           if (selManData) {
             Array.from(selManData.options || []).forEach(opt => {
               const parts = String(opt.value || '').split(',');
-              push(parts[1], opt.text);
+              push(parts[1], opt.text, parts[2]);
             });
           }
           return people;
@@ -263,8 +264,27 @@ def set_people_direct(driver: webdriver.Chrome, people: list[Any]) -> dict[str, 
         }
 
         if (missing.length === 0 && selected.length > 0) {
-          document.getElementById('_hidManId').value = selected.map(p => p.id).join(',');
-          document.getElementById('_areMan').value = selected.map(p => p.name).join(',');
+          const ids = selected.map(p => p.id).join(',');
+          const names = selected.map(p => p.name).join(',');
+          const firstTitle = selected[0]?.title || '';
+          const hidManId = document.getElementById('_hidManId');
+          const areMan = document.getElementById('_areMan');
+          if (hidManId) hidManId.value = ids;
+          if (areMan) areMan.value = names;
+          const txtMan = document.getElementById('_txtMan');
+          if (txtMan) txtMan.value = names;
+          const selMan = document.getElementById('_selMan');
+          if (selMan) {
+            const option = Array.from(selMan.options || []).find(opt =>
+              String(opt.value || '').split(',')[0].trim() === selected[0].id ||
+              String(opt.text || '').trim() === selected[0].name
+            );
+            if (option) selMan.value = option.value;
+          }
+          const selTitle = document.getElementById('_selTitle');
+          if (selTitle && firstTitle) selTitle.value = firstTitle;
+          const txtTitle = document.getElementById('_txtTitle');
+          if (txtTitle && selTitle && selTitle.selectedIndex >= 0) txtTitle.value = selTitle.options[selTitle.selectedIndex].text;
           const pcnt = document.getElementById('_txtPcnt');
           if (pcnt) pcnt.value = String(selected.length);
         }
@@ -275,6 +295,8 @@ def set_people_direct(driver: webdriver.Chrome, people: list[Any]) -> dict[str, 
           missing,
           hidManId: document.getElementById('_hidManId')?.value || '',
           areMan: document.getElementById('_areMan')?.value || '',
+          txtMan: document.getElementById('_txtMan')?.value || '',
+          txtTitle: document.getElementById('_txtTitle')?.value || '',
           pcnt: document.getElementById('_txtPcnt')?.value || ''
         };
         """,
@@ -699,9 +721,9 @@ def fill_entry_log_form_for_test(
         if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
         if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
         if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        if (!byIds(['_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
-        if (!byIds(['_txtReason', '_txtReasonPlace', '_txtPlace'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由', values.reason)) result.missing.push('reason');
-        if (values.radio && !byIds(['_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
+        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
+        if (!byIds(['_areMemo', '_txtReason', '_txtReasonPlace', '_txtPlace'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由', values.reason)) result.missing.push('reason');
+        if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
         if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
         """,
