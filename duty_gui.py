@@ -143,6 +143,7 @@ class DutyGui(tk.Tk):
         self.comparison_running = False
         self.comparison_completed_hours: set[str] = set()
         self.logout_cleared = False
+        self.login_running = False
 
         self._build_layout()
         if DEFAULT_PREVIEW.exists():
@@ -190,7 +191,8 @@ class DutyGui(tk.Tk):
         ttk.Entry(login_box, textvariable=self.user_id, width=24).grid(row=0, column=3, sticky=tk.W, padx=(6, 16))
         ttk.Label(login_box, text="密碼").grid(row=0, column=4, sticky=tk.W)
         ttk.Entry(login_box, textvariable=self.password, width=28, show="*").grid(row=0, column=5, sticky=tk.W, padx=(6, 16))
-        ttk.Button(login_box, text="測試登入", style="Accent.TButton", command=self.verify_login).grid(row=0, column=6, padx=4)
+        self.review_login_button = ttk.Button(login_box, text="測試登入", style="Accent.TButton", command=self.verify_login)
+        self.review_login_button.grid(row=0, column=6, padx=4)
         ttk.Button(login_box, text="縮小", command=self.iconify).grid(row=0, column=7, padx=4)
         ttk.Button(login_box, text="登出/清除", command=self.clear_login).grid(row=0, column=8, padx=4)
         ttk.Button(login_box, text="查看此人任務", command=self.show_actor_tasks).grid(row=0, column=9, padx=4)
@@ -603,12 +605,16 @@ class DutyGui(tk.Tk):
             return {}
 
     def verify_login(self) -> None:
+        if self.login_running:
+            return
         user_id = self.user_id.get().strip()
         password = self.password.get()
         if not user_id or not password:
             messagebox.showwarning("資料不足", "請輸入帳號、密碼。")
             return
 
+        self.login_running = True
+        self.set_login_buttons_enabled(False)
         self.login_status.set("測試登入中...")
         thread = threading.Thread(target=self._verify_login_worker, args=(user_id, password), daemon=True)
         thread.start()
@@ -620,10 +626,11 @@ class DutyGui(tk.Tk):
             options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
+            driver.set_page_load_timeout(30)
             login(driver, user_id, password)
             actor_no, actor_name = self.identify_logged_in_actor(driver)
             if not actor_no:
-                raise RuntimeError("登入成功，但頁面未顯示可辨識的登入者姓名，暫時無法自動反查番號。")
+                raise RuntimeError("帳號或密碼可能錯誤，或登入後頁面沒有顯示可辨識的姓名。")
         except Exception as exc:
             self.after(0, lambda: self._login_failed(str(exc)))
             return
@@ -829,6 +836,8 @@ class DutyGui(tk.Tk):
         ) or ""
 
     def _login_succeeded(self, actor_no: str, user_id: str, password: str) -> None:
+        self.login_running = False
+        self.set_login_buttons_enabled(True)
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
         self.login_status.set(f"已登入：{self.person_label(actor_no)}")
         self.actor_no.set(actor_no)
@@ -849,8 +858,11 @@ class DutyGui(tk.Tk):
             self.refresh_comparison_background(today_roc_date(), "login")
 
     def _login_failed(self, error: str) -> None:
+        self.login_running = False
+        self.set_login_buttons_enabled(True)
         self.session = None
         self.login_status.set(f"登入失敗：{error}")
+        messagebox.showerror("登入失敗", error)
         self.update_login_panel()
         self.refresh_tasks()
 
@@ -885,6 +897,14 @@ class DutyGui(tk.Tk):
             if not self.login_button.winfo_manager():
                 self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True, before=self.logout_button)
             self.logout_button.pack_forget()
+        self.set_login_buttons_enabled(not self.login_running)
+
+    def set_login_buttons_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for attr in ("login_button", "review_login_button"):
+            button = getattr(self, attr, None)
+            if button is not None:
+                button.configure(state=state)
 
     def show_actor_tasks(self) -> None:
         actor_no = self.actor_no.get().strip()

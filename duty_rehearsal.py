@@ -692,7 +692,7 @@ def fill_entry_log_form_for_test(
         },
     )
 
-    people_result = set_entry_people(driver, [person], fallback_popup=True)
+    people_result = set_entry_people(driver, [person], fallback_popup=save)
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
     if save:
         time.sleep(2)
