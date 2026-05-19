@@ -35,6 +35,7 @@ from compare_rehearsal_records import (
 )
 from duty_rehearsal import (
     ENTRY_LOG_AP,
+    OFF_DUTY_SUMMARY_KEYS,
     WORK_LOG_AP,
     fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
@@ -515,6 +516,7 @@ class DutyGui(tk.Tk):
             messagebox.showerror("載入失敗", str(exc))
             return
 
+        self.sanitize_schedule_data(data)
         today_staff = data.get("today", {}).get("staff", {})
         yesterday_staff = data.get("yesterday", {}).get("staff", {})
         self.data = data
@@ -532,6 +534,18 @@ class DutyGui(tk.Tk):
             self.audit_date_combo.configure(values=self.available_audit_dates())
         self.refresh_tasks()
         self.refresh_duty_tasks()
+
+    def sanitize_schedule_data(self, data: dict[str, Any]) -> None:
+        for sheet_key in ("yesterday", "today", "tomorrow"):
+            sheet = data.get(sheet_key, {})
+            for row in sheet.get("rows", []):
+                row.get("columns", {}).pop("檢核欄", None)
+            summary = sheet.get("summary", {})
+            off_duty = set()
+            for key in OFF_DUTY_SUMMARY_KEYS:
+                off_duty.update(str(no) for no in summary.get(key, []))
+            if off_duty and "在勤" in summary:
+                summary["在勤"] = [str(no) for no in summary["在勤"] if str(no) not in off_duty]
 
     def load_audit_date(self) -> None:
         value = "".join(ch for ch in self.audit_date.get() if ch.isdigit())

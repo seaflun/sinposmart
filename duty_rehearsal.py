@@ -36,6 +36,22 @@ WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 
 HANDOFF_HOURS = [8, 10, 12, 14, 16, 18, 20, 22]
+OFF_DUTY_SUMMARY_KEYS = {
+    "公假",
+    "請休",
+    "產假",
+    "病假",
+    "事假",
+    "榮譽假",
+    "喪假",
+    "差假",
+    "婚假",
+    "特別註記",
+    "補休",
+    "其他假別",
+    "停休",
+    "輪休公假",
+}
 TRAINING_BY_WEEKDAY = {
     0: ("河川抽水及水源運用", "SCBA訓練", "火災特性"),
     1: ("通風排煙訓練", "人命救助訓練", "火場控制及殘火處理"),
@@ -1155,6 +1171,11 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         summary={key: roster_nums(value) for key, value in data.get("summary", {}).items()},
         staff=data.get("staff", {}),
     )
+    off_duty = set()
+    for key in OFF_DUTY_SUMMARY_KEYS:
+        off_duty.update(sheet.summary.get(key, []))
+    if off_duty and "在勤" in sheet.summary:
+        sheet.summary["在勤"] = [no for no in sheet.summary["在勤"] if no not in off_duty]
     return sheet
 
 
@@ -1293,6 +1314,40 @@ def rest_starting_at(sheet: DutySheet, hour: int, next_sheet: DutySheet | None =
                         probe = next_end
                 starts[no] = block_end
     return starts
+
+
+def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, int, int | None]]:
+    blocks: list[tuple[str, int, int | None]] = []
+    active: dict[str, int] = {}
+    ordered_rows = sorted(sheet.rows, key=lambda item: slot_start(item.slot) if slot_start(item.slot) is not None else -1)
+    for row in ordered_rows:
+        start = slot_start(row.slot)
+        end = slot_end(row.slot)
+        if start is None or end is None:
+            continue
+        current = set(row.columns.get("休息", []))
+        for no in current:
+            active.setdefault(no, start)
+        for no in list(active.keys()):
+            if no in current:
+                continue
+            block_start = active.pop(no)
+            block_end = start
+            if block_end == 8 and next_sheet and no in people_at(next_sheet, 8, "休息"):
+                probe = 8
+                while True:
+                    next_row = row_for_hour(next_sheet, probe)
+                    if not next_row or no not in next_row.columns.get("休息", []):
+                        break
+                    next_end = slot_end(next_row.slot)
+                    if next_end is None or next_end <= probe:
+                        break
+                    block_end = next_end
+                    probe = next_end
+            blocks.append((no, block_start, block_end))
+    for no, block_start in active.items():
+        blocks.append((no, block_start, None))
+    return blocks
 
 
 def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None]]:
@@ -1548,53 +1603,56 @@ def planned_actions(
             )
         )
 
-    for no, end in sorted(today_rest_start_08.items(), key=lambda item: int(item[0])):
-        if no in today_on and no in yesterday_on:
-            actions.append(
-                PlannedAction(
-                    kind="entry_log",
-                    time="08:00",
-                    actor=entry_actor_at(today, yesterday, 8, 0),
-                    target=no,
-                    fields={
-                        "登打時間": "08:00",
-                        "系統寫入時間": "08:00",
-                        "出或入": "出",
-                        "領用事由及地點": "休息",
-                        "手提無線電編號": "",
-                        "是否歸還": "",
-                    },
-                    source="昨日與今日皆在勤且今日08起休息",
-                    duplicate_key=f"entry:{target}:8:out:{no}:休息",
-                )
-            )
-            actions.append(
-                PlannedAction(
-                    kind="entry_log",
-                    time=f"{end:02d}:00",
-                    actor=entry_actor_at(today, yesterday, end, 0),
-                    target=no,
-                    fields={
-                        "登打時間": f"{end:02d}:00",
-                        "系統寫入時間": f"{end:02d}:00",
-                        "出或入": "入",
-                        "領用事由及地點": "返隊",
-                        "手提無線電編號": "",
-                        "是否歸還": "",
-                    },
-                    source="今日08起休息結束",
-                    duplicate_key=f"entry:{target}:{end}:in:{no}:返隊",
-                )
-            )
-
-    # External duty sign-out/sign-in. Sign-out is entered by the previous duty
-    # desk; sign-in is entered by the duty desk covering the external duty end.
-    for duty_name, no, start, end in external_duty_blocks(today, tomorrow):
+    for no, start, end in rest_blocks(today, tomorrow):
+        if no not in today_on or (start == 8 and no not in yesterday_on):
+            continue
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{start:02d}:00",
                 actor=entry_actor_at(today, yesterday, start, 0),
+                target=no,
+                fields={
+                    "登打時間": f"{start:02d}:00",
+                    "系統寫入時間": f"{start:02d}:00",
+                    "出或入": "出",
+                    "領用事由及地點": "休息",
+                    "手提無線電編號": "",
+                    "是否歸還": "",
+                },
+                source="休息簽出",
+                duplicate_key=f"entry:{target}:{start}:out:{no}:休息",
+            )
+        )
+        if end is None:
+            continue
+        actions.append(
+            PlannedAction(
+                kind="entry_log",
+                time=f"{end:02d}:00",
+                actor=entry_actor_at(today, yesterday, end, 0),
+                target=no,
+                fields={
+                    "登打時間": f"{end:02d}:00",
+                    "系統寫入時間": f"{end:02d}:00",
+                    "出或入": "入",
+                    "領用事由及地點": "返隊",
+                    "手提無線電編號": "",
+                    "是否歸還": "",
+                },
+                source="休息結束",
+                duplicate_key=f"entry:{target}:{end}:in:{no}:返隊",
+            )
+        )
+
+    # External duty sign-out/sign-in. Sign-out is entered by the duty desk
+    # covering the external duty start; sign-in is entered near the duty end.
+    for duty_name, no, start, end in external_duty_blocks(today, tomorrow):
+        actions.append(
+            PlannedAction(
+                kind="entry_log",
+                time=f"{start:02d}:00",
+                actor=duty_actor_at(today, yesterday, start, 0),
                 target=no,
                 fields={
                     "登打時間": f"{start:02d}:00",
