@@ -39,8 +39,8 @@ from duty_rehearsal import (
     WORK_LOG_AP,
     fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
+    inspect_entry_log_format,
     login,
-    open_entry_log_form_for_manual,
     parse_roc_date,
     planned_actions,
     query_cases,
@@ -1114,7 +1114,7 @@ class DutyGui(tk.Tk):
             login(driver, session.user_id, session.password)
             target_date = self.data.get("target_date") or today_roc_date()
             if visible and action.get("kind") == "entry_log":
-                result = open_entry_log_form_for_manual(driver)
+                result = inspect_entry_log_format(driver, action, self.staff, target_date)
             elif action.get("kind") == "entry_log":
                 result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=save)
             else:

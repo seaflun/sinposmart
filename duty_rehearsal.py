@@ -859,6 +859,110 @@ def open_entry_log_form_for_manual(driver: webdriver.Chrome) -> dict[str, Any]:
     }
 
 
+def inspect_entry_log_format(
+    driver: webdriver.Chrome,
+    action: dict[str, Any],
+    staff: dict[str, dict[str, str]],
+    target_roc_date: str,
+) -> dict[str, Any]:
+    """Open entry-log form and capture main/popup control formats."""
+
+    fields = action.get("fields", {})
+    time_value = fields.get("系統寫入時間", fields.get("登打時間", action.get("time", "00:00")))
+    hour, minute = time_value.split(":", 1)
+    target_no = str(action.get("target", ""))
+    person = {
+        "id": staff.get(target_no, {}).get("user_id", ""),
+        "name": staff.get(target_no, {}).get("name", target_no),
+    }
+
+    open_ap(driver, ENTRY_LOG_AP)
+    time.sleep(1)
+    before_controls = control_snapshot(driver)
+    insert_result = click_insert_control(driver)
+    time.sleep(2)
+    main_before_popup = control_snapshot(driver)
+    fill_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+
+        function setById(id, value) {
+          const el = document.getElementById(id);
+          if (!el) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const option = Array.from(el.options || []).find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim()
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id, value});
+          return true;
+        }
+
+        if (!setById('_txtDATE', values.date)) result.missing.push('_txtDATE');
+        if (!setById('_selTIMEH', values.hour)) result.missing.push('_selTIMEH');
+        if (!setById('_selTIMEM', values.minute)) result.missing.push('_selTIMEM');
+        if (!setById('_areMemo', values.reason)) result.missing.push('_areMemo');
+        return result;
+        """,
+        {
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "reason": fields.get("領用事由及地點", ""),
+        },
+    )
+    handles_before = set(driver.window_handles)
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "_btnOpenWin"))).click()
+    WebDriverWait(driver, 10).until(lambda d: len(set(d.window_handles) - handles_before) == 1)
+    popup_window = (set(driver.window_handles) - handles_before).pop()
+    driver.switch_to.window(popup_window)
+    popup_controls = control_snapshot(driver)
+    popup_summary = driver.execute_script(
+        """
+        return {
+          title: document.title,
+          url: location.href,
+          bodyText: document.body ? document.body.innerText.slice(0, 8000) : '',
+          checkboxes: Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]')).map(el => ({
+            id: el.id || '',
+            name: el.name || '',
+            value: el.value || '',
+            checked: el.checked,
+            rowText: el.closest('tr')?.innerText || el.parentElement?.innerText || ''
+          })),
+          buttons: Array.from(document.querySelectorAll('input, button, a')).map(el => ({
+            tag: el.tagName.toLowerCase(),
+            type: el.type || '',
+            id: el.id || '',
+            name: el.name || '',
+            value: el.value || '',
+            text: el.innerText || ''
+          }))
+        };
+        """
+    )
+    driver.switch_to.window(driver.window_handles[0])
+    return {
+        "ok": True,
+        "target_person": person,
+        "insert": insert_result,
+        "fill": fill_result,
+        "before_controls": before_controls,
+        "main_before_popup": main_before_popup,
+        "popup_controls": popup_controls,
+        "popup_summary": popup_summary,
+        "save": {"ok": False, "skipped": True},
+    }
+
+
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     wait = WebDriverWait(driver, 20)
     driver.get(f"{BASE_URL}/login119")
