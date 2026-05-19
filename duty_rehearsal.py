@@ -634,6 +634,7 @@ def fill_entry_log_form_for_test(
     before_controls = control_snapshot(driver)
     insert_result = click_insert_control(driver)
     time.sleep(2)
+    people_result = set_entry_people(driver, [person], fallback_popup=True)
 
     fill_result = driver.execute_script(
         """
@@ -715,7 +716,6 @@ def fill_entry_log_form_for_test(
         },
     )
 
-    people_result = set_entry_people(driver, [person], fallback_popup=save)
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
     if save:
         time.sleep(2)
