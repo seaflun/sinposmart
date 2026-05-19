@@ -1032,7 +1032,7 @@ class DutyGui(tk.Tk):
             if compare.get("group") == "review":
                 continue
             indices.append(index)
-        return sorted(indices, key=lambda idx: self.action_minutes(self.duty_actions[idx]))
+        return sorted(indices, key=lambda idx: self.action_datetime(self.duty_actions[idx]))
 
     def action_minutes(self, action: dict[str, Any]) -> int:
         value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
@@ -1040,7 +1040,35 @@ class DutyGui(tk.Tk):
             hour, minute = [int(part) for part in value.split(":", 1)]
         except ValueError:
             return 0
-        return hour * 60 + minute
+        return int(action.get("date_offset", 0) or 0) * 1440 + hour * 60 + minute
+
+    def action_datetime(self, action: dict[str, Any]) -> datetime:
+        value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
+        try:
+            hour, minute = [int(part) for part in value.split(":", 1)]
+        except ValueError:
+            hour, minute = 0, 0
+        try:
+            base_date = parse_roc_date(self.duty_data.get("target_date") or today_roc_date())
+        except ValueError:
+            base_date = date.today()
+        offset = int(action.get("date_offset", 0) or 0)
+        target_date = base_date + timedelta(days=offset)
+        return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+
+    def action_display_time(self, action: dict[str, Any]) -> str:
+        fields = action.get("fields", {})
+        value = fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")
+        offset = int(action.get("date_offset", 0) or 0)
+        return f"D+{offset} {value}" if offset else value
+
+    def action_target_roc_date(self, action: dict[str, Any]) -> str:
+        try:
+            base_date = parse_roc_date(self.duty_data.get("target_date") or today_roc_date())
+        except ValueError:
+            base_date = date.today()
+        offset = int(action.get("date_offset", 0) or 0)
+        return roc_date(base_date + timedelta(days=offset))
 
     def refresh_duty_tasks(self) -> None:
         if not hasattr(self, "duty_tree"):
@@ -1052,12 +1080,11 @@ class DutyGui(tk.Tk):
             self.duty_status_text.set("")
             return
         now = datetime.now()
-        now_min = now.hour * 60 + now.minute
         next_item = None
         for index in self.duty_task_indices():
             action = self.duty_actions[index]
-            minutes = self.action_minutes(action)
-            if next_item is None and minutes >= now_min:
+            action_at = self.action_datetime(action)
+            if next_item is None and action_at >= now:
                 next_item = action
             compare = self.duty_action_compare.get(index, {})
             if index in self.submitting_indices:
@@ -1070,10 +1097,9 @@ class DutyGui(tk.Tk):
                 status = "已提前登打"
                 tag = "triggered"
             else:
-                status = "到點待執行" if minutes <= now_min else "等待"
-                tag = "ready" if minutes <= now_min else "waiting"
-            fields = action.get("fields", {})
-            task_time = fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")
+                status = "到點待執行" if action_at <= now else "等待"
+                tag = "ready" if action_at <= now else "waiting"
+            task_time = self.action_display_time(action)
             self.duty_tree.insert(
                 "",
                 tk.END,
@@ -1090,9 +1116,9 @@ class DutyGui(tk.Tk):
             self.duty_tree.selection_set(kept_selection)
             self.duty_tree.focus(kept_selection[0])
         if next_item:
-            next_min = self.action_minutes(next_item)
-            delta = max(0, next_min - now_min)
-            self.next_task_text.set(f"{next_min // 60:02d}:{next_min % 60:02d}  {self.action_summary(next_item)}，約 {delta} 分鐘後")
+            next_at = self.action_datetime(next_item)
+            delta = max(0, int((next_at - now).total_seconds() // 60))
+            self.next_task_text.set(f"{self.action_display_time(next_item)}  {self.action_summary(next_item)}，約 {delta} 分鐘後")
         else:
             self.next_task_text.set("今日目前沒有未完成的當班任務")
         if self.session and self.session.verified:
@@ -1108,14 +1134,14 @@ class DutyGui(tk.Tk):
     def trigger_due_tasks(self, now: datetime) -> None:
         if not self.session or not self.session.verified:
             return
-        now_min = now.hour * 60 + now.minute
         for index in self.duty_task_indices():
             if index in self.executed_due or index in self.submitting_indices:
                 continue
             action = self.duty_actions[index]
             if action.get("kind") not in ("work_log", "entry_log"):
                 continue
-            if self.action_minutes(action) == now_min:
+            action_at = self.action_datetime(action)
+            if action_at.date() == now.date() and action_at.hour == now.hour and action_at.minute == now.minute:
                 self.log_trigger(index, action, "due")
                 self.submit_duty_action(index, action, save=True, visible=False, confirm=False, notify=False)
 
@@ -1178,8 +1204,14 @@ class DutyGui(tk.Tk):
             return
         index, action, save, visible, notify = self.submit_queue.pop(0)
         self.submit_worker_running = True
+        result_path = self.create_submit_result_path(index, action, save, visible)
+        self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
+        self.refresh_duty_tasks()
+        threading.Thread(target=self._save_work_log_worker, args=((index, action, result_path, save, visible, notify), self.session, visible), daemon=True).start()
+
+    def create_submit_result_path(self, index: int, action: dict[str, Any], save: bool, visible: bool) -> Path:
         prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
-        result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
+        result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S_%f}_{index}.json")
         started_result = {
             "stage": "started",
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1191,11 +1223,15 @@ class DutyGui(tk.Tk):
             "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
-        self.refresh_duty_tasks()
-        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path, save, visible, notify), daemon=True).start()
+        return result_path
 
-    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path, save: bool, visible: bool, notify: bool) -> None:
+    def next_queued_submit_job(self) -> tuple[int, dict[str, Any], Path, bool, bool, bool] | None:
+        if not self.submit_queue:
+            return None
+        index, action, save, visible, notify = self.submit_queue.pop(0)
+        return index, action, self.create_submit_result_path(index, action, save, visible), save, visible, notify
+
+    def _save_work_log_worker(self, first_job: tuple[int, dict[str, Any], Path, bool, bool, bool], session: LoginSession, visible: bool) -> None:
         driver = None
         try:
             options = Options()
@@ -1206,20 +1242,40 @@ class DutyGui(tk.Tk):
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
-            target_date = self.duty_data.get("target_date") or today_roc_date()
-            if action.get("kind") == "entry_log":
-                result = fill_entry_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
-            else:
-                result = fill_work_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
-            result["stage"] = "submitted" if save else "filled"
-            result["action_index"] = index
-            result["action"] = action
-            result["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            result["save"] = save
-            result["visible"] = visible
-            result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            job = first_job
+            while job:
+                index, action, result_path, save, job_visible, notify = job
+                try:
+                    target_date = self.action_target_roc_date(action)
+                    if action.get("kind") == "entry_log":
+                        result = fill_entry_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
+                    else:
+                        result = fill_work_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
+                    result["stage"] = "submitted" if save else "filled"
+                    result["action_index"] = index
+                    result["action"] = action
+                    result["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    result["save"] = save
+                    result["visible"] = job_visible
+                    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self.after(0, lambda idx=index, path=result_path, note=notify: self._save_work_log_item_succeeded(idx, path, note))
+                except Exception as exc:
+                    error = str(exc)
+                    failure_result = {
+                        "stage": "failed",
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                        "action_index": index,
+                        "action": action,
+                        "error": error,
+                        "save": save,
+                        "visible": job_visible,
+                    }
+                    result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self.after(0, lambda idx=index, err=error, path=result_path, note=notify: self._save_work_log_item_failed(idx, err, path, note))
+                job = self.next_queued_submit_job()
         except Exception as exc:
             error = str(exc)
+            index, action, result_path, save, job_visible, notify = first_job
             failure_result = {
                 "stage": "failed",
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1227,19 +1283,17 @@ class DutyGui(tk.Tk):
                 "action": action,
                 "error": error,
                 "save": save,
-                "visible": visible,
+                "visible": job_visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.after(0, lambda: self._save_work_log_failed(index, error, result_path, notify))
-            return
+            self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify))
         finally:
             if driver:
                 driver.quit()
-        self.after(0, lambda: self._save_work_log_succeeded(index, result_path, notify))
+            self.after(0, self._submit_worker_finished)
 
-    def _save_work_log_succeeded(self, index: int, result_path: Path, notify: bool) -> None:
+    def _save_work_log_item_succeeded(self, index: int, result_path: Path, notify: bool) -> None:
         self.submitting_indices.discard(index)
-        self.submit_worker_running = False
         self.executed_due.add(index)
         self.duty_action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
         self.duty_status_text.set("已提前登打")
@@ -1249,14 +1303,16 @@ class DutyGui(tk.Tk):
             self.refresh_comparison_background(self.duty_data["target_date"], "early-submit")
         self.refresh_duty_tasks()
         self.refresh_tasks()
-        self.start_next_submit_job()
 
-    def _save_work_log_failed(self, index: int, error: str, result_path: Path, notify: bool) -> None:
+    def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool) -> None:
         self.submitting_indices.discard(index)
-        self.submit_worker_running = False
         self.duty_status_text.set(f"提前登打失敗：{error}，結果：{result_path.name}")
         if notify:
             messagebox.showerror("提前登打失敗", f"{error}\n\n結果檔：{result_path.name}")
+        self.refresh_duty_tasks()
+
+    def _submit_worker_finished(self) -> None:
+        self.submit_worker_running = False
         self.refresh_duty_tasks()
         self.start_next_submit_job()
 

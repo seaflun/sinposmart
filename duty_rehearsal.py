@@ -117,6 +117,7 @@ class PlannedAction:
     fields: dict[str, Any]
     source: str
     duplicate_key: str
+    date_offset: int = 0
 
 
 def roc_date(d: date) -> str:
@@ -1350,8 +1351,8 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
     return blocks
 
 
-def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None]]:
-    blocks: list[tuple[str, str, int, int | None]] = []
+def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None, int]]:
+    blocks: list[tuple[str, str, int, int | None, int]] = []
     ignore = {"值班", "救護", "備勤", "休息", "檢核欄"}
     active: dict[tuple[str, str], int] = {}
     ordered_rows = sorted(sheet.rows, key=lambda item: slot_start(item.slot) if slot_start(item.slot) is not None else -1)
@@ -1385,12 +1386,27 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
                         probe = next_end
                 elif block_end == 8 and next_sheet and no not in next_sheet.summary.get("在勤", []):
                     block_end = None
-                blocks.append((duty_name, no, block_start, block_end))
+                blocks.append((duty_name, no, block_start, block_end, 0))
         # Extend currently active keys through this row by keeping them in active.
     final_end = slot_end(ordered_rows[-1].slot) if ordered_rows else None
     if final_end is not None:
         for (duty_name, no), start in active.items():
-            blocks.append((duty_name, no, start, final_end))
+            block_end = final_end
+            end_offset = 0
+            if final_end == 24 and next_sheet:
+                block_end = None
+                probe = 0
+                while probe < 24:
+                    next_row = row_for_hour(next_sheet, probe)
+                    if not next_row or no not in next_row.columns.get(duty_name, []):
+                        break
+                    next_end = slot_end(next_row.slot)
+                    if next_end is None or next_end <= probe:
+                        break
+                    block_end = next_end
+                    end_offset = 1
+                    probe = next_end
+            blocks.append((duty_name, no, start, block_end, end_offset))
     return blocks
 
 
@@ -1647,7 +1663,7 @@ def planned_actions(
 
     # External duty sign-out/sign-in. Sign-out is entered by the duty desk
     # covering the external duty start; sign-in is entered near the duty end.
-    for duty_name, no, start, end in external_duty_blocks(today, tomorrow):
+    for duty_name, no, start, end, end_offset in external_duty_blocks(today, tomorrow):
         actions.append(
             PlannedAction(
                 kind="entry_log",
@@ -1684,6 +1700,7 @@ def planned_actions(
                 },
                 source="外勤簽入",
                 duplicate_key=f"entry:{target}:{end}:in:{no}:返隊:{duty_name}",
+                date_offset=end_offset,
             )
         )
 
@@ -1756,6 +1773,14 @@ def planned_actions(
                 )
             )
 
+    if tomorrow:
+        next_target = target + timedelta(days=1)
+        for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
+            if action.time != "08:00" or action.source != "值班交接":
+                continue
+            action.date_offset = 1
+            actions.append(action)
+
     # Radio test at 11:10, entered by 10-12 duty.
     radio_actor = duty_actor_at(today, yesterday, 11, 10)
     if radio_actor:
@@ -1821,7 +1846,7 @@ def planned_actions(
     def sort_key(index_and_action: tuple[int, PlannedAction]) -> tuple[int, int]:
         index, action = index_and_action
         hour, minute = [int(part) for part in action.time.split(":")]
-        return hour * 60 + minute, index
+        return action.date_offset * 1440 + hour * 60 + minute, index
 
     # Keep insertion order inside the same minute. This matters for handoff:
     # the outgoing "值退" row must be planned before the incoming "值班" row.
