@@ -130,6 +130,10 @@ class DutyGui(tk.Tk):
         self.actions: list[dict[str, Any]] = []
         self.data: dict[str, Any] = {}
         self.action_compare: dict[int, dict[str, Any]] = {}
+        self.duty_staff: dict[str, dict[str, str]] = {}
+        self.duty_actions: list[dict[str, Any]] = []
+        self.duty_data: dict[str, Any] = {}
+        self.duty_action_compare: dict[int, dict[str, Any]] = {}
         self.session: LoginSession | None = None
         self.executed_due: set[int] = set()
         self.submitting_indices: set[int] = set()
@@ -177,10 +181,10 @@ class DutyGui(tk.Tk):
         self.top_frame = top
         self.review_widgets.append(top)
         ttk.Label(top, text="預演 JSON").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(top, textvariable=self.preview_path, width=80).grid(row=0, column=1, sticky=tk.EW, padx=8)
+        ttk.Entry(top, textvariable=self.preview_path, width=36).grid(row=0, column=1, sticky=tk.W, padx=8)
         ttk.Button(top, text="選擇", command=self.choose_preview).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="載入", command=lambda: self.load_preview(Path(self.preview_path.get()))).grid(row=0, column=3)
-        top.columnconfigure(1, weight=1)
+        top.columnconfigure(1, weight=0)
 
         login_box = ttk.LabelFrame(root, text="目前值班人員登入", padding=10)
         login_box.pack(fill=tk.X, pady=(10, 0))
@@ -267,12 +271,12 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "compare": 64,
-            "execute_time": 48,
-            "actor": 40,
-            "target": 58,
-            "kind": 32,
-            "summary": 140,
+            "compare": 72,
+            "execute_time": 74,
+            "actor": 64,
+            "target": 76,
+            "kind": 54,
+            "summary": 180,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
@@ -502,7 +506,7 @@ class DutyGui(tk.Tk):
         self.simple_mode.set(mode == "值班模式")
         self.apply_mode()
 
-    def load_preview(self, path: Path) -> None:
+    def load_preview(self, path: Path, update_duty: bool = True) -> None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -515,6 +519,11 @@ class DutyGui(tk.Tk):
         self.staff = {**yesterday_staff, **today_staff}
         self.actions = data.get("actions", [])
         self.action_compare = self.build_comparison(data)
+        if update_duty:
+            self.duty_data = data
+            self.duty_staff = self.staff
+            self.duty_actions = self.actions
+            self.duty_action_compare = dict(self.action_compare)
         compare_note = "，已套用比對檔" if comparison_path(data.get("target_date", "")).exists() else ""
         self.status_text.set(f"已載入 {path.name}，任務 {len(self.actions)} 筆{compare_note}。")
         if hasattr(self, "audit_date_combo"):
@@ -539,7 +548,7 @@ class DutyGui(tk.Tk):
             messagebox.showwarning("找不到資料", f"找不到 {schedule_path(value).name}，請先產生該日排程資料。")
             return
         self.preview_path.set(str(path))
-        self.load_preview(path)
+        self.load_preview(path, update_duty=False)
 
     def load_today_preview_if_available(self) -> bool:
         target_roc_date = today_roc_date()
@@ -550,7 +559,7 @@ class DutyGui(tk.Tk):
             return False
         self.audit_date.set(target_roc_date)
         self.preview_path.set(str(path))
-        self.load_preview(path)
+        self.load_preview(path, update_duty=True)
         return True
 
     def build_comparison(self, data: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -762,7 +771,7 @@ class DutyGui(tk.Tk):
         self.snapshot_completed_slots.add(key)
         if path.exists():
             self.preview_path.set(str(path))
-            self.load_preview(path)
+            self.load_preview(path, update_duty=False)
         self.login_status.set(f"已登入：{self.person_label(actor_no)}，已建立排程資料。")
 
     def _schedule_failed(self, actor_no: str, error: str) -> None:
@@ -773,7 +782,7 @@ class DutyGui(tk.Tk):
         try:
             now = datetime.now()
             if now.minute < 5 and self.session and self.session.verified:
-                target_roc_date = self.data.get("target_date") or today_roc_date()
+                target_roc_date = self.duty_data.get("target_date") or today_roc_date()
                 key = f"comparison-{target_roc_date}-{now:%Y%m%d%H}"
                 if key not in self.comparison_completed_hours:
                     self.refresh_comparison_background(target_roc_date, f"{now:%H}00")
@@ -814,6 +823,8 @@ class DutyGui(tk.Tk):
         if path.exists() and self.data.get("target_date") == target_roc_date:
             self.action_compare = self.build_comparison(self.data)
             self.refresh_tasks()
+        if path.exists() and self.duty_data.get("target_date") == target_roc_date:
+            self.duty_action_compare = self.build_comparison(self.duty_data)
             self.refresh_duty_tasks()
         self.login_status.set(f"已登入：{self.person_label(actor_no)}，背景比對已更新。")
 
@@ -982,14 +993,14 @@ class DutyGui(tk.Tk):
         if not actor_no:
             return []
         indices = []
-        for index, action in enumerate(self.actions):
+        for index, action in enumerate(self.duty_actions):
             if str(action.get("actor", "")) != actor_no:
                 continue
-            compare = self.action_compare.get(index, {})
+            compare = self.duty_action_compare.get(index, {})
             if compare.get("group") == "review":
                 continue
             indices.append(index)
-        return sorted(indices, key=lambda idx: self.action_minutes(self.actions[idx]))
+        return sorted(indices, key=lambda idx: self.action_minutes(self.duty_actions[idx]))
 
     def action_minutes(self, action: dict[str, Any]) -> int:
         value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
@@ -1012,11 +1023,11 @@ class DutyGui(tk.Tk):
         now_min = now.hour * 60 + now.minute
         next_item = None
         for index in self.duty_task_indices():
-            action = self.actions[index]
+            action = self.duty_actions[index]
             minutes = self.action_minutes(action)
             if next_item is None and minutes >= now_min:
                 next_item = action
-            compare = self.action_compare.get(index, {})
+            compare = self.duty_action_compare.get(index, {})
             if index in self.submitting_indices:
                 status = "正在登打"
                 tag = "ready"
@@ -1069,7 +1080,7 @@ class DutyGui(tk.Tk):
         for index in self.duty_task_indices():
             if index in self.executed_due or index in self.submitting_indices:
                 continue
-            action = self.actions[index]
+            action = self.duty_actions[index]
             if action.get("kind") not in ("work_log", "entry_log"):
                 continue
             if self.action_minutes(action) == now_min:
@@ -1088,9 +1099,9 @@ class DutyGui(tk.Tk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再提前記錄。")
             return
-        self.log_trigger(index, self.actions[index], "manual")
+        self.log_trigger(index, self.duty_actions[index], "manual")
         self.executed_due.add(index)
-        self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.actions[index])}")
+        self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.duty_actions[index])}")
         self.refresh_duty_tasks()
 
     def save_selected_work_log_test(self) -> None:
@@ -1105,7 +1116,7 @@ class DutyGui(tk.Tk):
         if not str(iid).startswith("duty-"):
             return
         index = int(str(iid).split("-", 1)[1])
-        action = self.actions[index]
+        action = self.duty_actions[index]
         if action.get("kind") not in ("work_log", "entry_log"):
             messagebox.showwarning("類型不符", "目前只支援工作紀錄簿與出入登記提前登打。")
             return
@@ -1153,11 +1164,11 @@ class DutyGui(tk.Tk):
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
-            target_date = self.data.get("target_date") or today_roc_date()
+            target_date = self.duty_data.get("target_date") or today_roc_date()
             if action.get("kind") == "entry_log":
-                result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=save)
+                result = fill_entry_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
             else:
-                result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=save)
+                result = fill_work_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
             result["stage"] = "submitted" if save else "filled"
             result["action_index"] = index
             result["action"] = action
@@ -1187,12 +1198,12 @@ class DutyGui(tk.Tk):
     def _save_work_log_succeeded(self, index: int, result_path: Path, notify: bool) -> None:
         self.submitting_indices.discard(index)
         self.executed_due.add(index)
-        self.action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
+        self.duty_action_compare[index] = {"compare": "已提前登打", "group": "done", "matched": []}
         self.duty_status_text.set("已提前登打")
         if notify:
             messagebox.showinfo("提前登打", "已提前登打。")
-        if self.data.get("target_date"):
-            self.refresh_comparison_background(self.data["target_date"], "early-submit")
+        if self.duty_data.get("target_date"):
+            self.refresh_comparison_background(self.duty_data["target_date"], "early-submit")
         self.refresh_duty_tasks()
         self.refresh_tasks()
 
@@ -1211,7 +1222,7 @@ class DutyGui(tk.Tk):
             "action_index": index,
             "actor_no": session.actor_no if session else "",
             "user_id": session.user_id if session else "",
-            "target_date": self.data.get("target_date", ""),
+            "target_date": self.duty_data.get("target_date", ""),
             "kind": action.get("kind", ""),
             "time": action.get("time", ""),
             "source": action.get("source", ""),
@@ -1240,8 +1251,8 @@ class DutyGui(tk.Tk):
             self.title("勤務自動化控制台 - 值班人員")
             self.duty_widgets[0].pack(fill=tk.BOTH, expand=True)
         else:
-            self.geometry("1040x650")
-            self.minsize(900, 560)
+            self.geometry("780x650")
+            self.minsize(720, 560)
             self.filter_actor.set(False)
             self.status_filter.set("需處理")
             self.title("勤務自動化控制台 - 幹部審查")
