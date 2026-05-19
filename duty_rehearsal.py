@@ -324,17 +324,19 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
               if (item && typeof item === 'object') {
                 return {
                   id: String(item.id || item.user_id || '').trim(),
-                  name: String(item.name || '').trim()
+                  name: String(item.name || '').trim(),
+                  dutyNo: String(item.duty_no || item.dutyNo || item.no || '').trim()
                 };
               }
-              return {id: '', name: String(item || '').trim()};
-            }).filter(x => x.id || x.name);
+              return {id: '', name: String(item || '').trim(), dutyNo: ''};
+            }).filter(x => x.id || x.name || x.dutyNo);
             const checks = Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]'));
             const selected = [];
             const missing = [];
             const candidates = checks.map(el => ({
               value: String(el.value || ''),
-              rowText: String(el.closest('tr')?.innerText || el.parentElement?.innerText || '')
+              rowText: String(el.closest('tr')?.innerText || el.parentElement?.innerText || ''),
+              cells: Array.from(el.closest('tr')?.children || []).map(cell => String(cell.innerText || '').trim())
             }));
 
             for (const target of targets) {
@@ -342,8 +344,11 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
                 const parts = String(el.value || '').split(',');
                 const id = parts[0].trim();
                 const personName = parts.slice(1).join(',').trim();
-                const rowText = String(el.closest('tr')?.innerText || el.parentElement?.innerText || '');
+                const row = el.closest('tr');
+                const rowText = String(row?.innerText || el.parentElement?.innerText || '');
+                const cells = Array.from(row?.children || []).map(cell => String(cell.innerText || '').trim());
                 return (target.id && id === target.id) ||
+                       (target.dutyNo && cells.some(text => text === target.dutyNo)) ||
                        (target.name && (
                          personName === target.name ||
                          personName.includes(target.name) ||
@@ -352,12 +357,11 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
                        ));
               });
               if (box) {
-                box.checked = true;
-                box.dispatchEvent(new Event('click', {bubbles: true}));
+                if (!box.checked) box.click();
                 box.dispatchEvent(new Event('change', {bubbles: true}));
                 selected.push(box.value);
               } else {
-                missing.push(target.name || target.id);
+                missing.push(target.dutyNo || target.name || target.id);
               }
             }
 
@@ -669,6 +673,7 @@ def fill_entry_log_form_for_test(
     person = {
         "id": staff.get(target_no, {}).get("user_id", ""),
         "name": staff.get(target_no, {}).get("name", target_no),
+        "duty_no": target_no,
     }
 
     open_ap(driver, ENTRY_LOG_AP)
@@ -874,6 +879,7 @@ def inspect_entry_log_format(
     person = {
         "id": staff.get(target_no, {}).get("user_id", ""),
         "name": staff.get(target_no, {}).get("name", target_no),
+        "duty_no": target_no,
     }
 
     open_ap(driver, ENTRY_LOG_AP)
