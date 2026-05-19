@@ -172,6 +172,29 @@ def js_set(driver: webdriver.Chrome, element_id: str, value: str) -> bool:
     )
 
 
+def detect_login_error(driver: webdriver.Chrome) -> str:
+    try:
+        alert = driver.switch_to.alert
+        text = alert.text.strip()
+        alert.accept()
+        if text:
+            return text
+    except Exception:
+        pass
+    return driver.execute_script(
+        """
+        const text = document.body ? document.body.innerText : '';
+        const values = Array.from(document.querySelectorAll('input, textarea, select'))
+          .map(el => el.value || el.options?.[el.selectedIndex]?.text || '')
+          .join('\\n');
+        const pageText = [text, values].join('\\n');
+        const known = '帳號密碼有誤或尚未申請帳號權限,請確認後再重新登入';
+        if (pageText.includes(known)) return known;
+        return '';
+        """
+    ) or ""
+
+
 def set_people_direct(driver: webdriver.Chrome, people: list[Any]) -> dict[str, Any]:
     """Select form people by writing the same fields as the picker popup.
 
@@ -725,7 +748,11 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
         }
         """
     )
-    time.sleep(5)
+    for _ in range(20):
+        error = detect_login_error(driver)
+        if error:
+            raise RuntimeError(error)
+        time.sleep(0.25)
     # The legacy app can keep login119 in the address bar after posting. The
     # real proof is whether authenticated AP pages load, so callers verify that.
 
