@@ -49,16 +49,38 @@ from duty_rehearsal import (
 def latest_preview_file() -> Path:
     now = datetime.now()
     today_roc = f"{now.year - 1911:03d}{now.month:02d}{now.day:02d}"
-    today_file = Path(f"rehearsal_output_{today_roc}.json")
+    today_file = schedule_path(today_roc)
     if today_file.exists():
         return today_file
-    candidates = sorted(Path.cwd().glob("rehearsal_output_*.json"), key=lambda path: path.stat().st_mtime)
+    legacy_today = legacy_rehearsal_path(today_roc)
+    if legacy_today.exists():
+        return legacy_today
+    candidates = sorted(
+        list(Path.cwd().glob("schedule_output_*.json")) + list(Path.cwd().glob("rehearsal_output_*.json")),
+        key=lambda path: path.stat().st_mtime,
+    )
     return candidates[-1] if candidates else Path("rehearsal_output_1150517.json")
 
 
 def today_roc_date() -> str:
     now = datetime.now()
     return f"{now.year - 1911:03d}{now.month:02d}{now.day:02d}"
+
+
+def roc_date_after(value: str, days: int) -> str:
+    return roc_date(parse_roc_date(value) + timedelta(days=days))
+
+
+def schedule_path(target_roc_date: str) -> Path:
+    return Path(f"schedule_output_{target_roc_date}.json")
+
+
+def comparison_path(target_roc_date: str) -> Path:
+    return Path(f"comparison_output_{target_roc_date}.json")
+
+
+def legacy_rehearsal_path(target_roc_date: str) -> Path:
+    return Path(f"rehearsal_output_{target_roc_date}.json")
 
 
 DEFAULT_PREVIEW = latest_preview_file()
@@ -115,6 +137,8 @@ class DutyGui(tk.Tk):
         self.audit_bottom_frame: ttk.Frame | None = None
         self.snapshot_running = False
         self.snapshot_completed_slots: set[str] = set()
+        self.comparison_running = False
+        self.comparison_completed_hours: set[str] = set()
         self.logout_cleared = False
 
         self._build_layout()
@@ -122,6 +146,7 @@ class DutyGui(tk.Tk):
             self.load_preview(DEFAULT_PREVIEW)
         self.after(1000, self.tick_clock)
         self.after(15000, self.check_scheduled_snapshot)
+        self.after(60000, self.check_hourly_comparison)
 
     def _build_layout(self) -> None:
         style = ttk.Style(self)
@@ -342,12 +367,13 @@ class DutyGui(tk.Tk):
             self.load_preview(Path(path))
 
     def available_audit_dates(self) -> list[str]:
-        values = []
-        for path in sorted(Path.cwd().glob("rehearsal_output_*.json")):
+        values = set()
+        paths = list(Path.cwd().glob("schedule_output_*.json")) + list(Path.cwd().glob("rehearsal_output_*.json"))
+        for path in sorted(paths):
             value = path.stem.rsplit("_", 1)[-1]
             if len(value) == 7 and value.isdigit():
-                values.append(value)
-        return values or [today_roc_date()]
+                values.add(value)
+        return sorted(values) or [today_roc_date()]
 
     def shift_audit_date(self, days: int) -> None:
         value = "".join(ch for ch in self.audit_date.get() if ch.isdigit())
@@ -479,7 +505,8 @@ class DutyGui(tk.Tk):
         self.staff = {**yesterday_staff, **today_staff}
         self.actions = data.get("actions", [])
         self.action_compare = self.build_comparison(data)
-        self.status_text.set(f"已載入 {path.name}，任務 {len(self.actions)} 筆。")
+        compare_note = "，已套用比對檔" if comparison_path(data.get("target_date", "")).exists() else ""
+        self.status_text.set(f"已載入 {path.name}，任務 {len(self.actions)} 筆{compare_note}。")
         if hasattr(self, "audit_date_combo"):
             self.audit_date_combo.configure(values=self.available_audit_dates())
         self.refresh_tasks()
@@ -490,16 +517,20 @@ class DutyGui(tk.Tk):
         if len(value) != 7:
             messagebox.showwarning("日期格式錯誤", "請輸入民國日期，例如 1150518。")
             return
-        path = Path(f"rehearsal_output_{value}.json")
+        path = schedule_path(value)
         if not path.exists():
-            messagebox.showwarning("找不到資料", f"找不到 {path.name}，請先執行預演抓取該日資料。")
+            path = legacy_rehearsal_path(value)
+        if not path.exists():
+            messagebox.showwarning("找不到資料", f"找不到 {schedule_path(value).name}，請先產生該日排程資料。")
             return
         self.preview_path.set(str(path))
         self.load_preview(path)
 
     def load_today_preview_if_available(self) -> bool:
         target_roc_date = today_roc_date()
-        path = Path(f"rehearsal_output_{target_roc_date}.json")
+        path = schedule_path(target_roc_date)
+        if not path.exists():
+            path = legacy_rehearsal_path(target_roc_date)
         if not path.exists():
             return False
         self.audit_date.set(target_roc_date)
@@ -509,8 +540,11 @@ class DutyGui(tk.Tk):
 
     def build_comparison(self, data: dict[str, Any]) -> dict[int, dict[str, Any]]:
         target_date = data.get("target_date", "")
-        entry_rows = flatten_rows(data.get("visible_entry_rows", []), target_date) if target_date else []
-        work_rows = flatten_rows(data.get("visible_work_rows", []), target_date) if target_date else []
+        comparison_data = self.load_comparison_data(target_date) if target_date else {}
+        entry_source = comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", []))
+        work_source = comparison_data.get("visible_work_rows", data.get("visible_work_rows", []))
+        entry_rows = flatten_rows(entry_source, target_date) if target_date else []
+        work_rows = flatten_rows(work_source, target_date) if target_date else []
         result: dict[int, dict[str, Any]] = {}
         external_targets: dict[str, set[str]] = {}
         for action in [a for a in data.get("actions", []) if a.get("kind") == "entry_log" and a.get("source", "").startswith("外勤")]:
@@ -558,6 +592,15 @@ class DutyGui(tk.Tk):
                 result[index]["compare"] = "外勤確認"
         return result
 
+    def load_comparison_data(self, target_roc_date: str) -> dict[str, Any]:
+        path = comparison_path(target_roc_date)
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
     def verify_login(self) -> None:
         user_id = self.user_id.get().strip()
         password = self.password.get()
@@ -588,7 +631,7 @@ class DutyGui(tk.Tk):
                 driver.quit()
         self.after(0, lambda: self._login_succeeded(actor_no, user_id, password))
 
-    def write_login_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
+    def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
         target_date = parse_roc_date(target_roc_date)
         yesterday_date = target_date - timedelta(days=1)
         tomorrow_date = target_date + timedelta(days=1)
@@ -601,11 +644,10 @@ class DutyGui(tk.Tk):
             tomorrow_sheet = None
         yesterday_cases = query_cases(driver, roc_date(yesterday_date))
         cases = query_cases(driver, roc_date(target_date))
-        work_rows = query_visible_table(driver, WORK_LOG_AP, roc_date(target_date))
-        entry_rows = query_visible_table(driver, ENTRY_LOG_AP, roc_date(target_date))
         actions = planned_actions(today_sheet, yesterday_sheet, cases, target_date, yesterday_cases, tomorrow_sheet)
 
         payload = {
+            "file_type": "schedule",
             "target_date": roc_date(target_date),
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "today": asdict(today_sheet),
@@ -614,44 +656,59 @@ class DutyGui(tk.Tk):
             "cases": [asdict(c) for c in cases],
             "yesterday_cases": [asdict(c) for c in yesterday_cases],
             "actions": [asdict(a) for a in actions],
-            "visible_work_rows": work_rows,
-            "visible_entry_rows": entry_rows,
         }
 
-        canonical_path = Path(f"rehearsal_output_{target_roc_date}.json")
+        canonical_path = schedule_path(target_roc_date)
         canonical_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         snapshots_dir = Path("snapshots")
         snapshots_dir.mkdir(exist_ok=True)
         slot_part = f"_{slot_label}" if slot_label else ""
-        snapshot_path = snapshots_dir / f"rehearsal_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
+        snapshot_path = snapshots_dir / f"schedule_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
+        snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return canonical_path
+
+    def write_comparison_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
+        work_rows = query_visible_table(driver, WORK_LOG_AP, target_roc_date)
+        entry_rows = query_visible_table(driver, ENTRY_LOG_AP, target_roc_date)
+        payload = {
+            "file_type": "comparison",
+            "target_date": target_roc_date,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "visible_work_rows": work_rows,
+            "visible_entry_rows": entry_rows,
+        }
+
+        canonical_path = comparison_path(target_roc_date)
+        canonical_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        snapshots_dir = Path("snapshots")
+        snapshots_dir.mkdir(exist_ok=True)
+        slot_part = f"_{slot_label}" if slot_label else ""
+        snapshot_path = snapshots_dir / f"comparison_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
         snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return canonical_path
 
     def check_scheduled_snapshot(self) -> None:
         try:
             now = datetime.now()
-            slots = {8: "0800", 22: "2200"}
-            slot_label = slots.get(now.hour)
-            if slot_label and now.minute < 10:
-                target_roc_date = today_roc_date()
-                key = f"{target_roc_date}-{slot_label}"
-                existing = list(Path("snapshots").glob(f"rehearsal_output_{target_roc_date}_{slot_label}_*.json"))
-                if existing:
+            if now.hour == 22 and now.minute < 10:
+                target_roc_date = roc_date_after(today_roc_date(), 1)
+                key = f"schedule-{target_roc_date}-2200"
+                if schedule_path(target_roc_date).exists():
                     self.snapshot_completed_slots.add(key)
                 elif key not in self.snapshot_completed_slots:
-                    self.refresh_snapshot_background(slot_label)
+                    self.refresh_schedule_background(target_roc_date, "2200")
         finally:
             self.after(30000, self.check_scheduled_snapshot)
 
-    def refresh_snapshot_background(self, slot_label: str) -> None:
+    def refresh_schedule_background(self, target_roc_date: str, slot_label: str) -> None:
         if self.snapshot_running or not (self.session and self.session.verified):
             return
         session = self.session
-        target_roc_date = today_roc_date()
-        key = f"{target_roc_date}-{slot_label}"
+        key = f"schedule-{target_roc_date}-{slot_label}"
         self.snapshot_running = True
-        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，正在更新 {target_roc_date} 資料...")
+        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，正在建立 {target_roc_date} 排程...")
 
         def worker() -> None:
             driver = None
@@ -661,29 +718,81 @@ class DutyGui(tk.Tk):
                 options.add_argument("--disable-popup-blocking")
                 driver = webdriver.Chrome(options=options)
                 login(driver, session.user_id, session.password)
-                path = self.write_login_snapshot(driver, target_roc_date, slot_label)
+                path = self.write_schedule_snapshot(driver, target_roc_date, slot_label)
             except Exception as exc:
                 error = str(exc)
-                self.after(0, lambda: self._snapshot_failed(session.actor_no, error))
+                self.after(0, lambda: self._schedule_failed(session.actor_no, error))
                 return
             finally:
                 if driver:
                     driver.quit()
-            self.after(0, lambda: self._snapshot_succeeded(session.actor_no, key, slot_label, path))
+            self.after(0, lambda: self._schedule_succeeded(session.actor_no, key, path))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _snapshot_succeeded(self, actor_no: str, key: str, slot_label: str, path: Path) -> None:
+    def _schedule_succeeded(self, actor_no: str, key: str, path: Path) -> None:
         self.snapshot_running = False
         self.snapshot_completed_slots.add(key)
         if path.exists():
             self.preview_path.set(str(path))
             self.load_preview(path)
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，已更新今日資料。")
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，已建立排程資料。")
 
-    def _snapshot_failed(self, actor_no: str, error: str) -> None:
+    def _schedule_failed(self, actor_no: str, error: str) -> None:
         self.snapshot_running = False
-        self.login_status.set(f"已登入：{self.person_label(actor_no)}，更新今日資料失敗：{error}")
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，建立排程失敗：{error}")
+
+    def check_hourly_comparison(self) -> None:
+        try:
+            now = datetime.now()
+            if now.minute < 5 and self.session and self.session.verified:
+                target_roc_date = self.data.get("target_date") or today_roc_date()
+                key = f"comparison-{target_roc_date}-{now:%Y%m%d%H}"
+                if key not in self.comparison_completed_hours:
+                    self.refresh_comparison_background(target_roc_date, f"{now:%H}00")
+        finally:
+            self.after(60000, self.check_hourly_comparison)
+
+    def refresh_comparison_background(self, target_roc_date: str, slot_label: str) -> None:
+        if self.comparison_running or not (self.session and self.session.verified):
+            return
+        session = self.session
+        key = f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
+        self.comparison_running = True
+        self.login_status.set(f"已登入：{self.person_label(session.actor_no)}，背景比對 {target_roc_date}...")
+
+        def worker() -> None:
+            driver = None
+            try:
+                options = Options()
+                options.add_argument("--headless=new")
+                options.add_argument("--disable-popup-blocking")
+                driver = webdriver.Chrome(options=options)
+                login(driver, session.user_id, session.password)
+                path = self.write_comparison_snapshot(driver, target_roc_date, slot_label)
+            except Exception as exc:
+                error = str(exc)
+                self.after(0, lambda: self._comparison_failed(session.actor_no, error))
+                return
+            finally:
+                if driver:
+                    driver.quit()
+            self.after(0, lambda: self._comparison_succeeded(session.actor_no, key, target_roc_date, path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _comparison_succeeded(self, actor_no: str, key: str, target_roc_date: str, path: Path) -> None:
+        self.comparison_running = False
+        self.comparison_completed_hours.add(key)
+        if path.exists() and self.data.get("target_date") == target_roc_date:
+            self.action_compare = self.build_comparison(self.data)
+            self.refresh_tasks()
+            self.refresh_duty_tasks()
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，背景比對已更新。")
+
+    def _comparison_failed(self, actor_no: str, error: str) -> None:
+        self.comparison_running = False
+        self.login_status.set(f"已登入：{self.person_label(actor_no)}，背景比對失敗：{error}")
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
         texts = [self.page_identity_text(driver)]
@@ -734,7 +843,7 @@ class DutyGui(tk.Tk):
         else:
             self.refresh_tasks()
             self.refresh_duty_tasks()
-            self.refresh_snapshot_background("login")
+            self.login_status.set(f"已登入：{self.person_label(actor_no)}，找不到今日排程檔，登入未執行系統查詢。")
 
     def _login_failed(self, error: str) -> None:
         self.session = None

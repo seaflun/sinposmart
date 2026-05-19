@@ -185,8 +185,12 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
         **data.get("yesterday", {}).get("staff", {}),
         **data.get("today", {}).get("staff", {}),
     }
-    entry_rows = flatten_rows(data.get("visible_entry_rows", []), target_date)
-    work_rows = flatten_rows(data.get("visible_work_rows", []), target_date)
+    comparison_path = json_path.with_name(f"comparison_output_{target_date}.json")
+    comparison_data = {}
+    if comparison_path.exists():
+        comparison_data = json.loads(comparison_path.read_text(encoding="utf-8"))
+    entry_rows = flatten_rows(comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", [])), target_date)
+    work_rows = flatten_rows(comparison_data.get("visible_work_rows", data.get("visible_work_rows", [])), target_date)
 
     lines = [
         f"{target_date} 預演 vs 系統既有紀錄比對",

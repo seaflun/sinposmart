@@ -70,6 +70,16 @@ py compare_rehearsal_records.py rehearsal_output_1150518.json --out snapshots\ve
 - `提前記錄` 和到點流程目前只寫入本機 `duty_trigger_log.jsonl`。
 - 下一步建議先做「填表但不儲存」：開啟新增頁、填入欄位、檢查欄位對應，再決定是否接上最後儲存按鈕。
 
+## 2026-05-19 資料拆檔規則
+
+- `schedule_output_日期.json`：只保存依勤務表、案件資料推導出的排程 actions。
+- `comparison_output_日期.json`：只保存工作紀錄簿、出入暨領用無線電機登記簿的既有登打查詢結果。
+- 舊的 `rehearsal_output_日期.json` 仍可讀，但新流程不再把排程和比對資料混在同一個檔案。
+- 登入時只讀本機既有排程檔，不查勤務系統，避免影響登入時間。
+- 每天 22:00 後背景查詢隔日勤務表並產生隔日 `schedule_output_日期.json`。
+- 已登入狀態下，每小時整點前 5 分鐘內背景更新一次 `comparison_output_日期.json`。
+- 這些 JSON 屬於 Google Drive 同步資料，已加入 `.gitignore`，不靠 Git 提交版本。
+
 ## 比交接文件更好的方法
 
 最佳做法是把本資料夾變成 Git repo。Google Drive 負責同步檔案，Git 負責記錄每次改了哪些行、可以回復版本、也能讓兩台電腦先看差異再繼續。

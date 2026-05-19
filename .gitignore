@@ -7,4 +7,9 @@ duty_trigger_log.jsonl
 *.log
 .DS_Store
 Thumbs.db
+schedule_output_*.json
+comparison_output_*.json
 snapshots/*_login_*.json
+snapshots/schedule_output_*.json
+snapshots/comparison_output_*.json
+snapshots/verify_compare_*.txt
