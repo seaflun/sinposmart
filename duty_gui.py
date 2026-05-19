@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import tkinter as tk
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -336,6 +337,7 @@ class DutyGui(tk.Tk):
         controls = ttk.Frame(panel)
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
+        ttk.Button(controls, text="可視填表", style="Soft.TButton", command=self.visible_fill_selected).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Button(controls, text="提前登打", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
@@ -1014,6 +1016,12 @@ class DutyGui(tk.Tk):
         self.refresh_duty_tasks()
 
     def save_selected_work_log_test(self) -> None:
+        self.start_submit_selected(save=True, visible=False)
+
+    def visible_fill_selected(self) -> None:
+        self.start_submit_selected(save=False, visible=True)
+
+    def start_submit_selected(self, save: bool, visible: bool) -> None:
         selection = self.duty_tree.selection()
         if not selection:
             messagebox.showinfo("提前登打", "請先選擇一筆工作紀錄任務。")
@@ -1029,9 +1037,12 @@ class DutyGui(tk.Tk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再提前登打。")
             return
-        if not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        if save and not messagebox.askyesno("確認提前登打", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
-        prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
+        if visible:
+            prefix = "visible_entry_log_fill_test" if action.get("kind") == "entry_log" else "visible_work_log_fill_test"
+        else:
+            prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
         result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
         started_result = {
             "stage": "started",
@@ -1040,29 +1051,41 @@ class DutyGui(tk.Tk):
             "action": action,
             "user_id": self.session.user_id,
             "summary": self.duty_action_summary(action),
+            "save": save,
+            "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.duty_status_text.set(f"已開始提前登打：{self.duty_action_summary(action)}")
-        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path), daemon=True).start()
+        label = "可視填表" if visible else "提前登打"
+        self.duty_status_text.set(f"已開始{label}：{self.duty_action_summary(action)}")
+        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path, save, visible), daemon=True).start()
 
-    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path) -> None:
+    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path, save: bool, visible: bool) -> None:
         driver = None
         try:
             options = Options()
-            options.add_argument("--headless=new")
+            if visible:
+                options.add_argument("--start-maximized")
+            else:
+                options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
             target_date = self.data.get("target_date") or today_roc_date()
             if action.get("kind") == "entry_log":
-                result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=True)
+                result = fill_entry_log_form_for_test(driver, action, self.staff, target_date, save=save)
             else:
-                result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=True)
-            result["stage"] = "submitted"
+                result = fill_work_log_form_for_test(driver, action, self.staff, target_date, save=save)
+            result["stage"] = "submitted" if save else "filled_visible"
             result["action_index"] = index
             result["action"] = action
             result["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            result["save"] = save
+            result["visible"] = visible
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            if visible:
+                self.after(0, lambda: self._visible_fill_succeeded(result_path))
+                time.sleep(600)
+                return
         except Exception as exc:
             error = str(exc)
             failure_result = {
@@ -1071,6 +1094,8 @@ class DutyGui(tk.Tk):
                 "action_index": index,
                 "action": action,
                 "error": error,
+                "save": save,
+                "visible": visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
             self.after(0, lambda: self._save_work_log_failed(error, result_path))
@@ -1089,6 +1114,10 @@ class DutyGui(tk.Tk):
             self.refresh_comparison_background(self.data["target_date"], "early-submit")
         self.refresh_duty_tasks()
         self.refresh_tasks()
+
+    def _visible_fill_succeeded(self, result_path: Path) -> None:
+        self.duty_status_text.set(f"已完成可視填表，結果：{result_path.name}")
+        messagebox.showinfo("可視填表", f"已填表但未儲存。\nChrome 視窗會保留約 10 分鐘。\n結果檔：{result_path.name}")
 
     def _save_work_log_failed(self, error: str, result_path: Path) -> None:
         self.duty_status_text.set(f"提前登打失敗：{error}，結果：{result_path.name}")
