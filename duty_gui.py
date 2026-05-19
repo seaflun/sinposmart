@@ -236,7 +236,6 @@ class DutyGui(tk.Tk):
             width=8,
             state="readonly",
         ).pack(side=tk.LEFT)
-        ttk.Label(tools, textvariable=self.status_text).pack(side=tk.RIGHT)
         self.status_filter.trace_add("write", lambda *_: self.refresh_tasks())
         self.kind_filter.trace_add("write", lambda *_: self.refresh_tasks())
 
@@ -555,31 +554,33 @@ class DutyGui(tk.Tk):
         for index, action in enumerate(data.get("actions", [])):
             fields = action.get("fields", {})
             if action.get("kind") == "entry_log":
-                exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
-                near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
                 reason = fields.get("領用事由及地點", "")
-                if exact:
-                    result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
-                elif is_future_action(target_date, action):
+                if is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
-                elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
-                    result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
-                elif near:
-                    result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
-                elif reason in ("到勤", "退勤", "休息後退勤"):
-                    result[index] = {"compare": "需補登", "group": "todo", "matched": []}
-                elif action.get("source", "").startswith("外勤"):
-                    result[index] = {"compare": "人工確認", "group": "review", "matched": []}
                 else:
-                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
+                    exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
+                    near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
+                    if exact:
+                        result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
+                    elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
+                        result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
+                    elif near:
+                        result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
+                    elif reason in ("到勤", "退勤", "休息後退勤"):
+                        result[index] = {"compare": "需補登", "group": "todo", "matched": []}
+                    elif action.get("source", "").startswith("外勤"):
+                        result[index] = {"compare": "人工確認", "group": "review", "matched": []}
+                    else:
+                        result[index] = {"compare": "未找到", "group": "todo", "matched": []}
             else:
-                matches = find_work_matches(work_rows, target_date, self.staff, action)
-                if matches:
-                    result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
-                elif is_future_action(target_date, action):
+                if is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                 else:
-                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
+                    matches = find_work_matches(work_rows, target_date, self.staff, action)
+                    if matches:
+                        result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
+                    else:
+                        result[index] = {"compare": "未找到", "group": "todo", "matched": []}
 
         for index, action in enumerate(data.get("actions", [])):
             # A matching external record under a different name means the planned
