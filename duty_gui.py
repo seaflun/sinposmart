@@ -115,6 +115,7 @@ class DutyGui(tk.Tk):
         self.audit_bottom_frame: ttk.Frame | None = None
         self.snapshot_running = False
         self.snapshot_completed_slots: set[str] = set()
+        self.logout_cleared = False
 
         self._build_layout()
         if DEFAULT_PREVIEW.exists():
@@ -496,6 +497,16 @@ class DutyGui(tk.Tk):
         self.preview_path.set(str(path))
         self.load_preview(path)
 
+    def load_today_preview_if_available(self) -> bool:
+        target_roc_date = today_roc_date()
+        path = Path(f"rehearsal_output_{target_roc_date}.json")
+        if not path.exists():
+            return False
+        self.audit_date.set(target_roc_date)
+        self.preview_path.set(str(path))
+        self.load_preview(path)
+        return True
+
     def build_comparison(self, data: dict[str, Any]) -> dict[int, dict[str, Any]]:
         target_date = data.get("target_date", "")
         entry_rows = flatten_rows(data.get("visible_entry_rows", []), target_date) if target_date else []
@@ -712,14 +723,18 @@ class DutyGui(tk.Tk):
         self.login_status.set(f"已登入：{self.person_label(actor_no)}")
         self.actor_no.set(actor_no)
         self.password.set("")
+        self.logout_cleared = False
         self.audit_date.set(today_roc_date())
         if self.simple_mode.get():
             self.filter_actor.set(True)
             self.status_filter.set("可執行")
         self.update_login_panel()
-        self.refresh_tasks()
-        self.refresh_duty_tasks()
-        self.refresh_snapshot_background("login")
+        if self.load_today_preview_if_available():
+            self.login_status.set(f"已登入：{self.person_label(actor_no)}，已載入今日資料。")
+        else:
+            self.refresh_tasks()
+            self.refresh_duty_tasks()
+            self.refresh_snapshot_background("login")
 
     def _login_failed(self, error: str) -> None:
         self.session = None
@@ -730,9 +745,13 @@ class DutyGui(tk.Tk):
     def clear_login(self) -> None:
         self.session = None
         self.password.set("")
+        self.logout_cleared = True
         self.login_status.set("已清除登入狀態。")
         self.update_login_panel()
         self.refresh_tasks()
+        self.refresh_duty_tasks()
+        self.next_task_text.set("下一項任務：-")
+        self.duty_status_text.set("")
 
     def update_login_panel(self) -> None:
         if not hasattr(self, "login_button"):
@@ -801,6 +820,10 @@ class DutyGui(tk.Tk):
         if not hasattr(self, "duty_tree"):
             return
         self.duty_tree.delete(*self.duty_tree.get_children())
+        if self.logout_cleared and not (self.session and self.session.verified):
+            self.next_task_text.set("下一項任務：-")
+            self.duty_status_text.set("")
+            return
         now = datetime.now()
         now_min = now.hour * 60 + now.minute
         next_item = None
@@ -840,6 +863,8 @@ class DutyGui(tk.Tk):
             self.next_task_text.set("今日目前沒有未完成的當班任務")
         if self.session and self.session.verified:
             self.duty_status_text.set("登入有效；到點後會記錄待接線任務。")
+        elif self.logout_cleared:
+            self.duty_status_text.set("")
         else:
             self.duty_status_text.set("尚未登入，所有任務不執行。")
 
