@@ -317,72 +317,80 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
     WebDriverWait(driver, 10).until(lambda d: len(set(d.window_handles) - before_handles) == 1)
     popup_window = (set(driver.window_handles) - before_handles).pop()
     driver.switch_to.window(popup_window)
+    result = driver.execute_script(
+        """
+        const targets = arguments[0].map(item => {
+          if (item && typeof item === 'object') {
+            return {
+              id: String(item.id || item.user_id || '').trim(),
+              name: String(item.name || '').trim(),
+              dutyNo: String(item.duty_no || item.dutyNo || item.no || '').trim()
+            };
+          }
+          return {id: '', name: String(item || '').trim(), dutyNo: ''};
+        }).filter(x => x.id || x.name || x.dutyNo);
+        const checks = Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]'));
+        const selected = [];
+        const missing = [];
+        const candidates = checks.map(el => ({
+          value: String(el.value || ''),
+          rowText: String(el.closest('tr')?.innerText || el.parentElement?.innerText || ''),
+          cells: Array.from(el.closest('tr')?.children || []).map(cell => String(cell.innerText || '').trim())
+        }));
+
+        for (const target of targets) {
+          const box = checks.find(el => {
+            const parts = String(el.value || '').split(',');
+            const id = parts[0].trim();
+            const personName = parts.slice(1).join(',').trim();
+            const row = el.closest('tr');
+            const rowText = String(row?.innerText || el.parentElement?.innerText || '');
+            const cells = Array.from(row?.children || []).map(cell => String(cell.innerText || '').trim());
+            return (target.id && id === target.id) ||
+                   (target.dutyNo && cells.some(text => text === target.dutyNo)) ||
+                   (target.name && (
+                     personName === target.name ||
+                     personName.includes(target.name) ||
+                     target.name.includes(personName) ||
+                     rowText.includes(target.name)
+                   ));
+          });
+          if (box) {
+            box.scrollIntoView({block: 'center'});
+            if (!box.checked) box.click();
+            box.dispatchEvent(new Event('change', {bubbles: true}));
+            selected.push({
+              value: box.value,
+              rowText: box.closest('tr')?.innerText || box.parentElement?.innerText || '',
+              checked: box.checked
+            });
+          } else {
+            missing.push(target.dutyNo || target.name || target.id);
+          }
+        }
+
+        return {ok: missing.length === 0 && selected.length > 0, selected, missing, candidates};
+        """,
+        people,
+    )
+    if result.get("ok"):
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "_btnSure"))).click()
+    driver.switch_to.window(main_window)
+
     try:
-        result = driver.execute_script(
-            """
-            const targets = arguments[0].map(item => {
-              if (item && typeof item === 'object') {
-                return {
-                  id: String(item.id || item.user_id || '').trim(),
-                  name: String(item.name || '').trim(),
-                  dutyNo: String(item.duty_no || item.dutyNo || item.no || '').trim()
-                };
-              }
-              return {id: '', name: String(item || '').trim(), dutyNo: ''};
-            }).filter(x => x.id || x.name || x.dutyNo);
-            const checks = Array.from(document.querySelectorAll('input[type="checkbox"], input[name="_chkUser"]'));
-            const selected = [];
-            const missing = [];
-            const candidates = checks.map(el => ({
-              value: String(el.value || ''),
-              rowText: String(el.closest('tr')?.innerText || el.parentElement?.innerText || ''),
-              cells: Array.from(el.closest('tr')?.children || []).map(cell => String(cell.innerText || '').trim())
-            }));
-
-            for (const target of targets) {
-              const box = checks.find(el => {
-                const parts = String(el.value || '').split(',');
-                const id = parts[0].trim();
-                const personName = parts.slice(1).join(',').trim();
-                const row = el.closest('tr');
-                const rowText = String(row?.innerText || el.parentElement?.innerText || '');
-                const cells = Array.from(row?.children || []).map(cell => String(cell.innerText || '').trim());
-                return (target.id && id === target.id) ||
-                       (target.dutyNo && cells.some(text => text === target.dutyNo)) ||
-                       (target.name && (
-                         personName === target.name ||
-                         personName.includes(target.name) ||
-                         target.name.includes(personName) ||
-                         rowText.includes(target.name)
-                       ));
-              });
-              if (box) {
-                if (!box.checked) box.click();
-                box.dispatchEvent(new Event('change', {bubbles: true}));
-                selected.push(box.value);
-              } else {
-                missing.push(target.dutyNo || target.name || target.id);
-              }
-            }
-
-            if (missing.length === 0 && selected.length > 0) {
-              if (typeof sureOK === 'function') sureOK();
-              else {
-                const sure = document.getElementById('_btnSure') ||
-                  Array.from(document.querySelectorAll('input, button')).find(el => /確定|選取|帶入|OK/i.test([el.id, el.name, el.value, el.innerText].map(x => String(x || '')).join(' ')));
-                if (sure) sure.click();
-              }
-            }
-            return {ok: missing.length === 0 && selected.length > 0, selected, missing, candidates};
-            """,
-            people,
+        WebDriverWait(driver, 5).until(
+            lambda d: d.execute_script(
+                """
+                return Boolean(
+                  document.getElementById('_txtMan')?.value ||
+                  document.getElementById('_areMan')?.value ||
+                  document.getElementById('_hidManId')?.value
+                );
+                """
+            )
         )
-    finally:
-        if popup_window in driver.window_handles:
-            driver.close()
-        driver.switch_to.window(main_window)
-
-    time.sleep(1)
+    except TimeoutException:
+        pass
     verify = driver.execute_script(
         """
         return {
@@ -396,6 +404,10 @@ def select_people_via_popup(driver: webdriver.Chrome, people: list[Any]) -> dict
     )
     result.update(verify)
     result["ok"] = bool(result.get("ok") and ((verify.get("hidManId") and verify.get("areMan")) or verify.get("txtMan")))
+    if popup_window in driver.window_handles:
+        driver.switch_to.window(popup_window)
+        driver.close()
+        driver.switch_to.window(main_window)
     return result
 
 
