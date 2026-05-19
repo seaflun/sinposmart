@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import tkinter as tk
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -336,6 +337,7 @@ class DutyGui(tk.Tk):
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         ttk.Button(controls, text="審核模式", style="Soft.TButton", command=lambda: self.switch_mode("審核模式")).pack(side=tk.RIGHT)
         ttk.Button(controls, text="只記錄不送出", style="Soft.TButton", command=self.early_execute_selected).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(controls, text="可視填表測試", style="Soft.TButton", command=self.visible_fill_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Button(controls, text="正式儲存測試", style="Accent.TButton", command=self.save_selected_work_log_test).pack(side=tk.RIGHT, padx=(0, 8))
 
         columns = ("time", "summary", "status")
@@ -1016,9 +1018,15 @@ class DutyGui(tk.Tk):
         self.refresh_duty_tasks()
 
     def save_selected_work_log_test(self) -> None:
+        self.start_work_log_test(save=True, visible=False)
+
+    def visible_fill_work_log_test(self) -> None:
+        self.start_work_log_test(save=False, visible=True)
+
+    def start_work_log_test(self, save: bool, visible: bool) -> None:
         selection = self.duty_tree.selection()
         if not selection:
-            messagebox.showinfo("正式儲存測試", "請先選擇一筆工作紀錄任務。")
+            messagebox.showinfo("工作紀錄測試", "請先選擇一筆工作紀錄任務。")
             return
         iid = selection[0]
         if not str(iid).startswith("duty-"):
@@ -1029,11 +1037,12 @@ class DutyGui(tk.Tk):
             messagebox.showwarning("類型不符", "目前只支援工作紀錄簿測試儲存。")
             return
         if not self.session or not self.session.verified:
-            messagebox.showwarning("尚未登入", "請先登入後再測試儲存。")
+            messagebox.showwarning("尚未登入", "請先登入後再測試。")
             return
-        if not messagebox.askyesno("確認正式儲存", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        if save and not messagebox.askyesno("確認正式儲存", f"將儲存到正式勤務系統：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
-        result_path = Path(f"work_log_form_test_{datetime.now():%Y%m%d_%H%M%S}.json")
+        prefix = "work_log_form_test" if save else "visible_work_log_fill_test"
+        result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.json")
         started_result = {
             "stage": "started",
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1041,16 +1050,22 @@ class DutyGui(tk.Tk):
             "action": action,
             "user_id": self.session.user_id,
             "summary": self.duty_action_summary(action),
+            "save": save,
+            "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.duty_status_text.set(f"已開始正式儲存測試：{self.duty_action_summary(action)}")
-        threading.Thread(target=self._save_work_log_worker, args=(index, action, self.session, result_path), daemon=True).start()
+        label = "正式儲存測試" if save else "可視填表測試"
+        self.duty_status_text.set(f"已開始{label}：{self.duty_action_summary(action)}")
+        threading.Thread(target=self._work_log_test_worker, args=(index, action, self.session, result_path, save, visible), daemon=True).start()
 
-    def _save_work_log_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path) -> None:
+    def _work_log_test_worker(self, index: int, action: dict[str, Any], session: LoginSession, result_path: Path, save: bool, visible: bool) -> None:
         driver = None
         try:
             options = Options()
-            options.add_argument("--headless=new")
+            if visible:
+                options.add_argument("--start-maximized")
+            else:
+                options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
             driver = webdriver.Chrome(options=options)
             login(driver, session.user_id, session.password)
@@ -1059,13 +1074,19 @@ class DutyGui(tk.Tk):
                 action,
                 self.staff,
                 self.data.get("target_date") or today_roc_date(),
-                save=True,
+                save=save,
             )
-            result["stage"] = "submitted"
+            result["stage"] = "submitted" if save else "filled_visible"
             result["action_index"] = index
             result["action"] = action
             result["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            result["save"] = save
+            result["visible"] = visible
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            if visible:
+                self.after(0, lambda: self._work_log_test_succeeded(index, result_path, save))
+                time.sleep(600)
+                return
         except Exception as exc:
             error = str(exc)
             failure_result = {
@@ -1074,24 +1095,31 @@ class DutyGui(tk.Tk):
                 "action_index": index,
                 "action": action,
                 "error": error,
+                "save": save,
+                "visible": visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.after(0, lambda: self._save_work_log_failed(error, result_path))
+            self.after(0, lambda: self._work_log_test_failed(error, result_path, save))
             return
         finally:
             if driver:
                 driver.quit()
-        self.after(0, lambda: self._save_work_log_succeeded(index, result_path))
+        self.after(0, lambda: self._work_log_test_succeeded(index, result_path, save))
 
-    def _save_work_log_succeeded(self, index: int, result_path: Path) -> None:
-        self.executed_due.add(index)
-        self.duty_status_text.set(f"已送出儲存測試，結果：{result_path.name}")
-        messagebox.showinfo("正式儲存測試", f"已送出儲存測試。\n結果檔：{result_path.name}")
-        self.refresh_duty_tasks()
+    def _work_log_test_succeeded(self, index: int, result_path: Path, save: bool) -> None:
+        if save:
+            self.executed_due.add(index)
+            self.duty_status_text.set(f"已送出儲存測試，結果：{result_path.name}")
+            messagebox.showinfo("正式儲存測試", f"已送出儲存測試。\n結果檔：{result_path.name}")
+            self.refresh_duty_tasks()
+            return
+        self.duty_status_text.set(f"已完成可視填表測試，結果：{result_path.name}")
+        messagebox.showinfo("可視填表測試", f"已填表但未儲存。\nChrome 視窗會保留約 10 分鐘。\n結果檔：{result_path.name}")
 
-    def _save_work_log_failed(self, error: str, result_path: Path) -> None:
-        self.duty_status_text.set(f"正式儲存測試失敗：{error}，結果：{result_path.name}")
-        messagebox.showerror("正式儲存測試失敗", f"{error}\n\n結果檔：{result_path.name}")
+    def _work_log_test_failed(self, error: str, result_path: Path, save: bool) -> None:
+        label = "正式儲存測試" if save else "可視填表測試"
+        self.duty_status_text.set(f"{label}失敗：{error}，結果：{result_path.name}")
+        messagebox.showerror(f"{label}失敗", f"{error}\n\n結果檔：{result_path.name}")
 
     def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
         session = self.session
