@@ -580,30 +580,39 @@ class DutyGui(tk.Tk):
 
     def build_comparison(self, data: dict[str, Any]) -> dict[int, dict[str, Any]]:
         target_date = data.get("target_date", "")
-        comparison_data = self.load_comparison_data(target_date) if target_date else {}
-        entry_source = comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", []))
-        work_source = comparison_data.get("visible_work_rows", data.get("visible_work_rows", []))
-        entry_rows = flatten_rows(entry_source, target_date) if target_date else []
-        work_rows = flatten_rows(work_source, target_date) if target_date else []
+        comparison_cache: dict[str, dict[str, Any]] = {}
+        for offset in sorted({int(action.get("date_offset", 0) or 0) for action in data.get("actions", [])} | {0}):
+            action_date = roc_date_after(target_date, offset) if target_date else ""
+            comparison_data = self.load_comparison_data(action_date) if action_date else {}
+            entry_source = comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", []))
+            work_source = comparison_data.get("visible_work_rows", data.get("visible_work_rows", []))
+            comparison_cache[action_date] = {
+                "entry_rows": flatten_rows(entry_source, action_date) if action_date else [],
+                "work_rows": flatten_rows(work_source, action_date) if action_date else [],
+            }
         result: dict[int, dict[str, Any]] = {}
         external_targets: dict[str, set[str]] = {}
         for action in [a for a in data.get("actions", []) if a.get("kind") == "entry_log" and a.get("source", "").startswith("外勤")]:
             fields = action.get("fields", {})
-            key = f"{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
+            action_date = self.action_target_roc_date(action)
+            key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
             external_targets.setdefault(key, set()).add(self.staff.get(str(action.get("target", "")), {}).get("name", ""))
 
         for index, action in enumerate(data.get("actions", [])):
             fields = action.get("fields", {})
+            action_date = self.action_target_roc_date(action)
+            entry_rows = comparison_cache.get(action_date, {}).get("entry_rows", [])
+            work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
             if action.get("kind") == "entry_log":
                 reason = fields.get("領用事由及地點", "")
                 if is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                     continue
-                exact = find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=False)
-                near = [] if exact else find_entry_matches(entry_rows, target_date, self.staff, action, allow_near=True)
+                exact = find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=False)
+                near = [] if exact else find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=True)
                 if exact:
                     result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
-                elif is_possible_handoff_adjustment(entry_rows, target_date, self.staff, action):
+                elif is_possible_handoff_adjustment(entry_rows, action_date, self.staff, action):
                     result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
                 elif near:
                     result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
@@ -617,7 +626,7 @@ class DutyGui(tk.Tk):
                 if is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                     continue
-                matches = find_work_matches(work_rows, target_date, self.staff, action)
+                matches = find_work_matches(work_rows, action_date, self.staff, action)
                 if matches:
                     result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
                 else:
@@ -629,7 +638,8 @@ class DutyGui(tk.Tk):
             if action.get("kind") != "entry_log" or not action.get("source", "").startswith("外勤"):
                 continue
             fields = action.get("fields", {})
-            key = f"{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
+            action_date = self.action_target_roc_date(action)
+            key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
             if result.get(index, {}).get("compare") == "人工確認" and external_targets.get(key):
                 result[index]["compare"] = "外勤確認"
         return result

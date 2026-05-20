@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,18 @@ def flatten_rows(rows: list[list[str]], target_date: str) -> list[str]:
     return out
 
 
+def roc_date_after(value: str, days: int) -> str:
+    year = int(value[:3]) + 1911
+    month = int(value[3:5])
+    day = int(value[5:7])
+    shifted = datetime(year, month, day) + timedelta(days=days)
+    return f"{shifted.year - 1911:03d}{shifted.month:02d}{shifted.day:02d}"
+
+
+def action_target_date(base_target_date: str, action: dict[str, Any]) -> str:
+    return roc_date_after(base_target_date, int(action.get("date_offset", 0) or 0))
+
+
 def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool = False, near_minutes: int = 5) -> bool:
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     if f"{roc_slash} {time_value}" in row or f"{target_date}\n{time_value}" in row:
@@ -61,6 +73,7 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
 def is_future_action(target_date: str, action: dict[str, Any]) -> bool:
     now = datetime.now()
     today_roc = f"{now.year - 1911:03d}{now.month:02d}{now.day:02d}"
+    target_date = action_target_date(target_date, action)
     if target_date > today_roc:
         return True
     if target_date != today_roc:
@@ -202,12 +215,17 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
         **data.get("yesterday", {}).get("staff", {}),
         **data.get("today", {}).get("staff", {}),
     }
-    comparison_path = json_path.with_name(f"comparison_output_{target_date}.json")
-    comparison_data = {}
-    if comparison_path.exists():
-        comparison_data = json.loads(comparison_path.read_text(encoding="utf-8"))
-    entry_rows = flatten_rows(comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", [])), target_date)
-    work_rows = flatten_rows(comparison_data.get("visible_work_rows", data.get("visible_work_rows", [])), target_date)
+    comparison_sources: dict[str, dict[str, Any]] = {}
+    for offset in sorted({int(action.get("date_offset", 0) or 0) for action in data.get("actions", [])} | {0}):
+        action_date = roc_date_after(target_date, offset)
+        comparison_file = json_path.with_name(f"comparison_output_{action_date}.json")
+        payload: dict[str, Any] = {}
+        if comparison_file.exists():
+            payload = json.loads(comparison_file.read_text(encoding="utf-8"))
+        comparison_sources[action_date] = {
+            "entry_rows": flatten_rows(payload.get("visible_entry_rows", data.get("visible_entry_rows", [])), action_date),
+            "work_rows": flatten_rows(payload.get("visible_work_rows", data.get("visible_work_rows", [])), action_date),
+        }
 
     lines = [
         f"{target_date} 預演 vs 系統既有紀錄比對",
@@ -221,17 +239,19 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
     critical_missing: list[str] = []
     external_missing: list[str] = []
     for action in [a for a in data["actions"] if a["kind"] == "entry_log"]:
-        exact = find_entry_matches(entry_rows, target_date, staff, action, allow_near=False)
+        action_date = action_target_date(target_date, action)
+        entry_rows = comparison_sources.get(action_date, {}).get("entry_rows", [])
+        exact = find_entry_matches(entry_rows, action_date, staff, action, allow_near=False)
         if exact:
             lines.append(f"[已存在] {summarize_entry(action, staff)}")
             continue
         if is_future_action(target_date, action):
             lines.append(f"[尚未到點] {summarize_entry(action, staff)}")
             continue
-        if is_possible_handoff_adjustment(entry_rows, target_date, staff, action):
+        if is_possible_handoff_adjustment(entry_rows, action_date, staff, action):
             lines.append(f"[可能臨時調整] {summarize_entry(action, staff)}")
             continue
-        near = find_entry_matches(entry_rows, target_date, staff, action, allow_near=True)
+        near = find_entry_matches(entry_rows, action_date, staff, action, allow_near=True)
         if near:
             entry_near += 1
             lines.append(f"[時間不同但近似] {summarize_entry(action, staff)}")
@@ -257,7 +277,9 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
     )
     work_missing = 0
     for action in [a for a in data["actions"] if a["kind"] == "work_log"]:
-        matches = find_work_matches(work_rows, target_date, staff, action)
+        action_date = action_target_date(target_date, action)
+        work_rows = comparison_sources.get(action_date, {}).get("work_rows", [])
+        matches = find_work_matches(work_rows, action_date, staff, action)
         if matches:
             lines.append(f"[已存在] {summarize_work(action, staff)}")
         elif is_future_action(target_date, action):
