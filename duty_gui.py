@@ -13,6 +13,7 @@ This GUI is intentionally conservative:
 from __future__ import annotations
 
 import json
+import os
 import threading
 import tkinter as tk
 from dataclasses import asdict, dataclass
@@ -87,6 +88,7 @@ def legacy_rehearsal_path(target_roc_date: str) -> Path:
 
 
 DEFAULT_PREVIEW = latest_preview_file()
+SAVED_LOGIN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DutyAutomation" / "saved_login.json"
 
 
 @dataclass
@@ -153,6 +155,7 @@ class DutyGui(tk.Tk):
         self.login_running = False
         self.login_attempt_id = 0
 
+        self.load_saved_login()
         self._build_layout()
         if DEFAULT_PREVIEW.exists():
             self.load_preview(DEFAULT_PREVIEW)
@@ -653,6 +656,26 @@ class DutyGui(tk.Tk):
         except Exception:
             return {}
 
+    def load_saved_login(self) -> None:
+        if not SAVED_LOGIN_PATH.exists():
+            return
+        try:
+            payload = json.loads(SAVED_LOGIN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        self.actor_no.set(str(payload.get("actor_no", "") or ""))
+        self.user_id.set(str(payload.get("user_id", "") or ""))
+        self.password.set(str(payload.get("password", "") or ""))
+
+    def save_login_locally(self, actor_no: str, user_id: str, password: str) -> None:
+        SAVED_LOGIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "actor_no": actor_no,
+            "user_id": user_id,
+            "password": password,
+        }
+        SAVED_LOGIN_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def verify_login(self) -> None:
         if self.login_running:
             return
@@ -909,9 +932,9 @@ class DutyGui(tk.Tk):
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
+        self.save_login_locally(actor_no, user_id, password)
         self.set_logged_in_status(actor_no)
         self.actor_no.set(actor_no)
-        self.password.set("")
         self.logout_cleared = False
         self.audit_date.set(today_roc_date())
         if self.simple_mode.get():
@@ -967,7 +990,7 @@ class DutyGui(tk.Tk):
         self.submitting_indices.clear()
         self.submit_queue.clear()
         self.submit_worker_running = False
-        self.password.set("")
+        self.load_saved_login()
         self.logout_cleared = True
         self.login_status.set("已清除登入狀態。")
         self.update_login_panel()
