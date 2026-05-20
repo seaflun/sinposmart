@@ -822,6 +822,7 @@ class DutyGui(tk.Tk):
             return
         session = self.session
         key = f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
+        comparison_dates = self.comparison_target_dates(target_roc_date)
         self.comparison_running = True
         self.set_logged_in_status(session.actor_no)
 
@@ -833,7 +834,7 @@ class DutyGui(tk.Tk):
                 options.add_argument("--disable-popup-blocking")
                 driver = webdriver.Chrome(options=options)
                 login(driver, session.user_id, session.password)
-                path = self.write_comparison_snapshot(driver, target_roc_date, slot_label)
+                paths = [self.write_comparison_snapshot(driver, comparison_date, slot_label) for comparison_date in comparison_dates]
             except Exception as exc:
                 error = str(exc)
                 self.after(0, lambda: self._comparison_failed(session.actor_no, error))
@@ -841,17 +842,26 @@ class DutyGui(tk.Tk):
             finally:
                 if driver:
                     driver.quit()
-            self.after(0, lambda: self._comparison_succeeded(session.actor_no, key, target_roc_date, path))
+            self.after(0, lambda: self._comparison_succeeded(session.actor_no, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _comparison_succeeded(self, actor_no: str, key: str, target_roc_date: str, path: Path) -> None:
+    def comparison_target_dates(self, target_roc_date: str) -> list[str]:
+        dates = {target_roc_date}
+        for dataset in (self.data, self.duty_data):
+            if dataset.get("target_date") != target_roc_date:
+                continue
+            for action in dataset.get("actions", []):
+                dates.add(roc_date_after(target_roc_date, int(action.get("date_offset", 0) or 0)))
+        return sorted(dates)
+
+    def _comparison_succeeded(self, actor_no: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.comparison_running = False
         self.comparison_completed_hours.add(key)
-        if path.exists() and self.data.get("target_date") == target_roc_date:
+        if any(path.exists() for path in paths) and self.data.get("target_date") == target_roc_date:
             self.action_compare = self.build_comparison(self.data)
             self.refresh_tasks()
-        if path.exists() and self.duty_data.get("target_date") == target_roc_date:
+        if any(path.exists() for path in paths) and self.duty_data.get("target_date") == target_roc_date:
             self.duty_action_compare = self.build_comparison(self.duty_data)
             self.refresh_duty_tasks()
         self.set_logged_in_status(actor_no)
