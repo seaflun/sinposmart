@@ -74,25 +74,6 @@ def is_future_action(target_date: str, action: dict[str, Any]) -> bool:
     return hour * 60 + minute > now.hour * 60 + now.minute
 
 
-def reason_tokens(reason: str) -> list[str]:
-    if reason == "防溺車巡暨駕訓":
-        return ["防溺", "車巡"]
-    return [reason] if reason else []
-
-
-def reason_aliases(reason: str) -> list[str]:
-    aliases = {
-        "到勤": ["到勤", "到隊", "簽入"],
-        "退勤": ["退勤", "下勤", "簽出"],
-        "休息後退勤": ["休息後退勤", "退勤", "下勤", "簽出"],
-        "休息": ["休息", "外出"],
-        "返隊": ["返隊", "返營", "簽入"],
-        "值班": ["值班", "接班"],
-        "值退": ["值退", "退班"],
-    }
-    return aliases.get(reason, [reason] if reason else [])
-
-
 def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
     if not outin:
         return True
@@ -110,17 +91,6 @@ def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
     if external_entry and outin == "入":
         checks.append("簽入")
     return any(check in row for check in checks)
-
-
-def row_matches_reason(row: str, reason: str) -> bool:
-    if not reason:
-        return True
-    c = clean(row)
-    aliases = reason_aliases(reason)
-    if reason in ("到勤", "退勤", "休息後退勤", "休息", "返隊", "值班", "值退"):
-        return any(clean(alias) in c for alias in aliases)
-    tokens = reason_tokens(reason)
-    return all(token in c for token in tokens)
 
 
 def is_handoff_entry(action: dict[str, Any]) -> bool:
@@ -161,7 +131,6 @@ def find_entry_matches(
     fields = action["fields"]
     target_name = staff.get(str(action["target"]), {}).get("name", "")
     outin = fields.get("出或入", "")
-    reason = fields.get("領用事由及地點", "")
     system_time = fields.get("系統寫入時間", action["time"])
     strict_time = outin in ("值班", "值退")
     external_entry = str(action.get("source", "")).startswith("外勤")
@@ -178,7 +147,7 @@ def find_entry_matches(
             if row_has_time(row, target_date, system_time, allow_near=True, near_minutes=120):
                 matches.append(row)
             continue
-        if not row_matches_reason(row, reason):
+        if not row_has_time(row, target_date, system_time, allow_near=allow_near):
             continue
         matches.append(row)
     return matches
