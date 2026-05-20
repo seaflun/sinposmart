@@ -80,6 +80,49 @@ def reason_tokens(reason: str) -> list[str]:
     return [reason] if reason else []
 
 
+def reason_aliases(reason: str) -> list[str]:
+    aliases = {
+        "到勤": ["到勤", "到隊", "簽入"],
+        "退勤": ["退勤", "下勤", "簽出"],
+        "休息後退勤": ["休息後退勤", "退勤", "下勤", "簽出"],
+        "休息": ["休息", "外出"],
+        "返隊": ["返隊", "返營", "簽入"],
+        "值班": ["值班", "接班"],
+        "值退": ["值退", "退班"],
+    }
+    return aliases.get(reason, [reason] if reason else [])
+
+
+def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
+    if not outin:
+        return True
+    checks = [outin]
+    if outin == "出":
+        checks.extend(["簽出", "外出"])
+    elif outin == "入":
+        checks.extend(["簽入", "返隊", "到勤"])
+    elif outin == "值班":
+        checks.extend(["接班"])
+    elif outin == "值退":
+        checks.extend(["退班"])
+    if external_entry and outin == "出":
+        checks.append("簽出")
+    if external_entry and outin == "入":
+        checks.append("簽入")
+    return any(check in row for check in checks)
+
+
+def row_matches_reason(row: str, reason: str) -> bool:
+    if not reason:
+        return True
+    c = clean(row)
+    aliases = reason_aliases(reason)
+    if reason in ("到勤", "退勤", "休息後退勤", "休息", "返隊", "值班", "值退"):
+        return any(clean(alias) in c for alias in aliases)
+    tokens = reason_tokens(reason)
+    return all(token in c for token in tokens)
+
+
 def is_handoff_entry(action: dict[str, Any]) -> bool:
     return action.get("kind") == "entry_log" and action.get("fields", {}).get("出或入") in ("值班", "值退")
 
@@ -124,15 +167,9 @@ def find_entry_matches(
     external_entry = str(action.get("source", "")).startswith("外勤")
     matches = []
     for row in rows:
-        c = clean(row)
         if target_name and target_name not in row:
             continue
-        outin_match = not outin or outin in row
-        if external_entry and outin == "出" and "簽出" in row:
-            outin_match = True
-        if external_entry and outin == "入" and "簽入" in row:
-            outin_match = True
-        if not outin_match:
+        if not row_has_outin(row, outin, external_entry=external_entry):
             continue
         if strict_time:
             if not row_has_time(row, target_date, system_time, allow_near=allow_near):
@@ -141,10 +178,8 @@ def find_entry_matches(
             if row_has_time(row, target_date, system_time, allow_near=True, near_minutes=120):
                 matches.append(row)
             continue
-        tokens = reason_tokens(reason)
-        if tokens and reason not in ("到勤", "退勤", "休息後退勤", "休息", "返隊", "值班", "值退"):
-            if not all(token in c for token in tokens):
-                continue
+        if not row_matches_reason(row, reason):
+            continue
         matches.append(row)
     return matches
 
