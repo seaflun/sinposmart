@@ -90,8 +90,6 @@ def is_future_action(target_date: str, action: dict[str, Any]) -> bool:
 def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
     if not outin:
         return True
-    if "請選擇" in row:
-        return True
     checks = [outin]
     if outin == "出":
         checks.extend(["簽出", "外出"])
@@ -146,9 +144,12 @@ def find_entry_matches(
     fields = action["fields"]
     target_name = staff.get(str(action["target"]), {}).get("name", "")
     outin = fields.get("出或入", "")
+    reason = fields.get("領用事由及地點", "")
     system_time = fields.get("系統寫入時間", action["time"])
     strict_time = outin in ("值班", "值退")
     external_entry = str(action.get("source", "")).startswith("外勤")
+    rest_entry = reason in ("休息", "返隊", "休息後退勤") or "休息" in str(action.get("source", ""))
+    near_minutes = 120 if rest_entry else 5
     matches = []
     for row in rows:
         if target_name and target_name not in row:
@@ -162,7 +163,7 @@ def find_entry_matches(
             if row_has_time(row, target_date, system_time, allow_near=True, near_minutes=120):
                 matches.append(row)
             continue
-        if not row_has_time(row, target_date, system_time, allow_near=allow_near):
+        if not row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
             continue
         matches.append(row)
     return matches
