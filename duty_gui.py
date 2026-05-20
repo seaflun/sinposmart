@@ -91,6 +91,10 @@ DEFAULT_PREVIEW = latest_preview_file()
 SAVED_LOGIN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DutyAutomation" / "saved_login.json"
 
 
+def duty_window_dates(base_roc_date: str) -> list[str]:
+    return [roc_date_after(base_roc_date, -1), base_roc_date, roc_date_after(base_roc_date, 1)]
+
+
 @dataclass
 class LoginSession:
     actor_no: str
@@ -789,11 +793,17 @@ class DutyGui(tk.Tk):
         elif key not in self.snapshot_completed_slots:
             self.refresh_schedule_background(target_roc_date, slot_label)
 
-    def refresh_schedule_background(self, target_roc_date: str, slot_label: str) -> None:
+    def ensure_duty_window_background(self, base_roc_date: str, slot_label: str) -> None:
+        target_dates = [value for value in duty_window_dates(base_roc_date) if not schedule_path(value).exists()]
+        if target_dates:
+            self.refresh_schedule_background(base_roc_date, slot_label, target_dates=target_dates)
+
+    def refresh_schedule_background(self, target_roc_date: str, slot_label: str, target_dates: list[str] | None = None) -> None:
         if self.snapshot_running or not (self.session and self.session.verified):
             return
         session = self.session
         key = f"schedule-{target_roc_date}-{slot_label}"
+        target_dates = target_dates or [target_roc_date]
         self.snapshot_running = True
         self.set_logged_in_status(session.actor_no)
 
@@ -805,7 +815,7 @@ class DutyGui(tk.Tk):
                 options.add_argument("--disable-popup-blocking")
                 driver = webdriver.Chrome(options=options)
                 login(driver, session.user_id, session.password)
-                path = self.write_schedule_snapshot(driver, target_roc_date, slot_label)
+                paths = [self.write_schedule_snapshot(driver, value, slot_label) for value in target_dates]
             except Exception as exc:
                 error = str(exc)
                 self.after(0, lambda: self._schedule_failed(session.actor_no, error))
@@ -813,16 +823,17 @@ class DutyGui(tk.Tk):
             finally:
                 if driver:
                     driver.quit()
-            self.after(0, lambda: self._schedule_succeeded(session.actor_no, key, path))
+            self.after(0, lambda: self._schedule_succeeded(session.actor_no, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _schedule_succeeded(self, actor_no: str, key: str, path: Path) -> None:
+    def _schedule_succeeded(self, actor_no: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.snapshot_running = False
         self.snapshot_completed_slots.add(key)
-        if path.exists():
-            self.preview_path.set(str(path))
-            self.load_preview(path, update_duty=False)
+        today_path = next((path for path in paths if path.exists() and path.name == schedule_path(today_roc_date()).name), None)
+        if today_path and not self.data.get("target_date"):
+            self.preview_path.set(str(today_path))
+            self.load_preview(today_path, update_duty=False)
         self.set_logged_in_status(actor_no)
 
     def _schedule_failed(self, actor_no: str, error: str) -> None:
@@ -833,19 +844,19 @@ class DutyGui(tk.Tk):
         try:
             now = datetime.now()
             if now.minute < 5 and self.session and self.session.verified:
-                target_roc_date = self.duty_data.get("target_date") or today_roc_date()
+                target_roc_date = today_roc_date()
                 key = f"comparison-{target_roc_date}-{now:%Y%m%d%H}"
                 if key not in self.comparison_completed_hours:
-                    self.refresh_comparison_background(target_roc_date, f"{now:%H}00")
+                    self.refresh_comparison_background(target_roc_date, f"{now:%H}00", comparison_dates=duty_window_dates(target_roc_date))
         finally:
             self.after(60000, self.check_hourly_comparison)
 
-    def refresh_comparison_background(self, target_roc_date: str, slot_label: str) -> None:
+    def refresh_comparison_background(self, target_roc_date: str, slot_label: str, comparison_dates: list[str] | None = None) -> None:
         if self.comparison_running or not (self.session and self.session.verified):
             return
         session = self.session
         key = f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
-        comparison_dates = self.comparison_target_dates(target_roc_date)
+        comparison_dates = comparison_dates or self.comparison_target_dates(target_roc_date)
         self.comparison_running = True
         self.set_logged_in_status(session.actor_no)
 
@@ -941,15 +952,16 @@ class DutyGui(tk.Tk):
             self.filter_actor.set(True)
             self.status_filter.set("可執行")
         self.update_login_panel()
-        self.ensure_tomorrow_schedule_background("login")
+        login_target_date = today_roc_date()
+        self.ensure_duty_window_background(login_target_date, "login")
         if self.load_today_preview_if_available():
             self.set_logged_in_status(actor_no)
-            self.refresh_comparison_background(self.data.get("target_date") or today_roc_date(), "login")
+            self.refresh_comparison_background(login_target_date, "login", comparison_dates=duty_window_dates(login_target_date))
         else:
             self.refresh_tasks()
             self.refresh_duty_tasks()
             self.set_logged_in_status(actor_no)
-            self.refresh_comparison_background(today_roc_date(), "login")
+            self.refresh_comparison_background(login_target_date, "login", comparison_dates=duty_window_dates(login_target_date))
 
     def _login_failed(self, attempt_id: int, error: str) -> None:
         if attempt_id != self.login_attempt_id:
