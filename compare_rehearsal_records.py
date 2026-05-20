@@ -90,6 +90,8 @@ def is_future_action(target_date: str, action: dict[str, Any]) -> bool:
 def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
     if not outin:
         return True
+    if "請選擇" in row:
+        return True
     checks = [outin]
     if outin == "出":
         checks.extend(["簽出", "外出"])

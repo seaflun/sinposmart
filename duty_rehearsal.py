@@ -893,6 +893,52 @@ def fill_entry_log_form_for_test(
         },
     )
     time.sleep(1)
+    reason_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: []};
+
+        function setControl(el, value) {
+          if (!el) return false;
+          el.value = value;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            if (setControl(document.getElementById(id), value)) return true;
+          }
+          return false;
+        }
+        function byNearbyText(label, value) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const candidates = cells.slice(labelIndex + 1).flatMap(cell =>
+              Array.from(cell.querySelectorAll('input, textarea'))
+            );
+            for (const control of candidates) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          return false;
+        }
+
+        if (values.reason && !byIds(['_txtPlace', '_txtReason', '_txtMemo', '_txtRemark'], values.reason) && !byNearbyText('領用事由及地點', values.reason) && !byNearbyText('事由及地點', values.reason)) {
+          result.missing.push('reason');
+        }
+        return result;
+        """,
+        {
+            "reason": fields.get("領用事由及地點", ""),
+        },
+    )
+    time.sleep(1)
 
     save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}
     if save:
@@ -903,6 +949,7 @@ def fill_entry_log_form_for_test(
         "insert": insert_result,
         "fill": fill_result,
         "outin": outin_result,
+        "reason": reason_result,
         "people": people_result,
         "save": save_result,
         "before_controls": before_controls,
@@ -1627,14 +1674,14 @@ def planned_actions(
 
     for no in sorted(yesterday_on - today_on, key=int):
         if no in yesterday_rest_start_06:
-            at = 6
-            minute = 0
+            at = 7
+            minute = 54
             reason = "休息後退勤"
         else:
             at = 8
             minute = 5
             reason = "退勤"
-        actor = entry_actor_at(today, yesterday, 8 if reason == "退勤" else at, 0 if reason == "退勤" else minute)
+        actor = entry_actor_at(today, yesterday, 8 if reason in ("退勤", "休息後退勤") else at, 0 if reason in ("退勤", "休息後退勤") else minute)
         actions.append(
             PlannedAction(
                 kind="entry_log",
@@ -1642,7 +1689,7 @@ def planned_actions(
                 actor=actor,
                 target=no,
                 fields={
-                    "登打時間": "08:00" if reason == "退勤" else f"{at:02d}:{minute:02d}",
+                    "登打時間": "08:00" if reason in ("退勤", "休息後退勤") else f"{at:02d}:{minute:02d}",
                     "系統寫入時間": f"{at:02d}:{minute:02d}",
                     "出或入": "出",
                     "領用事由及地點": reason,
