@@ -36,6 +36,17 @@ cache/
 outputs/
 exports/
 reports/generated/
+archive/
+_整理封存/
+_update_backups/
+issue_reports/
+screenshots/
+snapshots/
+daily_vehicle_legacy/artifacts/
+UPDATE/*.zip
+UPDATE/*.sha256.txt
+UPDATE/desktop.ini
+WinPython_公務電腦使用包/runtime_outputs/
 
 # logs
 logs/
