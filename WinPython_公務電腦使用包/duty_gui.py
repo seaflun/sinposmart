@@ -2406,9 +2406,10 @@ class DutyGui(tk.Tk):
         if action.get("kind") != "entry_log":
             return False
         fields = action.get("fields", {})
+        outin = fields.get("出或入", "")
         reason = fields.get("領用事由及地點", "")
-        if fields.get("出或入", "") in ("值班", "值退") or reason in ("值班", "值退"):
-            return False
+        if outin in ("值班", "值退") or reason in ("值班", "值退", "到勤"):
+            return True
         return str(action.get("source", "")).startswith("外勤") or reason in ("休息", "休息返隊", "休息後退勤")
 
     def action_for_manual_submit(self, action: dict[str, Any]) -> dict[str, Any]:
