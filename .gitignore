@@ -36,6 +36,7 @@ cache/
 outputs/
 exports/
 reports/generated/
+runtime_outputs/
 archive/
 _整理封存/
 _update_backups/

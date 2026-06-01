@@ -34,6 +34,19 @@ from typing import Any
 
 DAILY_SCREENSHOT_DIR = "每日勤務表"
 NIGHT_SCREENSHOT_DIR = "夜間勤務"
+RUNTIME_OUTPUT_DIR = Path("runtime_outputs")
+SCHEDULE_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "schedule"
+COMPARISON_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "comparison"
+REHEARSAL_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "rehearsal"
+FORM_TEST_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "form_tests"
+SNAPSHOT_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "snapshots"
+AUTO_CLEAN_RULES = (
+    (SCHEDULE_OUTPUT_DIR, "*.json", 45),
+    (COMPARISON_OUTPUT_DIR, "*.json", 45),
+    (REHEARSAL_OUTPUT_DIR, "*.json", 14),
+    (FORM_TEST_OUTPUT_DIR, "*.json", 7),
+    (SNAPSHOT_OUTPUT_DIR, "*.json", 14),
+)
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -232,7 +245,10 @@ def latest_preview_file() -> Path:
     if legacy_today.exists():
         return legacy_today
     candidates = sorted(
-        list(Path.cwd().glob("schedule_output_*.json")) + list(Path.cwd().glob("rehearsal_output_*.json")),
+        list(SCHEDULE_OUTPUT_DIR.glob("schedule_output_*.json"))
+        + list(REHEARSAL_OUTPUT_DIR.glob("rehearsal_output_*.json"))
+        + list(Path.cwd().glob("schedule_output_*.json"))
+        + list(Path.cwd().glob("rehearsal_output_*.json")),
         key=lambda path: path.stat().st_mtime,
     )
     return candidates[-1] if candidates else Path("rehearsal_output_1150517.json")
@@ -254,15 +270,29 @@ def roc_date_after(value: str, days: int) -> str:
 
 
 def schedule_path(target_roc_date: str) -> Path:
-    return Path(f"schedule_output_{target_roc_date}.json")
+    return SCHEDULE_OUTPUT_DIR / f"schedule_output_{target_roc_date}.json"
 
 
 def comparison_path(target_roc_date: str) -> Path:
-    return Path(f"comparison_output_{target_roc_date}.json")
+    return COMPARISON_OUTPUT_DIR / f"comparison_output_{target_roc_date}.json"
 
 
 def legacy_rehearsal_path(target_roc_date: str) -> Path:
-    return Path(f"rehearsal_output_{target_roc_date}.json")
+    return REHEARSAL_OUTPUT_DIR / f"rehearsal_output_{target_roc_date}.json"
+
+
+def cleanup_old_json_files() -> None:
+    now = datetime.now()
+    for folder, pattern, keep_days in AUTO_CLEAN_RULES:
+        if not folder.exists():
+            continue
+        for old_path in folder.glob(pattern):
+            try:
+                age = now - datetime.fromtimestamp(old_path.stat().st_mtime)
+                if age > timedelta(days=keep_days):
+                    old_path.unlink()
+            except Exception:
+                continue
 
 
 DEFAULT_PREVIEW = latest_preview_file()
@@ -361,6 +391,7 @@ class DutyGui(tk.Tk):
         self.last_notification_at: datetime | None = None
         self.opened_screenshot_folder_slots: set[str] = set()
 
+        cleanup_old_json_files()
         self.load_saved_login()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -1683,12 +1714,12 @@ class DutyGui(tk.Tk):
         }
 
         canonical_path = schedule_path(target_roc_date)
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
         canonical_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        snapshots_dir = Path("snapshots")
-        snapshots_dir.mkdir(exist_ok=True)
+        SNAPSHOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         slot_part = f"_{slot_label}" if slot_label else ""
-        snapshot_path = snapshots_dir / f"schedule_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
+        snapshot_path = SNAPSHOT_OUTPUT_DIR / f"schedule_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
         snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return canonical_path
 
@@ -1704,12 +1735,12 @@ class DutyGui(tk.Tk):
         }
 
         canonical_path = comparison_path(target_roc_date)
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
         canonical_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        snapshots_dir = Path("snapshots")
-        snapshots_dir.mkdir(exist_ok=True)
+        SNAPSHOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         slot_part = f"_{slot_label}" if slot_label else ""
-        snapshot_path = snapshots_dir / f"comparison_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
+        snapshot_path = SNAPSHOT_OUTPUT_DIR / f"comparison_output_{target_roc_date}{slot_part}_{datetime.now():%H%M%S}.json"
         snapshot_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return canonical_path
 
@@ -2715,7 +2746,8 @@ class DutyGui(tk.Tk):
 
     def create_submit_result_path(self, index: int, action: dict[str, Any], save: bool, visible: bool) -> Path:
         prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
-        result_path = Path(f"{prefix}_{datetime.now():%Y%m%d_%H%M%S_%f}_{index}.json")
+        FORM_TEST_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        result_path = FORM_TEST_OUTPUT_DIR / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S_%f}_{index}.json"
         started_result = {
             "stage": "started",
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -2764,11 +2796,11 @@ class DutyGui(tk.Tk):
             candidates.extend([Path("duty_trigger_log.jsonl"), Path("requirements.txt"), Path("CODE_MAP.md"), Path("HANDOFF.md")])
             if result_path:
                 candidates.append(result_path)
-            candidates.extend(sorted(Path.cwd().glob("*_form_test_*.json"), key=lambda path: path.stat().st_mtime)[-20:])
-            snapshot_dir = Path("snapshots")
-            if snapshot_dir.exists():
-                candidates.extend(sorted(snapshot_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)[-20:])
-                candidates.extend(sorted(snapshot_dir.glob("*.txt"), key=lambda path: path.stat().st_mtime)[-10:])
+            if FORM_TEST_OUTPUT_DIR.exists():
+                candidates.extend(sorted(FORM_TEST_OUTPUT_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)[-20:])
+            if SNAPSHOT_OUTPUT_DIR.exists():
+                candidates.extend(sorted(SNAPSHOT_OUTPUT_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)[-20:])
+                candidates.extend(sorted(SNAPSHOT_OUTPUT_DIR.glob("*.txt"), key=lambda path: path.stat().st_mtime)[-10:])
             seen: set[Path] = set()
             for path in candidates:
                 if not path.exists() or not path.is_file():
