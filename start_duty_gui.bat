@@ -2,23 +2,19 @@
 setlocal
 cd /d "%~dp0"
 
-where pythonw >nul 2>nul
-if %errorlevel%==0 (
-  start "" pythonw duty_gui.pyw
+set "PYTHONW=C:\Users\User\AppData\Local\Python\bin\pythonw.exe"
+set "PYTHON=C:\Users\User\AppData\Local\Python\bin\python.exe"
+
+if exist "%PYTHONW%" (
+  start "" "%PYTHONW%" "duty_gui.pyw"
   exit /b 0
 )
 
-where py >nul 2>nul
-if %errorlevel%==0 (
-  start "" py -3 duty_gui.pyw
+if exist "%PYTHON%" (
+  start "" "%PYTHON%" "duty_gui.pyw"
   exit /b 0
 )
 
-where python >nul 2>nul
-if %errorlevel%==0 (
-  start "" python duty_gui.pyw
-  exit /b 0
-)
-
-echo 找不到 Python，請先安裝 Python 3.11 以上。
+echo Python not found.
 pause
+exit /b 1

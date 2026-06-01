@@ -1,0 +1,26 @@
+{
+  "login": {
+    "user_id": "tyfd01510",
+    "user_pwd": "alan810730@Aggggg"
+  },
+  "last_selection": {
+    "attack": "新坡15/KES-5922",
+    "stop": "新坡11/KEC-2608",
+    "amb1": "新坡91/BGV-2310",
+    "amb2": "新坡93/BSL-9230"
+  },
+  "car_options": {
+    "attack": ["新坡15/KES-5922", "新坡16/981-S5", "新車代號/車牌號碼"],
+    "stop": ["新坡11/KEC-2608"],
+    "amb": ["新坡91/BGV-2310", "新坡92/BXB-7593", "新坡93/BSL-9230"]
+  },
+  "notification": {
+    "enabled": true,
+    "provider": "line",
+    "line_channel_access_token": "5nA7PYBlQ+qzF+gPXXRqhn7bRaSuaqOFBakk2/ODCgw3p7K6JIf2jHSfuYqFvhC8LAXWQQeHM1SM4O774xdTPi0ibcT6gSYDbmyzmppHAvt0TP4fdmJTq/ZS1fO3iIcYQ1O0TunlRV+8l7Xrz4DSBwdB04t89/1O/w1cDnyilFU=",
+    "line_to_id": "Uf2573574f8594fea56067df935a2542d",
+    "line_group_id": "Uf2573574f8594fea56067df935a2542d",
+    "gcs_bucket_name": "sinpo-duty-schedule-images",
+    "gcs_service_account_json": "effortless-leaf-353501-63492cc3ece4.json"
+  }
+}

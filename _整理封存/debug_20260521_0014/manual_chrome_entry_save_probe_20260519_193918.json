@@ -1,0 +1,2700 @@
+{
+  "created_at": "2026-05-19T19:39:18",
+  "stage": "after_people",
+  "updated_at": "2026-05-19T19:39:30",
+  "opened_snapshot": {
+    "_areMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": true,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": ""
+    },
+    "_areMemo": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": ""
+    },
+    "_btnInsert": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "新　　增"
+    },
+    "_btnOpenWin": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "選取人員"
+    },
+    "_btnUpdate": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "確定"
+    },
+    "_hidManId": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "hidden",
+      "value": ""
+    },
+    "_selIsout": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "結束",
+          "value": "I4"
+        },
+        {
+          "selected": false,
+          "text": "開始",
+          "value": "O4"
+        },
+        {
+          "selected": false,
+          "text": "值退",
+          "value": "I3"
+        },
+        {
+          "selected": false,
+          "text": "值班",
+          "value": "I2"
+        },
+        {
+          "selected": false,
+          "text": "入",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "出",
+          "value": "O"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n結束\n開始\n值退\n值班\n入\n出",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selMan": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "鄧力嘉",
+          "value": "L124020504,4"
+        },
+        {
+          "selected": false,
+          "text": "莊勝斌",
+          "value": "R123757061,3"
+        },
+        {
+          "selected": false,
+          "text": "孫子翔",
+          "value": "F124534198,3"
+        },
+        {
+          "selected": false,
+          "text": "簡永豐",
+          "value": "H122184334,3"
+        },
+        {
+          "selected": false,
+          "text": "張鴻志",
+          "value": "H122191802,3"
+        },
+        {
+          "selected": false,
+          "text": "吳宗耕",
+          "value": "S122666106,0"
+        },
+        {
+          "selected": false,
+          "text": "包華先",
+          "value": "B122850168,0"
+        },
+        {
+          "selected": false,
+          "text": "曾彥綸",
+          "value": "B123017532,0"
+        },
+        {
+          "selected": false,
+          "text": "鍾佳諭",
+          "value": "H123692817,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏澤",
+          "value": "S123439032,0"
+        },
+        {
+          "selected": false,
+          "text": "簡君諺",
+          "value": "A130553462,0"
+        },
+        {
+          "selected": false,
+          "text": "王昱勛",
+          "value": "F128586287,0"
+        },
+        {
+          "selected": false,
+          "text": "葉宗哲",
+          "value": "H125728098,0"
+        },
+        {
+          "selected": false,
+          "text": "王浩任",
+          "value": "S125216715,0"
+        },
+        {
+          "selected": false,
+          "text": "李仕詮",
+          "value": "L125430657,0"
+        },
+        {
+          "selected": false,
+          "text": "楊弘宇",
+          "value": "tyfd02317,0"
+        },
+        {
+          "selected": false,
+          "text": "楊仲豪",
+          "value": "H122321962,0"
+        },
+        {
+          "selected": false,
+          "text": "林志偉",
+          "value": "I100011300,0"
+        },
+        {
+          "selected": false,
+          "text": "劉家誠",
+          "value": "H124366414,0"
+        },
+        {
+          "selected": false,
+          "text": "張家和",
+          "value": "S124774209,0"
+        },
+        {
+          "selected": false,
+          "text": "陳俊翰",
+          "value": "N124514003,0"
+        },
+        {
+          "selected": false,
+          "text": "賴俊豪",
+          "value": "L124961260,0"
+        },
+        {
+          "selected": false,
+          "text": "郭國偵",
+          "value": "R124189021,0"
+        },
+        {
+          "selected": false,
+          "text": "楊紹文",
+          "value": "B123532203,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏為",
+          "value": "tyfd02321,0"
+        },
+        {
+          "selected": false,
+          "text": "林宸彥",
+          "value": "tyfd02471,0"
+        },
+        {
+          "selected": false,
+          "text": "邱士逢",
+          "value": "D12335178,2"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "\n請選擇鄧力嘉莊勝斌孫子翔簡永豐張鴻志吳宗耕包華先曾彥綸鍾佳諭林宏澤簡君諺王昱勛葉宗哲王浩任李仕詮楊弘宇楊仲豪林志偉劉家誠張家和陳俊翰賴俊豪郭國偵楊紹文林宏為林宸彥邱士逢",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selTIMEH": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": true,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": false,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23",
+      "type": "select-one",
+      "value": "00"
+    },
+    "_selTIMEM": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": true,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": false,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        },
+        {
+          "selected": false,
+          "text": "24",
+          "value": "24"
+        },
+        {
+          "selected": false,
+          "text": "25",
+          "value": "25"
+        },
+        {
+          "selected": false,
+          "text": "26",
+          "value": "26"
+        },
+        {
+          "selected": false,
+          "text": "27",
+          "value": "27"
+        },
+        {
+          "selected": false,
+          "text": "28",
+          "value": "28"
+        },
+        {
+          "selected": false,
+          "text": "29",
+          "value": "29"
+        },
+        {
+          "selected": false,
+          "text": "30",
+          "value": "30"
+        },
+        {
+          "selected": false,
+          "text": "31",
+          "value": "31"
+        },
+        {
+          "selected": false,
+          "text": "32",
+          "value": "32"
+        },
+        {
+          "selected": false,
+          "text": "33",
+          "value": "33"
+        },
+        {
+          "selected": false,
+          "text": "34",
+          "value": "34"
+        },
+        {
+          "selected": false,
+          "text": "35",
+          "value": "35"
+        },
+        {
+          "selected": false,
+          "text": "36",
+          "value": "36"
+        },
+        {
+          "selected": false,
+          "text": "37",
+          "value": "37"
+        },
+        {
+          "selected": false,
+          "text": "38",
+          "value": "38"
+        },
+        {
+          "selected": false,
+          "text": "39",
+          "value": "39"
+        },
+        {
+          "selected": false,
+          "text": "40",
+          "value": "40"
+        },
+        {
+          "selected": false,
+          "text": "41",
+          "value": "41"
+        },
+        {
+          "selected": false,
+          "text": "42",
+          "value": "42"
+        },
+        {
+          "selected": false,
+          "text": "43",
+          "value": "43"
+        },
+        {
+          "selected": false,
+          "text": "44",
+          "value": "44"
+        },
+        {
+          "selected": false,
+          "text": "45",
+          "value": "45"
+        },
+        {
+          "selected": false,
+          "text": "46",
+          "value": "46"
+        },
+        {
+          "selected": false,
+          "text": "47",
+          "value": "47"
+        },
+        {
+          "selected": false,
+          "text": "48",
+          "value": "48"
+        },
+        {
+          "selected": false,
+          "text": "49",
+          "value": "49"
+        },
+        {
+          "selected": false,
+          "text": "50",
+          "value": "50"
+        },
+        {
+          "selected": false,
+          "text": "51",
+          "value": "51"
+        },
+        {
+          "selected": false,
+          "text": "52",
+          "value": "52"
+        },
+        {
+          "selected": false,
+          "text": "53",
+          "value": "53"
+        },
+        {
+          "selected": false,
+          "text": "54",
+          "value": "54"
+        },
+        {
+          "selected": false,
+          "text": "55",
+          "value": "55"
+        },
+        {
+          "selected": false,
+          "text": "56",
+          "value": "56"
+        },
+        {
+          "selected": false,
+          "text": "57",
+          "value": "57"
+        },
+        {
+          "selected": false,
+          "text": "58",
+          "value": "58"
+        },
+        {
+          "selected": false,
+          "text": "59",
+          "value": "59"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59",
+      "type": "select-one",
+      "value": "00"
+    },
+    "_selTitle": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "工友",
+          "value": "S"
+        },
+        {
+          "selected": false,
+          "text": "護理師",
+          "value": "R"
+        },
+        {
+          "selected": false,
+          "text": "秘書",
+          "value": "Q"
+        },
+        {
+          "selected": false,
+          "text": "股長",
+          "value": "P"
+        },
+        {
+          "selected": false,
+          "text": "專員",
+          "value": "O"
+        },
+        {
+          "selected": false,
+          "text": "專門委員",
+          "value": "N"
+        },
+        {
+          "selected": false,
+          "text": "簡任技正",
+          "value": "M"
+        },
+        {
+          "selected": false,
+          "text": "組員",
+          "value": "L"
+        },
+        {
+          "selected": false,
+          "text": "佐理員",
+          "value": "K"
+        },
+        {
+          "selected": false,
+          "text": "技正",
+          "value": "J"
+        },
+        {
+          "selected": false,
+          "text": "組長",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "機要",
+          "value": "H"
+        },
+        {
+          "selected": false,
+          "text": "副局長",
+          "value": "G"
+        },
+        {
+          "selected": false,
+          "text": "助理員",
+          "value": "F"
+        },
+        {
+          "selected": false,
+          "text": "技佐",
+          "value": "E"
+        },
+        {
+          "selected": false,
+          "text": "書記",
+          "value": "D"
+        },
+        {
+          "selected": false,
+          "text": "局長",
+          "value": "C"
+        },
+        {
+          "selected": false,
+          "text": "督察員",
+          "value": "c"
+        },
+        {
+          "selected": false,
+          "text": "主任秘書",
+          "value": "B"
+        },
+        {
+          "selected": false,
+          "text": "督察",
+          "value": "b"
+        },
+        {
+          "selected": false,
+          "text": "主任",
+          "value": "A"
+        },
+        {
+          "selected": false,
+          "text": "技士",
+          "value": "9"
+        },
+        {
+          "selected": false,
+          "text": "科長",
+          "value": "8"
+        },
+        {
+          "selected": false,
+          "text": "科員",
+          "value": "7"
+        },
+        {
+          "selected": false,
+          "text": "副大隊長",
+          "value": "6"
+        },
+        {
+          "selected": false,
+          "text": "大隊長",
+          "value": "5"
+        },
+        {
+          "selected": false,
+          "text": "分隊長",
+          "value": "4"
+        },
+        {
+          "selected": false,
+          "text": "小隊長",
+          "value": "3"
+        },
+        {
+          "selected": false,
+          "text": "實習生",
+          "value": "2"
+        },
+        {
+          "selected": false,
+          "text": "替代役",
+          "value": "1"
+        },
+        {
+          "selected": false,
+          "text": "隊員",
+          "value": "0"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n工友\n護理師\n秘書\n股長\n專員\n專門委員\n簡任技正\n組員\n佐理員\n技正\n組長\n機要\n副局長\n助理員\n技佐\n書記\n局長\n督察員\n主任秘書\n督察\n主任\n技士\n科長\n科員\n副大隊長\n大隊長\n分隊長\n小隊長\n實習生\n替代役\n隊員\n",
+      "type": "select-one",
+      "value": ""
+    },
+    "_txtDATE": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": "1150519"
+    },
+    "_txtMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    },
+    "_txtTitle": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    }
+  },
+  "time_memo_snapshot": {
+    "_areMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": true,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": ""
+    },
+    "_areMemo": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": "??"
+    },
+    "_btnInsert": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "新　　增"
+    },
+    "_btnOpenWin": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "選取人員"
+    },
+    "_btnUpdate": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "確定"
+    },
+    "_hidManId": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "hidden",
+      "value": ""
+    },
+    "_selIsout": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "結束",
+          "value": "I4"
+        },
+        {
+          "selected": false,
+          "text": "開始",
+          "value": "O4"
+        },
+        {
+          "selected": false,
+          "text": "值退",
+          "value": "I3"
+        },
+        {
+          "selected": false,
+          "text": "值班",
+          "value": "I2"
+        },
+        {
+          "selected": false,
+          "text": "入",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "出",
+          "value": "O"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n結束\n開始\n值退\n值班\n入\n出",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selMan": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "鄧力嘉",
+          "value": "L124020504,4"
+        },
+        {
+          "selected": false,
+          "text": "莊勝斌",
+          "value": "R123757061,3"
+        },
+        {
+          "selected": false,
+          "text": "孫子翔",
+          "value": "F124534198,3"
+        },
+        {
+          "selected": false,
+          "text": "簡永豐",
+          "value": "H122184334,3"
+        },
+        {
+          "selected": false,
+          "text": "張鴻志",
+          "value": "H122191802,3"
+        },
+        {
+          "selected": false,
+          "text": "吳宗耕",
+          "value": "S122666106,0"
+        },
+        {
+          "selected": false,
+          "text": "包華先",
+          "value": "B122850168,0"
+        },
+        {
+          "selected": false,
+          "text": "曾彥綸",
+          "value": "B123017532,0"
+        },
+        {
+          "selected": false,
+          "text": "鍾佳諭",
+          "value": "H123692817,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏澤",
+          "value": "S123439032,0"
+        },
+        {
+          "selected": false,
+          "text": "簡君諺",
+          "value": "A130553462,0"
+        },
+        {
+          "selected": false,
+          "text": "王昱勛",
+          "value": "F128586287,0"
+        },
+        {
+          "selected": false,
+          "text": "葉宗哲",
+          "value": "H125728098,0"
+        },
+        {
+          "selected": false,
+          "text": "王浩任",
+          "value": "S125216715,0"
+        },
+        {
+          "selected": false,
+          "text": "李仕詮",
+          "value": "L125430657,0"
+        },
+        {
+          "selected": false,
+          "text": "楊弘宇",
+          "value": "tyfd02317,0"
+        },
+        {
+          "selected": false,
+          "text": "楊仲豪",
+          "value": "H122321962,0"
+        },
+        {
+          "selected": false,
+          "text": "林志偉",
+          "value": "I100011300,0"
+        },
+        {
+          "selected": false,
+          "text": "劉家誠",
+          "value": "H124366414,0"
+        },
+        {
+          "selected": false,
+          "text": "張家和",
+          "value": "S124774209,0"
+        },
+        {
+          "selected": false,
+          "text": "陳俊翰",
+          "value": "N124514003,0"
+        },
+        {
+          "selected": false,
+          "text": "賴俊豪",
+          "value": "L124961260,0"
+        },
+        {
+          "selected": false,
+          "text": "郭國偵",
+          "value": "R124189021,0"
+        },
+        {
+          "selected": false,
+          "text": "楊紹文",
+          "value": "B123532203,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏為",
+          "value": "tyfd02321,0"
+        },
+        {
+          "selected": false,
+          "text": "林宸彥",
+          "value": "tyfd02471,0"
+        },
+        {
+          "selected": false,
+          "text": "邱士逢",
+          "value": "D12335178,2"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "\n請選擇鄧力嘉莊勝斌孫子翔簡永豐張鴻志吳宗耕包華先曾彥綸鍾佳諭林宏澤簡君諺王昱勛葉宗哲王浩任李仕詮楊弘宇楊仲豪林志偉劉家誠張家和陳俊翰賴俊豪郭國偵楊紹文林宏為林宸彥邱士逢",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selTIMEH": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": true,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23",
+      "type": "select-one",
+      "value": "22"
+    },
+    "_selTIMEM": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": true,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": false,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        },
+        {
+          "selected": false,
+          "text": "24",
+          "value": "24"
+        },
+        {
+          "selected": false,
+          "text": "25",
+          "value": "25"
+        },
+        {
+          "selected": false,
+          "text": "26",
+          "value": "26"
+        },
+        {
+          "selected": false,
+          "text": "27",
+          "value": "27"
+        },
+        {
+          "selected": false,
+          "text": "28",
+          "value": "28"
+        },
+        {
+          "selected": false,
+          "text": "29",
+          "value": "29"
+        },
+        {
+          "selected": false,
+          "text": "30",
+          "value": "30"
+        },
+        {
+          "selected": false,
+          "text": "31",
+          "value": "31"
+        },
+        {
+          "selected": false,
+          "text": "32",
+          "value": "32"
+        },
+        {
+          "selected": false,
+          "text": "33",
+          "value": "33"
+        },
+        {
+          "selected": false,
+          "text": "34",
+          "value": "34"
+        },
+        {
+          "selected": false,
+          "text": "35",
+          "value": "35"
+        },
+        {
+          "selected": false,
+          "text": "36",
+          "value": "36"
+        },
+        {
+          "selected": false,
+          "text": "37",
+          "value": "37"
+        },
+        {
+          "selected": false,
+          "text": "38",
+          "value": "38"
+        },
+        {
+          "selected": false,
+          "text": "39",
+          "value": "39"
+        },
+        {
+          "selected": false,
+          "text": "40",
+          "value": "40"
+        },
+        {
+          "selected": false,
+          "text": "41",
+          "value": "41"
+        },
+        {
+          "selected": false,
+          "text": "42",
+          "value": "42"
+        },
+        {
+          "selected": false,
+          "text": "43",
+          "value": "43"
+        },
+        {
+          "selected": false,
+          "text": "44",
+          "value": "44"
+        },
+        {
+          "selected": false,
+          "text": "45",
+          "value": "45"
+        },
+        {
+          "selected": false,
+          "text": "46",
+          "value": "46"
+        },
+        {
+          "selected": false,
+          "text": "47",
+          "value": "47"
+        },
+        {
+          "selected": false,
+          "text": "48",
+          "value": "48"
+        },
+        {
+          "selected": false,
+          "text": "49",
+          "value": "49"
+        },
+        {
+          "selected": false,
+          "text": "50",
+          "value": "50"
+        },
+        {
+          "selected": false,
+          "text": "51",
+          "value": "51"
+        },
+        {
+          "selected": false,
+          "text": "52",
+          "value": "52"
+        },
+        {
+          "selected": false,
+          "text": "53",
+          "value": "53"
+        },
+        {
+          "selected": false,
+          "text": "54",
+          "value": "54"
+        },
+        {
+          "selected": false,
+          "text": "55",
+          "value": "55"
+        },
+        {
+          "selected": false,
+          "text": "56",
+          "value": "56"
+        },
+        {
+          "selected": false,
+          "text": "57",
+          "value": "57"
+        },
+        {
+          "selected": false,
+          "text": "58",
+          "value": "58"
+        },
+        {
+          "selected": false,
+          "text": "59",
+          "value": "59"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59",
+      "type": "select-one",
+      "value": "00"
+    },
+    "_selTitle": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "工友",
+          "value": "S"
+        },
+        {
+          "selected": false,
+          "text": "護理師",
+          "value": "R"
+        },
+        {
+          "selected": false,
+          "text": "秘書",
+          "value": "Q"
+        },
+        {
+          "selected": false,
+          "text": "股長",
+          "value": "P"
+        },
+        {
+          "selected": false,
+          "text": "專員",
+          "value": "O"
+        },
+        {
+          "selected": false,
+          "text": "專門委員",
+          "value": "N"
+        },
+        {
+          "selected": false,
+          "text": "簡任技正",
+          "value": "M"
+        },
+        {
+          "selected": false,
+          "text": "組員",
+          "value": "L"
+        },
+        {
+          "selected": false,
+          "text": "佐理員",
+          "value": "K"
+        },
+        {
+          "selected": false,
+          "text": "技正",
+          "value": "J"
+        },
+        {
+          "selected": false,
+          "text": "組長",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "機要",
+          "value": "H"
+        },
+        {
+          "selected": false,
+          "text": "副局長",
+          "value": "G"
+        },
+        {
+          "selected": false,
+          "text": "助理員",
+          "value": "F"
+        },
+        {
+          "selected": false,
+          "text": "技佐",
+          "value": "E"
+        },
+        {
+          "selected": false,
+          "text": "書記",
+          "value": "D"
+        },
+        {
+          "selected": false,
+          "text": "局長",
+          "value": "C"
+        },
+        {
+          "selected": false,
+          "text": "督察員",
+          "value": "c"
+        },
+        {
+          "selected": false,
+          "text": "主任秘書",
+          "value": "B"
+        },
+        {
+          "selected": false,
+          "text": "督察",
+          "value": "b"
+        },
+        {
+          "selected": false,
+          "text": "主任",
+          "value": "A"
+        },
+        {
+          "selected": false,
+          "text": "技士",
+          "value": "9"
+        },
+        {
+          "selected": false,
+          "text": "科長",
+          "value": "8"
+        },
+        {
+          "selected": false,
+          "text": "科員",
+          "value": "7"
+        },
+        {
+          "selected": false,
+          "text": "副大隊長",
+          "value": "6"
+        },
+        {
+          "selected": false,
+          "text": "大隊長",
+          "value": "5"
+        },
+        {
+          "selected": false,
+          "text": "分隊長",
+          "value": "4"
+        },
+        {
+          "selected": false,
+          "text": "小隊長",
+          "value": "3"
+        },
+        {
+          "selected": false,
+          "text": "實習生",
+          "value": "2"
+        },
+        {
+          "selected": false,
+          "text": "替代役",
+          "value": "1"
+        },
+        {
+          "selected": false,
+          "text": "隊員",
+          "value": "0"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n工友\n護理師\n秘書\n股長\n專員\n專門委員\n簡任技正\n組員\n佐理員\n技正\n組長\n機要\n副局長\n助理員\n技佐\n書記\n局長\n督察員\n主任秘書\n督察\n主任\n技士\n科長\n科員\n副大隊長\n大隊長\n分隊長\n小隊長\n實習生\n替代役\n隊員\n",
+      "type": "select-one",
+      "value": ""
+    },
+    "_txtDATE": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": "1150519"
+    },
+    "_txtMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    },
+    "_txtTitle": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    }
+  },
+  "after_people_snapshot": {
+    "_areMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": true,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": "曾彥綸"
+    },
+    "_areMemo": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "textarea",
+      "text": "",
+      "type": "textarea",
+      "value": "??"
+    },
+    "_btnInsert": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "新　　增"
+    },
+    "_btnOpenWin": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "選取人員"
+    },
+    "_btnUpdate": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "button",
+      "value": "確定"
+    },
+    "_hidManId": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "hidden",
+      "value": "B123017532"
+    },
+    "_selIsout": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "結束",
+          "value": "I4"
+        },
+        {
+          "selected": false,
+          "text": "開始",
+          "value": "O4"
+        },
+        {
+          "selected": false,
+          "text": "值退",
+          "value": "I3"
+        },
+        {
+          "selected": false,
+          "text": "值班",
+          "value": "I2"
+        },
+        {
+          "selected": false,
+          "text": "入",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "出",
+          "value": "O"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n結束\n開始\n值退\n值班\n入\n出",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selMan": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "鄧力嘉",
+          "value": "L124020504,4"
+        },
+        {
+          "selected": false,
+          "text": "莊勝斌",
+          "value": "R123757061,3"
+        },
+        {
+          "selected": false,
+          "text": "孫子翔",
+          "value": "F124534198,3"
+        },
+        {
+          "selected": false,
+          "text": "簡永豐",
+          "value": "H122184334,3"
+        },
+        {
+          "selected": false,
+          "text": "張鴻志",
+          "value": "H122191802,3"
+        },
+        {
+          "selected": false,
+          "text": "吳宗耕",
+          "value": "S122666106,0"
+        },
+        {
+          "selected": false,
+          "text": "包華先",
+          "value": "B122850168,0"
+        },
+        {
+          "selected": false,
+          "text": "曾彥綸",
+          "value": "B123017532,0"
+        },
+        {
+          "selected": false,
+          "text": "鍾佳諭",
+          "value": "H123692817,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏澤",
+          "value": "S123439032,0"
+        },
+        {
+          "selected": false,
+          "text": "簡君諺",
+          "value": "A130553462,0"
+        },
+        {
+          "selected": false,
+          "text": "王昱勛",
+          "value": "F128586287,0"
+        },
+        {
+          "selected": false,
+          "text": "葉宗哲",
+          "value": "H125728098,0"
+        },
+        {
+          "selected": false,
+          "text": "王浩任",
+          "value": "S125216715,0"
+        },
+        {
+          "selected": false,
+          "text": "李仕詮",
+          "value": "L125430657,0"
+        },
+        {
+          "selected": false,
+          "text": "楊弘宇",
+          "value": "tyfd02317,0"
+        },
+        {
+          "selected": false,
+          "text": "楊仲豪",
+          "value": "H122321962,0"
+        },
+        {
+          "selected": false,
+          "text": "林志偉",
+          "value": "I100011300,0"
+        },
+        {
+          "selected": false,
+          "text": "劉家誠",
+          "value": "H124366414,0"
+        },
+        {
+          "selected": false,
+          "text": "張家和",
+          "value": "S124774209,0"
+        },
+        {
+          "selected": false,
+          "text": "陳俊翰",
+          "value": "N124514003,0"
+        },
+        {
+          "selected": false,
+          "text": "賴俊豪",
+          "value": "L124961260,0"
+        },
+        {
+          "selected": false,
+          "text": "郭國偵",
+          "value": "R124189021,0"
+        },
+        {
+          "selected": false,
+          "text": "楊紹文",
+          "value": "B123532203,0"
+        },
+        {
+          "selected": false,
+          "text": "林宏為",
+          "value": "tyfd02321,0"
+        },
+        {
+          "selected": false,
+          "text": "林宸彥",
+          "value": "tyfd02471,0"
+        },
+        {
+          "selected": false,
+          "text": "邱士逢",
+          "value": "D12335178,2"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "\n請選擇鄧力嘉莊勝斌孫子翔簡永豐張鴻志吳宗耕包華先曾彥綸鍾佳諭林宏澤簡君諺王昱勛葉宗哲王浩任李仕詮楊弘宇楊仲豪林志偉劉家誠張家和陳俊翰賴俊豪郭國偵楊紹文林宏為林宸彥邱士逢",
+      "type": "select-one",
+      "value": ""
+    },
+    "_selTIMEH": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": true,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23",
+      "type": "select-one",
+      "value": "22"
+    },
+    "_selTIMEM": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        {
+          "selected": true,
+          "text": "00",
+          "value": "00"
+        },
+        {
+          "selected": false,
+          "text": "01",
+          "value": "01"
+        },
+        {
+          "selected": false,
+          "text": "02",
+          "value": "02"
+        },
+        {
+          "selected": false,
+          "text": "03",
+          "value": "03"
+        },
+        {
+          "selected": false,
+          "text": "04",
+          "value": "04"
+        },
+        {
+          "selected": false,
+          "text": "05",
+          "value": "05"
+        },
+        {
+          "selected": false,
+          "text": "06",
+          "value": "06"
+        },
+        {
+          "selected": false,
+          "text": "07",
+          "value": "07"
+        },
+        {
+          "selected": false,
+          "text": "08",
+          "value": "08"
+        },
+        {
+          "selected": false,
+          "text": "09",
+          "value": "09"
+        },
+        {
+          "selected": false,
+          "text": "10",
+          "value": "10"
+        },
+        {
+          "selected": false,
+          "text": "11",
+          "value": "11"
+        },
+        {
+          "selected": false,
+          "text": "12",
+          "value": "12"
+        },
+        {
+          "selected": false,
+          "text": "13",
+          "value": "13"
+        },
+        {
+          "selected": false,
+          "text": "14",
+          "value": "14"
+        },
+        {
+          "selected": false,
+          "text": "15",
+          "value": "15"
+        },
+        {
+          "selected": false,
+          "text": "16",
+          "value": "16"
+        },
+        {
+          "selected": false,
+          "text": "17",
+          "value": "17"
+        },
+        {
+          "selected": false,
+          "text": "18",
+          "value": "18"
+        },
+        {
+          "selected": false,
+          "text": "19",
+          "value": "19"
+        },
+        {
+          "selected": false,
+          "text": "20",
+          "value": "20"
+        },
+        {
+          "selected": false,
+          "text": "21",
+          "value": "21"
+        },
+        {
+          "selected": false,
+          "text": "22",
+          "value": "22"
+        },
+        {
+          "selected": false,
+          "text": "23",
+          "value": "23"
+        },
+        {
+          "selected": false,
+          "text": "24",
+          "value": "24"
+        },
+        {
+          "selected": false,
+          "text": "25",
+          "value": "25"
+        },
+        {
+          "selected": false,
+          "text": "26",
+          "value": "26"
+        },
+        {
+          "selected": false,
+          "text": "27",
+          "value": "27"
+        },
+        {
+          "selected": false,
+          "text": "28",
+          "value": "28"
+        },
+        {
+          "selected": false,
+          "text": "29",
+          "value": "29"
+        },
+        {
+          "selected": false,
+          "text": "30",
+          "value": "30"
+        },
+        {
+          "selected": false,
+          "text": "31",
+          "value": "31"
+        },
+        {
+          "selected": false,
+          "text": "32",
+          "value": "32"
+        },
+        {
+          "selected": false,
+          "text": "33",
+          "value": "33"
+        },
+        {
+          "selected": false,
+          "text": "34",
+          "value": "34"
+        },
+        {
+          "selected": false,
+          "text": "35",
+          "value": "35"
+        },
+        {
+          "selected": false,
+          "text": "36",
+          "value": "36"
+        },
+        {
+          "selected": false,
+          "text": "37",
+          "value": "37"
+        },
+        {
+          "selected": false,
+          "text": "38",
+          "value": "38"
+        },
+        {
+          "selected": false,
+          "text": "39",
+          "value": "39"
+        },
+        {
+          "selected": false,
+          "text": "40",
+          "value": "40"
+        },
+        {
+          "selected": false,
+          "text": "41",
+          "value": "41"
+        },
+        {
+          "selected": false,
+          "text": "42",
+          "value": "42"
+        },
+        {
+          "selected": false,
+          "text": "43",
+          "value": "43"
+        },
+        {
+          "selected": false,
+          "text": "44",
+          "value": "44"
+        },
+        {
+          "selected": false,
+          "text": "45",
+          "value": "45"
+        },
+        {
+          "selected": false,
+          "text": "46",
+          "value": "46"
+        },
+        {
+          "selected": false,
+          "text": "47",
+          "value": "47"
+        },
+        {
+          "selected": false,
+          "text": "48",
+          "value": "48"
+        },
+        {
+          "selected": false,
+          "text": "49",
+          "value": "49"
+        },
+        {
+          "selected": false,
+          "text": "50",
+          "value": "50"
+        },
+        {
+          "selected": false,
+          "text": "51",
+          "value": "51"
+        },
+        {
+          "selected": false,
+          "text": "52",
+          "value": "52"
+        },
+        {
+          "selected": false,
+          "text": "53",
+          "value": "53"
+        },
+        {
+          "selected": false,
+          "text": "54",
+          "value": "54"
+        },
+        {
+          "selected": false,
+          "text": "55",
+          "value": "55"
+        },
+        {
+          "selected": false,
+          "text": "56",
+          "value": "56"
+        },
+        {
+          "selected": false,
+          "text": "57",
+          "value": "57"
+        },
+        {
+          "selected": false,
+          "text": "58",
+          "value": "58"
+        },
+        {
+          "selected": false,
+          "text": "59",
+          "value": "59"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59",
+      "type": "select-one",
+      "value": "00"
+    },
+    "_selTitle": {
+      "disabled": false,
+      "options": [
+        {
+          "selected": true,
+          "text": "請選擇",
+          "value": ""
+        },
+        {
+          "selected": false,
+          "text": "工友",
+          "value": "S"
+        },
+        {
+          "selected": false,
+          "text": "護理師",
+          "value": "R"
+        },
+        {
+          "selected": false,
+          "text": "秘書",
+          "value": "Q"
+        },
+        {
+          "selected": false,
+          "text": "股長",
+          "value": "P"
+        },
+        {
+          "selected": false,
+          "text": "專員",
+          "value": "O"
+        },
+        {
+          "selected": false,
+          "text": "專門委員",
+          "value": "N"
+        },
+        {
+          "selected": false,
+          "text": "簡任技正",
+          "value": "M"
+        },
+        {
+          "selected": false,
+          "text": "組員",
+          "value": "L"
+        },
+        {
+          "selected": false,
+          "text": "佐理員",
+          "value": "K"
+        },
+        {
+          "selected": false,
+          "text": "技正",
+          "value": "J"
+        },
+        {
+          "selected": false,
+          "text": "組長",
+          "value": "I"
+        },
+        {
+          "selected": false,
+          "text": "機要",
+          "value": "H"
+        },
+        {
+          "selected": false,
+          "text": "副局長",
+          "value": "G"
+        },
+        {
+          "selected": false,
+          "text": "助理員",
+          "value": "F"
+        },
+        {
+          "selected": false,
+          "text": "技佐",
+          "value": "E"
+        },
+        {
+          "selected": false,
+          "text": "書記",
+          "value": "D"
+        },
+        {
+          "selected": false,
+          "text": "局長",
+          "value": "C"
+        },
+        {
+          "selected": false,
+          "text": "督察員",
+          "value": "c"
+        },
+        {
+          "selected": false,
+          "text": "主任秘書",
+          "value": "B"
+        },
+        {
+          "selected": false,
+          "text": "督察",
+          "value": "b"
+        },
+        {
+          "selected": false,
+          "text": "主任",
+          "value": "A"
+        },
+        {
+          "selected": false,
+          "text": "技士",
+          "value": "9"
+        },
+        {
+          "selected": false,
+          "text": "科長",
+          "value": "8"
+        },
+        {
+          "selected": false,
+          "text": "科員",
+          "value": "7"
+        },
+        {
+          "selected": false,
+          "text": "副大隊長",
+          "value": "6"
+        },
+        {
+          "selected": false,
+          "text": "大隊長",
+          "value": "5"
+        },
+        {
+          "selected": false,
+          "text": "分隊長",
+          "value": "4"
+        },
+        {
+          "selected": false,
+          "text": "小隊長",
+          "value": "3"
+        },
+        {
+          "selected": false,
+          "text": "實習生",
+          "value": "2"
+        },
+        {
+          "selected": false,
+          "text": "替代役",
+          "value": "1"
+        },
+        {
+          "selected": false,
+          "text": "隊員",
+          "value": "0"
+        }
+      ],
+      "readOnly": false,
+      "tag": "select",
+      "text": "請選擇\n工友\n護理師\n秘書\n股長\n專員\n專門委員\n簡任技正\n組員\n佐理員\n技正\n組長\n機要\n副局長\n助理員\n技佐\n書記\n局長\n督察員\n主任秘書\n督察\n主任\n技士\n科長\n科員\n副大隊長\n大隊長\n分隊長\n小隊長\n實習生\n替代役\n隊員\n",
+      "type": "select-one",
+      "value": ""
+    },
+    "_txtDATE": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": "1150519"
+    },
+    "_txtMan": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    },
+    "_txtTitle": {
+      "disabled": false,
+      "options": [],
+      "readOnly": false,
+      "tag": "input",
+      "text": "",
+      "type": "text",
+      "value": ""
+    }
+  },
+  "selected_row": "人員清單\n番號 職別 姓名\n1 分隊長 鄧力嘉\n2 小隊長 莊勝斌\n3 小隊長 孫子翔\n4 小隊長 簡永豐\n5 小隊長 張鴻志\n6 隊員 吳宗耕\n7 隊員 包華先\n8 隊員 曾彥綸\n9 隊員 鍾佳諭\n10 隊員 林宏澤\n11 隊員 簡君諺\n12 隊員 王昱勛\n13 隊員 葉宗哲\n14 隊員 王浩任\n15 隊員 李仕詮\n16 隊員 楊弘宇\n17 隊員 楊仲豪\n18 隊員 林志偉\n19 隊員 劉家誠\n21 隊員 張家和\n23 隊員 陳俊翰\n24 隊員 賴俊豪\n25 隊員 郭國偵\n26 隊員 楊紹文\n27 隊員 林宏為\n28 隊員 林宸彥\n  實習生 邱士逢\n  共 27 筆"
+}

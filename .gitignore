@@ -14,3 +14,43 @@ snapshots/*_login_*.json
 snapshots/schedule_output_*.json
 snapshots/comparison_output_*.json
 snapshots/verify_compare_*.txt
+
+# Python
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# temporary files
+tmp/
+temp/
+cache/
+.cache/
+
+# outputs
+outputs/
+exports/
+reports/generated/
+
+# logs
+logs/
+*.log
+
+# secrets
+.env.*
+*.key
+*.pem
+*.token
+secrets.json
+credentials.json
+
+# OS / editor
+.vscode/
+.idea/
+duty_sheet_legacy/effortless-leaf-353501-63492cc3ece4.json
+WinPython_公務電腦使用包/duty_sheet_legacy/effortless-leaf-353501-63492cc3ece4.json

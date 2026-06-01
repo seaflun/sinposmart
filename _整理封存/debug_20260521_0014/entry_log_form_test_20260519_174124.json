@@ -1,0 +1,24 @@
+{
+  "stage": "failed",
+  "updated_at": "2026-05-19T17:41:37",
+  "action_index": 46,
+  "action": {
+    "kind": "entry_log",
+    "time": "22:00",
+    "actor": "8",
+    "target": "8",
+    "fields": {
+      "登打時間": "22:00",
+      "系統寫入時間": "22:00",
+      "出或入": "值退",
+      "領用事由及地點": "值退",
+      "手提無線電編號": "",
+      "是否歸還": ""
+    },
+    "source": "值班交接",
+    "duplicate_key": "entry:2026-05-19:22:值退:8"
+  },
+  "error": "Alert Text: 領用人員欄位不可空值！\nMessage: unexpected alert open: {Alert text : 領用人員欄位不可空值！}\n  (Session info: chrome=148.0.7778.168)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x7ff6e6cc1e35+2e8d45]\n\tchromedriver!GetHandleVerifier [0x7ff6e69ee6c0+155d0]\n\tchromedriver!(No symbol) [0x7ff6e673d57d]\n\tchromedriver!(No symbol) [0x7ff6e67e5703]\n\tchromedriver!(No symbol) [0x7ff6e6789d58]\n\tchromedriver!(No symbol) [0x7ff6e678ac43]\n\tchromedriver!GetHandleVerifier [0x7ff6e6cedab9+3149c9]\n\tchromedriver!GetHandleVerifier [0x7ff6e6ce802b+30ef3b]\n\tchromedriver!GetHandleVerifier [0x7ff6e6d0c872+333782]\n\tchromedriver!GetHandleVerifier [0x7ff6e6a0b785+32695]\n\tchromedriver!GetHandleVerifier [0x7ff6e6a142bc+3b1cc]\n\tchromedriver!GetHandleVerifier [0x7ff6e69f7f24+1ee34]\n\tchromedriver!GetHandleVerifier [0x7ff6e69f80b4+1efc4]\n\tchromedriver!GetHandleVerifier [0x7ff6e69dbf27+2e37]\n\tKERNEL32!BaseThreadInitThunk [0x7ffc5663e957+17]\n\tntdll!RtlUserThreadStart [0x7ffc5750427c+2c]\n",
+  "save": true,
+  "visible": false
+}

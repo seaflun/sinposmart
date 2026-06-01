@@ -102,3 +102,34 @@ git commit -m "Describe the change"
 ```
 
 如果暫時不使用 Git，就至少每次工作後更新本檔案。
+
+## 2026-05-25 進度更新
+
+### 已完成
+
+- 已依 `AGENTS.md` 先同步雲端 `專案\skill`，本次確認並安裝 10 個含 `SKILL.md` 的 skills；本機既有 skill 已先備份到 `%USERPROFILE%\.codex\skills\_backups`。
+- 核心 GUI 已改為 `SinpoSmart` 顯示名稱，加入系統匣圖示、關閉視窗時縮到系統匣、Windows 通知標題與單一執行個體鎖。
+- 登入流程加入本機帳密記憶功能，使用 Windows DPAPI 保護已儲存帳密，並保留手動輸入流程。
+- 值班模式已加強自動登打佇列、到點執行、登打前重查比對、失敗時產生 `issue_reports` 壓縮包。
+- 比對邏輯已補強休息、返隊、外勤、案件工作紀錄與近似時間判斷，降低錯把既有紀錄列為待補登的機率。
+- 已新增 `duty_sheet_automation.py`，把舊勤務表登打流程包成 SinpoSmart 內嵌視窗，先沿用舊專案核心，不重寫舊 Selenium 流程。
+- 公務電腦使用包、WinPython 啟動批次檔、環境檢查與相依套件清單已更新到目前 SinpoSmart 需求。
+
+### 目前驗證
+
+- `py -m py_compile duty_gui.py duty_gui.pyw duty_rehearsal.py compare_rehearsal_records.py export_preview_texts.py check_environment.py duty_sheet_automation.py` 通過。
+- 目前已有 `schedule_output_1150519.json` 到 `schedule_output_1150522.json`、`comparison_output_1150518.json` 到 `comparison_output_1150523.json` 可作為近期比對資料。
+- `issue_reports` 內已有 2026-05-21 的失敗封包，可用來追查當時自動登打或比對問題。
+
+### 目前風險
+
+- 工作樹仍有大量未提交變更，包含核心程式、文件、公務電腦包與測試輸出；提交前需再確認哪些檔案要納入版本控管。
+- `HANDOFF.md` 舊段落在目前 PowerShell 顯示為亂碼，本次只追加新段落，沒有重寫舊內容。
+- `duty_sheet_automation.py` 仍依賴舊 `duty_sheet_legacy\sinposmart_1.py`，正式使用前應先在測試模式確認 Excel、車輛欄位與 LINE/GCS 設定。
+
+### 下一步
+
+1. 在勤務電腦執行 `SETUP_WINPYTHON.bat` 與 `RUN_DUTY_GUI_WINPYTHON.vbs`，確認無 console 啟動、系統匣、通知與 Chrome 啟動正常。
+2. 用實際帳號跑登入、查詢、審核模式，先確認比對結果符合勤務系統既有紀錄。
+3. 若自動登打失敗，優先保留最新 `issue_reports\issue_report_*.zip`，再回頭看提交前重查比對與欄位填入流程。
+4. 核心值班登打穩定後，再逐步驗證勤務表登打視窗，不要同時打開多個新功能問題。
