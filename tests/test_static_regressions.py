@@ -95,6 +95,24 @@ class StaticRegressionTests(unittest.TestCase):
             self.assertNotIn('$shortcut.TargetPath = $pythonw', script)
             self.assertLess(script.index("start_duty_gui_no_console.vbs"), script.index("RUN_DUTY_GUI_WINPYTHON.vbs"))
 
+    def test_duty_sheet_screenshot_fits_summary_cells(self) -> None:
+        for relative_path in ("duty_sheet_legacy/sinposmart_1.py", "WinPython_公務電腦使用包/duty_sheet_legacy/sinposmart_1.py"):
+            source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn("def fit_summary_cells_for_screenshot", source)
+            self.assertIn('"月補"', source)
+            self.assertIn("summary_range.ShrinkToFit = True", source)
+            self.assertIn('value_cell.NumberFormat = "@"', source)
+            self.assertIn("value_cell.Value = str(original_value)", source)
+            self.assertIn("fit_summary_cells_for_screenshot(worksheet, sheet_values, min_col, min_row, max_col, max_row)", source)
+            self.assertIn("def copy_range_picture_with_retry", source)
+            self.assertIn("copy_range_picture_with_retry(export_range)", source)
+            self.assertIn("export_range.Width + 8", source)
+            self.assertIn("def export_chart_to_png", source)
+            self.assertIn("tempfile.gettempdir()", source)
+            self.assertIn("export_chart_to_png(chart, output_path)", source)
+            self.assertIn('upload_stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")', source)
+            self.assertIn('{upload_stamp}_{Path(image_path).name}', source)
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []

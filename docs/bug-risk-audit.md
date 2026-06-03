@@ -65,6 +65,11 @@
    - 修正：開機捷徑候選順序改為優先使用 `start_duty_gui_no_console.vbs`，沒有時才使用 `RUN_DUTY_GUI_WINPYTHON.vbs`。
    - 驗證：`tests/test_static_regressions.py::test_startup_shortcuts_use_no_console_launchers`
 
+9. 勤務表截圖右下角假別統計可能被 Excel 自動轉值或匯出裁切。
+   - 風險：`月補 5.10` 這類文字在寫入 Excel COM 截圖範圍時可能被轉成數字 `5.1`，或 `CopyPicture`/`Chart.Export` 在大範圍、中文路徑時失敗。
+   - 修正：截圖前將假別統計值強制用文字格式重寫，對 `CopyPicture` 與 PNG 匯出加入重試/暫存路徑備援，並讓 GCS 上傳檔名每次帶時間戳，避免 LINE/GCS 快取拿到舊圖。
+   - 驗證：用 `C:\Users\seafl\Downloads\新坡勤務表115年0601.xlsm` 實測 `1150604`，正式輸出圖 `每日勤務表\0604.png` 已顯示完整 `月補 5.10`。
+
 ## 仍可能出錯的點
 
 1. 背景執行緒結束時 GUI 已關閉。

@@ -12,6 +12,7 @@ import warnings
 import json
 import os
 import tempfile
+import shutil
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from selenium.common.exceptions import UnexpectedAlertPresentException
@@ -219,6 +220,58 @@ def resolve_night_capture_range(sheet):
             break
     return f"B24:{get_column_letter(end_col)}33"
 
+def fit_summary_cells_for_screenshot(worksheet, sheet_values, min_col, min_row, max_col, max_row):
+    """截圖前微調右下角假別統計，避免窄欄把 10 顯示成 1。"""
+    summary_labels = {"輪休", "月補", "補休", "請休", "公假", "婚假", "喪假", "身心假", "陪產假"}
+    for row in range(min_row, max_row + 1):
+        for col in range(min_col, max_col + 1):
+            value = worksheet.Cells(row, col).Value
+            if value is None or str(value).strip() not in summary_labels:
+                continue
+            end_col = min(max_col, col + 6)
+            summary_range = worksheet.Range(worksheet.Cells(row, col + 1), worksheet.Cells(row, end_col))
+            summary_range.ShrinkToFit = True
+            summary_range.WrapText = False
+            summary_range.Font.Size = 10
+            for value_col in range(col + 1, end_col + 1):
+                original_value = sheet_values.cell(row=row, column=value_col).value
+                if original_value is None or str(original_value).strip() == "":
+                    continue
+                value_cell = worksheet.Cells(row, value_col)
+                value_cell.NumberFormat = "@"
+                value_cell.Value = str(original_value)
+
+def copy_range_picture_with_retry(export_range):
+    last_error = None
+    for appearance, picture_format in ((1, 2), (2, 2), (1, -4147), (2, -4147)):
+        try:
+            export_range.CopyPicture(Appearance=appearance, Format=picture_format)
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+    raise RuntimeError("Excel 範圍複製圖片失敗") from last_error
+
+def export_chart_to_png(chart, output_path):
+    output_path = Path(output_path)
+    try:
+        if chart.Export(str(output_path)):
+            return
+    except Exception:
+        pass
+
+    fallback_path = Path(tempfile.gettempdir()) / f"sinposmart_capture_{datetime.now():%Y%m%d%H%M%S%f}.png"
+    try:
+        if not chart.Export(str(fallback_path)):
+            raise RuntimeError("Excel 工作表匯出圖片失敗")
+        shutil.move(str(fallback_path), str(output_path))
+    finally:
+        if fallback_path.exists():
+            try:
+                fallback_path.unlink()
+            except Exception:
+                pass
+
 # 2-3. Excel 截圖輸出
 def export_excel_sheet_to_image(excel_path, sheet_name, capture_range=None, output_path=None):
     """使用本機 Excel 將指定工作表輸出為 PNG，並回傳實際擷取範圍。"""
@@ -295,6 +348,7 @@ def export_excel_sheet_to_image(excel_path, sheet_name, capture_range=None, outp
                     if duty_id in on_duty_ids:
                         id_cell.Interior.Pattern = 1
                         id_cell.Interior.Color = gray_color
+            fit_summary_cells_for_screenshot(worksheet, sheet_values, min_col, min_row, max_col, max_row)
         finally:
             wb_meta.close()
             wb_values.close()
@@ -305,19 +359,18 @@ def export_excel_sheet_to_image(excel_path, sheet_name, capture_range=None, outp
         export_range.Select()
         time.sleep(1)
 
-        export_range.CopyPicture(Appearance=1, Format=2)
+        copy_range_picture_with_retry(export_range)
         chart_object = worksheet.ChartObjects().Add(
             export_range.Left,
             export_range.Top,
-            export_range.Width,
-            export_range.Height
+            export_range.Width + 8,
+            export_range.Height + 2
         )
         chart = chart_object.Chart
         chart.Paste()
         time.sleep(1)
 
-        if not chart.Export(str(output_path)):
-            raise RuntimeError("Excel 工作表匯出圖片失敗")
+        export_chart_to_png(chart, output_path)
 
         return str(output_path), export_range.Address
     finally:
@@ -348,7 +401,8 @@ def upload_image_to_gcs(image_path, target_date, notification_config):
 
     client = storage.Client.from_service_account_json(service_account_json)
     bucket = client.bucket(bucket_name)
-    object_name = f"duty-schedules/{target_date}/{Path(image_path).name}"
+    upload_stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    object_name = f"duty-schedules/{target_date}/{upload_stamp}_{Path(image_path).name}"
     blob = bucket.blob(object_name)
     blob.upload_from_filename(image_path, content_type="image/png")
 
