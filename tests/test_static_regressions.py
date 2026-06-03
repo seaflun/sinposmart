@@ -85,6 +85,14 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("start_duty_gui.bat", script)
         self.assertNotIn("pythonw.exe", script.lower())
 
+    def test_startup_shortcuts_use_no_console_launchers(self) -> None:
+        for relative_path in ("install_startup_shortcut.ps1", "WinPython_公務電腦使用包/install_startup_shortcut.ps1"):
+            script = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn("System32\\wscript.exe", script)
+            self.assertIn("RUN_DUTY_GUI_WINPYTHON.vbs", script)
+            self.assertNotIn("C:\\Users\\User", script)
+            self.assertNotIn('$shortcut.TargetPath = $pythonw', script)
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []

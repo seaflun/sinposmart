@@ -50,6 +50,11 @@
    - 補強：更新器下載 ZIP 後會比對公開 SHA256 檔，避免下載中斷或檔案被替換仍套用。
    - 仍需：公開 Drive 檔案內容同步到新版。
 
+6. 開機自動啟動捷徑可能綁死錯誤 Python。
+   - 風險：`install_startup_shortcut.ps1` 原本會把捷徑指到 `pythonw.exe`，且曾包含 `C:\Users\User` 硬編碼；不同公務電腦帳號或 PATH 異常時會開機啟動失敗。
+   - 修正：根目錄與公務包的開機捷徑現在改用 `System32\wscript.exe` 啟動既有 `.vbs`，再由既有 `.bat`/WinPython 偵測流程找 Python。
+   - 驗證：`tests/test_static_regressions.py::test_startup_shortcuts_use_no_console_launchers`
+
 ## 仍可能出錯的點
 
 1. 背景執行緒結束時 GUI 已關閉。
