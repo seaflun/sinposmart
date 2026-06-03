@@ -53,6 +53,7 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("try {", script)
         self.assertIn("} finally {", script)
         self.assertIn("Remove-Item -LiteralPath $tempDir -Recurse -Force", script)
+        self.assertIn("Could not remove temporary update folder", script)
 
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:

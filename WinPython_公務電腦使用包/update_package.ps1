@@ -123,7 +123,11 @@ try {
 
     Write-Host "Update completed. Restart the app if it is running."
 } finally {
-    if (Test-Path -LiteralPath $tempDir) {
-        Remove-Item -LiteralPath $tempDir -Recurse -Force
+    try {
+        if (Test-Path -LiteralPath $tempDir) {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force
+        }
+    } catch {
+        Write-Warning "Could not remove temporary update folder: $tempDir"
     }
 }
