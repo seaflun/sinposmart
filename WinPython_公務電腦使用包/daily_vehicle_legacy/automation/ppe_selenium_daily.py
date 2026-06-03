@@ -298,25 +298,47 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
 def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     print("[equip] opening equipment check list")
     driver.get(EQUIP_CHECK_LIST_URL)
-    rows = query_grid_rows(driver, wait, "equip")
 
-    for index in range(1, len(rows) + 1):
+    while True:
+        rows = query_grid_rows(driver, wait, "equip")
+        target_index = None
+        target_license = None
+
+        for index in range(1, len(rows) + 1):
+            row_xpath = f"//div[@id='grid']//tbody/tr[{index}]"
+            row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
+            cells = row_element.find_elements(By.TAG_NAME, "td")
+            car_license = cells[3].text.strip() if len(cells) > 3 else f"car-{index}"
+            check_buttons = row_element.find_elements(
+                By.XPATH,
+                f".//button[text()='{TEXT_EQUIP_CHECK}' or contains(., '{TEXT_EQUIP_CHECK}')]",
+            )
+
+            if not check_buttons:
+                print(f"[equip] {car_license}: already done")
+                continue
+
+            target_index = index
+            target_license = car_license
+            break
+
+        if target_index is None:
+            print("[equip] no pending equipment checks")
+            break
+
         wait_for_spinner(wait)
-        row_xpath = f"//div[@id='grid']//tbody/tr[{index}]"
+        row_xpath = f"//div[@id='grid']//tbody/tr[{target_index}]"
         row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
-        cells = row_element.find_elements(By.TAG_NAME, "td")
-
-        car_license = cells[3].text.strip() if len(cells) > 3 else f"car-{index}"
         check_buttons = row_element.find_elements(
             By.XPATH,
             f".//button[text()='{TEXT_EQUIP_CHECK}' or contains(., '{TEXT_EQUIP_CHECK}')]",
         )
 
         if not check_buttons:
-            print(f"[equip] {car_license}: already done")
+            print(f"[equip] {target_license}: already done")
             continue
 
-        print(f"[equip] {car_license}: processing")
+        print(f"[equip] {target_license}: processing")
         driver.execute_script("arguments[0].click();", check_buttons[0])
         wait_for_spinner(wait)
 
@@ -358,9 +380,8 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
                 or "/CarEquipCheck/Take" not in current_driver.current_url
             )
         )
-        print(f"[equip] {car_license}: submitted")
+        print(f"[equip] {target_license}: submitted")
         driver.get(EQUIP_CHECK_LIST_URL)
-        query_grid_rows(driver, wait, "equip")
 
 
 def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
