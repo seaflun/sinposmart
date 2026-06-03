@@ -76,7 +76,7 @@ $remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
 Write-Host "Local version : $localVersion"
 Write-Host "Remote version: $remoteVersion"
 
-if ($localVersion -eq $remoteVersion) {
+if ([string]::CompareOrdinal($remoteVersion, $localVersion) -le 0) {
     Write-Host "Already up to date."
     exit 0
 }

@@ -40,6 +40,10 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("Update version mismatch.", script)
         self.assertIn("$packageVersion | Set-Content", script)
 
+    def test_update_package_does_not_downgrade(self) -> None:
+        script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("[string]::CompareOrdinal($remoteVersion, $localVersion) -le 0", script)
+
     def test_update_package_never_copies_sensitive_local_files(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("$alwaysSkipFiles = @(", script)
