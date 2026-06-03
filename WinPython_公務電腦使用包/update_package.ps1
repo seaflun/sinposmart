@@ -5,8 +5,8 @@ $remoteZipUrl = "https://drive.google.com/uc?export=download&id=1DB6-0fFBaCciV5D
 
 $packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localVersionPath = Join-Path $packageDir "VERSION.txt"
-$parentDir = Split-Path -Parent $packageDir
-$backupDir = Join-Path $parentDir "_update_backups"
+$backupRoot = Join-Path $env:LOCALAPPDATA "SinpoSmart"
+$backupDir = Join-Path $backupRoot "update_backups"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $tempDir = Join-Path $env:TEMP "SinpoSmartUpdate-$stamp"
 $zipPath = Join-Path $tempDir "package.zip"

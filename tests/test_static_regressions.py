@@ -66,6 +66,12 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("Remove-Item -LiteralPath $tempDir -Recurse -Force", script)
         self.assertIn("Could not remove temporary update folder", script)
 
+    def test_update_package_backups_stay_out_of_synced_project_folder(self) -> None:
+        script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('$backupRoot = Join-Path $env:LOCALAPPDATA "SinpoSmart"', script)
+        self.assertIn('$backupDir = Join-Path $backupRoot "update_backups"', script)
+        self.assertNotIn('Join-Path $parentDir "_update_backups"', script)
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []
