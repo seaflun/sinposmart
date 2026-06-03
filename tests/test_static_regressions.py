@@ -51,6 +51,14 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("Remote VERSION.txt has an invalid version", script)
         self.assertIn("Update zip VERSION.txt has an invalid version", script)
 
+    def test_update_package_verifies_download_sha256(self) -> None:
+        script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("$remoteSha256Url", script)
+        self.assertIn("function Get-Sha256FromText", script)
+        self.assertIn("[0-9a-fA-F]{64}", script)
+        self.assertIn("Get-FileHash -LiteralPath $zipPath -Algorithm SHA256", script)
+        self.assertIn("Downloaded package SHA256 mismatch", script)
+
     def test_update_package_never_copies_sensitive_local_files(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("$alwaysSkipFiles = @(", script)

@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $remoteVersionUrl = "https://drive.google.com/uc?export=download&id=11iI5g_86MZG0Ck8PdngRjWz8V7fMuikp"
 $remoteZipUrl = "https://drive.google.com/uc?export=download&id=1DB6-0fFBaCciV5DaxeNfIqczwfKYhge0"
+$remoteSha256Url = "https://drive.google.com/uc?export=download&id=1BkYfrovbMw0Q9l3mGGPwTe-gIjTvnXev"
 
 $packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localVersionPath = Join-Path $packageDir "VERSION.txt"
@@ -33,6 +34,15 @@ function Test-VersionText {
         return $true
     }
     return $Version -match "^\d{4}\.\d{2}\.\d{2}\.\d{4}$"
+}
+
+function Get-Sha256FromText {
+    param([string]$Text)
+    $firstToken = ($Text.Trim().TrimStart([char]0xFEFF) -split "\s+")[0]
+    if ($firstToken -notmatch "^[0-9a-fA-F]{64}$") {
+        throw "Remote SHA256 file has an invalid hash: $firstToken"
+    }
+    return $firstToken.ToLowerInvariant()
 }
 
 function Copy-UpdateTree {
@@ -84,6 +94,7 @@ if (-not (Test-Path -LiteralPath $localVersionPath)) {
 
 $localVersion = (Get-Content -LiteralPath $localVersionPath -Raw -Encoding UTF8).Trim()
 $remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
+$remoteSha256 = Get-Sha256FromText -Text (Get-TextFromUrl -Url $remoteSha256Url)
 
 if (-not (Test-VersionText -Version $localVersion -AllowZero)) {
     throw "Local VERSION.txt has an invalid version: $localVersion"
@@ -109,6 +120,10 @@ try {
 
     if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
         throw "Downloaded package is missing or too small."
+    }
+    $downloadedSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($downloadedSha256 -ne $remoteSha256) {
+        throw "Downloaded package SHA256 mismatch. Expected $remoteSha256 but got $downloadedSha256."
     }
 
     $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
