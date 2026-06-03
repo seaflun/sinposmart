@@ -30,10 +30,12 @@ function Copy-UpdateTree {
     )
 
     $skipDirs = @("logs", "runtime_outputs", "tmp", "snapshots", "__pycache__", "artifacts")
-    $skipFiles = @(
+    $alwaysSkipFiles = @(
         "duty_sheet_legacy\config.json",
         "duty_sheet_legacy\effortless-leaf-353501-63492cc3ece4.json",
-        "daily_vehicle_legacy\.env",
+        "daily_vehicle_legacy\.env"
+    )
+    $preserveIfExistsFiles = @(
         "rest_time_automation_config.json"
     )
 
@@ -46,7 +48,11 @@ function Copy-UpdateTree {
             return
         }
         $target = Join-Path $DestDir $relative
-        if (($skipFiles -contains $relative) -and (Test-Path -LiteralPath $target)) {
+        if ($alwaysSkipFiles -contains $relative) {
+            Write-Host "Skipped local-only file: $relative"
+            return
+        }
+        if (($preserveIfExistsFiles -contains $relative) -and (Test-Path -LiteralPath $target)) {
             Write-Host "Preserved local file: $relative"
             return
         }

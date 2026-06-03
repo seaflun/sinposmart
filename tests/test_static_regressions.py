@@ -40,6 +40,14 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("Update version mismatch.", script)
         self.assertIn("$packageVersion | Set-Content", script)
 
+    def test_update_package_never_copies_sensitive_local_files(self) -> None:
+        script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("$alwaysSkipFiles = @(", script)
+        self.assertIn('"duty_sheet_legacy\\config.json"', script)
+        self.assertIn('"duty_sheet_legacy\\effortless-leaf-353501-63492cc3ece4.json"', script)
+        self.assertIn('"daily_vehicle_legacy\\.env"', script)
+        self.assertIn("if ($alwaysSkipFiles -contains $relative)", script)
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []
