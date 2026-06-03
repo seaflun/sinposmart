@@ -41,6 +41,18 @@ class StaticRegressionTests(unittest.TestCase):
             self.assertIn('self.log_trigger(index, self.duty_actions[index], trigger_type, status="skipped_duplicate", completion_key=completion_key)', source)
             self.assertIn('self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed")', source)
             self.assertIn('if record.get("status") not in ("manual_marked", "submitted", "skipped_duplicate"):', source)
+            self.assertIn('self.manual_completed_keys = self.restore_manual_completed_keys(data.get("target_date", ""), self.duty_actions)', source)
+            self.assertIn('self.manual_completed_keys = self.restore_manual_completed_keys(today_data.get("target_date", ""), self.duty_actions)', source)
+            self.assertIn("def should_count_as_next_duty_item", source)
+            self.assertIn('elif pending_previous:', source)
+            self.assertIn('self.next_task_text.set(f"前一班尚有 {pending_previous} 筆待手動處理")', source)
+            self.assertIn("def set_duty_status", source)
+            self.assertIn("def active_duty_status_override", source)
+            self.assertIn('self.set_duty_status("值班段落結束 5 分鐘，已自動登出。", hold_seconds=10)', source)
+            self.assertIn('elif status_override:', source)
+            self.assertIn('self.set_duty_status(compare_text, hold_seconds=6)', source)
+            self.assertIn('self.set_duty_status(f"登打失敗：{error}，結果：{result_path.name}{package_note}", hold_seconds=12)', source)
+            self.assertIn('self.duty_status_text.set(self.active_duty_status_override() or "")', source)
 
     def test_update_package_rejects_version_mismatch(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")

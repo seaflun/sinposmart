@@ -342,6 +342,8 @@ class DutyGui(tk.Tk):
         self.time_text = tk.StringVar(value="")
         self.next_task_text = tk.StringVar(value="下一項任務：-")
         self.duty_status_text = tk.StringVar(value="請先登入。")
+        self.duty_status_override_text = ""
+        self.duty_status_override_until: datetime | None = None
         self.summary_vars = {
             "todo": tk.StringVar(value="未找到 0"),
             "review": tk.StringVar(value="人工確認 0"),
@@ -1051,6 +1053,7 @@ class DutyGui(tk.Tk):
             self.duty_data = data
             self.duty_staff = self.staff
             self.duty_actions = data.get("actions", [])
+            self.manual_completed_keys = self.restore_manual_completed_keys(data.get("target_date", ""), self.duty_actions)
             self.duty_action_compare = self.apply_manual_completed_overrides(dict(self.action_compare), self.duty_actions)
             self.sync_session_actor_from_user_id()
         compare_note = "，已套用比對檔" if comparison_path(data.get("target_date", "")).exists() else ""
@@ -1306,6 +1309,26 @@ class DutyGui(tk.Tk):
             if self.action_completion_key(action) in self.manual_completed_keys:
                 compare[index] = {"compare": "已手動登打", "group": "done", "matched": []}
         return compare
+
+    def clear_duty_status_override(self) -> None:
+        self.duty_status_override_text = ""
+        self.duty_status_override_until = None
+
+    def set_duty_status(self, text: str, hold_seconds: int = 0) -> None:
+        self.duty_status_text.set(text)
+        if hold_seconds > 0:
+            self.duty_status_override_text = text
+            self.duty_status_override_until = datetime.now() + timedelta(seconds=hold_seconds)
+        else:
+            self.clear_duty_status_override()
+
+    def active_duty_status_override(self) -> str:
+        if not self.duty_status_override_text or self.duty_status_override_until is None:
+            return ""
+        if datetime.now() >= self.duty_status_override_until:
+            self.clear_duty_status_override()
+            return ""
+        return self.duty_status_override_text
 
     def restore_manual_completed_keys(self, target_roc_date: str, actions: list[dict[str, Any]]) -> set[str]:
         log_path = Path("duty_trigger_log.jsonl")
@@ -1863,6 +1886,7 @@ class DutyGui(tk.Tk):
                         self.duty_data = today_data
                         self.duty_staff = {**today_data.get("yesterday", {}).get("staff", {}), **today_data.get("today", {}).get("staff", {})}
                         self.duty_actions = today_data.get("actions", [])
+                        self.manual_completed_keys = self.restore_manual_completed_keys(today_data.get("target_date", ""), self.duty_actions)
                         self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(today_data), self.duty_actions)
                         self.sync_session_actor_from_user_id()
                         self.refresh_duty_tasks()
@@ -2030,6 +2054,7 @@ class DutyGui(tk.Tk):
             return
         self.login_running = False
         self.set_login_buttons_enabled(True)
+        self.clear_duty_status_override()
         self.executed_due.clear()
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
@@ -2183,7 +2208,7 @@ class DutyGui(tk.Tk):
         label = self.logged_in_identity_label(expected_actor)
         self.clear_login()
         self.login_status.set(f"已自動登出：{label}")
-        self.duty_status_text.set("值班段落結束 5 分鐘，已自動登出。")
+        self.set_duty_status("值班段落結束 5 分鐘，已自動登出。", hold_seconds=10)
         self.notify_user(APP_DISPLAY_NAME, f"{label} 已自動登出")
 
     def set_logged_in_status(self, actor_no: str) -> None:
@@ -2207,6 +2232,7 @@ class DutyGui(tk.Tk):
 
     def clear_login(self) -> None:
         self.cancel_auto_logout()
+        self.clear_duty_status_override()
         self.session = None
         self.executed_due.clear()
         self.manual_completed_keys.clear()
@@ -2628,6 +2654,21 @@ class DutyGui(tk.Tk):
             return "未返隊，暫停登打"
         return ""
 
+    def should_count_as_next_duty_item(
+        self,
+        index: int,
+        action: dict[str, Any],
+        compare: dict[str, Any],
+        actor_no: str,
+    ) -> bool:
+        if not actor_no or str(action.get("actor", "")) != str(actor_no):
+            return False
+        if index in self.submitting_indices or index in self.executed_due or index in self.paused_due_indices:
+            return False
+        if compare.get("group") in ("done", "manual"):
+            return False
+        return self.is_auto_duty_action(action)
+
     def refresh_duty_tasks(self) -> None:
         if not hasattr(self, "duty_tree"):
             return
@@ -2635,18 +2676,19 @@ class DutyGui(tk.Tk):
         self.duty_tree.delete(*self.duty_tree.get_children())
         if self.logout_cleared and not (self.session and self.session.verified):
             self.next_task_text.set("下一項任務：-")
-            self.duty_status_text.set("")
+            self.duty_status_text.set(self.active_duty_status_override() or "")
             return
         now = datetime.now()
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         next_item = None
+        pending_previous = self.pending_previous_duty_count(actor_no) if actor_no else 0
         for index in self.duty_task_indices():
             action = self.duty_actions[index]
             is_previous_actor_item = actor_no and str(action.get("actor", "")) != str(actor_no)
             action_at = self.action_datetime(action)
-            if next_item is None and action_at >= now:
-                next_item = action
             compare = self.duty_action_compare.get(index, {})
+            if next_item is None and self.should_count_as_next_duty_item(index, action, compare, actor_no):
+                next_item = action
             if index in self.submitting_indices:
                 status = "正在登打"
                 tag = "ready"
@@ -2690,10 +2732,12 @@ class DutyGui(tk.Tk):
             next_at = self.action_datetime(next_item)
             delta = max(0, int((next_at - now).total_seconds() // 60))
             self.next_task_text.set(f"{self.action_display_time(next_item)}  {self.action_summary(next_item)}，約 {delta} 分鐘後")
+        elif pending_previous:
+            self.next_task_text.set(f"前一班尚有 {pending_previous} 筆待手動處理")
         else:
             self.next_task_text.set("今日目前沒有未完成的當班任務")
+        status_override = self.active_duty_status_override()
         if self.session and self.session.verified:
-            pending_previous = self.pending_previous_duty_count(actor_no)
             if self.submitting_indices:
                 self.duty_status_text.set("正在登打")
             elif self.paused_due_indices:
@@ -2702,10 +2746,12 @@ class DutyGui(tk.Tk):
                 self.duty_status_text.set(f"本段已完成，預計 {self.auto_logout_deadline:%H:%M} 自動登出。")
             elif pending_previous:
                 self.duty_status_text.set(f"前一班未登打 {pending_previous} 筆，請先處理；其餘工作與自動出入會到點執行。")
+            elif status_override:
+                self.duty_status_text.set(status_override)
             else:
                 self.duty_status_text.set("登入有效；工作、值班、值退、到勤、退勤、休息後退勤會自動執行。")
         elif self.logout_cleared:
-            self.duty_status_text.set("")
+            self.duty_status_text.set(status_override or "")
         else:
             self.duty_status_text.set("尚未登入，所有任務不執行。")
 
@@ -2794,7 +2840,7 @@ class DutyGui(tk.Tk):
         self.log_trigger(index, self.duty_actions[index], "manual", status="manual_marked")
         self.executed_due.add(index)
         self.manual_completed_keys.add(self.action_completion_key(self.duty_actions[index]))
-        self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.duty_actions[index])}")
+        self.set_duty_status(f"已記錄待接線：{self.duty_action_summary(self.duty_actions[index])}", hold_seconds=8)
         self.refresh_duty_tasks()
 
     # Submit pipeline
@@ -2828,7 +2874,7 @@ class DutyGui(tk.Tk):
             return
         for index, action in sorted(selected_actions, key=lambda item: self.submit_order_key(item[0], item[1])):
             self.submit_duty_action(index, action, save=save, visible=visible, confirm=False, notify=False, trigger_type="manual")
-        self.duty_status_text.set(f"已加入手動登打佇列：{len(selected_actions)} 筆")
+        self.set_duty_status(f"已加入手動登打佇列：{len(selected_actions)} 筆", hold_seconds=6)
 
     def submit_duty_action(self, index: int, action: dict[str, Any], save: bool, visible: bool, confirm: bool, notify: bool, trigger_type: str = "manual") -> None:
         if not self.session or not self.session.verified:
@@ -3053,7 +3099,7 @@ class DutyGui(tk.Tk):
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
         self.duty_action_compare[index] = {"compare": compare_text, "group": "done", "matched": []}
-        self.duty_status_text.set(compare_text)
+        self.set_duty_status(compare_text, hold_seconds=6)
         if trigger_type != "manual":
             self.notify_user(APP_DISPLAY_NAME, f"完成：{self.notification_action_summary(self.duty_actions[index])}")
         if notify:
@@ -3075,7 +3121,7 @@ class DutyGui(tk.Tk):
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
         self.duty_action_compare[index] = {"compare": "已存在", "group": "done", "matched": []}
-        self.duty_status_text.set(f"已存在，略過登打：{result_path.name}")
+        self.set_duty_status(f"已存在，略過登打：{result_path.name}", hold_seconds=8)
         self.notify_user(APP_DISPLAY_NAME, f"已存在略過：{self.notification_action_summary(self.duty_actions[index])}")
         if notify:
             messagebox.showinfo("防重複", f"查詢到既有紀錄，已略過登打。\n\n結果檔：{result_path.name}")
@@ -3095,7 +3141,7 @@ class DutyGui(tk.Tk):
             package_note = f"，問題包：{package_path.name}"
         except Exception:
             package_note = ""
-        self.duty_status_text.set(f"登打失敗：{error}，結果：{result_path.name}{package_note}")
+        self.set_duty_status(f"登打失敗：{error}，結果：{result_path.name}{package_note}", hold_seconds=12)
         self.notify_user(APP_DISPLAY_NAME, f"登打失敗：{error}\n結果：{result_path.name}{package_note}", duration_ms=6500)
         if notify:
             messagebox.showerror("登打失敗", f"{error}\n\n結果檔：{result_path.name}{package_note}")
