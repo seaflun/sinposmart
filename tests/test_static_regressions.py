@@ -80,6 +80,11 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn('$backupDir = Join-Path $backupRoot "update_backups"', script)
         self.assertNotIn('Join-Path $parentDir "_update_backups"', script)
 
+    def test_no_console_launcher_uses_batch_python_detection(self) -> None:
+        script = (PROJECT_ROOT / "start_duty_gui_no_console.vbs").read_text(encoding="utf-8-sig")
+        self.assertIn("start_duty_gui.bat", script)
+        self.assertNotIn("pythonw.exe", script.lower())
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []
