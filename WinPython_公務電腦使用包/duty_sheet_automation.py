@@ -60,10 +60,17 @@ def legacy_workdir(project_dir: Path) -> Iterator[None]:
 
 def load_legacy_module(project_dir: Path) -> ModuleType:
     module_name = "_sinposmart_duty_sheet_automation"
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
     script_path = project_dir / LEGACY_SCRIPT
+    source_mtime = script_path.stat().st_mtime
+    existing = sys.modules.get(module_name)
+    if (
+        existing is not None
+        and getattr(existing, "__sinposmart_source_path__", None) == str(script_path)
+        and getattr(existing, "__sinposmart_source_mtime__", None) == source_mtime
+    ):
+        return existing
+    sys.modules.pop(module_name, None)
+    importlib.invalidate_caches()
     spec = importlib.util.spec_from_file_location(module_name, script_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"無法載入勤務表自動化腳本：{script_path}")
@@ -73,6 +80,8 @@ def load_legacy_module(project_dir: Path) -> ModuleType:
     try:
         with legacy_workdir(project_dir):
             spec.loader.exec_module(module)
+        module.__sinposmart_source_path__ = str(script_path)
+        module.__sinposmart_source_mtime__ = source_mtime
     finally:
         try:
             sys.path.remove(str(project_dir))
@@ -240,6 +249,13 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
     def set_status(message: str) -> None:
         status_var.set(message)
 
+    def run_on_dialog(callback) -> None:
+        try:
+            if dialog.winfo_exists():
+                dialog.after(0, lambda: callback() if dialog.winfo_exists() else None)
+        except tk.TclError:
+            pass
+
     def run_automation() -> None:
         uid = user_var.get().strip()
         pwd = password_var.get()
@@ -279,13 +295,13 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
                 success = True
             except Exception as exc:
                 error = str(exc)
-                dialog.after(0, lambda: messagebox.showerror("勤務表登打失敗", error, parent=dialog))
-                dialog.after(0, lambda: set_status(f"失敗：{error}"))
+                run_on_dialog(lambda: messagebox.showerror("勤務表登打失敗", error, parent=dialog))
+                run_on_dialog(lambda: set_status(f"失敗：{error}"))
             finally:
                 if success:
-                    dialog.after(0, close_dialog)
+                    run_on_dialog(close_dialog)
                 else:
-                    dialog.after(0, lambda: start_button.configure(state=tk.NORMAL, text="啟動登打"))
+                    run_on_dialog(lambda: start_button.configure(state=tk.NORMAL, text="啟動登打"))
 
         threading.Thread(target=worker, daemon=True).start()
 

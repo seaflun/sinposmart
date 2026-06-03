@@ -32,6 +32,12 @@ BASE_URL = "https://dutymgt.tyfd.gov.tw/tyfd119"
 
 DUTY_TABLE_AP = "wap119.RPS105020"
 ENTRY_LOG_AP = "wap119.RPS04040"
+ENTRY_OUTIN_VALUE_MAP = {
+    "出": "O",
+    "入": "I",
+    "值班": "I2",
+    "值退": "I3",
+}
 WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 
@@ -931,7 +937,7 @@ def fill_entry_log_form_for_test(
             "title_text": "",
             "outin": fields.get("出或入", ""),
             "outin_text": fields.get("出或入", ""),
-            "outin_value": "I3" if fields.get("出或入", "") == "值退" else "",
+            "outin_value": ENTRY_OUTIN_VALUE_MAP.get(fields.get("出或入", ""), ""),
             "radio": fields.get("手提無線電編號", ""),
             "returned": fields.get("是否歸還", ""),
         },
@@ -1472,8 +1478,9 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
                     block_end = next_end
                     probe = next_end
             blocks.append((no, block_start, block_end))
+    final_end = slot_end(ordered_rows[-1].slot) if ordered_rows else None
     for no, block_start in active.items():
-        blocks.append((no, block_start, None))
+        blocks.append((no, block_start, final_end))
     return blocks
 
 
@@ -1802,7 +1809,7 @@ def planned_actions(
         if rest_is_external_route(today, no, start, end):
             continue
         start_offset = 1 if start < 8 else 0
-        end_offset = 1 if end is not None and end <= 8 else 0
+        end_offset = 1 if end is not None and (end <= 8 or end == 24) else 0
         if start == 6 and start_offset == 1 and tomorrow and no not in set(tomorrow.summary.get("在勤", [])):
             continue
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
@@ -1829,23 +1836,25 @@ def planned_actions(
             continue
         if end_offset and start == 6:
             continue
+        end_hour = 0 if end == 24 else end
+        end_time = f"{end_hour:02d}:00"
         end_actor = next_morning_entry_actor(today, end) if end_offset else entry_actor_at(today, yesterday, end, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
-                time=f"{end:02d}:00",
+                time=end_time,
                 actor=end_actor,
                 target=no,
                 fields={
-                    "登打時間": f"{end:02d}:00",
-                    "系統寫入時間": f"{end:02d}:00",
+                    "登打時間": end_time,
+                    "系統寫入時間": end_time,
                     "出或入": "入",
                     "領用事由及地點": "休息返隊",
                     "手提無線電編號": "",
                     "是否歸還": "",
                 },
                 source="休息結束",
-                duplicate_key=f"entry:{target}:{end}:in:{no}:休息返隊",
+                duplicate_key=f"entry:{target}:{end_hour}:in:{no}:休息返隊",
                 date_offset=end_offset,
             )
         )

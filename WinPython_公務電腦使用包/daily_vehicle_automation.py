@@ -19,6 +19,7 @@ AUTOMATION_SCRIPT = Path("automation") / "ppe_selenium_daily.py"
 ENV_EXAMPLE = ".env.example"
 RUNNING_PID_FILE = ".daily_vehicle_runner.pid"
 WINDOW_TITLE = "SinpoSmart - 車輛保養清點"
+OUTPUT_TAIL_LIMIT = 3000
 
 _RUNNING_PROJECTS: set[str] = set()
 _RUNNING_LOCK = threading.Lock()
@@ -63,9 +64,13 @@ def load_dotenv_like(path: Path) -> dict[str, str]:
     return values
 
 
-def write_env_file(path: Path, values: dict[str, str]) -> None:
-    lines = [f"{key}={value}" for key, value in values.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def output_tail(output: str, limit: int = OUTPUT_TAIL_LIMIT) -> str:
+    output = (output or "").strip()
+    if not output:
+        return "沒有輸出內容。"
+    if len(output) <= limit:
+        return output
+    return "...\n" + output[-limit:]
 
 
 def running_pid_path(project_dir: Path) -> Path:
@@ -166,9 +171,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
     if not messagebox.askyesno(WINDOW_TITLE, "將開啟瀏覽器執行車輛保養清點，是否繼續？", parent=parent):
         return
 
-    env_path = project_dir / ".env"
     default_env = load_dotenv_like(project_dir / ENV_EXAMPLE)
-    current_env = {**default_env, **load_dotenv_like(env_path)}
+    current_env = {**default_env, **load_dotenv_like(project_dir / ".env")}
     env_values = {
         **current_env,
         "PPE_ACCOUNT": account,
@@ -177,10 +181,16 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
         "KEEP_BROWSER_OPEN": "true",
         "SELENIUM_REMOTE_URL": "",
     }
-    write_env_file(env_path, env_values)
 
     command = [sys.executable, "-u", str(script_path)]
     set_running(project_dir, True)
+
+    def run_on_parent(callback) -> None:
+        try:
+            if parent.winfo_exists():
+                parent.after(0, lambda: callback() if parent.winfo_exists() else None)
+        except tk.TclError:
+            pass
 
     def worker() -> None:
         process: subprocess.Popen[str] | None = None
@@ -188,18 +198,24 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
             process = subprocess.Popen(
                 command,
                 cwd=project_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 env={**os.environ, **env_values},
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             set_running(project_dir, True, process.pid)
-            return_code = process.wait()
+            output, _ = process.communicate()
+            return_code = process.returncode
             if return_code == 0:
-                parent.after(0, lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
+                run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
-                parent.after(0, lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點執行失敗，代碼：{return_code}", parent=parent))
+                detail = output_tail(output)
+                run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點執行失敗，代碼：{return_code}\n\n輸出尾端：\n{detail}", parent=parent))
         except Exception as exc:
-            parent.after(0, lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點啟動失敗：{exc}", parent=parent))
+            error = str(exc)
+            run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點啟動失敗：{error}", parent=parent))
         finally:
             set_running(project_dir, False, process.pid if process else None)
 

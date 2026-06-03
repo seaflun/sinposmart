@@ -45,12 +45,12 @@ function Copy-UpdateTree {
         if ($parts | Where-Object { $skipDirs -contains $_ }) {
             return
         }
-        if ($skipFiles -contains $relative) {
+        $target = Join-Path $DestDir $relative
+        if (($skipFiles -contains $relative) -and (Test-Path -LiteralPath $target)) {
             Write-Host "Preserved local file: $relative"
             return
         }
 
-        $target = Join-Path $DestDir $relative
         $targetDir = Split-Path -Parent $target
         if (-not (Test-Path -LiteralPath $targetDir)) {
             New-Item -ItemType Directory -Path $targetDir | Out-Null
@@ -95,7 +95,10 @@ Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
 $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
     Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.py") } |
     Select-Object -First 1 -ExpandProperty FullName
-if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.py"))) {
+    $sourceDir = $extractDir
+}
+if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
     throw "Update zip does not contain a valid package folder."
 }
 

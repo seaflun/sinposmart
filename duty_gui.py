@@ -82,6 +82,7 @@ except Exception:
 
 from compare_rehearsal_records import (
     build_case_work_audits,
+    find_arrival_entry_exists,
     find_entry_matches,
     find_case_work_matches,
     find_work_matches,
@@ -360,6 +361,7 @@ class DutyGui(tk.Tk):
         self.executed_due: set[int] = set()
         self.manual_completed_keys: set[str] = set()
         self.paused_due_indices: dict[int, str] = {}
+        self.failed_due_retry_after: dict[int, datetime] = {}
         self.submitting_indices: set[int] = set()
         self.submit_queue: list[tuple[int, dict[str, Any], bool, bool, bool, str]] = []
         self.submit_worker_running = False
@@ -377,6 +379,7 @@ class DutyGui(tk.Tk):
         self.snapshot_completed_slots: set[str] = set()
         self.comparison_running = False
         self.comparison_completed_hours: set[str] = set()
+        self.pending_hourly_comparison: tuple[str, str, list[str], str, str] | None = None
         self.logout_cleared = False
         self.auto_logout_after_id: str | None = None
         self.auto_logout_deadline: datetime | None = None
@@ -1085,6 +1088,12 @@ class DutyGui(tk.Tk):
         reason = fields.get("領用事由及地點", "")
         outin = fields.get("出或入", "")
         system_time = fields.get("系統寫入時間", action.get("time", ""))
+        try:
+            hour, minute = [int(part) for part in system_time.split(":", 1)]
+            if hour >= 24:
+                system_time = f"{hour % 24:02d}:{minute:02d}"
+        except ValueError:
+            pass
         target_name = self.staff.get(str(action.get("target", "")), {}).get("name", "")
         acceptable_reasons = ("休息返隊", "返隊") if reason == "休息返隊" else (reason,)
         matches = []
@@ -1109,8 +1118,10 @@ class DutyGui(tk.Tk):
                     continue
                 if str(candidate.get("target", "")) != str(action.get("target", "")):
                     continue
-                if self.action_target_roc_date(candidate, target_date) != action_date:
-                    continue
+                candidate_date = self.action_target_roc_date(candidate, target_date)
+                if candidate_date != action_date:
+                    rest_out_exists = True
+                    break
                 if self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=False) or self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=True):
                     rest_out_exists = True
                     break
@@ -1231,9 +1242,12 @@ class DutyGui(tk.Tk):
                     result[index] = self.compare_rest_entry(actions, action, action_date, entry_rows, target_date)
                     continue
                 exact = find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=False)
+                arrival_exists = [] if exact else find_arrival_entry_exists(entry_rows, action_date, self.staff, action)
                 near = [] if exact else find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=True)
                 if exact:
                     result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
+                elif arrival_exists:
+                    result[index] = {"compare": "已存在(時間不同)", "group": "done", "matched": arrival_exists[:1]}
                 elif is_possible_handoff_adjustment(entry_rows, action_date, self.staff, action):
                     result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
                 elif near:
@@ -1796,6 +1810,8 @@ class DutyGui(tk.Tk):
 
     def _schedule_succeeded(self, actor_no: str, user_id: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.snapshot_running = False
+        if not self.current_session_matches(user_id):
+            return
         self.snapshot_completed_slots.add(key)
         today_path = next((path for path in paths if path.exists() and path.name == schedule_path(duty_business_roc_date()).name), None)
         if today_path:
@@ -1823,7 +1839,7 @@ class DutyGui(tk.Tk):
                         self.refresh_duty_tasks()
                 except Exception:
                     pass
-        if self.session and self.session.verified and self.session.user_id == user_id:
+        if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         selected_date = "".join(ch for ch in self.audit_date.get() if ch.isdigit())
         selected_path = next((path for path in paths if path.exists() and path.name == schedule_path(selected_date).name), None)
@@ -1833,7 +1849,7 @@ class DutyGui(tk.Tk):
 
     def _schedule_failed(self, actor_no: str, user_id: str, error: str) -> None:
         self.snapshot_running = False
-        if self.session and self.session.verified and self.session.user_id == user_id:
+        if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
 
     def check_hourly_comparison(self) -> None:
@@ -1843,7 +1859,11 @@ class DutyGui(tk.Tk):
                 target_roc_date = duty_business_roc_date()
                 key = f"comparison-{target_roc_date}-{now:%Y%m%d%H}"
                 if key not in self.comparison_completed_hours:
-                    self.refresh_comparison_background(target_roc_date, f"{now:%H}00", comparison_dates=duty_window_dates(target_roc_date))
+                    comparison_dates = duty_window_dates(target_roc_date)
+                    if self.comparison_running:
+                        self.pending_hourly_comparison = (target_roc_date, f"{now:%H}00", comparison_dates, self.session.user_id, key)
+                    else:
+                        self.refresh_comparison_background(target_roc_date, f"{now:%H}00", comparison_dates=comparison_dates, completion_key=key)
         finally:
             self.after(60000, self.check_hourly_comparison)
 
@@ -1864,11 +1884,24 @@ class DutyGui(tk.Tk):
         self.refresh_schedule_background(target_roc_date, "manual-refresh", target_dates=[target_roc_date])
         self.refresh_comparison_background(target_roc_date, "manual-refresh", comparison_dates=duty_window_dates(target_roc_date))
 
-    def refresh_comparison_background(self, target_roc_date: str, slot_label: str, comparison_dates: list[str] | None = None) -> None:
+    def current_session_matches(self, user_id: str) -> bool:
+        return bool(self.session and self.session.verified and self.session.user_id == user_id)
+
+    def run_pending_hourly_comparison(self) -> None:
+        pending = self.pending_hourly_comparison
+        if not pending or self.comparison_running:
+            return
+        target_roc_date, slot_label, comparison_dates, user_id, key = pending
+        self.pending_hourly_comparison = None
+        if not self.current_session_matches(user_id) or key in self.comparison_completed_hours:
+            return
+        self.refresh_comparison_background(target_roc_date, slot_label, comparison_dates=comparison_dates, completion_key=key)
+
+    def refresh_comparison_background(self, target_roc_date: str, slot_label: str, comparison_dates: list[str] | None = None, completion_key: str | None = None) -> None:
         if self.comparison_running or not (self.session and self.session.verified):
             return
         session = self.session
-        key = f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
+        key = completion_key or f"comparison-{target_roc_date}-{datetime.now():%Y%m%d%H}"
         comparison_dates = comparison_dates or self.comparison_target_dates(target_roc_date)
         self.comparison_running = True
         self.set_logged_in_status(session.actor_no)
@@ -1904,6 +1937,9 @@ class DutyGui(tk.Tk):
 
     def _comparison_succeeded(self, actor_no: str, user_id: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.comparison_running = False
+        if not self.current_session_matches(user_id):
+            self.run_pending_hourly_comparison()
+            return
         self.comparison_completed_hours.add(key)
         if any(path.exists() for path in paths) and self.data.get("target_date") == target_roc_date:
             self.action_compare = self.build_comparison(self.data)
@@ -1911,13 +1947,15 @@ class DutyGui(tk.Tk):
         if any(path.exists() for path in paths) and self.duty_data.get("target_date") == target_roc_date:
             self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
             self.refresh_duty_tasks()
-        if self.session and self.session.verified and self.session.user_id == user_id:
+        if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
+        self.run_pending_hourly_comparison()
 
     def _comparison_failed(self, actor_no: str, user_id: str, error: str) -> None:
         self.comparison_running = False
-        if self.session and self.session.verified and self.session.user_id == user_id:
+        if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
+        self.run_pending_hourly_comparison()
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
         texts = [self.page_identity_text(driver)]
@@ -1966,8 +2004,10 @@ class DutyGui(tk.Tk):
         self.executed_due.clear()
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
+        self.failed_due_retry_after.clear()
         self.submit_queue.clear()
         self.submit_worker_running = False
+        self.pending_hourly_comparison = None
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates.clear()
         self.submit_comparison_refresh_scheduled = False
@@ -2140,8 +2180,10 @@ class DutyGui(tk.Tk):
         self.executed_due.clear()
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
+        self.failed_due_retry_after.clear()
         self.submit_queue.clear()
         self.submit_worker_running = False
+        self.pending_hourly_comparison = None
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates.clear()
         self.submit_comparison_refresh_scheduled = False
@@ -2256,6 +2298,24 @@ class DutyGui(tk.Tk):
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
+    def show_desktop(self) -> None:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            try:
+                shell_app = win32com.client.Dispatch("Shell.Application")
+                try:
+                    shell_app.MinimizeAll()
+                except Exception:
+                    shell_app.ToggleDesktop()
+            finally:
+                pythoncom.CoUninitialize()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
     def open_folder_topmost(self, folder: Path) -> None:
         folder = folder.resolve()
         try:
@@ -2303,6 +2363,7 @@ class DutyGui(tk.Tk):
         if slot_key in self.opened_screenshot_folder_slots:
             return
         self.opened_screenshot_folder_slots.add(slot_key)
+        self.show_desktop()
         self.open_folder_topmost(self.screenshot_folder_path(folder_name))
 
     def duty_task_indices(self) -> list[int]:
@@ -2360,11 +2421,12 @@ class DutyGui(tk.Tk):
             hour, minute = [int(part) for part in value.split(":", 1)]
         except ValueError:
             hour, minute = 0, 0
+        extra_days, hour = divmod(hour, 24)
         try:
             base_date = parse_roc_date(self.duty_data.get("target_date") or today_roc_date())
         except ValueError:
             base_date = date.today()
-        offset = int(action.get("date_offset", 0) or 0)
+        offset = int(action.get("date_offset", 0) or 0) + extra_days
         target_date = base_date + timedelta(days=offset)
         return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
 
@@ -2378,7 +2440,13 @@ class DutyGui(tk.Tk):
             base_date = parse_roc_date(base_target_date)
         except ValueError:
             base_date = date.today()
-        action_date = base_date + timedelta(days=int(action.get("date_offset", 0) or 0))
+        try:
+            hour = int(value.split(":", 1)[0])
+        except ValueError:
+            hour = 0
+        action_date = base_date + timedelta(days=int(action.get("date_offset", 0) or 0) + hour // 24)
+        if hour >= 24:
+            value = f"{hour % 24:02d}:{value.split(':', 1)[1]}"
         return f"{action_date.day}日 {value}" if action_date != base_date else value
 
     def action_target_roc_date(self, action: dict[str, Any], base_target_date: str | None = None) -> str:
@@ -2386,7 +2454,12 @@ class DutyGui(tk.Tk):
             base_date = parse_roc_date(base_target_date or self.duty_data.get("target_date") or today_roc_date())
         except ValueError:
             base_date = date.today()
-        offset = int(action.get("date_offset", 0) or 0)
+        value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
+        try:
+            extra_days = int(value.split(":", 1)[0]) // 24
+        except ValueError:
+            extra_days = 0
+        offset = int(action.get("date_offset", 0) or 0) + extra_days
         return roc_date(base_date + timedelta(days=offset))
 
     def submit_order_key(self, index: int, action: dict[str, Any]) -> tuple[datetime, int]:
@@ -2551,7 +2624,8 @@ class DutyGui(tk.Tk):
                 status = "暫停"
                 tag = "manual"
             elif index in self.executed_due:
-                status = "已手動登打"
+                completion_key = self.action_completion_key(action)
+                status = "已手動登打" if completion_key in self.manual_completed_keys else "已登打"
                 tag = "triggered"
             elif is_previous_actor_item:
                 status = "前班手動"
@@ -2642,12 +2716,20 @@ class DutyGui(tk.Tk):
         for index in self.duty_task_indices():
             if index in self.executed_due or index in self.submitting_indices:
                 continue
+            retry_after = self.failed_due_retry_after.get(index)
+            if retry_after and now < retry_after:
+                continue
+            if retry_after and now >= retry_after:
+                self.failed_due_retry_after.pop(index, None)
             action = self.duty_actions[index]
             if action.get("kind") not in ("work_log", "entry_log"):
                 continue
             if str(action.get("actor", "")) != str(self.session.actor_no):
                 continue
             compare = self.duty_action_compare.get(index, {})
+            if compare.get("group") == "done":
+                self.executed_due.add(index)
+                continue
             if compare.get("group") == "manual" or not self.is_auto_duty_action(action):
                 continue
             action_at = self.action_datetime(action)
@@ -2678,6 +2760,7 @@ class DutyGui(tk.Tk):
             return
         self.log_trigger(index, self.duty_actions[index], "manual")
         self.executed_due.add(index)
+        self.manual_completed_keys.add(self.action_completion_key(self.duty_actions[index]))
         self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.duty_actions[index])}")
         self.refresh_duty_tasks()
 
@@ -2755,6 +2838,9 @@ class DutyGui(tk.Tk):
             "action_index": index,
             "action": action,
             "user_id": self.session.user_id,
+            "process_id": os.getpid(),
+            "executable": sys.executable,
+            "cwd": str(Path.cwd()),
             "summary": self.duty_action_summary(action),
             "save": save,
             "visible": visible,
@@ -2913,7 +2999,7 @@ class DutyGui(tk.Tk):
                 "visible": job_visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify))
+            self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify, trigger_type))
         finally:
             if driver:
                 driver.quit()
@@ -2925,7 +3011,10 @@ class DutyGui(tk.Tk):
         if trigger_type == "manual":
             self.executed_due.add(index)
             self.manual_completed_keys.add(self.action_completion_key(self.duty_actions[index]))
-        elif self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
+        elif trigger_type == "due":
+            self.executed_due.add(index)
+        self.failed_due_retry_after.pop(index, None)
+        if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
         self.duty_action_compare[index] = {"compare": compare_text, "group": "done", "matched": []}
         self.duty_status_text.set(compare_text)
@@ -2942,6 +3031,7 @@ class DutyGui(tk.Tk):
     def _save_work_log_item_skipped_duplicate(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
         self.executed_due.add(index)
+        self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
         self.duty_action_compare[index] = {"compare": "已存在", "group": "done", "matched": []}
@@ -2955,8 +3045,10 @@ class DutyGui(tk.Tk):
         self.refresh_duty_tasks()
         self.refresh_tasks()
 
-    def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool) -> None:
+    def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
+        if trigger_type == "due":
+            self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)
         try:
             package_path = self.export_issue_package(result_path=result_path, error=error, show_dialog=False)
             package_note = f"，問題包：{package_path.name}"
@@ -3008,6 +3100,9 @@ class DutyGui(tk.Tk):
             "source": action.get("source", ""),
             "target": action.get("target", ""),
             "fields": action.get("fields", {}),
+            "process_id": os.getpid(),
+            "executable": sys.executable,
+            "cwd": str(Path.cwd()),
             "status": "pending_write_automation",
         }
         with Path("duty_trigger_log.jsonl").open("a", encoding="utf-8") as f:

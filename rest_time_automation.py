@@ -31,6 +31,7 @@ from duty_rehearsal import build_driver, js_click, login, open_ap
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
 RETAINED_DRIVERS: list[object] = []
+MAX_RETAINED_DRIVERS = 1
 MONTHLY_BASE_SHEET_ID = "1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0"
 MONTHLY_BASE_SHEET_GID = "1587057625"
 MONTHLY_BASE_EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?{query}"
@@ -183,8 +184,15 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     def set_running(running: bool) -> None:
         start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
 
+    def run_on_dialog(callback: Callable[[], None]) -> None:
+        try:
+            if dialog.winfo_exists():
+                dialog.after(0, lambda: callback() if dialog.winfo_exists() else None)
+        except tk.TclError:
+            pass
+
     def set_status(message: str) -> None:
-        dialog.after(0, lambda: status_var.set(message))
+        run_on_dialog(lambda: status_var.set(message))
 
     def run_automation() -> None:
         uid = user_id.strip()
@@ -203,14 +211,13 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         def worker() -> None:
             try:
                 result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no)
-                dialog.after(0, lambda: show_complete_and_close(result))
-                set_status(result)
+                run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 error = str(exc)
-                dialog.after(0, lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
+                run_on_dialog(lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
-                dialog.after(0, lambda: set_running(False))
+                run_on_dialog(lambda: set_running(False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -307,8 +314,15 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
     def set_running(running: bool) -> None:
         start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
 
+    def run_on_dialog(callback: Callable[[], None]) -> None:
+        try:
+            if dialog.winfo_exists():
+                dialog.after(0, lambda: callback() if dialog.winfo_exists() else None)
+        except tk.TclError:
+            pass
+
     def set_status(message: str) -> None:
-        dialog.after(0, lambda: status_var.set(message))
+        run_on_dialog(lambda: status_var.set(message))
 
     def show_complete_and_close(result: str) -> None:
         messagebox.showinfo("完成", result, parent=dialog)
@@ -330,14 +344,13 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         def worker() -> None:
             try:
                 result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True)
-                dialog.after(0, lambda: show_complete_and_close(result))
-                set_status(result)
+                run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 error = format_automation_error(exc)
-                dialog.after(0, lambda: messagebox.showerror("每月基準表登打失敗", error, parent=dialog))
+                run_on_dialog(lambda: messagebox.showerror("每月基準表登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
-                dialog.after(0, lambda: set_running(False))
+                run_on_dialog(lambda: set_running(False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -400,6 +413,16 @@ def save_last_workbook_path(path: Path) -> None:
         pass
 
 
+def retain_driver(driver: object) -> None:
+    RETAINED_DRIVERS.append(driver)
+    while len(RETAINED_DRIVERS) > MAX_RETAINED_DRIVERS:
+        old_driver = RETAINED_DRIVERS.pop(0)
+        try:
+            old_driver.quit()
+        except Exception:
+            pass
+
+
 def submit_rest_entries(
     user_id: str,
     password: str,
@@ -440,7 +463,7 @@ def submit_rest_entries(
         close_current_popup(driver)
         click_person_save(driver, person.staff_no)
         if keep_browser_open:
-            RETAINED_DRIVERS.append(driver)
+            retain_driver(driver)
         success = True
         return f"完成：新增 {inserted} 筆，略過已存在 {skipped} 筆，刪除重複休息 {deleted_duplicates} 筆，已按個人儲存。"
     finally:
@@ -474,7 +497,7 @@ def submit_monthly_base_entries(
         status(f"已填入 {filled} 格，按個人儲存...")
         click_person_row_save(driver, plan.name)
         if keep_browser_open:
-            RETAINED_DRIVERS.append(driver)
+            retain_driver(driver)
         success = True
         return f"完成：{plan.roc_year}年{plan.month:02d}月 {plan.name} 已填入 {filled} 格並個人儲存。"
     finally:
@@ -507,33 +530,36 @@ def delete_duplicate_rest_rows(driver, status: Callable[[str], None]) -> int:
 
 def parse_rest_entries(workbook_path: Path, target_name: str | None = None, target_no: str | None = None) -> list[RestEntry]:
     wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
-    _year, _month, days = workbook_date_info(wb)
-    person_no = workbook_person_no(wb, target_name)
-    if target_name and not person_no:
-        raise RuntimeError(f"勤務表輪休表找不到 {target_name} 的番號，已停止避免用勤務系統列編號誤打。")
-    person_no = person_no or target_no
-    if not person_no:
-        raise RuntimeError("無法從勤務表判斷登入者的編號。")
-    hours_by_day: dict[int, list[tuple[int, int]]] = {}
-    for day in range(1, days + 1):
-        sheet_name = f"{day}號"
-        if sheet_name not in wb.sheetnames:
-            continue
-        sheet = wb[sheet_name]
-        rest_col = find_rest_column(sheet)
-        if not rest_col:
-            continue
-        day_hours: list[tuple[int, int]] = []
-        for row in range(10, 34):
-            slot = str(sheet.cell(row=row, column=2).value or "").strip()
-            rest_value = sheet.cell(row=row, column=rest_col).value
-            if person_no not in split_numbers(rest_value):
+    try:
+        _year, _month, days = workbook_date_info(wb)
+        person_no = workbook_person_no(wb, target_name)
+        if target_name and not person_no:
+            raise RuntimeError(f"勤務表輪休表找不到 {target_name} 的番號，已停止避免用勤務系統列編號誤打。")
+        person_no = person_no or target_no
+        if not person_no:
+            raise RuntimeError("無法從勤務表判斷登入者的編號。")
+        hours_by_day: dict[int, list[tuple[int, int]]] = {}
+        for day in range(1, days + 1):
+            sheet_name = f"{day}號"
+            if sheet_name not in wb.sheetnames:
                 continue
-            parsed = parse_slot(slot)
-            if parsed:
-                day_hours.append(parsed)
-        hours_by_day[day] = day_hours
-    return group_rest_entries(hours_by_day, days)
+            sheet = wb[sheet_name]
+            rest_col = find_rest_column(sheet)
+            if not rest_col:
+                continue
+            day_hours: list[tuple[int, int]] = []
+            for row in range(10, 34):
+                slot = str(sheet.cell(row=row, column=2).value or "").strip()
+                rest_value = sheet.cell(row=row, column=rest_col).value
+                if person_no not in split_numbers(rest_value):
+                    continue
+                parsed = parse_slot(slot)
+                if parsed:
+                    day_hours.append(parsed)
+            hours_by_day[day] = day_hours
+        return group_rest_entries(hours_by_day, days)
+    finally:
+        wb.close()
 
 
 def workbook_date_info(wb: openpyxl.Workbook) -> tuple[int, int, int]:
@@ -563,15 +589,18 @@ def workbook_person_name(workbook_path: Path, target_no: str | None) -> str:
     if not target_no:
         return ""
     wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
-    roster = next((sheet for sheet in wb.worksheets if "輪休" in sheet.title), None)
-    if roster is None:
+    try:
+        roster = next((sheet for sheet in wb.worksheets if "輪休" in sheet.title), None)
+        if roster is None:
+            return ""
+        for col in range(1, roster.max_column + 1):
+            number = roster.cell(row=4, column=col).value
+            number_text = str(int(number)) if isinstance(number, (int, float)) else str(number or "").strip()
+            if number_text == target_no:
+                return str(roster.cell(row=5, column=col).value or "").strip()
         return ""
-    for col in range(1, roster.max_column + 1):
-        number = roster.cell(row=4, column=col).value
-        number_text = str(int(number)) if isinstance(number, (int, float)) else str(number or "").strip()
-        if number_text == target_no:
-            return str(roster.cell(row=5, column=col).value or "").strip()
-    return ""
+    finally:
+        wb.close()
 
 
 def find_rest_column(sheet: openpyxl.worksheet.worksheet.Worksheet) -> int | None:

@@ -209,6 +209,32 @@ def find_entry_matches(
     return matches
 
 
+def find_arrival_entry_exists(
+    rows: list[str],
+    target_date: str,
+    staff: dict[str, dict[str, str]],
+    action: dict[str, Any],
+) -> list[str]:
+    fields = action.get("fields", {})
+    if action.get("kind") != "entry_log" or fields.get("領用事由及地點") != "到勤" or fields.get("出或入") != "入":
+        return []
+    target_number = str(action.get("target", ""))
+    target_name = staff.get(target_number, {}).get("name", "")
+    roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
+    matches = []
+    for row in rows:
+        if target_date not in row and roc_slash not in row:
+            continue
+        if target_name:
+            if target_name not in row:
+                continue
+        elif target_number and target_number not in row:
+            continue
+        if row_has_outin(row, "入") and "到勤" in row:
+            matches.append(row)
+    return matches
+
+
 # Work and case matching
 
 def find_work_matches(

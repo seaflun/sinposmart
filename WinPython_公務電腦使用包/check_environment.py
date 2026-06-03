@@ -18,6 +18,10 @@ REQUIRED_MODULES = [
     "PIL",
     "win32com",
     "win11toast",
+    "openpyxl",
+    "tkcalendar",
+    "requests",
+    "google.cloud.storage",
 ]
 
 
