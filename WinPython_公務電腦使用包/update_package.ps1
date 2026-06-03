@@ -102,7 +102,16 @@ if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Contai
     throw "Update zip does not contain a valid package folder."
 }
 
+$packageVersionPath = Join-Path $sourceDir "VERSION.txt"
+if (-not (Test-Path -LiteralPath $packageVersionPath -PathType Leaf)) {
+    throw "Update zip does not contain VERSION.txt."
+}
+$packageVersion = (Get-Content -LiteralPath $packageVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
+if ($packageVersion -ne $remoteVersion) {
+    throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
+}
+
 Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
-$remoteVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
+$packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
 
 Write-Host "Update completed. Restart the app if it is running."
