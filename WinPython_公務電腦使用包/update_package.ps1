@@ -23,6 +23,18 @@ function Get-TextFromUrl {
     return $text.Trim().TrimStart([char]0xFEFF)
 }
 
+function Test-VersionText {
+    param(
+        [string]$Version,
+        [switch]$AllowZero
+    )
+
+    if ($AllowZero -and $Version -eq "0") {
+        return $true
+    }
+    return $Version -match "^\d{4}\.\d{2}\.\d{2}\.\d{4}$"
+}
+
 function Copy-UpdateTree {
     param(
         [string]$SourceDir,
@@ -73,6 +85,13 @@ if (-not (Test-Path -LiteralPath $localVersionPath)) {
 $localVersion = (Get-Content -LiteralPath $localVersionPath -Raw -Encoding UTF8).Trim()
 $remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
 
+if (-not (Test-VersionText -Version $localVersion -AllowZero)) {
+    throw "Local VERSION.txt has an invalid version: $localVersion"
+}
+if (-not (Test-VersionText -Version $remoteVersion)) {
+    throw "Remote VERSION.txt has an invalid version: $remoteVersion"
+}
+
 Write-Host "Local version : $localVersion"
 Write-Host "Remote version: $remoteVersion"
 
@@ -114,6 +133,9 @@ try {
         throw "Update zip does not contain VERSION.txt."
     }
     $packageVersion = (Get-Content -LiteralPath $packageVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
+    if (-not (Test-VersionText -Version $packageVersion)) {
+        throw "Update zip VERSION.txt has an invalid version: $packageVersion"
+    }
     if ($packageVersion -ne $remoteVersion) {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
