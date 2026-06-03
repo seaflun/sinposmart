@@ -50,6 +50,7 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("^\\d{4}\\.\\d{2}\\.\\d{2}\\.\\d{4}$", script)
         self.assertIn("Remote VERSION.txt has an invalid version", script)
         self.assertIn("Update zip VERSION.txt has an invalid version", script)
+        self.assertIn("$localVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)", script)
 
     def test_update_package_verifies_download_sha256(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")

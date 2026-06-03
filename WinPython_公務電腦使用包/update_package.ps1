@@ -92,7 +92,7 @@ if (-not (Test-Path -LiteralPath $localVersionPath)) {
     "0" | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
 }
 
-$localVersion = (Get-Content -LiteralPath $localVersionPath -Raw -Encoding UTF8).Trim()
+$localVersion = (Get-Content -LiteralPath $localVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
 $remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
 $remoteSha256 = Get-Sha256FromText -Text (Get-TextFromUrl -Url $remoteSha256Url)
 

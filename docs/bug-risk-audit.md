@@ -5,7 +5,7 @@
 ## 目前最高風險
 
 1. Google Drive 公開更新檔尚未同步到本機新版。
-   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1618`
+   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1637`
    - 公開 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 公開 ZIP 內 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 影響：公務電腦可能仍下載舊版，拿不到最新修補。
@@ -54,6 +54,11 @@
    - 風險：`install_startup_shortcut.ps1` 原本會把捷徑指到 `pythonw.exe`，且曾包含 `C:\Users\User` 硬編碼；不同公務電腦帳號或 PATH 異常時會開機啟動失敗。
    - 修正：根目錄與公務包的開機捷徑現在改用 `System32\wscript.exe` 啟動既有 `.vbs`，再由既有 `.bat`/WinPython 偵測流程找 Python。
    - 驗證：`tests/test_static_regressions.py::test_startup_shortcuts_use_no_console_launchers`
+
+7. 更新器讀本機版本時可能被 UTF-8 BOM 影響。
+   - 風險：`VERSION.txt` 若由 Windows PowerShell `Set-Content -Encoding UTF8` 寫出，開頭可能帶 BOM；本機版本驗證若未去 BOM，會誤判版本格式錯誤而中止更新。
+   - 修正：`WinPython_公務電腦使用包/update_package.ps1` 讀本機 `VERSION.txt` 時與遠端/ZIP 一樣清除 BOM。
+   - 驗證：`tests/test_static_regressions.py::test_update_package_validates_version_text`
 
 ## 仍可能出錯的點
 
