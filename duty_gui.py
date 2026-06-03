@@ -2984,7 +2984,7 @@ class DutyGui(tk.Tk):
                         "visible": job_visible,
                     }
                     result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
-                    self.after(0, lambda idx=index, err=error, path=result_path, note=notify: self._save_work_log_item_failed(idx, err, path, note))
+                    self.after(0, lambda idx=index, err=error, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_failed(idx, err, path, note, origin))
                 job = self.next_queued_submit_job()
         except Exception as exc:
             error = str(exc)
