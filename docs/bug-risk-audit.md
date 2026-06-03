@@ -5,7 +5,7 @@
 ## 目前最高風險
 
 1. Google Drive 公開更新檔尚未同步到本機新版。
-   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1552`
+   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1556`
    - 公開 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 公開 ZIP 內 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 影響：公務電腦可能仍下載舊版，拿不到最新修補。
@@ -43,6 +43,7 @@
    - 修正：`WinPython_公務電腦使用包/update_package.ps1` 改指目前 Drive 資料夾內 canonical ZIP file ID。
    - 補強：更新器下載 ZIP 後會檢查 ZIP 內 `VERSION.txt` 必須等於遠端 `VERSION.txt`，不一致就中止。
    - 補強：更新器永遠跳過勤務表設定、Google service account、每日車輛 `.env`，避免更新包誤帶本機設定或憑證。
+   - 補強：更新器會在成功或失敗後清理自己建立的 `%TEMP%` 暫存下載/解壓資料。
    - 仍需：公開 Drive 檔案內容同步到新版。
 
 ## 仍可能出錯的點

@@ -81,43 +81,49 @@ if ($localVersion -eq $remoteVersion) {
     exit 0
 }
 
-New-Item -ItemType Directory -Path $tempDir | Out-Null
-New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+try {
+    New-Item -ItemType Directory -Path $tempDir | Out-Null
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
-Write-Host "Downloading update package..."
-Invoke-WebRequest -Uri $remoteZipUrl -OutFile $zipPath -UseBasicParsing -MaximumRedirection 5
+    Write-Host "Downloading update package..."
+    Invoke-WebRequest -Uri $remoteZipUrl -OutFile $zipPath -UseBasicParsing -MaximumRedirection 5
 
-if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
-    throw "Downloaded package is missing or too small."
+    if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
+        throw "Downloaded package is missing or too small."
+    }
+
+    $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
+    Write-Host "Creating backup: $backupZip"
+    Compress-Archive -LiteralPath (Join-Path $packageDir "*") -DestinationPath $backupZip -Force
+
+    New-Item -ItemType Directory -Path $extractDir | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+
+    $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.py") } |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.py"))) {
+        $sourceDir = $extractDir
+    }
+    if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+        throw "Update zip does not contain a valid package folder."
+    }
+
+    $packageVersionPath = Join-Path $sourceDir "VERSION.txt"
+    if (-not (Test-Path -LiteralPath $packageVersionPath -PathType Leaf)) {
+        throw "Update zip does not contain VERSION.txt."
+    }
+    $packageVersion = (Get-Content -LiteralPath $packageVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
+    if ($packageVersion -ne $remoteVersion) {
+        throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
+    }
+
+    Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
+    $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
+
+    Write-Host "Update completed. Restart the app if it is running."
+} finally {
+    if (Test-Path -LiteralPath $tempDir) {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force
+    }
 }
-
-$backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
-Write-Host "Creating backup: $backupZip"
-Compress-Archive -LiteralPath (Join-Path $packageDir "*") -DestinationPath $backupZip -Force
-
-New-Item -ItemType Directory -Path $extractDir | Out-Null
-Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
-
-$sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
-    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.py") } |
-    Select-Object -First 1 -ExpandProperty FullName
-if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.py"))) {
-    $sourceDir = $extractDir
-}
-if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
-    throw "Update zip does not contain a valid package folder."
-}
-
-$packageVersionPath = Join-Path $sourceDir "VERSION.txt"
-if (-not (Test-Path -LiteralPath $packageVersionPath -PathType Leaf)) {
-    throw "Update zip does not contain VERSION.txt."
-}
-$packageVersion = (Get-Content -LiteralPath $packageVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
-if ($packageVersion -ne $remoteVersion) {
-    throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
-}
-
-Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
-$packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
-
-Write-Host "Update completed. Restart the app if it is running."

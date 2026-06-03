@@ -48,6 +48,12 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn('"daily_vehicle_legacy\\.env"', script)
         self.assertIn("if ($alwaysSkipFiles -contains $relative)", script)
 
+    def test_update_package_cleans_temporary_downloads(self) -> None:
+        script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("try {", script)
+        self.assertIn("} finally {", script)
+        self.assertIn("Remove-Item -LiteralPath $tempDir -Recurse -Force", script)
+
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:
         counts = []
