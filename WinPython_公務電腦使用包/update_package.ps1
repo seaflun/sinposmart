@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $remoteVersionUrl = "https://drive.google.com/uc?export=download&id=11iI5g_86MZG0Ck8PdngRjWz8V7fMuikp"
-$remoteZipUrl = "https://drive.google.com/uc?export=download&id=1aTOlbOapoegCwiftmAkubmi_YyaRye_E"
+$remoteZipUrl = "https://drive.google.com/uc?export=download&id=1DB6-0fFBaCciV5DaxeNfIqczwfKYhge0"
 
 $packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localVersionPath = Join-Path $packageDir "VERSION.txt"
