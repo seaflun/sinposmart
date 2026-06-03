@@ -1307,6 +1307,35 @@ class DutyGui(tk.Tk):
                 compare[index] = {"compare": "已手動登打", "group": "done", "matched": []}
         return compare
 
+    def restore_manual_completed_keys(self, target_roc_date: str, actions: list[dict[str, Any]]) -> set[str]:
+        log_path = Path("duty_trigger_log.jsonl")
+        if not target_roc_date or not log_path.exists():
+            return set()
+        valid_keys = {self.action_completion_key(action) for action in actions}
+        restored: set[str] = set()
+        try:
+            with log_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception:
+                        continue
+                    if record.get("trigger_type") != "manual":
+                        continue
+                    if record.get("target_date") != target_roc_date:
+                        continue
+                    if record.get("status") not in ("manual_marked", "submitted", "skipped_duplicate"):
+                        continue
+                    completion_key = str(record.get("completion_key", "") or "").strip()
+                    if completion_key and completion_key in valid_keys:
+                        restored.add(completion_key)
+        except Exception:
+            return set()
+        return restored
+
     def load_comparison_data(self, target_roc_date: str) -> dict[str, Any]:
         path = comparison_path(target_roc_date)
         if not path.exists():
@@ -2018,6 +2047,8 @@ class DutyGui(tk.Tk):
         if self.data.get("target_date"):
             self.action_compare = self.build_comparison(self.data)
         if self.duty_data.get("target_date"):
+            self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)
+        if self.duty_data.get("target_date"):
             self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
         self.set_logged_in_status(actor_no)
         self.actor_no.set(actor_no)
@@ -2196,6 +2227,8 @@ class DutyGui(tk.Tk):
         self.login_status.set("已清除登入狀態。")
         if self.data.get("target_date"):
             self.action_compare = self.build_comparison(self.data)
+        if self.duty_data.get("target_date"):
+            self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)
         if self.duty_data.get("target_date"):
             self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
         self.update_login_panel()
@@ -2758,7 +2791,7 @@ class DutyGui(tk.Tk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再手動登打。")
             return
-        self.log_trigger(index, self.duty_actions[index], "manual")
+        self.log_trigger(index, self.duty_actions[index], "manual", status="manual_marked")
         self.executed_due.add(index)
         self.manual_completed_keys.add(self.action_completion_key(self.duty_actions[index]))
         self.duty_status_text.set(f"已記錄待接線：{self.duty_action_summary(self.duty_actions[index])}")
@@ -2808,6 +2841,7 @@ class DutyGui(tk.Tk):
         if confirm and save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
             return
         if trigger_type == "manual":
+            self.log_trigger(index, action, trigger_type)
             action = self.action_for_manual_submit(action)
         self.submitting_indices.add(index)
         self.submit_queue.append((index, action, save, visible, notify, trigger_type))
@@ -3008,11 +3042,13 @@ class DutyGui(tk.Tk):
     def _save_work_log_item_succeeded(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
         compare_text = "已手動登打" if trigger_type == "manual" else "已登打"
+        completion_key = self.action_completion_key(self.duty_actions[index])
         if trigger_type == "manual":
             self.executed_due.add(index)
-            self.manual_completed_keys.add(self.action_completion_key(self.duty_actions[index]))
+            self.manual_completed_keys.add(completion_key)
         elif trigger_type == "due":
             self.executed_due.add(index)
+        self.log_trigger(index, self.duty_actions[index], trigger_type, status="submitted", completion_key=completion_key)
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
@@ -3031,6 +3067,10 @@ class DutyGui(tk.Tk):
     def _save_work_log_item_skipped_duplicate(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
         self.executed_due.add(index)
+        completion_key = self.action_completion_key(self.duty_actions[index])
+        if trigger_type == "manual":
+            self.manual_completed_keys.add(completion_key)
+        self.log_trigger(index, self.duty_actions[index], trigger_type, status="skipped_duplicate", completion_key=completion_key)
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
@@ -3047,6 +3087,7 @@ class DutyGui(tk.Tk):
 
     def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
+        self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed")
         if trigger_type == "due":
             self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)
         try:
@@ -3086,7 +3127,7 @@ class DutyGui(tk.Tk):
         target_roc_date = self.duty_data.get("target_date") or comparison_dates[0]
         self.refresh_comparison_background(target_roc_date, "early-submit", comparison_dates=comparison_dates)
 
-    def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str) -> None:
+    def log_trigger(self, index: int, action: dict[str, Any], trigger_type: str, status: str = "pending_write_automation", completion_key: str = "") -> None:
         session = self.session
         record = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -3103,7 +3144,8 @@ class DutyGui(tk.Tk):
             "process_id": os.getpid(),
             "executable": sys.executable,
             "cwd": str(Path.cwd()),
-            "status": "pending_write_automation",
+            "status": status,
+            "completion_key": completion_key or self.action_completion_key(action),
         }
         with Path("duty_trigger_log.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")

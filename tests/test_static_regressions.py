@@ -33,6 +33,14 @@ class StaticRegressionTests(unittest.TestCase):
             source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
             self.assertIn('status = "已手動登打" if completion_key in self.manual_completed_keys else "已登打"', source)
             self.assertIn('compare_text = "已手動登打" if trigger_type == "manual" else "已登打"', source)
+            self.assertIn("def restore_manual_completed_keys", source)
+            self.assertIn('self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)', source)
+            self.assertIn('self.log_trigger(index, self.duty_actions[index], "manual", status="manual_marked")', source)
+            self.assertIn('self.log_trigger(index, action, trigger_type)', source)
+            self.assertIn('self.log_trigger(index, self.duty_actions[index], trigger_type, status="submitted", completion_key=completion_key)', source)
+            self.assertIn('self.log_trigger(index, self.duty_actions[index], trigger_type, status="skipped_duplicate", completion_key=completion_key)', source)
+            self.assertIn('self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed")', source)
+            self.assertIn('if record.get("status") not in ("manual_marked", "submitted", "skipped_duplicate"):', source)
 
     def test_update_package_rejects_version_mismatch(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
