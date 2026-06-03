@@ -2,8 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcherCandidates = @(
-    (Join-Path $projectDir "RUN_DUTY_GUI_WINPYTHON.vbs"),
-    (Join-Path $projectDir "start_duty_gui_no_console.vbs")
+    (Join-Path $projectDir "start_duty_gui_no_console.vbs"),
+    (Join-Path $projectDir "RUN_DUTY_GUI_WINPYTHON.vbs")
 )
 $launcher = $launcherCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $launcher) {

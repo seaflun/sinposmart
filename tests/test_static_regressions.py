@@ -93,6 +93,7 @@ class StaticRegressionTests(unittest.TestCase):
             self.assertIn("RUN_DUTY_GUI_WINPYTHON.vbs", script)
             self.assertNotIn("C:\\Users\\User", script)
             self.assertNotIn('$shortcut.TargetPath = $pythonw', script)
+            self.assertLess(script.index("start_duty_gui_no_console.vbs"), script.index("RUN_DUTY_GUI_WINPYTHON.vbs"))
 
     @staticmethod
     def method_arg_counts(tree: ast.AST, method_name: str) -> list[int]:

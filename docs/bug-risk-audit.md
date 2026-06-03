@@ -5,7 +5,7 @@
 ## 目前最高風險
 
 1. Google Drive 公開更新檔尚未同步到本機新版。
-   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1637`
+   - 本機 `UPDATE/VERSION.txt`：`2026.06.03.1643`
    - 公開 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 公開 ZIP 內 `VERSION.txt` 讀回：`2026.06.03.0843`
    - 影響：公務電腦可能仍下載舊版，拿不到最新修補。
@@ -59,6 +59,11 @@
    - 風險：`VERSION.txt` 若由 Windows PowerShell `Set-Content -Encoding UTF8` 寫出，開頭可能帶 BOM；本機版本驗證若未去 BOM，會誤判版本格式錯誤而中止更新。
    - 修正：`WinPython_公務電腦使用包/update_package.ps1` 讀本機 `VERSION.txt` 時與遠端/ZIP 一樣清除 BOM。
    - 驗證：`tests/test_static_regressions.py::test_update_package_validates_version_text`
+
+8. 根目錄開機捷徑可能優先選到 WinPython 專用啟動器。
+   - 風險：一般本機有 `start_duty_gui_no_console.vbs` 可走 PATH fallback，但 `install_startup_shortcut.ps1` 若先選 `RUN_DUTY_GUI_WINPYTHON.vbs`，開機啟動會比手動啟動更容易因找不到 WinPython 而失敗。
+   - 修正：開機捷徑候選順序改為優先使用 `start_duty_gui_no_console.vbs`，沒有時才使用 `RUN_DUTY_GUI_WINPYTHON.vbs`。
+   - 驗證：`tests/test_static_regressions.py::test_startup_shortcuts_use_no_console_launchers`
 
 ## 仍可能出錯的點
 
