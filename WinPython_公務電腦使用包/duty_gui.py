@@ -1055,7 +1055,7 @@ class DutyGui(tk.Tk):
             self.duty_staff = self.staff
             self.duty_actions = data.get("actions", [])
             self.manual_completed_keys = self.restore_manual_completed_keys(data.get("target_date", ""), self.duty_actions)
-            self.duty_action_compare = self.apply_manual_completed_overrides(dict(self.action_compare), self.duty_actions)
+            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(data, self.duty_actions), self.duty_actions)
             self.sync_session_actor_from_user_id()
         compare_note = "，已套用比對檔" if comparison_path(data.get("target_date", "")).exists() else ""
         self.status_text.set(f"已載入 {path.name}，任務 {len(self.actions)} 筆{compare_note}。")
@@ -1087,7 +1087,14 @@ class DutyGui(tk.Tk):
     def build_audit_actions(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         return data.get("actions", []) + build_case_work_audits(data)
 
-    def rest_entry_matches(self, entry_rows: list[str], action_date: str, action: dict[str, Any], allow_near: bool) -> list[str]:
+    def rest_entry_matches(
+        self,
+        entry_rows: list[str],
+        action_date: str,
+        action: dict[str, Any],
+        allow_near: bool,
+        staff: dict[str, dict[str, str]] | None = None,
+    ) -> list[str]:
         fields = action.get("fields", {})
         reason = fields.get("領用事由及地點", "")
         outin = fields.get("出或入", "")
@@ -1098,7 +1105,8 @@ class DutyGui(tk.Tk):
                 system_time = f"{hour % 24:02d}:{minute:02d}"
         except ValueError:
             pass
-        target_name = self.staff.get(str(action.get("target", "")), {}).get("name", "")
+        staff = staff if staff is not None else self.staff
+        target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
         acceptable_reasons = ("休息返隊", "返隊") if reason == "休息返隊" else (reason,)
         matches = []
         for row in entry_rows:
@@ -1113,7 +1121,15 @@ class DutyGui(tk.Tk):
             matches.append(row)
         return matches
 
-    def compare_rest_entry(self, actions: list[dict[str, Any]], action: dict[str, Any], action_date: str, entry_rows: list[str], target_date: str) -> dict[str, Any]:
+    def compare_rest_entry(
+        self,
+        actions: list[dict[str, Any]],
+        action: dict[str, Any],
+        action_date: str,
+        entry_rows: list[str],
+        target_date: str,
+        staff: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
         reason = action.get("fields", {}).get("領用事由及地點", "")
         if reason == "休息返隊":
             rest_out_exists = False
@@ -1126,13 +1142,13 @@ class DutyGui(tk.Tk):
                 if candidate_date != action_date:
                     rest_out_exists = True
                     break
-                if self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=False) or self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=True):
+                if self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=False, staff=staff) or self.rest_entry_matches(entry_rows, action_date, candidate, allow_near=True, staff=staff):
                     rest_out_exists = True
                     break
             if not rest_out_exists:
                 return {"compare": "未找到", "group": "todo", "matched": []}
-        exact = self.rest_entry_matches(entry_rows, action_date, action, allow_near=False)
-        near = [] if exact else self.rest_entry_matches(entry_rows, action_date, action, allow_near=True)
+        exact = self.rest_entry_matches(entry_rows, action_date, action, allow_near=False, staff=staff)
+        near = [] if exact else self.rest_entry_matches(entry_rows, action_date, action, allow_near=True, staff=staff)
         if exact:
             return {"compare": "已存在", "group": "done", "matched": exact[:1]}
         if near:
@@ -1211,9 +1227,10 @@ class DutyGui(tk.Tk):
         self.load_preview(path, update_duty=True)
         return True
 
-    def build_comparison(self, data: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    def build_comparison(self, data: dict[str, Any], actions: list[dict[str, Any]] | None = None) -> dict[int, dict[str, Any]]:
         target_date = data.get("target_date", "")
-        actions = self.build_audit_actions(data)
+        actions = actions if actions is not None else self.build_audit_actions(data)
+        comparison_staff = {**data.get("yesterday", {}).get("staff", {}), **data.get("today", {}).get("staff", {})}
         comparison_cache: dict[str, dict[str, Any]] = {}
         for offset in sorted({int(action.get("date_offset", 0) or 0) for action in actions} | {0}):
             action_date = roc_date_after(target_date, offset) if target_date else ""
@@ -1230,7 +1247,7 @@ class DutyGui(tk.Tk):
             fields = action.get("fields", {})
             action_date = self.action_target_roc_date(action, target_date)
             key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
-            external_targets.setdefault(key, set()).add(self.staff.get(str(action.get("target", "")), {}).get("name", ""))
+            external_targets.setdefault(key, set()).add(comparison_staff.get(str(action.get("target", "")), {}).get("name", ""))
 
         for index, action in enumerate(actions):
             fields = action.get("fields", {})
@@ -1243,16 +1260,16 @@ class DutyGui(tk.Tk):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                     continue
                 if reason in ("休息", "休息返隊"):
-                    result[index] = self.compare_rest_entry(actions, action, action_date, entry_rows, target_date)
+                    result[index] = self.compare_rest_entry(actions, action, action_date, entry_rows, target_date, comparison_staff)
                     continue
-                exact = find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=False)
-                arrival_exists = [] if exact else find_arrival_entry_exists(entry_rows, action_date, self.staff, action)
-                near = [] if exact else find_entry_matches(entry_rows, action_date, self.staff, action, allow_near=True)
+                exact = find_entry_matches(entry_rows, action_date, comparison_staff, action, allow_near=False)
+                arrival_exists = [] if exact else find_arrival_entry_exists(entry_rows, action_date, comparison_staff, action)
+                near = [] if exact else find_entry_matches(entry_rows, action_date, comparison_staff, action, allow_near=True)
                 if exact:
                     result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
                 elif arrival_exists:
                     result[index] = {"compare": "已存在(時間不同)", "group": "done", "matched": arrival_exists[:1]}
-                elif is_possible_handoff_adjustment(entry_rows, action_date, self.staff, action):
+                elif is_possible_handoff_adjustment(entry_rows, action_date, comparison_staff, action):
                     result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
                 elif near:
                     result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
@@ -1266,7 +1283,7 @@ class DutyGui(tk.Tk):
                 if is_future_action(target_date, action):
                     result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                     continue
-                matches = find_case_work_matches(work_rows, action_date, action) if action.get("source") == "案件工作審核" else find_work_matches(work_rows, action_date, self.staff, action)
+                matches = find_case_work_matches(work_rows, action_date, action) if action.get("source") == "案件工作審核" else find_work_matches(work_rows, action_date, comparison_staff, action)
                 if matches:
                     result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
                 else:
@@ -1888,7 +1905,7 @@ class DutyGui(tk.Tk):
                         self.duty_staff = {**today_data.get("yesterday", {}).get("staff", {}), **today_data.get("today", {}).get("staff", {})}
                         self.duty_actions = today_data.get("actions", [])
                         self.manual_completed_keys = self.restore_manual_completed_keys(today_data.get("target_date", ""), self.duty_actions)
-                        self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(today_data), self.duty_actions)
+                        self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(today_data, self.duty_actions), self.duty_actions)
                         self.sync_session_actor_from_user_id()
                         self.refresh_duty_tasks()
                 except Exception:
@@ -1999,7 +2016,7 @@ class DutyGui(tk.Tk):
             self.action_compare = self.build_comparison(self.data)
             self.refresh_tasks()
         if any(path.exists() for path in paths) and self.duty_data.get("target_date") == target_roc_date:
-            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
+            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data, self.duty_actions), self.duty_actions)
             self.refresh_duty_tasks()
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
@@ -2075,7 +2092,7 @@ class DutyGui(tk.Tk):
         if self.duty_data.get("target_date"):
             self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)
         if self.duty_data.get("target_date"):
-            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
+            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data, self.duty_actions), self.duty_actions)
         self.set_logged_in_status(actor_no)
         self.actor_no.set(actor_no)
         self.logout_cleared = False
@@ -2257,7 +2274,7 @@ class DutyGui(tk.Tk):
         if self.duty_data.get("target_date"):
             self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)
         if self.duty_data.get("target_date"):
-            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data), self.duty_actions)
+            self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data, self.duty_actions), self.duty_actions)
         self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
@@ -2510,6 +2527,8 @@ class DutyGui(tk.Tk):
         return f"{action_date.day}日 {value}" if action_date != base_date else value
 
     def action_target_roc_date(self, action: dict[str, Any], base_target_date: str | None = None) -> str:
+        if action.get("submit_target_date"):
+            return str(action["submit_target_date"])
         try:
             base_date = parse_roc_date(base_target_date or self.duty_data.get("target_date") or today_roc_date())
         except ValueError:
@@ -2535,6 +2554,46 @@ class DutyGui(tk.Tk):
         reason = fields.get("領用事由及地點", "")
         return outin in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤")
 
+    def compare_needs_manual_review(self, compare: dict[str, Any]) -> bool:
+        return compare.get("group") in ("near", "adjust", "review")
+
+    def action_compare_sync_key(self, action: dict[str, Any], base_target_date: str) -> str:
+        fields = action.get("fields", {})
+        scheduled_time = fields.get("系統寫入時間") or fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")
+        return "|".join(
+            [
+                self.action_target_roc_date(action, base_target_date),
+                str(action.get("kind", "")),
+                str(action.get("source", "")),
+                str(action.get("actor", "")),
+                str(action.get("target", "")),
+                str(fields.get("出或入", "")),
+                str(fields.get("領用事由及地點", "")),
+                str(scheduled_time),
+                self.action_summary(action),
+            ]
+        )
+
+    def sync_duty_compare_from_audit(self) -> None:
+        audit_target_date = self.data.get("target_date", "")
+        duty_target_date = self.duty_data.get("target_date", "")
+        if not audit_target_date or not duty_target_date:
+            return
+        if not self.action_compare or not self.actions or not self.duty_actions:
+            return
+        audit_compare_by_key = {
+            self.action_compare_sync_key(action, audit_target_date): self.action_compare[index]
+            for index, action in enumerate(self.actions)
+            if index in self.action_compare
+        }
+        for index, action in enumerate(self.duty_actions):
+            current = self.duty_action_compare.get(index, {})
+            if current.get("group") in ("done", "manual"):
+                continue
+            compare = audit_compare_by_key.get(self.action_compare_sync_key(action, duty_target_date))
+            if compare:
+                self.duty_action_compare[index] = dict(compare)
+
     def manual_entry_uses_current_time(self, action: dict[str, Any]) -> bool:
         if action.get("kind") != "entry_log":
             return False
@@ -2548,12 +2607,14 @@ class DutyGui(tk.Tk):
     def action_for_manual_submit(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.manual_entry_uses_current_time(action):
             return action
-        current_time = datetime.now().strftime("%H:%M")
+        current_now = datetime.now()
+        current_time = current_now.strftime("%H:%M")
         updated = copy.deepcopy(action)
         fields = updated.setdefault("fields", {})
         fields["登打時間"] = current_time
         fields["系統寫入時間"] = current_time
         updated["time"] = current_time
+        updated["submit_target_date"] = roc_date(current_now.date())
         return updated
 
     def pending_previous_duty_count(self, actor_no: str) -> int:
@@ -2662,17 +2723,42 @@ class DutyGui(tk.Tk):
         compare: dict[str, Any],
         actor_no: str,
     ) -> bool:
-        if not actor_no or str(action.get("actor", "")) != str(actor_no):
-            return False
-        if index in self.submitting_indices or index in self.executed_due or index in self.paused_due_indices:
-            return False
-        if compare.get("group") in ("done", "manual"):
-            return False
-        return self.is_auto_duty_action(action)
+        _, _, is_next_candidate = self.resolve_duty_task_display(index, action, compare, actor_no, datetime.now())
+        return is_next_candidate
+
+    def resolve_duty_task_display(
+        self,
+        index: int,
+        action: dict[str, Any],
+        compare: dict[str, Any],
+        actor_no: str,
+        now: datetime,
+    ) -> tuple[str, str, bool]:
+        is_previous_actor_item = actor_no and str(action.get("actor", "")) != str(actor_no)
+        action_at = self.action_datetime(action)
+        is_auto_candidate = bool(actor_no and str(action.get("actor", "")) == str(actor_no) and self.is_auto_duty_action(action))
+        if index in self.submitting_indices:
+            return "正在登打", "ready", False
+        if compare.get("group") == "done":
+            return compare.get("compare") or "已存在", "triggered", False
+        if index in self.paused_due_indices:
+            return "暫停", "manual", False
+        if index in self.executed_due:
+            completion_key = self.action_completion_key(action)
+            status = "已手動登打" if completion_key in self.manual_completed_keys else "已登打"
+            return status, "triggered", False
+        if self.compare_needs_manual_review(compare):
+            return compare.get("compare") or "人工確認", "manual", False
+        if is_previous_actor_item:
+            return "前班手動", "waiting", False
+        if compare.get("group") == "manual" or not self.is_auto_duty_action(action):
+            return "手動", "waiting", False
+        return ("到點待執行", "ready", True) if action_at <= now else ("等待", "waiting", is_auto_candidate)
 
     def refresh_duty_tasks(self) -> None:
         if not hasattr(self, "duty_tree"):
             return
+        self.sync_duty_compare_from_audit()
         selected = set(self.duty_tree.selection())
         self.duty_tree.delete(*self.duty_tree.get_children())
         if self.logout_cleared and not (self.session and self.session.verified):
@@ -2685,33 +2771,10 @@ class DutyGui(tk.Tk):
         pending_previous = self.pending_previous_duty_count(actor_no) if actor_no else 0
         for index in self.duty_task_indices():
             action = self.duty_actions[index]
-            is_previous_actor_item = actor_no and str(action.get("actor", "")) != str(actor_no)
-            action_at = self.action_datetime(action)
             compare = self.duty_action_compare.get(index, {})
-            if next_item is None and self.should_count_as_next_duty_item(index, action, compare, actor_no):
+            status, tag, is_next_candidate = self.resolve_duty_task_display(index, action, compare, actor_no, now)
+            if next_item is None and is_next_candidate:
                 next_item = action
-            if index in self.submitting_indices:
-                status = "正在登打"
-                tag = "ready"
-            elif compare.get("group") == "done":
-                status = compare.get("compare") or "已存在"
-                tag = "triggered"
-            elif index in self.paused_due_indices:
-                status = "暫停"
-                tag = "manual"
-            elif index in self.executed_due:
-                completion_key = self.action_completion_key(action)
-                status = "已手動登打" if completion_key in self.manual_completed_keys else "已登打"
-                tag = "triggered"
-            elif is_previous_actor_item:
-                status = "前班手動"
-                tag = "waiting"
-            elif compare.get("group") == "manual" or not self.is_auto_duty_action(action):
-                status = "手動"
-                tag = "waiting"
-            else:
-                status = "到點待執行" if action_at <= now else "等待"
-                tag = "ready" if action_at <= now else "waiting"
             task_time = self.action_display_time(action)
             self.duty_tree.insert(
                 "",
@@ -2793,6 +2856,7 @@ class DutyGui(tk.Tk):
     def trigger_due_tasks(self, now: datetime) -> None:
         if not self.session or not self.session.verified:
             return
+        self.sync_duty_compare_from_audit()
         for index in self.duty_task_indices():
             if index in self.executed_due or index in self.submitting_indices:
                 continue
@@ -2810,7 +2874,7 @@ class DutyGui(tk.Tk):
             if compare.get("group") == "done":
                 self.executed_due.add(index)
                 continue
-            if compare.get("group") == "manual" or not self.is_auto_duty_action(action):
+            if compare.get("group") == "manual" or self.compare_needs_manual_review(compare) or not self.is_auto_duty_action(action):
                 continue
             action_at = self.action_datetime(action)
             is_paused_retry = index in self.paused_due_indices and action_at <= now

@@ -54,6 +54,40 @@ class StaticRegressionTests(unittest.TestCase):
             self.assertIn('self.set_duty_status(f"登打失敗：{error}，結果：{result_path.name}{package_note}", hold_seconds=12)', source)
             self.assertIn('self.duty_status_text.set(self.active_duty_status_override() or "")', source)
 
+    def test_near_compare_stays_manual_in_duty_mode(self) -> None:
+        for relative_path in self.duty_gui_paths():
+            source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn("def compare_needs_manual_review", source)
+            self.assertIn('return compare.get("group") in ("near", "adjust", "review")', source)
+            self.assertIn("def action_compare_sync_key", source)
+            self.assertIn("def sync_duty_compare_from_audit", source)
+            self.assertIn("def build_comparison(self, data: dict[str, Any], actions: list[dict[str, Any]] | None = None)", source)
+            self.assertIn("actions = actions if actions is not None else self.build_audit_actions(data)", source)
+            self.assertIn('comparison_staff = {**data.get("yesterday", {}).get("staff", {}), **data.get("today", {}).get("staff", {})}', source)
+            self.assertIn("find_entry_matches(entry_rows, action_date, comparison_staff, action", source)
+            self.assertIn("find_work_matches(work_rows, action_date, comparison_staff, action)", source)
+            self.assertNotIn("dict(self.action_compare), self.duty_actions", source)
+            self.assertGreaterEqual(source.count("self.build_comparison(self.duty_data, self.duty_actions)"), 3)
+            self.assertIn("audit_compare_by_key", source)
+            self.assertIn("self.action_compare_sync_key(action, audit_target_date)", source)
+            self.assertIn("self.action_compare_sync_key(action, duty_target_date)", source)
+            self.assertNotIn('self.data.get("target_date") != self.duty_data.get("target_date")', source)
+            self.assertGreaterEqual(source.count("self.sync_duty_compare_from_audit()"), 2)
+            self.assertIn("def resolve_duty_task_display", source)
+            self.assertIn("status, tag, is_next_candidate = self.resolve_duty_task_display", source)
+            self.assertIn('return ("到點待執行", "ready", True) if action_at <= now else ("等待", "waiting", is_auto_candidate)', source)
+            self.assertIn('return compare.get("compare") or "人工確認", "manual", False', source)
+            self.assertIn("if self.compare_needs_manual_review(compare):", source)
+            self.assertIn('compare.get("group") == "manual" or self.compare_needs_manual_review(compare)', source)
+
+    def test_manual_current_time_entry_uses_submit_date_override(self) -> None:
+        for relative_path in self.duty_gui_paths():
+            source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn('if action.get("submit_target_date"):', source)
+            self.assertIn('return str(action["submit_target_date"])', source)
+            self.assertIn("current_now = datetime.now()", source)
+            self.assertIn('updated["submit_target_date"] = roc_date(current_now.date())', source)
+
     def test_update_package_rejects_version_mismatch(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn('$packageVersionPath = Join-Path $sourceDir "VERSION.txt"', script)
