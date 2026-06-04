@@ -90,6 +90,7 @@ from compare_rehearsal_records import (
     has_open_external_assignment,
     is_future_action,
     is_possible_handoff_adjustment,
+    row_has_primary_person,
     row_has_outin,
     row_has_time,
     row_minutes,
@@ -2611,7 +2612,7 @@ class DutyGui(tk.Tk):
             returned_after_handoff = False
             events: list[tuple[int, bool]] = []
             for row in rows:
-                if target_name not in row:
+                if not row_has_primary_person(row, target_name):
                     continue
                 if not any(keyword in row for keyword in ("救護", "救災", "火警", "火災", "外勤")):
                     continue

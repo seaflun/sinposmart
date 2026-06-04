@@ -115,6 +115,14 @@ def row_cells(row: str) -> list[str]:
     return [clean(part) for part in row.split("|") if clean(part)]
 
 
+def row_has_primary_person(row: str, target_name: str) -> bool:
+    if not target_name:
+        return False
+    cells = row_cells(row)
+    normalized_target = clean(target_name)
+    return normalized_target in cells[2:5]
+
+
 def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
     if not outin:
         return True
@@ -272,7 +280,7 @@ def has_open_external_assignment(
     active = False
     events: list[tuple[int, bool]] = []
     for row in rows:
-        if target_name not in row:
+        if not row_has_primary_person(row, target_name):
             continue
         if not any(keyword in row for keyword in ("救護", "救災", "火警", "火災", "外勤")):
             continue
