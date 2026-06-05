@@ -88,6 +88,22 @@ class StaticRegressionTests(unittest.TestCase):
             self.assertIn("current_now = datetime.now()", source)
             self.assertIn('updated["submit_target_date"] = roc_date(current_now.date())', source)
 
+    def test_due_tasks_catch_up_after_exact_minute(self) -> None:
+        for relative_path in self.duty_gui_paths():
+            source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn("is_due_now = action_at <= now", source)
+            self.assertNotIn("action_at.hour == now.hour and action_at.minute == now.minute", source)
+
+    def test_public_computer_runtime_logs_mirror_to_cloud(self) -> None:
+        for relative_path in self.duty_gui_paths():
+            source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8-sig")
+            self.assertIn('CLOUD_LOG_DIR_NAME = "public_computer_logs"', source)
+            self.assertIn("def cloud_runtime_log_root", source)
+            self.assertIn("def mirror_runtime_file_to_cloud", source)
+            self.assertIn("def append_runtime_jsonl_to_cloud", source)
+            self.assertIn('mirror_runtime_file_to_cloud(result_path, "form_tests")', source)
+            self.assertIn('append_runtime_jsonl_to_cloud("duty_trigger_log.jsonl", line)', source)
+
     def test_update_package_rejects_version_mismatch(self) -> None:
         script = (PROJECT_ROOT / "WinPython_公務電腦使用包" / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn('$packageVersionPath = Join-Path $sourceDir "VERSION.txt"', script)

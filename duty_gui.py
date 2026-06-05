@@ -40,6 +40,14 @@ COMPARISON_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "comparison"
 REHEARSAL_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "rehearsal"
 FORM_TEST_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "form_tests"
 SNAPSHOT_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "snapshots"
+CLOUD_LOG_DIR_NAME = "public_computer_logs"
+CLOUD_PROJECT_CANDIDATES = (
+    Path(os.environ["SINPOSMART_CLOUD_PROJECT_DIR"])
+    if os.environ.get("SINPOSMART_CLOUD_PROJECT_DIR")
+    else None,
+    Path("G:/我的雲端硬碟/專案/值班勤務系統自動化"),
+    Path("I:/我的雲端硬碟/專案/值班勤務系統自動化"),
+)
 AUTO_CLEAN_RULES = (
     (SCHEDULE_OUTPUT_DIR, "*.json", 45),
     (COMPARISON_OUTPUT_DIR, "*.json", 45),
@@ -236,6 +244,40 @@ def ensure_windows_notification_shortcut() -> bool:
             pythoncom.CoUninitialize()
         except Exception:
             pass
+
+
+def cloud_runtime_log_root() -> Path | None:
+    for candidate in CLOUD_PROJECT_CANDIDATES:
+        if candidate and candidate.exists():
+            machine = re.sub(r"[^A-Za-z0-9_.-]+", "_", socket.gethostname()) or "unknown"
+            return candidate / RUNTIME_OUTPUT_DIR / CLOUD_LOG_DIR_NAME / machine
+    return None
+
+
+def mirror_runtime_file_to_cloud(path: Path, relative_folder: str = "") -> None:
+    try:
+        cloud_root = cloud_runtime_log_root()
+        if not cloud_root or not path.exists():
+            return
+        target_dir = cloud_root / relative_folder if relative_folder else cloud_root
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / path.name
+        target.write_bytes(path.read_bytes())
+    except Exception:
+        pass
+
+
+def append_runtime_jsonl_to_cloud(filename: str, line: str) -> None:
+    try:
+        cloud_root = cloud_runtime_log_root()
+        if not cloud_root:
+            return
+        cloud_root.mkdir(parents=True, exist_ok=True)
+        with (cloud_root / filename).open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
 
 def latest_preview_file() -> Path:
     now = datetime.now()
@@ -2878,7 +2920,7 @@ class DutyGui(tk.Tk):
                 continue
             action_at = self.action_datetime(action)
             is_paused_retry = index in self.paused_due_indices and action_at <= now
-            is_due_now = action_at.date() == now.date() and action_at.hour == now.hour and action_at.minute == now.minute
+            is_due_now = action_at <= now
             if is_due_now or is_paused_retry:
                 target_roc_date = self.action_target_roc_date(action)
                 pause_reason = self.should_pause_due_action(action, target_roc_date, now=now)
@@ -2991,6 +3033,7 @@ class DutyGui(tk.Tk):
             "visible": visible,
         }
         result_path.write_text(json.dumps(started_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        mirror_runtime_file_to_cloud(result_path, "form_tests")
         return result_path
 
     def next_queued_submit_job(self) -> tuple[int, dict[str, Any], Path, bool, bool, bool, str] | None:
@@ -3102,6 +3145,7 @@ class DutyGui(tk.Tk):
                             "matched": duplicate_matches[:3],
                         }
                         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                        mirror_runtime_file_to_cloud(result_path, "form_tests")
                         self.after(0, lambda idx=index, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_skipped_duplicate(idx, path, note, origin))
                         job = self.next_queued_submit_job()
                         continue
@@ -3116,6 +3160,7 @@ class DutyGui(tk.Tk):
                     result["save"] = save
                     result["visible"] = job_visible
                     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    mirror_runtime_file_to_cloud(result_path, "form_tests")
                     self.after(0, lambda idx=index, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_succeeded(idx, path, note, origin))
                 except Exception as exc:
                     error = str(exc)
@@ -3129,6 +3174,7 @@ class DutyGui(tk.Tk):
                         "visible": job_visible,
                     }
                     result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    mirror_runtime_file_to_cloud(result_path, "form_tests")
                     self.after(0, lambda idx=index, err=error, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_failed(idx, err, path, note, origin))
                 job = self.next_queued_submit_job()
         except Exception as exc:
@@ -3144,6 +3190,7 @@ class DutyGui(tk.Tk):
                 "visible": job_visible,
             }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
+            mirror_runtime_file_to_cloud(result_path, "form_tests")
             self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify, trigger_type))
         finally:
             if driver:
@@ -3258,8 +3305,10 @@ class DutyGui(tk.Tk):
             "status": status,
             "completion_key": completion_key or self.action_completion_key(action),
         }
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         with Path("duty_trigger_log.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(line)
+        append_runtime_jsonl_to_cloud("duty_trigger_log.jsonl", line)
 
     # Mode switching and audit table rendering
 
