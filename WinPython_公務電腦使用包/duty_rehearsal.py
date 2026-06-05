@@ -18,6 +18,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from selenium import webdriver
@@ -40,6 +41,7 @@ ENTRY_OUTIN_VALUE_MAP = {
 }
 WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
+WORK_LOG_DEFAULTS_PATH = Path(__file__).with_name("work_log_defaults.json")
 
 HANDOFF_HOURS = [8, 10, 12, 14, 16, 18, 20, 22]
 OFF_DUTY_SUMMARY_KEYS = {
@@ -156,6 +158,117 @@ def normalize_num(n: str) -> str:
 
 def is_fire_case_category(category: str) -> bool:
     return any(keyword in category for keyword in ("火警", "火災", "救災"))
+
+
+DEFAULT_WORK_LOG_DEFAULTS: dict[str, Any] = {
+    "radio_count": 34,
+    "emergency_vehicles_in_station": 6,
+    "emergency_vehicles_repair": 0,
+    "ems_case_vehicles": 1,
+    "fire_case_vehicles": 2,
+    "support_vehicles_in_station": 5,
+    "support_vehicles_out": 0,
+    "support_vehicles_repair": 0,
+    "rescue_equipment_in_station": 2,
+    "rescue_equipment_out": 0,
+    "important_note": "（比如○○車輛或橡皮艇報修、防颱應變中心成立等事項）。",
+    "tic_count": 5,
+    "case_vehicle_overrides": {},
+}
+
+
+def int_setting(settings: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        value = int(str(settings.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, value)
+
+
+def load_work_log_defaults() -> dict[str, Any]:
+    settings = dict(DEFAULT_WORK_LOG_DEFAULTS)
+    if WORK_LOG_DEFAULTS_PATH.exists():
+        try:
+            loaded = json.loads(WORK_LOG_DEFAULTS_PATH.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                settings.update(loaded)
+        except Exception:
+            pass
+    if not isinstance(settings.get("case_vehicle_overrides"), dict):
+        settings["case_vehicle_overrides"] = {}
+    return settings
+
+
+def save_work_log_defaults(settings: dict[str, Any]) -> None:
+    merged = dict(DEFAULT_WORK_LOG_DEFAULTS)
+    merged.update(settings)
+    if not isinstance(merged.get("case_vehicle_overrides"), dict):
+        merged["case_vehicle_overrides"] = {}
+    WORK_LOG_DEFAULTS_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def case_vehicle_key(case: CaseRecord, target_roc_date: str) -> str:
+    category = case.category or "案件"
+    return f"{target_roc_date}|{case.report_time}|{category}|{' '.join(case.raw[:4])}"
+
+
+def default_case_vehicle_count(case: CaseRecord, settings: dict[str, Any]) -> int:
+    if is_fire_case_category(case.category):
+        return 2
+    if "緊急救護" in case.category:
+        return 1
+    return 0
+
+
+def case_report_hour(case: CaseRecord) -> int | None:
+    if not case.report_time:
+        return None
+    match = re.match(r"(\d{1,2}):", case.report_time)
+    return int(match.group(1)) if match else None
+
+
+def is_test_case_row(row: list[str]) -> bool:
+    return any("測試" in str(cell).replace("（", "(").replace("）", ")") for cell in row)
+
+
+def unreturned_case_vehicle_items(
+    cases: list[CaseRecord],
+    settings: dict[str, Any] | None = None,
+    target_roc_date: str = "",
+    before_hour: int | None = None,
+) -> list[dict[str, Any]]:
+    settings = settings or load_work_log_defaults()
+    date_overrides = settings.get("case_vehicle_overrides", {}).get(target_roc_date, {})
+    if not isinstance(date_overrides, dict):
+        date_overrides = {}
+    items: list[dict[str, Any]] = []
+    for case in cases:
+        if case.return_time:
+            continue
+        report_hour = case_report_hour(case)
+        if before_hour is not None and report_hour is not None and report_hour >= before_hour:
+            continue
+        key = case_vehicle_key(case, target_roc_date)
+        default_count = default_case_vehicle_count(case, settings)
+        count = date_overrides.get(key, default_count)
+        try:
+            count = max(0, int(count))
+        except (TypeError, ValueError):
+            count = default_count
+        if count <= 0:
+            continue
+        items.append(
+            {
+                "key": key,
+                "date": target_roc_date,
+                "report_time": case.report_time,
+                "category": case.category or "案件",
+                "count": count,
+                "default_count": default_count,
+                "raw": case.raw,
+            }
+        )
+    return items
 
 
 def handheld_radio(number: str) -> str:
@@ -709,20 +822,68 @@ def fill_work_log_form_for_test(
         """
         const values = arguments[0];
         const result = {set: [], missing: []};
-        function setDirect(id, value) {
-          const el = document.getElementById(id);
+        function setControl(el, value) {
           if (!el) return false;
-          el.value = value;
+          if (el.tagName.toLowerCase() === 'select') {
+            const target = String(value || '').trim();
+            const options = Array.from(el.options || []);
+            const option = options.find(opt =>
+              String(opt.text || '').trim() === target ||
+              String(opt.value || '').trim() === target
+            ) || options.find(opt => String(opt.text || '').includes(target));
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
           result.set.push({id: el.id || '', name: el.name || '', value});
           return true;
         }
+        function setDirect(id, value) {
+          const el = document.getElementById(id);
+          return setControl(el, value);
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            if (setDirect(id, value)) return true;
+          }
+          return false;
+        }
+        function byOptionText(value) {
+          const target = String(value || '').trim();
+          const el = Array.from(document.querySelectorAll('select')).find(control =>
+            Array.from(control.options || []).some(opt =>
+              String(opt.text || '').trim() === target ||
+              String(opt.value || '').trim() === target ||
+              String(opt.text || '').includes(target)
+            )
+          );
+          return setControl(el, value);
+        }
+        function byNearbyText(label, value) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const controlsOf = root => Array.from(root.querySelectorAll('input, select, textarea'));
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const controls = cells.slice(labelIndex + 1).flatMap(controlsOf);
+            for (const control of controls) {
+              if (setControl(control, value)) return true;
+            }
+          }
+          return false;
+        }
+        if (values.reason && !byIds(['_selReason', '_selList4', '_selList2', '_txtReason'], values.reason) && !byNearbyText('事由', values.reason) && !byOptionText(values.reason)) result.missing.push('reason');
         if (!setDirect('_areDescription', values.description)) result.missing.push('description');
         if (!setDirect('_areStatus', values.status)) result.missing.push('status');
         return result;
         """,
         {
+            "reason": fields.get("事由", ""),
             "description": fields.get("工作概述", ""),
             "status": fields.get("處理情形", ""),
         },
@@ -1360,14 +1521,35 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
     time.sleep(1.5)
     rows = driver.execute_script(
         """
+        const textParts = (el) => {
+          const parts = [];
+          const push = (value) => {
+            value = (value || '').trim();
+            if (value && !parts.includes(value)) parts.push(value);
+          };
+          push(el.innerText);
+          push(el.textContent);
+          push(el.getAttribute('title'));
+          push(el.getAttribute('value'));
+          el.querySelectorAll('*').forEach(child => {
+            push(child.innerText);
+            push(child.textContent);
+            push(child.getAttribute('title'));
+            push(child.getAttribute('value'));
+            push(child.value);
+          });
+          return parts.join(' ');
+        };
         return Array.from(document.querySelectorAll('tr')).map(tr =>
-          Array.from(tr.children).map(td => (td.innerText || '').trim()).filter(Boolean)
+          Array.from(tr.children).map(td => textParts(td)).filter(Boolean)
         ).filter(row => row.length >= 3);
         """
     )
     cases: list[CaseRecord] = []
     for row in rows:
         joined = " ".join(row)
+        if is_test_case_row(row):
+            continue
         if not re.search(r"\d{1,2}:\d{2}:\d{2}", joined):
             continue
         times = re.findall(r"\d{1,2}:\d{2}:\d{2}", joined)
@@ -1413,6 +1595,17 @@ def row_for_hour(sheet: DutySheet, hour: int) -> DutyRow | None:
 def people_at(sheet: DutySheet, hour: int, column: str) -> list[str]:
     row = row_for_hour(sheet, hour)
     return row.columns.get(column, []) if row else []
+
+
+def is_active_checkout_column(column: str) -> bool:
+    return column not in OFF_DUTY_SUMMARY_KEYS and column != "檢核欄"
+
+
+def needs_next_morning_checkout(sheet: DutySheet, no: str) -> bool:
+    row = row_for_hour(sheet, 22)
+    if not row:
+        return False
+    return any(no in values for column, values in row.columns.items() if is_active_checkout_column(column))
 
 
 def rest_starting_at(sheet: DutySheet, hour: int, next_sheet: DutySheet | None = None) -> dict[str, int]:
@@ -1629,15 +1822,18 @@ def officer_for_training(sheet: DutySheet) -> str:
 
 # Work log text templates
 
-def work_handoff_description() -> str:
+def work_handoff_description(settings: dict[str, Any] | None = None, vehicle_out_count: int = 0) -> str:
+    settings = settings or load_work_log_defaults()
+    important_note = str(settings.get("important_note", "")).strip() or "無。"
+    emergency_in_station = max(0, int_setting(settings, "emergency_vehicles_in_station", 6) - vehicle_out_count)
     return "\n".join(
         [
-            "（一）無線電：良好34支。",
-            "（二）消防及救護車【各式消防救災救護車輛】在隊5台、出勤0台、報修1台。",
-            "（三）後勤車【機車、幫浦車、指揮車、火場鑑識車】在隊5台、出勤0台、報修0台。",
-            "（四）救災器材裝備【橡皮艇、救生艇】在隊2台、出勤0台。",
-            "（五）重要記事：（比如○○車輛或橡皮艇報修、防颱應變中心成立等事項）。",
-            "（六）TIC：隊上5支。",
+            f"（一）無線電：良好{int_setting(settings, 'radio_count', 34)}支。",
+            f"（二）消防及救護車【各式消防救災救護車輛】在隊{emergency_in_station}台、出勤{vehicle_out_count}台、報修{int_setting(settings, 'emergency_vehicles_repair', 0)}台。",
+            f"（三）後勤車【機車、幫浦車、指揮車、火場鑑識車】在隊{int_setting(settings, 'support_vehicles_in_station', 5)}台、出勤{int_setting(settings, 'support_vehicles_out', 0)}台、報修{int_setting(settings, 'support_vehicles_repair', 0)}台。",
+            f"（四）救災器材裝備【橡皮艇、救生艇】在隊{int_setting(settings, 'rescue_equipment_in_station', 2)}台、出勤{int_setting(settings, 'rescue_equipment_out', 0)}台。",
+            f"（五）重要記事：{important_note}",
+            f"（六）TIC：隊上{int_setting(settings, 'tic_count', 5)}支。",
         ]
     )
 
@@ -1738,6 +1934,7 @@ def planned_actions(
 ) -> list[PlannedAction]:
     actions: list[PlannedAction] = []
     yesterday_cases = yesterday_cases or []
+    work_log_defaults = load_work_log_defaults()
 
     # 08 boundary, including rest-start exceptions.
     today_on = set(today.summary.get("在勤", []))
@@ -1774,6 +1971,8 @@ def planned_actions(
         )
 
     for no in sorted(yesterday_on - today_on, key=int):
+        if yesterday and not needs_next_morning_checkout(yesterday, no):
+            continue
         if no in yesterday_rest_start_06:
             at = 6
             minute = 0
@@ -1916,10 +2115,14 @@ def planned_actions(
         if hour == 8:
             time_range = "22-08"
             counts = case_counts_overnight(yesterday_cases, today_cases)
+            vehicle_items = unreturned_case_vehicle_items(yesterday_cases, work_log_defaults, roc_date(target - timedelta(days=1)))
+            vehicle_items.extend(unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=8))
         else:
             start_hour = hour - 2
             time_range = f"{start_hour:02d}-{hour:02d}"
             counts = case_counts(today_cases, start_hour, hour)
+            vehicle_items = unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=hour)
+        vehicle_out_count = sum(int(item.get("count", 0)) for item in vehicle_items)
         for no in outgoing:
             actions.append(
                 PlannedAction(
@@ -1970,7 +2173,7 @@ def planned_actions(
                     fields={
                         "工作時間": f"{hour:02d}:00",
                         "勤務項目": "值班(宿)",
-                        "工作概述": work_handoff_description(),
+                        "工作概述": work_handoff_description(work_log_defaults, vehicle_out_count),
                         "處理情形": work_handoff_status_text(time_range, counts),
                         "服勤人員": [actor],
                     },

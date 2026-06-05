@@ -106,11 +106,15 @@ from compare_rehearsal_records import (
     summarize_work,
 )
 from duty_rehearsal import (
+    CaseRecord,
+    DEFAULT_WORK_LOG_DEFAULTS,
     ENTRY_LOG_AP,
     OFF_DUTY_SUMMARY_KEYS,
     WORK_LOG_AP,
     fill_entry_log_form_for_test,
     fill_work_log_form_for_test,
+    int_setting,
+    load_work_log_defaults,
     login,
     parse_roc_date,
     planned_actions,
@@ -118,8 +122,11 @@ from duty_rehearsal import (
     query_duty_sheet,
     query_visible_table,
     roc_date,
+    save_work_log_defaults,
     slot_end,
     slot_start,
+    unreturned_case_vehicle_items,
+    work_handoff_description,
 )
 
 
@@ -408,13 +415,15 @@ class DutyGui(tk.Tk):
         self.paused_due_indices: dict[int, str] = {}
         self.failed_due_retry_after: dict[int, datetime] = {}
         self.submitting_indices: set[int] = set()
-        self.submit_queue: list[tuple[int, dict[str, Any], bool, bool, bool, str]] = []
-        self.submit_worker_running = False
+        self.submit_queues: dict[str, list[tuple[int, dict[str, Any], bool, bool, bool, str]]] = {"entry": [], "work": []}
+        self.submit_worker_running: dict[str, bool] = {"entry": False, "work": False}
+        self.work_submit_parallel_enabled = True
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates: set[str] = set()
         self.submit_comparison_refresh_scheduled = False
         self.duty_selection_anchor = ""
         self.saved_accounts: list[dict[str, str]] = []
+        self.work_log_defaults = load_work_log_defaults()
         self.review_widgets: list[tk.Widget] = []
         self.duty_widgets: list[tk.Widget] = []
         self.login_form_widgets: list[tk.Widget] = []
@@ -678,7 +687,12 @@ class DutyGui(tk.Tk):
         login_card.pack(fill=tk.X, pady=(10, 0))
         login_panel = tk.Frame(login_card, bg="#eff6ff")
         login_panel.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
-        tk.Label(login_panel, text="消防勤務管理系統", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 12, "bold")).pack(anchor=tk.W)
+        duty_header = tk.Frame(login_panel, bg="#eff6ff")
+        duty_header.pack(fill=tk.X)
+        tk.Label(duty_header, text="消防勤務管理系統", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 12, "bold")).pack(side=tk.LEFT)
+        self.work_log_settings_button = ttk.Button(duty_header, text="⚙", width=3, style="PanelTool.TButton", command=self.open_work_log_defaults_dialog, takefocus=False)
+        self.work_log_settings_button.pack(side=tk.RIGHT)
+        self.work_log_settings_button.pack_forget()
         self.credentials_grid = tk.Frame(login_panel, bg="#eff6ff")
         self.credentials_grid.pack(fill=tk.X, pady=(8, 0))
         self.credentials_grid.columnconfigure(0, weight=1)
@@ -2119,8 +2133,9 @@ class DutyGui(tk.Tk):
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
         self.failed_due_retry_after.clear()
-        self.submit_queue.clear()
-        self.submit_worker_running = False
+        self.submit_queues = {"entry": [], "work": []}
+        self.submit_worker_running = {"entry": False, "work": False}
+        self.work_submit_parallel_enabled = True
         self.pending_hourly_comparison = None
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates.clear()
@@ -2248,7 +2263,7 @@ class DutyGui(tk.Tk):
     def schedule_auto_logout(self, actor_no: str, action: dict[str, Any]) -> None:
         self.cancel_auto_logout()
         action_at = self.action_datetime(action)
-        deadline = action_at + timedelta(minutes=5)
+        deadline = action_at + timedelta(minutes=10)
         delay_ms = max(0, int((deadline - datetime.now()).total_seconds() * 1000))
         self.auto_logout_deadline = deadline
         self.auto_logout_actor_no = str(actor_no)
@@ -2268,7 +2283,7 @@ class DutyGui(tk.Tk):
         label = self.logged_in_identity_label(expected_actor)
         self.clear_login()
         self.login_status.set(f"已自動登出：{label}")
-        self.set_duty_status("值班段落結束 5 分鐘，已自動登出。", hold_seconds=10)
+        self.set_duty_status("值班段落結束 10 分鐘，已自動登出。", hold_seconds=10)
         self.notify_user(APP_DISPLAY_NAME, f"{label} 已自動登出")
 
     def set_logged_in_status(self, actor_no: str) -> None:
@@ -2298,8 +2313,9 @@ class DutyGui(tk.Tk):
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
         self.failed_due_retry_after.clear()
-        self.submit_queue.clear()
-        self.submit_worker_running = False
+        self.submit_queues = {"entry": [], "work": []}
+        self.submit_worker_running = {"entry": False, "work": False}
+        self.work_submit_parallel_enabled = True
         self.pending_hourly_comparison = None
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates.clear()
@@ -2331,6 +2347,8 @@ class DutyGui(tk.Tk):
                 widget.pack_forget()
             if not self.logout_button.winfo_manager():
                 self.logout_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if hasattr(self, "work_log_settings_button") and not self.work_log_settings_button.winfo_manager():
+                self.work_log_settings_button.pack(side=tk.RIGHT)
             self.set_duty_action_buttons_visible(True)
         else:
             self.credentials_grid.pack_forget()
@@ -2338,6 +2356,8 @@ class DutyGui(tk.Tk):
             if not self.login_button.winfo_manager():
                 self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True, before=self.logout_button)
             self.logout_button.pack_forget()
+            if hasattr(self, "work_log_settings_button"):
+                self.work_log_settings_button.pack_forget()
             self.set_duty_action_buttons_visible(False)
         self.set_login_buttons_enabled(not self.login_running)
 
@@ -2356,6 +2376,195 @@ class DutyGui(tk.Tk):
                 self.duty_sheet_tools_card.pack_forget()
             self.audit_mode_button.pack_forget()
             self.early_submit_button.pack_forget()
+
+    def work_log_case_records(self, key: str) -> list[CaseRecord]:
+        records: list[CaseRecord] = []
+        for item in self.duty_data.get(key, []) or []:
+            if isinstance(item, CaseRecord):
+                records.append(item)
+            elif isinstance(item, dict):
+                records.append(
+                    CaseRecord(
+                        report_time=str(item.get("report_time", "")),
+                        return_time=str(item.get("return_time", "")),
+                        category=str(item.get("category", "")),
+                        raw=[str(value) for value in item.get("raw", [])],
+                    )
+                )
+        return records
+
+    def work_log_case_items(self) -> list[dict[str, Any]]:
+        target_date = self.duty_data.get("target_date", "") or duty_business_roc_date()
+        items = unreturned_case_vehicle_items(self.work_log_case_records("yesterday_cases"), self.work_log_defaults, roc_date_after(target_date, -1))
+        items.extend(unreturned_case_vehicle_items(self.work_log_case_records("cases"), self.work_log_defaults, target_date))
+        return items
+
+    def handoff_vehicle_out_count(self, hour: int) -> int:
+        target_date = self.duty_data.get("target_date", "") or duty_business_roc_date()
+        if hour == 8:
+            items = unreturned_case_vehicle_items(self.work_log_case_records("yesterday_cases"), self.work_log_defaults, roc_date_after(target_date, -1))
+            items.extend(unreturned_case_vehicle_items(self.work_log_case_records("cases"), self.work_log_defaults, target_date, before_hour=8))
+        else:
+            items = unreturned_case_vehicle_items(self.work_log_case_records("cases"), self.work_log_defaults, target_date, before_hour=hour)
+        return sum(int(item.get("count", 0)) for item in items)
+
+    def refresh_work_log_handoff_descriptions(self) -> None:
+        for action in self.duty_actions:
+            if action.get("kind") != "work_log" or action.get("source") != "值班交接":
+                continue
+            try:
+                hour = int(str(action.get("time", "00:00")).split(":", 1)[0])
+            except ValueError:
+                hour = 0
+            action.setdefault("fields", {})["工作概述"] = work_handoff_description(self.work_log_defaults, self.handoff_vehicle_out_count(hour))
+        for action in self.duty_data.get("actions", []) or []:
+            if action.get("kind") != "work_log" or action.get("source") != "值班交接":
+                continue
+            try:
+                hour = int(str(action.get("time", "00:00")).split(":", 1)[0])
+            except ValueError:
+                hour = 0
+            action.setdefault("fields", {})["工作概述"] = work_handoff_description(self.work_log_defaults, self.handoff_vehicle_out_count(hour))
+
+    def open_work_log_defaults_dialog(self) -> None:
+        self.work_log_defaults = load_work_log_defaults()
+        dialog = tk.Toplevel(self)
+        dialog.title("工作紀錄預設內容")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(bg="#f4f7fb")
+        dialog.geometry("520x660")
+        dialog.minsize(500, 620)
+        self.apply_window_icon(dialog)
+
+        container = tk.Frame(dialog, bg="#f4f7fb")
+        container.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        header = tk.Frame(container, bg="#e0f2fe", highlightbackground="#bae6fd", highlightthickness=1)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="工作紀錄預設內容", bg="#e0f2fe", fg="#0f172a", font=("Microsoft JhengHei", 13, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 2))
+        tk.Label(header, text="消防救護車出勤由未返隊案件帶入，例外可調整單筆案件台數。", bg="#e0f2fe", fg="#0369a1", font=("Microsoft JhengHei", 9)).pack(anchor=tk.W, padx=12, pady=(0, 10))
+
+        form = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
+        form.pack(fill=tk.X, pady=(10, 0))
+        vars_by_key: dict[str, tk.StringVar] = {}
+
+        def add_setting_spin(parent: tk.Widget, row: int, col: int, key: str, label: str, unit: str) -> None:
+            tk.Label(parent, text=label, bg="#ffffff", fg="#475569", font=("Microsoft JhengHei", 9)).grid(row=row, column=col, sticky=tk.W, padx=(8, 3), pady=6)
+            var = tk.StringVar(value=str(int_setting(self.work_log_defaults, key, int_setting(DEFAULT_WORK_LOG_DEFAULTS, key, 0))))
+            vars_by_key[key] = var
+            tk.Spinbox(parent, from_=0, to=99, width=4, textvariable=var, font=("Microsoft JhengHei", 9), justify=tk.CENTER).grid(row=row, column=col + 1, sticky=tk.W, pady=6)
+            tk.Label(parent, text=unit, bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).grid(row=row, column=col + 2, sticky=tk.W, padx=(2, 8), pady=6)
+
+        def add_item_label(row: int, text: str) -> None:
+            tk.Label(form, text=text, bg="#ffffff", fg="#0f172a", font=("Microsoft JhengHei", 9, "bold"), width=12, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, padx=(12, 2), pady=6)
+
+        add_item_label(0, "無線電")
+        add_setting_spin(form, 0, 1, "radio_count", "良好", "支")
+        add_item_label(1, "消防及救護車")
+        add_setting_spin(form, 1, 1, "emergency_vehicles_in_station", "在隊", "台")
+        add_setting_spin(form, 1, 4, "emergency_vehicles_repair", "報修", "台")
+        add_item_label(2, "後勤車")
+        add_setting_spin(form, 2, 1, "support_vehicles_in_station", "在隊", "台")
+        add_setting_spin(form, 2, 4, "support_vehicles_out", "出勤", "台")
+        add_setting_spin(form, 2, 7, "support_vehicles_repair", "報修", "台")
+        add_item_label(3, "救災器材")
+        add_setting_spin(form, 3, 1, "rescue_equipment_in_station", "在隊", "台")
+        add_setting_spin(form, 3, 4, "rescue_equipment_out", "出勤", "台")
+        add_item_label(4, "TIC")
+        add_setting_spin(form, 4, 1, "tic_count", "隊上", "支")
+
+        note_card = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
+        note_card.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(note_card, text="重要記事", bg="#ffffff", fg="#334155", font=("Microsoft JhengHei", 9, "bold")).pack(anchor=tk.W, padx=12, pady=(8, 2))
+        note_text = tk.Text(note_card, height=3, wrap=tk.WORD, font=("Microsoft JhengHei", 9), relief=tk.FLAT, highlightbackground="#cbd5e1", highlightthickness=1)
+        note_text.pack(fill=tk.X, padx=12, pady=(0, 10))
+        note_text.insert("1.0", str(self.work_log_defaults.get("important_note", "")))
+
+        case_card = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
+        case_card.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        tk.Label(case_card, text="未返隊案件出勤估算", bg="#ffffff", fg="#334155", font=("Microsoft JhengHei", 9, "bold")).pack(anchor=tk.W, padx=12, pady=(8, 4))
+        case_rows = tk.Frame(case_card, bg="#ffffff")
+        case_rows.pack(fill=tk.X, padx=12)
+        case_vars: dict[str, tk.StringVar] = {}
+        items = self.work_log_case_items()
+        if not items:
+            tk.Label(case_rows, text="目前沒有查到未返隊案件；登入查詢後會由案件帶入。", bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).pack(anchor=tk.W, pady=(0, 8))
+        for item in items:
+            row = tk.Frame(case_rows, bg="#ffffff")
+            row.pack(fill=tk.X, pady=2)
+            date_text = str(item.get("date", ""))
+            if len(date_text) == 7 and date_text.isdigit():
+                date_text = f"{date_text[:3]}/{date_text[3:5]}/{date_text[5:7]}"
+            label = f"{date_text} {item.get('report_time', '')} {item.get('category', '案件')}"
+            tk.Label(row, text=label, bg="#ffffff", fg="#0f172a", font=("Microsoft JhengHei", 9), width=40, anchor=tk.W).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(item.get("count", item.get("default_count", 0))))
+            case_vars[str(item["key"])] = var
+            tk.Spinbox(row, from_=0, to=9, width=3, textvariable=var, font=("Microsoft JhengHei", 9), justify=tk.CENTER).pack(side=tk.LEFT)
+            tk.Label(row, text="台", bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).pack(side=tk.LEFT, padx=(3, 0))
+
+        preview = tk.Label(case_card, text="", bg="#f8fafc", fg="#1e3a8a", font=("Microsoft JhengHei", 9), justify=tk.LEFT, anchor=tk.W, wraplength=460)
+        preview.pack(fill=tk.X, padx=12, pady=(8, 10))
+
+        def collect_settings() -> dict[str, Any]:
+            settings = dict(self.work_log_defaults)
+            for key, var in vars_by_key.items():
+                try:
+                    settings[key] = max(0, int(var.get()))
+                except ValueError:
+                    settings[key] = 0
+            settings["important_note"] = note_text.get("1.0", tk.END).strip()
+            overrides = dict(settings.get("case_vehicle_overrides", {})) if isinstance(settings.get("case_vehicle_overrides"), dict) else {}
+            for key, var in case_vars.items():
+                date_key = key.split("|", 1)[0]
+                overrides.setdefault(date_key, {})
+                try:
+                    overrides[date_key][key] = max(0, int(var.get()))
+                except ValueError:
+                    overrides[date_key][key] = 0
+            settings["case_vehicle_overrides"] = overrides
+            return settings
+
+        def refresh_preview(*_args: object) -> None:
+            settings = collect_settings()
+            total = 0
+            for var in case_vars.values():
+                try:
+                    total += max(0, int(var.get()))
+                except ValueError:
+                    pass
+            preview.config(text=work_handoff_description(settings, total))
+
+        for var in list(vars_by_key.values()) + list(case_vars.values()):
+            var.trace_add("write", refresh_preview)
+        note_text.bind("<KeyRelease>", refresh_preview)
+        refresh_preview()
+
+        buttons = tk.Frame(container, bg="#f4f7fb")
+        buttons.pack(fill=tk.X, pady=(10, 0))
+
+        def reset_defaults() -> None:
+            for key, var in vars_by_key.items():
+                var.set(str(DEFAULT_WORK_LOG_DEFAULTS.get(key, 0)))
+            note_text.delete("1.0", tk.END)
+            note_text.insert("1.0", str(DEFAULT_WORK_LOG_DEFAULTS.get("important_note", "")))
+            for item in items:
+                key = str(item["key"])
+                if key in case_vars:
+                    case_vars[key].set(str(item.get("default_count", 0)))
+            refresh_preview()
+
+        def save_settings() -> None:
+            self.work_log_defaults = collect_settings()
+            save_work_log_defaults(self.work_log_defaults)
+            self.refresh_work_log_handoff_descriptions()
+            self.refresh_duty_tasks()
+            self.set_duty_status("已儲存工作紀錄預設內容。", hold_seconds=6)
+            dialog.destroy()
+
+        ttk.Button(buttons, text="還原預設", style="PanelTool.TButton", command=reset_defaults).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="取消", style="PanelTool.TButton", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="儲存", style="Accent.TButton", command=save_settings).pack(side=tk.RIGHT, padx=(0, 8))
 
     def open_duty_sheet_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
@@ -2746,14 +2955,9 @@ class DutyGui(tk.Tk):
         now = now or datetime.now()
         if target_roc_date == roc_date(now.date()):
             current_minute = now.hour * 60 + now.minute
-        external_rows = self.comparison_external_rows(target_roc_date)
-        handoff_group = self.handoff_group_actions(action, target_roc_date)
-        if handoff_group:
-            if self.handoff_group_has_open_external_assignment(external_rows, target_roc_date, handoff_group, current_minute):
-                return "值班人員未返隊，暫停交接"
-            return ""
         if reason not in ("退勤", "休息後退勤"):
             return ""
+        external_rows = self.comparison_external_rows(target_roc_date)
         if has_open_external_assignment(external_rows, target_roc_date, self.duty_staff, action, current_minute=current_minute):
             return "未返隊，暫停登打"
         return ""
@@ -2996,24 +3200,35 @@ class DutyGui(tk.Tk):
         if trigger_type == "manual":
             self.log_trigger(index, action, trigger_type)
             action = self.action_for_manual_submit(action)
+        lane = self.submit_lane_for_action(action, visible, trigger_type)
         self.submitting_indices.add(index)
-        self.submit_queue.append((index, action, save, visible, notify, trigger_type))
+        self.submit_queues[lane].append((index, action, save, visible, notify, trigger_type))
         summary = self.duty_action_summary(action)
         self.duty_status_text.set(f"正在登打：{summary}")
         if trigger_type != "manual":
             self.notify_user(APP_DISPLAY_NAME, f"開始：{self.notification_action_summary(action)}")
         self.refresh_duty_tasks()
-        self.start_next_submit_job()
+        self.start_next_submit_job(lane)
 
-    def start_next_submit_job(self) -> None:
-        if self.submit_worker_running or not self.submit_queue or not self.session:
+    def submit_lane_for_action(self, action: dict[str, Any], visible: bool, trigger_type: str) -> str:
+        if trigger_type == "due" and not visible and action.get("kind") == "work_log" and self.work_submit_parallel_enabled:
+            return "work"
+        return "entry"
+
+    def submit_queue_has_items(self) -> bool:
+        return any(self.submit_queues.get(lane) for lane in ("entry", "work"))
+
+    def start_next_submit_job(self, lane: str = "entry") -> None:
+        if lane not in self.submit_queues:
+            lane = "entry"
+        if self.submit_worker_running.get(lane) or not self.submit_queues.get(lane) or not self.session:
             return
-        index, action, save, visible, notify, trigger_type = self.submit_queue.pop(0)
-        self.submit_worker_running = True
+        index, action, save, visible, notify, trigger_type = self.submit_queues[lane].pop(0)
+        self.submit_worker_running[lane] = True
         result_path = self.create_submit_result_path(index, action, save, visible)
         self.duty_status_text.set(f"正在登打：{self.duty_action_summary(action)}")
         self.refresh_duty_tasks()
-        threading.Thread(target=self._save_work_log_worker, args=((index, action, result_path, save, visible, notify, trigger_type), self.session, visible), daemon=True).start()
+        threading.Thread(target=self._save_work_log_worker, args=((index, action, result_path, save, visible, notify, trigger_type), self.session, visible, lane), daemon=True).start()
 
     def create_submit_result_path(self, index: int, action: dict[str, Any], save: bool, visible: bool) -> Path:
         prefix = "entry_log_form_test" if action.get("kind") == "entry_log" else "work_log_form_test"
@@ -3036,10 +3251,10 @@ class DutyGui(tk.Tk):
         mirror_runtime_file_to_cloud(result_path, "form_tests")
         return result_path
 
-    def next_queued_submit_job(self) -> tuple[int, dict[str, Any], Path, bool, bool, bool, str] | None:
-        if not self.submit_queue:
+    def next_queued_submit_job(self, lane: str) -> tuple[int, dict[str, Any], Path, bool, bool, bool, str] | None:
+        if not self.submit_queues.get(lane):
             return None
-        index, action, save, visible, notify, trigger_type = self.submit_queue.pop(0)
+        index, action, save, visible, notify, trigger_type = self.submit_queues[lane].pop(0)
         return index, action, self.create_submit_result_path(index, action, save, visible), save, visible, notify, trigger_type
 
     def export_issue_package(self, result_path: Path | None = None, error: str | None = None, show_dialog: bool = True) -> Path:
@@ -3115,7 +3330,7 @@ class DutyGui(tk.Tk):
                 return latest_action
         return action
 
-    def _save_work_log_worker(self, first_job: tuple[int, dict[str, Any], Path, bool, bool, bool, str], session: LoginSession, visible: bool) -> None:
+    def _save_work_log_worker(self, first_job: tuple[int, dict[str, Any], Path, bool, bool, bool, str], session: LoginSession, visible: bool, lane: str = "entry") -> None:
         driver = None
         try:
             options = Options()
@@ -3147,7 +3362,7 @@ class DutyGui(tk.Tk):
                         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
                         mirror_runtime_file_to_cloud(result_path, "form_tests")
                         self.after(0, lambda idx=index, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_skipped_duplicate(idx, path, note, origin))
-                        job = self.next_queued_submit_job()
+                        job = self.next_queued_submit_job(lane)
                         continue
                     if action.get("kind") == "entry_log":
                         result = fill_entry_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
@@ -3176,10 +3391,13 @@ class DutyGui(tk.Tk):
                     result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
                     mirror_runtime_file_to_cloud(result_path, "form_tests")
                     self.after(0, lambda idx=index, err=error, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_failed(idx, err, path, note, origin))
-                job = self.next_queued_submit_job()
+                job = self.next_queued_submit_job(lane)
         except Exception as exc:
             error = str(exc)
             index, action, result_path, save, job_visible, notify, trigger_type = first_job
+            if lane == "work":
+                self.after(0, lambda raw=(index, action, save, job_visible, notify, trigger_type), err=error: self.fallback_work_submit_to_entry(raw, err))
+                return
             failure_result = {
                 "stage": "failed",
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -3195,7 +3413,7 @@ class DutyGui(tk.Tk):
         finally:
             if driver:
                 driver.quit()
-            self.after(0, self._submit_worker_finished)
+            self.after(0, lambda value=lane: self._submit_worker_finished(value))
 
     def _save_work_log_item_succeeded(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
@@ -3259,13 +3477,21 @@ class DutyGui(tk.Tk):
             messagebox.showerror("登打失敗", f"{error}\n\n結果檔：{result_path.name}{package_note}")
         self.refresh_duty_tasks()
 
-    def _submit_worker_finished(self) -> None:
-        self.submit_worker_running = False
-        if self.submit_needs_comparison_refresh and not self.submit_queue and self.duty_data.get("target_date"):
+    def fallback_work_submit_to_entry(self, first_job: tuple[int, dict[str, Any], bool, bool, bool, str], error: str) -> None:
+        self.work_submit_parallel_enabled = False
+        remaining_work = self.submit_queues.get("work", [])
+        self.submit_queues["work"] = []
+        self.submit_queues["entry"] = [first_job, *remaining_work, *self.submit_queues.get("entry", [])]
+        self.set_duty_status(f"工作背景登入失敗，改用單佇列順序登打：{error}", hold_seconds=10)
+        self.start_next_submit_job("entry")
+
+    def _submit_worker_finished(self, lane: str = "entry") -> None:
+        self.submit_worker_running[lane] = False
+        if self.submit_needs_comparison_refresh and not self.submit_queue_has_items() and self.duty_data.get("target_date"):
             self.submit_needs_comparison_refresh = False
             self.schedule_submit_comparison_refresh()
         self.refresh_duty_tasks()
-        self.start_next_submit_job()
+        self.start_next_submit_job(lane)
 
     def schedule_submit_comparison_refresh(self) -> None:
         if self.submit_comparison_refresh_scheduled:

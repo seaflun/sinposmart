@@ -192,11 +192,11 @@ def find_entry_matches(
     strict_time = outin in ("值班", "值退")
     external_entry = str(action.get("source", "")).startswith("外勤")
     rest_entry = reason in ("休息", "休息返隊", "休息後退勤") or "休息" in str(action.get("source", ""))
-    near_minutes = 120 if rest_entry else 5
+    near_minutes = 120
     matches = []
     for row in rows:
         if target_name:
-            if target_name not in row:
+            if not row_has_primary_person(row, target_name):
                 continue
         elif target_number and target_number not in row:
             continue
@@ -205,7 +205,7 @@ def find_entry_matches(
         if external_entry and reason and reason not in row:
             continue
         if strict_time:
-            if not row_has_time(row, target_date, system_time, allow_near=allow_near):
+            if not row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
                 continue
         if external_entry:
             if row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=120):
@@ -234,7 +234,7 @@ def find_arrival_entry_exists(
         if target_date not in row and roc_slash not in row:
             continue
         if target_name:
-            if target_name not in row:
+            if not row_has_primary_person(row, target_name):
                 continue
         elif target_number and target_number not in row:
             continue

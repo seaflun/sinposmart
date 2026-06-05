@@ -1,0 +1,15 @@
+{
+  "radio_count": 34,
+  "emergency_vehicles_in_station": 6,
+  "emergency_vehicles_repair": 0,
+  "ems_case_vehicles": 1,
+  "fire_case_vehicles": 2,
+  "support_vehicles_in_station": 5,
+  "support_vehicles_out": 0,
+  "support_vehicles_repair": 0,
+  "rescue_equipment_in_station": 2,
+  "rescue_equipment_out": 0,
+  "important_note": "（比如○○車輛或橡皮艇報修、防颱應變中心成立等事項）。",
+  "tic_count": 5,
+  "case_vehicle_overrides": {}
+}
