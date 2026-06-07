@@ -685,140 +685,36 @@ def click_entry_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
 
 # Work log automation
 
-def fill_work_log_form_for_test(
-    driver: webdriver.Chrome,
-    action: dict[str, Any],
-    staff: dict[str, dict[str, str]],
-    target_roc_date: str,
-    save: bool = False,
-) -> dict[str, Any]:
-    """Fill the work-log form. Save only when explicitly requested."""
+def accept_pending_alerts(driver: webdriver.Chrome, max_alerts: int = 2) -> list[str]:
+    accepted: list[str] = []
+    for _ in range(max_alerts):
+        try:
+            alert = driver.switch_to.alert
+            text = alert.text.strip()
+            alert.accept()
+            accepted.append(text)
+            time.sleep(0.5)
+        except Exception:
+            break
+    return accepted
 
-    fields = action.get("fields", {})
-    time_value = fields.get("工作時間", action.get("time", "00:00"))
-    hour, minute = time_value.split(":", 1)
-    people = [
-        {
-            "id": staff.get(str(no), {}).get("user_id", ""),
-            "name": staff.get(str(no), {}).get("name", str(no)),
-        }
-        for no in fields.get("服勤人員", [])
-    ]
 
-    navigated = ensure_ap(driver, WORK_LOG_AP)
-    if navigated:
-        time.sleep(1)
-    before_controls = control_snapshot(driver)
-    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH') && document.getElementById('_areDescription'));")
-    insert_result = {"ok": True, "skipped": True, "reason": "work form already open"} if form_ready else click_insert_control(driver)
-    time.sleep(2)
+def quit_driver(driver: webdriver.Chrome | None) -> None:
+    if not driver:
+        return
+    service = getattr(driver, "service", None)
+    try:
+        driver.quit()
+    finally:
+        if service:
+            try:
+                service.stop()
+            except Exception:
+                pass
 
-    fill_result = driver.execute_script(
-        """
-        const values = arguments[0];
-        const result = {set: [], missing: []};
-        const used = new Set();
 
-        function visibleControls() {
-          return Array.from(document.querySelectorAll('input, select, textarea'));
-        }
-        function setControl(el, value) {
-          if (!el) return false;
-          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
-          if (used.has(key)) return false;
-          if (el.tagName.toLowerCase() === 'select') {
-            const options = Array.from(el.options || []);
-            const exactOption = options.find(opt =>
-              String(opt.text || '').trim() === String(value).trim() ||
-              String(opt.value || '').trim() === String(value).trim()
-            );
-            const option = exactOption || options.find(opt =>
-              String(opt.text || '').includes(String(value).trim())
-            );
-            if (!option) return false;
-            el.value = option.value;
-          } else {
-            el.value = value;
-          }
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          used.add(key);
-          result.set.push({id: el.id || '', name: el.name || '', value});
-          return true;
-        }
-        function byIds(ids, value) {
-          for (const id of ids) {
-            const el = document.getElementById(id);
-            if (setControl(el, value)) return true;
-          }
-          return false;
-        }
-        function optionMatches(opt, value, exactOnly = false) {
-          const target = String(value || '').trim();
-          const text = String(opt.text || '').trim();
-          const optValue = String(opt.value || '').trim();
-          if (text === target || optValue === target) return true;
-          if (exactOnly) return false;
-          return text.includes(target);
-        }
-        function byOptionText(value) {
-          const exactOnly = String(value || '').trim() === '其他';
-          const el = visibleControls().find(control =>
-            control.tagName.toLowerCase() === 'select' &&
-            Array.from(control.options || []).some(opt => optionMatches(opt, value, exactOnly))
-          );
-          return setControl(el, value);
-        }
-        function byNearbyText(label, value, preferTextarea = false) {
-          const normalize = text => String(text || '').replace(/\\s+/g, '');
-          const controlsOf = root => Array.from(root.querySelectorAll('input, select, textarea'));
-          const rows = Array.from(document.querySelectorAll('tr'));
-          for (const row of rows) {
-            const cells = Array.from(row.children);
-            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
-            if (labelIndex < 0) continue;
-            const targetCells = cells.slice(labelIndex + 1);
-            const controls = targetCells.flatMap(controlsOf);
-            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
-            for (const control of candidates) {
-              if (setControl(control, value)) return true;
-            }
-          }
-          const labels = Array.from(document.querySelectorAll('td, th, label, span'));
-          const node = labels.find(el => normalize(el.innerText).includes(label));
-          if (!node) return false;
-          let cursor = node.parentElement;
-          for (let depth = 0; depth < 3 && cursor; depth += 1, cursor = cursor.parentElement) {
-            const controls = controlsOf(cursor);
-            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
-            for (const control of candidates) {
-              if (setControl(control, value)) return true;
-            }
-          }
-          return false;
-        }
-
-        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
-        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
-        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        byIds(['_selETIMEH', '_selETimeH'], values.hour);
-        byIds(['_selETIMEM', '_selETimeM'], values.minute);
-        if (!byOptionText(values.item)) result.missing.push('item');
-        if (values.reason && !byNearbyText('事由', values.reason)) result.missing.push('reason');
-        return result;
-        """,
-        {
-            "date": target_roc_date,
-            "hour": hour,
-            "minute": minute,
-            "item": fields.get("勤務項目", ""),
-            "reason": fields.get("事由", ""),
-            "description": fields.get("工作概述", ""),
-            "status": fields.get("處理情形", ""),
-        },
-    )
-    time.sleep(1)
-    content_result = driver.execute_script(
+def set_work_log_content_fields(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
+    return driver.execute_script(
         """
         const values = arguments[0];
         const result = {set: [], missing: []};
@@ -838,6 +734,57 @@ def fill_work_log_form_for_test(
           }
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function setDirect(id, value) {
+          const el = document.getElementById(id);
+          return setControl(el, value);
+        }
+        if (!setDirect('_areDescription', values.description)) result.missing.push('description');
+        if (!setDirect('_areStatus', values.status)) result.missing.push('status');
+        return result;
+        """,
+        {
+            "description": fields.get("工作概述", ""),
+            "status": fields.get("處理情形", ""),
+        },
+    )
+
+
+def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
+    reason = fields.get("事由", "")
+    if not reason:
+        return {"set": [], "missing": [], "skipped": True}
+    return driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: [], confirms: []};
+        function setControl(el, value) {
+          if (!el) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const target = String(value || '').trim();
+            const options = Array.from(el.options || []);
+            const option = options.find(opt =>
+              String(opt.text || '').trim() === target ||
+              String(opt.value || '').trim() === target
+            ) || options.find(opt => String(opt.text || '').includes(target));
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          const originalConfirm = window.confirm;
+          window.confirm = message => {
+            result.confirms.push(String(message || ''));
+            return true;
+          };
+          try {
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          } finally {
+            window.confirm = originalConfirm;
+          }
           result.set.push({id: el.id || '', name: el.name || '', value});
           return true;
         }
@@ -877,17 +824,131 @@ def fill_work_log_form_for_test(
           }
           return false;
         }
-        if (values.reason && !byIds(['_selReason', '_selList4', '_selList2', '_txtReason'], values.reason) && !byNearbyText('事由', values.reason) && !byOptionText(values.reason)) result.missing.push('reason');
-        if (!setDirect('_areDescription', values.description)) result.missing.push('description');
-        if (!setDirect('_areStatus', values.status)) result.missing.push('status');
+        if (!byIds(['_selReason', '_selList4', '_selList2', '_txtReason'], values.reason) && !byNearbyText('事由', values.reason) && !byOptionText(values.reason)) result.missing.push('reason');
+        return result;
+        """,
+        {"reason": reason},
+    )
+
+
+def fill_work_log_form_for_test(
+    driver: webdriver.Chrome,
+    action: dict[str, Any],
+    staff: dict[str, dict[str, str]],
+    target_roc_date: str,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Fill the work-log form. Save only when explicitly requested."""
+
+    fields = action.get("fields", {})
+    time_value = fields.get("工作時間", action.get("time", "00:00"))
+    hour, minute = time_value.split(":", 1)
+    people = [
+        {
+            "id": staff.get(str(no), {}).get("user_id", ""),
+            "name": staff.get(str(no), {}).get("name", str(no)),
+        }
+        for no in fields.get("服勤人員", [])
+    ]
+
+    navigated = ensure_ap(driver, WORK_LOG_AP)
+    if navigated:
+        time.sleep(1)
+    before_controls = control_snapshot(driver)
+    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH') && document.getElementById('_areDescription'));")
+    insert_result = {"ok": True, "skipped": True, "reason": "work form already open"} if form_ready else click_insert_control(driver)
+    time.sleep(2)
+
+    fill_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: [], confirms: []};
+        const used = new Set();
+
+        function visibleControls() {
+          return Array.from(document.querySelectorAll('input, select, textarea'));
+        }
+        function setControl(el, value, confirmOnReplace = false) {
+          if (!el) return false;
+          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
+          if (used.has(key)) return false;
+          const oldValue = String(el.value || '');
+          const willReplace = oldValue.trim() !== '' && oldValue !== String(value);
+          if (el.tagName.toLowerCase() === 'select') {
+            const options = Array.from(el.options || []);
+            const exactOption = options.find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim()
+            );
+            const option = exactOption || options.find(opt =>
+              String(opt.text || '').includes(String(value).trim())
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          const originalConfirm = window.confirm;
+          if (confirmOnReplace && willReplace) {
+            window.confirm = message => {
+              result.confirms.push(String(message || ''));
+              return true;
+            };
+          }
+          try {
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          } finally {
+            window.confirm = originalConfirm;
+          }
+          used.add(key);
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            const el = document.getElementById(id);
+            if (setControl(el, value)) return true;
+          }
+          return false;
+        }
+        function optionMatches(opt, value, exactOnly = false) {
+          const target = String(value || '').trim();
+          const text = String(opt.text || '').trim();
+          const optValue = String(opt.value || '').trim();
+          if (text === target || optValue === target) return true;
+          if (exactOnly) return false;
+          return text.includes(target);
+        }
+        function byOptionText(value) {
+          const exactOnly = String(value || '').trim() === '其他';
+          const el = visibleControls().find(control =>
+            control.tagName.toLowerCase() === 'select' &&
+            Array.from(control.options || []).some(opt => optionMatches(opt, value, exactOnly))
+          );
+          return setControl(el, value, true);
+        }
+        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
+        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
+        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
+        byIds(['_selETIMEH', '_selETimeH'], values.hour);
+        byIds(['_selETIMEM', '_selETimeM'], values.minute);
+        if (!byOptionText(values.item)) result.missing.push('item');
         return result;
         """,
         {
-            "reason": fields.get("事由", ""),
-            "description": fields.get("工作概述", ""),
-            "status": fields.get("處理情形", ""),
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "item": fields.get("勤務項目", ""),
         },
     )
+    fill_result["item_alerts"] = accept_pending_alerts(driver)
+    reason_result = set_work_log_reason_field(driver, fields)
+    fill_result["reason"] = reason_result
+    fill_result["reason_alerts"] = accept_pending_alerts(driver)
+    time.sleep(1)
+    content_result = set_work_log_content_fields(driver, fields)
     fill_result["content"] = content_result
 
     people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
@@ -1725,6 +1786,8 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
             for no in values:
                 current.add((column, no))
                 route_start = adjacent_rest_start(sheet, no, start)
+                if route_start < 8 <= start:
+                    route_start = start
                 active.setdefault((column, no), start if route_start == 8 else route_start)
         for key in list(active.keys()):
             if key not in current:
@@ -2378,7 +2441,7 @@ def main() -> int:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             print(f"JSON 輸出: {args.json_out}")
     finally:
-        driver.quit()
+        quit_driver(driver)
     return 0
 
 

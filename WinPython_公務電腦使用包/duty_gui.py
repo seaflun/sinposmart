@@ -121,6 +121,7 @@ from duty_rehearsal import (
     query_cases,
     query_duty_sheet,
     query_visible_table,
+    quit_driver,
     roc_date,
     save_work_log_defaults,
     slot_end,
@@ -2019,7 +2020,7 @@ class DutyGui(tk.Tk):
             return
         finally:
             if driver:
-                driver.quit()
+                quit_driver(driver)
         self.after(0, lambda value=attempt_id: self._login_succeeded(value, actor_no, user_id, password))
 
     def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
@@ -2125,7 +2126,7 @@ class DutyGui(tk.Tk):
                 return
             finally:
                 if driver:
-                    driver.quit()
+                    quit_driver(driver)
             self.after(0, lambda: self._schedule_succeeded(session.actor_no, session.user_id, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2244,7 +2245,7 @@ class DutyGui(tk.Tk):
                 return
             finally:
                 if driver:
-                    driver.quit()
+                    quit_driver(driver)
             self.after(0, lambda: self._comparison_succeeded(session.actor_no, session.user_id, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3634,7 +3635,7 @@ class DutyGui(tk.Tk):
             self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify, trigger_type))
         finally:
             if driver:
-                driver.quit()
+                quit_driver(driver)
             self.after(0, lambda value=lane: self._submit_worker_finished(value))
 
     def _save_work_log_item_succeeded(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
