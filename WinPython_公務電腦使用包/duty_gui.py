@@ -25,6 +25,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -350,6 +352,13 @@ DEFAULT_PREVIEW = latest_preview_file()
 SAVED_LOGIN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DutyAutomation" / "saved_login.json"
 
 
+def credential_sync_endpoint(value: str) -> str:
+    endpoint = str(value or "").strip().rstrip("/")
+    if endpoint.endswith("/credential-sync"):
+        return endpoint
+    return f"{endpoint}/credential-sync"
+
+
 def duty_window_dates(base_roc_date: str) -> list[str]:
     return [roc_date_after(base_roc_date, -1), base_roc_date, roc_date_after(base_roc_date, 1)]
 
@@ -545,8 +554,10 @@ class DutyGui(tk.Tk):
         self.review_secondary_row.grid(row=1, column=0, columnspan=9, sticky=tk.W, pady=(8, 0))
         ttk.Button(self.review_secondary_row, text="縮小", command=self.iconify).pack(side=tk.LEFT)
         ttk.Button(self.review_secondary_row, text="登出/清除", command=self.clear_login).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(self.review_secondary_row, text="查看此人任務", command=self.show_actor_tasks).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(login_box, textvariable=self.login_status, foreground="#1f5f3f").grid(row=2, column=0, columnspan=9, sticky=tk.W, pady=(8, 0))
+        self.review_tertiary_row = ttk.Frame(login_box)
+        self.review_tertiary_row.grid(row=2, column=0, columnspan=9, sticky=tk.W, pady=(6, 0))
+        ttk.Button(self.review_tertiary_row, text="查看此人任務", command=self.show_actor_tasks).pack(side=tk.LEFT)
+        ttk.Label(login_box, textvariable=self.login_status, foreground="#1f5f3f").grid(row=3, column=0, columnspan=9, sticky=tk.W, pady=(8, 0))
 
         summary = ttk.Frame(root)
         summary.pack(fill=tk.X, pady=(10, 0))
@@ -618,6 +629,7 @@ class DutyGui(tk.Tk):
         audit_bottom_right.pack(side=tk.RIGHT, fill=tk.X, expand=True)
         ttk.Button(audit_bottom_left, text="值班模式", style="AuditMode.TButton", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
         ttk.Button(audit_bottom_left, text="匯出問題包", style="AuditMode.TButton", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(audit_bottom_left, text="同步到另一台", style="AuditMode.TButton", command=self.sync_current_account_dialog).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(audit_bottom_right, textvariable=self.status_text, style="AuditValue.TLabel", anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
 
         columns = (
@@ -1628,6 +1640,118 @@ class DutyGui(tk.Tk):
             return
         self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
         self.login_status.set("已儲存帳號清單。")
+
+    def saved_accounts_for_credential_sync(self) -> list[dict[str, str]]:
+        accounts: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for account in self.saved_accounts:
+            actor_no = str(account.get("actor_no", "") or "").strip()
+            user_id = str(account.get("user_id", "") or "").strip()
+            password = str(account.get("password", "") or "")
+            identity = user_id or actor_no
+            if not identity or not user_id or not password or identity in seen:
+                continue
+            seen.add(identity)
+            display_name = str(account.get("display_name", "") or self.current_account_display_name(actor_no, user_id)).strip()
+            accounts.append(
+                {
+                    "actor_no": actor_no,
+                    "user_id": user_id,
+                    "password": password,
+                    "display_name": display_name,
+                }
+            )
+        return accounts
+
+    def sync_current_account_dialog(self) -> None:
+        accounts = self.saved_accounts_for_credential_sync()
+        if not accounts:
+            messagebox.showwarning("資料不足", "目前沒有可同步的已儲存帳號密碼。")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("同步帳密到另一台")
+        dialog.geometry("460x240")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        target_url = tk.StringVar(value=os.environ.get("CREDENTIAL_SYNC_TARGET_URL", "http://另一台電腦IP:8765/credential-sync"))
+        sync_code = tk.StringVar()
+        account_names = "、".join(account["user_id"] for account in accounts[:5])
+        if len(accounts) > 5:
+            account_names += f" 等 {len(accounts)} 組"
+        status_text = tk.StringVar(value=f"將同步 {len(accounts)} 組已儲存帳號：{account_names}。不會同步 LINE、GCS 或其他設定。")
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="接收網址").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(frame, textvariable=target_url, width=48).grid(row=0, column=1, sticky=tk.EW, pady=5)
+        ttk.Label(frame, text="同步碼").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(frame, textvariable=sync_code, width=18).grid(row=1, column=1, sticky=tk.W, pady=5)
+        ttk.Label(frame, textvariable=status_text, wraplength=410).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 12))
+        frame.columnconfigure(1, weight=1)
+
+        def send() -> None:
+            url = target_url.get().strip()
+            code = sync_code.get().strip()
+            if not url or not code:
+                messagebox.showwarning("資料不足", "請輸入第二台接收網址與同步碼。", parent=dialog)
+                return
+            if not messagebox.askyesno(
+                "確認同步",
+                f"只會同步 {len(accounts)} 組已儲存的勤務系統帳號與密碼到另一台。\n\n不會同步 LINE token、GCS 金鑰或其他設定。確定送出？",
+                parent=dialog,
+            ):
+                return
+            status_text.set("同步中...")
+            threading.Thread(
+                target=self._send_credential_sync,
+                args=(dialog, status_text, url, code, accounts),
+                daemon=True,
+            ).start()
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(8, 0))
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="送出同步", style="Accent.TButton", command=send).pack(side=tk.RIGHT)
+
+    def _send_credential_sync(
+        self,
+        dialog: tk.Toplevel,
+        status_text: tk.StringVar,
+        target_url: str,
+        sync_code: str,
+        accounts: list[dict[str, str]],
+    ) -> None:
+        first_account = accounts[0]
+        payload = {
+            "sync_code": sync_code,
+            "accounts": accounts,
+            "actor_no": first_account["actor_no"],
+            "user_id": first_account["user_id"],
+            "password": first_account["password"],
+            "display_name": first_account["display_name"],
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            credential_sync_endpoint(target_url),
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self.after(0, lambda: status_text.set(f"同步失敗：HTTP {exc.code} {detail}"))
+            return
+        except Exception as exc:
+            self.after(0, lambda: status_text.set(f"同步失敗：{exc}"))
+            return
+        self.after(0, lambda: status_text.set(f"同步完成：{len(accounts)} 組帳號已送到另一台。"))
+        self.after(1200, dialog.destroy)
 
     def delete_selected_account(self) -> None:
         account = self.selected_saved_account()

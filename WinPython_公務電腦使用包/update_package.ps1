@@ -45,6 +45,73 @@ function Get-Sha256FromText {
     return $firstToken.ToLowerInvariant()
 }
 
+function Get-RunningDutyGuiProcesses {
+    $packagePath = $packageDir.TrimEnd([char]92)
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -match "duty_gui\.pyw?" -and
+            $_.CommandLine.Contains($packagePath)
+        }
+}
+
+function Stop-RunningDutyGui {
+    $processes = @(Get-RunningDutyGuiProcesses)
+    if (-not $processes) {
+        return $false
+    }
+
+    Write-Host "Closing running SinpoSmart app so the updated files can load..."
+    foreach ($process in $processes) {
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            Write-Host "Closed process $($process.ProcessId)."
+        } catch {
+            Write-Warning "Could not close process $($process.ProcessId): $_"
+        }
+    }
+    Start-Sleep -Milliseconds 800
+    return $true
+}
+
+function Start-DutyGui {
+    $entrypoint = Join-Path $packageDir "duty_gui.pyw"
+    if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
+        $entrypoint = Join-Path $packageDir "duty_gui.py"
+    }
+    if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
+        Write-Warning "Could not restart app because duty_gui.pyw/duty_gui.py was not found."
+        return
+    }
+
+    $finder = Join-Path $packageDir "find_winpython.ps1"
+    $pythonw = ""
+    if (Test-Path -LiteralPath $finder -PathType Leaf) {
+        $pythonw = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder -Windowed | Select-Object -First 1)
+    }
+    if (-not $pythonw) {
+        $command = Get-Command "pythonw.exe" -ErrorAction SilentlyContinue
+        if ($command) {
+            $pythonw = $command.Source
+        }
+    }
+    if (-not $pythonw) {
+        Write-Warning "Could not restart app because pythonw.exe was not found."
+        return
+    }
+
+    Start-Process -FilePath $pythonw -ArgumentList "`"$entrypoint`"" -WorkingDirectory $packageDir
+    Write-Host "Restarted SinpoSmart app."
+}
+
+function Restart-DutyGuiIfRunning {
+    if (Stop-RunningDutyGui) {
+        Start-DutyGui
+        return $true
+    }
+    return $false
+}
+
 function Copy-UpdateTree {
     param(
         [string]$SourceDir,
@@ -107,6 +174,7 @@ Write-Host "Local version : $localVersion"
 Write-Host "Remote version: $remoteVersion"
 
 if ([string]::CompareOrdinal($remoteVersion, $localVersion) -le 0) {
+    Restart-DutyGuiIfRunning | Out-Null
     Write-Host "Already up to date."
     exit 0
 }
