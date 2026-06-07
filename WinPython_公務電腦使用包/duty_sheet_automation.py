@@ -121,12 +121,18 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
     login_config = current_config.get("login", {})
     last = current_config.get("last_selection", {})
     opts = current_config.get("car_options", {})
+    hidden_opts = current_config.setdefault("hidden_car_options", {})
+    if not isinstance(hidden_opts, dict):
+        hidden_opts = {}
+        current_config["hidden_car_options"] = hidden_opts
+    hidden_opts.setdefault("attack", [])
+    hidden_opts.setdefault("amb", [])
 
     dialog = tk.Toplevel(parent)
     setattr(parent, "_duty_sheet_dialog", dialog)
     dialog.title("SinpoSmart - 勤務表登打")
-    dialog.geometry("350x500")
-    dialog.minsize(350, 480)
+    dialog.geometry("460x700")
+    dialog.minsize(430, 680)
     dialog.configure(bg="#f8fafc")
     dialog.transient(parent)
 
@@ -235,9 +241,196 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         ("救護 1 車", amb1_var, opts.get("amb", [])),
         ("救護 2 車", amb2_var, opts.get("amb", [])),
     ]
+    car_combos: dict[str, list[ttk.Combobox]] = {"attack": [], "amb": []}
     for row, (label, variable, values) in enumerate(car_rows):
         ttk.Label(car_card, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=3)
-        ttk.Combobox(car_card, textvariable=variable, values=values, width=combo_width).grid(row=row, column=1, sticky=tk.EW, pady=3)
+        combo = ttk.Combobox(car_card, textvariable=variable, values=values, width=combo_width)
+        combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        if label == "攻擊車":
+            car_combos["attack"].append(combo)
+        elif label.startswith("救護"):
+            car_combos["amb"].append(combo)
+
+    vehicle_groups = {"消防車": "attack", "救護車": "amb"}
+
+    def persist_vehicle_options() -> None:
+        cars_config = {
+            "attack": attack_var.get(),
+            "stop": stop_var.get(),
+            "amb1": amb1_var.get(),
+            "amb2": amb2_var.get(),
+            "workbook_path": file_var.get().strip(),
+        }
+        login_settings = {"user_id": user_var.get().strip(), "user_pwd": password_var.get()}
+        notification_config = current_config.get("notification", legacy.get_default_config()["notification"]).copy()
+        notification_config["enabled"] = bool(send_group_var.get())
+        with legacy_workdir(project_dir):
+            legacy.save_config(
+                cars_config,
+                login_settings=login_settings,
+                notification_settings=notification_config,
+                car_options=opts,
+                hidden_car_options=hidden_opts,
+            )
+
+    def refresh_vehicle_options() -> None:
+        for combo in car_combos["attack"]:
+            combo["values"] = opts.get("attack", [])
+        amb_values = opts.get("amb", [])
+        for combo in car_combos["amb"]:
+            combo["values"] = amb_values
+
+    def open_add_vehicle_dialog() -> tuple[str, str] | None:
+        result: dict[str, str] = {}
+        add_dialog = tk.Toplevel(dialog)
+        add_dialog.title("新增車輛")
+        add_dialog.transient(dialog)
+        add_dialog.grab_set()
+        add_dialog.resizable(False, False)
+
+        vehicle_type_var = tk.StringVar(value="救護車")
+        code_var = tk.StringVar()
+        plate_var = tk.StringVar()
+
+        ttk.Label(add_dialog, text="車輛類型").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
+        ttk.Combobox(add_dialog, textvariable=vehicle_type_var, values=list(vehicle_groups.keys()), state="readonly", width=16).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
+        ttk.Label(add_dialog, text="車輛代號").grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
+        code_entry = ttk.Entry(add_dialog, textvariable=code_var, width=20)
+        code_entry.grid(row=1, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Label(add_dialog, text="車牌號碼").grid(row=2, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(add_dialog, textvariable=plate_var, width=20).grid(row=2, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        button_row = ttk.Frame(add_dialog)
+        button_row.grid(row=3, column=0, columnspan=2, sticky=tk.E, padx=12, pady=(8, 12))
+
+        def confirm() -> None:
+            code = code_var.get().strip()
+            plate = plate_var.get().strip()
+            if not code or not plate:
+                messagebox.showwarning("資料不足", "請輸入車輛代號與車牌號碼。", parent=add_dialog)
+                return
+            result["group"] = vehicle_groups[vehicle_type_var.get()]
+            result["value"] = f"{code}/{plate}"
+            add_dialog.destroy()
+
+        ttk.Button(button_row, text="確定", command=confirm).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="取消", command=add_dialog.destroy).pack(side=tk.LEFT)
+        code_entry.focus_set()
+        dialog.wait_window(add_dialog)
+        if result:
+            return result["group"], result["value"]
+        return None
+
+    def add_vehicle_option() -> None:
+        selected = open_add_vehicle_dialog()
+        if selected is None:
+            return
+        group, value = selected
+        values = opts.setdefault(group, [])
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value in hidden_values:
+            hidden_values.remove(value)
+        if value not in values:
+            values.append(value)
+        refresh_vehicle_options()
+        persist_vehicle_options()
+        set_status(f"已新增車輛：{value}")
+
+    def open_remove_vehicle_dialog() -> tuple[str, str] | None:
+        choices: list[str] = []
+        choice_map: dict[str, tuple[str, str]] = {}
+        for group in ("attack", "amb"):
+            for value in opts.get(group, []):
+                if value not in choice_map:
+                    choices.append(value)
+                    choice_map[value] = (group, value)
+        if not choices:
+            messagebox.showwarning("沒有車輛", "目前沒有可移除的車輛。", parent=dialog)
+            return None
+
+        result: dict[str, tuple[str, str]] = {}
+        remove_dialog = tk.Toplevel(dialog)
+        remove_dialog.title("移除車輛")
+        remove_dialog.transient(dialog)
+        remove_dialog.grab_set()
+        remove_dialog.resizable(False, False)
+
+        selected_var = tk.StringVar(value=choices[0])
+        ttk.Label(remove_dialog, text="車輛代號/車牌號碼").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
+        ttk.Combobox(remove_dialog, textvariable=selected_var, values=choices, state="readonly", width=24).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
+
+        button_row = ttk.Frame(remove_dialog)
+        button_row.grid(row=1, column=0, columnspan=2, sticky=tk.E, padx=12, pady=(8, 12))
+
+        def confirm() -> None:
+            selected_value = selected_var.get()
+            if selected_value in choice_map:
+                result["selected"] = choice_map[selected_value]
+            remove_dialog.destroy()
+
+        ttk.Button(button_row, text="確定", command=confirm).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="取消", command=remove_dialog.destroy).pack(side=tk.LEFT)
+        dialog.wait_window(remove_dialog)
+        return result.get("selected")
+
+    def remove_vehicle_option() -> None:
+        selected = open_remove_vehicle_dialog()
+        if selected is None:
+            return
+        group, value = selected
+        values = opts.setdefault(group, [])
+        if value not in values:
+            messagebox.showwarning("找不到車輛", f"車輛清單中沒有：{value}", parent=dialog)
+            return
+        values.remove(value)
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value not in hidden_values:
+            hidden_values.append(value)
+        fallback = values[0] if values else ""
+        if group == "attack" and attack_var.get().strip() == value:
+            attack_var.set(fallback)
+        if group == "amb":
+            if amb1_var.get().strip() == value:
+                amb1_var.set(fallback)
+            if amb2_var.get().strip() == value:
+                amb2_var.set(fallback)
+        refresh_vehicle_options()
+        persist_vehicle_options()
+        set_status(f"已移除車輛：{value}")
+
+    vehicle_button_row = tk.Frame(car_card, bg="#f8fafc")
+    vehicle_button_row.grid(row=4, column=1, sticky=tk.EW, pady=(6, 0))
+    vehicle_button_row.columnconfigure(0, weight=1)
+    add_vehicle_button = tk.Button(
+        vehicle_button_row,
+        text="新增車輛",
+        command=add_vehicle_option,
+        bg="#2563eb",
+        fg="#ffffff",
+        activebackground="#1d4ed8",
+        activeforeground="#ffffff",
+        relief=tk.FLAT,
+        cursor="hand2",
+        width=18,
+        pady=5,
+    )
+    bind_button_hover(add_vehicle_button, "#2563eb", "#1d4ed8")
+    add_vehicle_button.grid(row=0, column=0, sticky=tk.EW)
+    remove_vehicle_button = tk.Button(
+        vehicle_button_row,
+        text="移除車輛",
+        command=remove_vehicle_option,
+        bg="#fff7ed",
+        fg="#9a3412",
+        activebackground="#ffedd5",
+        activeforeground="#7c2d12",
+        relief=tk.FLAT,
+        cursor="hand2",
+        width=18,
+        pady=5,
+    )
+    bind_button_hover(remove_vehicle_button, "#fff7ed", "#ffedd5")
+    remove_vehicle_button.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
 
     action_row = tk.Frame(body, bg="#f8fafc")
     action_row.pack(fill=tk.X, pady=(6, 8))
@@ -290,7 +483,13 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
                 if hasattr(legacy, "log_text"):
                     delattr(legacy, "log_text")
                 with legacy_workdir(project_dir):
-                    legacy.save_config(cars_config, login_settings=login_settings, notification_settings=notification_config)
+                    legacy.save_config(
+                        cars_config,
+                        login_settings=login_settings,
+                        notification_settings=notification_config,
+                        car_options=opts,
+                        hidden_car_options=hidden_opts,
+                    )
                     legacy.start_automation(uid, pwd, target_date, excel_path, cars_config)
                 success = True
             except Exception as exc:
@@ -318,20 +517,21 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         height=2,
     )
     bind_button_hover(start_button, "#16a34a", "#15803d")
-    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6))
+    start_button.grid(row=0, column=0, sticky=tk.EW)
     close_button = tk.Button(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#e2e8f0",
-        fg="#0f172a",
-        activebackground="#cbd5e1",
-        activeforeground="#0f172a",
+        bg="#475569",
+        fg="#ffffff",
+        activebackground="#334155",
+        activeforeground="#ffffff",
         relief=tk.FLAT,
+        cursor="hand2",
         font=("Microsoft JhengHei", 11, "bold"),
-        width=8,
+        width=9,
         height=2,
     )
-    bind_button_hover(close_button, "#e2e8f0", "#cbd5e1")
-    close_button.grid(row=0, column=1, sticky=tk.NSEW)
+    bind_button_hover(close_button, "#475569", "#334155")
+    close_button.grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
     return dialog
