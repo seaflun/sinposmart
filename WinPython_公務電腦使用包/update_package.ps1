@@ -1,8 +1,13 @@
+param(
+    [switch]$AssumeYes
+)
+
 $ErrorActionPreference = "Stop"
 
-$remoteVersionUrl = "https://drive.google.com/uc?export=download&id=11iI5g_86MZG0Ck8PdngRjWz8V7fMuikp"
-$remoteZipUrl = "https://drive.google.com/uc?export=download&id=1DB6-0fFBaCciV5DaxeNfIqczwfKYhge0"
-$remoteSha256Url = "https://drive.google.com/uc?export=download&id=1BkYfrovbMw0Q9l3mGGPwTe-gIjTvnXev"
+$releaseBaseUrl = "https://github.com/seaflun/sinposmart/releases/latest/download"
+$remoteVersionUrl = "$releaseBaseUrl/sinposmart-version.txt"
+$remoteZipUrl = "$releaseBaseUrl/sinposmart-public-package.zip"
+$remoteSha256Url = "$releaseBaseUrl/sinposmart-public-package.zip.sha256.txt"
 
 $packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localVersionPath = Join-Path $packageDir "VERSION.txt"
@@ -174,9 +179,17 @@ Write-Host "Local version : $localVersion"
 Write-Host "Remote version: $remoteVersion"
 
 if ([string]::CompareOrdinal($remoteVersion, $localVersion) -le 0) {
-    Restart-DutyGuiIfRunning | Out-Null
     Write-Host "Already up to date."
     exit 0
+}
+
+Write-Host "Update available: $localVersion -> $remoteVersion"
+if (-not $AssumeYes) {
+    $answer = Read-Host "Close running app, update, and restart now? (Y/N)"
+    if ($answer -notmatch "^[Yy]") {
+        Write-Host "Update cancelled."
+        exit 0
+    }
 }
 
 try {
@@ -223,10 +236,14 @@ try {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
 
+    $wasRunning = Stop-RunningDutyGui
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
+    if ($wasRunning) {
+        Start-DutyGui
+    }
 
-    Write-Host "Update completed. Restart the app if it is running."
+    Write-Host "Update completed."
 } finally {
     try {
         if (Test-Path -LiteralPath $tempDir) {

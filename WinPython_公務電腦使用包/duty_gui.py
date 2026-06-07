@@ -628,6 +628,7 @@ class DutyGui(tk.Tk):
         audit_bottom_right = ttk.Frame(self.audit_bottom_frame)
         audit_bottom_right.pack(side=tk.RIGHT, fill=tk.X, expand=True)
         ttk.Button(audit_bottom_left, text="值班模式", style="AuditMode.TButton", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
+        ttk.Button(audit_bottom_left, text="檢查更新", style="AuditMode.TButton", command=self.check_for_update).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(audit_bottom_left, text="匯出問題包", style="AuditMode.TButton", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(audit_bottom_left, text="同步到另一台", style="AuditMode.TButton", command=self.sync_current_account_dialog).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(audit_bottom_right, textvariable=self.status_text, style="AuditValue.TLabel", anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
@@ -3380,6 +3381,31 @@ class DutyGui(tk.Tk):
             return None
         index, action, save, visible, notify, trigger_type = self.submit_queues[lane].pop(0)
         return index, action, self.create_submit_result_path(index, action, save, visible), save, visible, notify, trigger_type
+
+    def check_for_update(self) -> None:
+        updater = Path(__file__).with_name("update_package.ps1")
+        if not updater.exists():
+            messagebox.showerror("檢查更新", f"找不到更新腳本：{updater}")
+            return
+        if not messagebox.askyesno(
+            "檢查更新",
+            "將開啟更新視窗檢查 GitHub 是否有新版。\n\n若有更新，確認後會關閉背景程式、更新並重新啟動。是否繼續？",
+        ):
+            return
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoExit",
+            "-File",
+            str(updater),
+        ]
+        creationflags = subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, "CREATE_NEW_CONSOLE") else 0
+        try:
+            subprocess.Popen(command, cwd=str(updater.parent), creationflags=creationflags)
+        except Exception as exc:
+            messagebox.showerror("檢查更新", f"無法啟動更新程式：{exc}")
 
     def export_issue_package(self, result_path: Path | None = None, error: str | None = None, show_dialog: bool = True) -> Path:
         issue_dir = Path("issue_reports")
