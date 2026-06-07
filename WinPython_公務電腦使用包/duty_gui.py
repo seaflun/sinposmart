@@ -1491,6 +1491,8 @@ class DutyGui(tk.Tk):
             "user_id": str(account.get("user_id", "") or ""),
             "password_dpapi": self.protect_password(str(account.get("password", "") or "")),
             "display_name": str(account.get("display_name", "") or ""),
+            "name": str(account.get("name", "") or ""),
+            "id_number": str(account.get("id_number", "") or ""),
         }
 
     def load_saved_login(self) -> None:
@@ -1528,6 +1530,8 @@ class DutyGui(tk.Tk):
                     "user_id": user_id,
                     "password": self.account_password_from_payload(account),
                     "display_name": str(account.get("display_name", "") or ""),
+                    "name": str(account.get("name", "") or account.get("person_name", "") or ""),
+                    "id_number": str(account.get("id_number", "") or account.get("national_id", "") or ""),
                 }
             )
         self.saved_accounts = normalized
@@ -1632,6 +1636,104 @@ class DutyGui(tk.Tk):
             return f"{actor_no}番 {user_id}" if user_id else f"{actor_no}番"
         return user_id
 
+    def collect_json_texts(self, value: Any, texts: list[str]) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                self.collect_json_texts(item, texts)
+        elif isinstance(value, list):
+            for item in value:
+                self.collect_json_texts(item, texts)
+        elif isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+
+    def work_log_rows_for_person(self, actor_no: str, name: str) -> list[str]:
+        rows: list[str] = []
+        seen: set[str] = set()
+
+        def add_row(row: str) -> None:
+            text = str(row or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                rows.append(text)
+
+        for compare, actions in ((self.action_compare, self.actions), (self.duty_action_compare, self.duty_actions)):
+            for index, result in compare.items():
+                if not isinstance(result, dict):
+                    continue
+                try:
+                    action = actions[int(index)]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if action.get("kind") != "work_log":
+                    continue
+                for row in result.get("matched", []) or []:
+                    add_row(str(row))
+
+        target_dates = {
+            str(self.data.get("target_date", "") or ""),
+            str(self.duty_data.get("target_date", "") or ""),
+            duty_business_roc_date(),
+        }
+        for target_date in [value for value in target_dates if value]:
+            comparison_data = self.load_comparison_data(target_date)
+            for row in flatten_rows(comparison_data.get("visible_work_rows", []), target_date):
+                add_row(row)
+
+        snapshot_paths = list(FORM_TEST_OUTPUT_DIR.glob("work_log_form_test_*.json")) + list(RUNTIME_OUTPUT_DIR.glob("work_log_form_test_*.json"))
+        for path in sorted(snapshot_paths, key=lambda item: item.stat().st_mtime, reverse=True)[:20]:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            texts: list[str] = []
+            self.collect_json_texts(data, texts)
+            for text in texts:
+                add_row(text)
+
+        actor_no = str(actor_no or "").strip()
+        name = str(name or "").strip()
+        if not actor_no and not name:
+            return []
+        filtered = [
+            row
+            for row in rows
+            if (name and name in row) or (actor_no and (f"{actor_no}番" in row or re.search(rf"(^|\D){re.escape(actor_no)}(\D|$)", row)))
+        ]
+        return filtered
+
+    def id_number_from_work_log(self, actor_no: str, name: str) -> str:
+        for row in self.work_log_rows_for_person(actor_no, name):
+            match = re.search(r"(?<![A-Z0-9])[A-Z][1289]\d{8}(?![A-Z0-9])", row, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).upper()
+        return ""
+
+    def account_person_metadata(self, account: dict[str, str], actor_no: str, user_id: str, display_name: str) -> tuple[str, str]:
+        actor_no = str(actor_no or "").strip() or self.actor_no_from_user_id(user_id)
+        name = str(account.get("name", "") or account.get("person_name", "") or "").strip()
+        id_number = str(account.get("id_number", "") or account.get("national_id", "") or "").strip()
+        info: dict[str, str] = {}
+        for source in (self.duty_staff, self.staff):
+            if actor_no and str(actor_no) in source:
+                info = source[str(actor_no)]
+                break
+        if not info:
+            for dataset in (self.duty_data, self.data):
+                for sheet_key in ("today", "yesterday", "tomorrow"):
+                    staff_info = dataset.get(sheet_key, {}).get("staff", {}).get(str(actor_no), {})
+                    if staff_info:
+                        info = staff_info
+                        break
+                if info:
+                    break
+        if info:
+            name = name or str(info.get("name", "") or "").strip()
+        if not name and display_name:
+            display_match = re.match(r"^\s*(?:\d+\s*番\s*)?(?:\S+\s+)?(.+?)\s*$", display_name)
+            name = display_match.group(1).strip() if display_match else display_name.strip()
+        id_number = id_number or self.id_number_from_work_log(actor_no, name)
+        return name, id_number
+
     def save_or_update_current_account(self) -> None:
         actor_no = self.actor_no.get().strip()
         user_id = self.user_id.get().strip()
@@ -1654,12 +1756,15 @@ class DutyGui(tk.Tk):
                 continue
             seen.add(identity)
             display_name = str(account.get("display_name", "") or self.current_account_display_name(actor_no, user_id)).strip()
+            name, id_number = self.account_person_metadata(account, actor_no, user_id, display_name)
             accounts.append(
                 {
                     "actor_no": actor_no,
                     "user_id": user_id,
                     "password": password,
                     "display_name": display_name,
+                    "name": name,
+                    "id_number": id_number,
                 }
             )
         return accounts
@@ -1682,7 +1787,7 @@ class DutyGui(tk.Tk):
         account_names = "、".join(account["user_id"] for account in accounts[:5])
         if len(accounts) > 5:
             account_names += f" 等 {len(accounts)} 組"
-        status_text = tk.StringVar(value=f"將同步 {len(accounts)} 組已儲存帳號：{account_names}。不會同步 LINE、GCS 或其他設定。")
+        status_text = tk.StringVar(value=f"將同步 {len(accounts)} 組已儲存帳號、姓名與身分證字號：{account_names}。不會同步 LINE、GCS 或其他設定。")
 
         frame = ttk.Frame(dialog, padding=14)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -1701,7 +1806,7 @@ class DutyGui(tk.Tk):
                 return
             if not messagebox.askyesno(
                 "確認同步",
-                f"只會同步 {len(accounts)} 組已儲存的勤務系統帳號與密碼到另一台。\n\n不會同步 LINE token、GCS 金鑰或其他設定。確定送出？",
+                f"只會同步 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號到另一台。\n\n不會同步 LINE token、GCS 金鑰或其他設定。確定送出？",
                 parent=dialog,
             ):
                 return
@@ -1733,6 +1838,8 @@ class DutyGui(tk.Tk):
             "user_id": first_account["user_id"],
             "password": first_account["password"],
             "display_name": first_account["display_name"],
+            "name": first_account["name"],
+            "id_number": first_account["id_number"],
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
