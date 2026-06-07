@@ -25,8 +25,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import urllib.error
-import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -134,6 +132,7 @@ from duty_rehearsal import (
 
 APP_USER_MODEL_ID = "TYFD.DutyAutomation"
 APP_DISPLAY_NAME = "SinpoSmart"
+CREDENTIAL_EXPORT_USER_ID = "tyfd01510"
 APP_ICON_PNG = Path(__file__).with_name("duty_tray_icon.png")
 APP_ICON_ICO = Path(__file__).with_name("duty_tray_icon.ico")
 APP_ICON_GIF = Path(__file__).with_name("duty_tray_icon.gif")
@@ -350,13 +349,6 @@ def cleanup_old_json_files() -> None:
 
 DEFAULT_PREVIEW = latest_preview_file()
 SAVED_LOGIN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DutyAutomation" / "saved_login.json"
-
-
-def credential_sync_endpoint(value: str) -> str:
-    endpoint = str(value or "").strip().rstrip("/")
-    if endpoint.endswith("/credential-sync"):
-        return endpoint
-    return f"{endpoint}/credential-sync"
 
 
 def duty_window_dates(base_roc_date: str) -> list[str]:
@@ -630,7 +622,9 @@ class DutyGui(tk.Tk):
         ttk.Button(audit_bottom_left, text="值班模式", style="AuditMode.TButton", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
         ttk.Button(audit_bottom_left, text="檢查更新", style="AuditMode.TButton", command=self.check_for_update).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(audit_bottom_left, text="匯出問題包", style="AuditMode.TButton", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(audit_bottom_left, text="同步到另一台", style="AuditMode.TButton", command=self.sync_current_account_dialog).pack(side=tk.LEFT, padx=(8, 0))
+        self.credential_export_button = ttk.Button(audit_bottom_left, text="匯出帳密JSON", style="AuditMode.TButton", command=self.sync_current_account_dialog)
+        self.credential_export_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.update_credential_export_button_state()
         ttk.Label(audit_bottom_right, textvariable=self.status_text, style="AuditValue.TLabel", anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
 
         columns = (
@@ -1769,69 +1763,9 @@ class DutyGui(tk.Tk):
             )
         return accounts
 
-    def sync_current_account_dialog(self) -> None:
-        accounts = self.saved_accounts_for_credential_sync()
-        if not accounts:
-            messagebox.showwarning("資料不足", "目前沒有可同步的已儲存帳號密碼。")
-            return
-
-        dialog = tk.Toplevel(self)
-        dialog.title("同步帳密到另一台")
-        dialog.geometry("460x240")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.grab_set()
-
-        target_url = tk.StringVar(value=os.environ.get("CREDENTIAL_SYNC_TARGET_URL", "http://另一台電腦IP:8765/credential-sync"))
-        sync_code = tk.StringVar()
-        account_names = "、".join(account["user_id"] for account in accounts[:5])
-        if len(accounts) > 5:
-            account_names += f" 等 {len(accounts)} 組"
-        status_text = tk.StringVar(value=f"將同步 {len(accounts)} 組已儲存帳號、姓名與身分證字號：{account_names}。不會同步 LINE、GCS 或其他設定。")
-
-        frame = ttk.Frame(dialog, padding=14)
-        frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="接收網址").grid(row=0, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(frame, textvariable=target_url, width=48).grid(row=0, column=1, sticky=tk.EW, pady=5)
-        ttk.Label(frame, text="同步碼").grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(frame, textvariable=sync_code, width=18).grid(row=1, column=1, sticky=tk.W, pady=5)
-        ttk.Label(frame, textvariable=status_text, wraplength=410).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 12))
-        frame.columnconfigure(1, weight=1)
-
-        def send() -> None:
-            url = target_url.get().strip()
-            code = sync_code.get().strip()
-            if not url or not code:
-                messagebox.showwarning("資料不足", "請輸入第二台接收網址與同步碼。", parent=dialog)
-                return
-            if not messagebox.askyesno(
-                "確認同步",
-                f"只會同步 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號到另一台。\n\n不會同步 LINE token、GCS 金鑰或其他設定。確定送出？",
-                parent=dialog,
-            ):
-                return
-            status_text.set("同步中...")
-            threading.Thread(
-                target=self._send_credential_sync,
-                args=(dialog, status_text, url, code, accounts),
-                daemon=True,
-            ).start()
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(8, 0))
-        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Button(buttons, text="送出同步", style="Accent.TButton", command=send).pack(side=tk.RIGHT)
-
-    def _send_credential_sync(
-        self,
-        dialog: tk.Toplevel,
-        status_text: tk.StringVar,
-        target_url: str,
-        sync_code: str,
-        accounts: list[dict[str, str]],
-    ) -> None:
+    def credential_sync_payload(self, accounts: list[dict[str, str]], sync_code: str = "") -> dict[str, Any]:
         first_account = accounts[0]
-        payload = {
+        return {
             "sync_code": sync_code,
             "accounts": accounts,
             "actor_no": first_account["actor_no"],
@@ -1841,25 +1775,55 @@ class DutyGui(tk.Tk):
             "name": first_account["name"],
             "id_number": first_account["id_number"],
         }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            credential_sync_endpoint(target_url),
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+
+    def can_export_credentials(self) -> bool:
+        return bool(
+            self.session
+            and self.session.verified
+            and self.session.user_id.strip().lower() == CREDENTIAL_EXPORT_USER_ID
         )
-        try:
-            with urllib.request.urlopen(request, timeout=8) as response:
-                response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            self.after(0, lambda: status_text.set(f"同步失敗：HTTP {exc.code} {detail}"))
+
+    def update_credential_export_button_state(self) -> None:
+        button = getattr(self, "credential_export_button", None)
+        if button is not None:
+            button.configure(state=tk.NORMAL if self.can_export_credentials() else tk.DISABLED)
+
+    def sync_current_account_dialog(self) -> None:
+        if not self.can_export_credentials():
+            messagebox.showwarning("權限不足", f"只有 {CREDENTIAL_EXPORT_USER_ID} 登入後才能匯出帳密 JSON。")
             return
-        except Exception as exc:
-            self.after(0, lambda: status_text.set(f"同步失敗：{exc}"))
+
+        accounts = self.saved_accounts_for_credential_sync()
+        if not accounts:
+            messagebox.showwarning("資料不足", "目前沒有可匯出的已儲存帳號密碼。")
             return
-        self.after(0, lambda: status_text.set(f"同步完成：{len(accounts)} 組帳號已送到另一台。"))
-        self.after(1200, dialog.destroy)
+
+        account_names = "、".join(account["user_id"] for account in accounts[:5])
+        if len(accounts) > 5:
+            account_names += f" 等 {len(accounts)} 組"
+        if not messagebox.askyesno(
+            "匯出帳密 JSON",
+            f"將匯出 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號。\n\n"
+            f"帳號：{account_names}\n\n"
+            "這個 JSON 檔含有明文密碼與身分證字號，請只交給指定電腦使用。確定匯出？",
+        ):
+            return
+
+        default_name = f"credential_sync_{datetime.now():%Y%m%d_%H%M%S}.json"
+        path = filedialog.asksaveasfilename(
+            title="匯出帳密 JSON",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        payload = self.credential_sync_payload(accounts)
+        export_path = Path(path)
+        export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.status_text.set(f"帳密 JSON 已匯出：{export_path.name}")
+        messagebox.showinfo("匯出完成", f"已匯出 {len(accounts)} 組帳密 JSON：\n{export_path}")
 
     def delete_selected_account(self) -> None:
         account = self.selected_saved_account()
@@ -2592,6 +2556,7 @@ class DutyGui(tk.Tk):
                 self.work_log_settings_button.pack_forget()
             self.set_duty_action_buttons_visible(False)
         self.set_login_buttons_enabled(not self.login_running)
+        self.update_credential_export_button_state()
 
     def set_duty_action_buttons_visible(self, visible: bool) -> None:
         if not hasattr(self, "audit_mode_button") or not hasattr(self, "early_submit_button"):
