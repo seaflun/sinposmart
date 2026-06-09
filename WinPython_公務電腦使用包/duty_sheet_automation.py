@@ -12,9 +12,32 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
+import customtkinter as ctk
 from types import ModuleType
 from typing import Iterator
 
+UI_FONT = "Microsoft JhengHei UI"
+UI_BG = "#f5f7fb"
+UI_PANEL = "#ffffff"
+UI_PANEL_TINT = "#eef6ff"
+UI_BORDER = "#d7e2f0"
+UI_TEXT = "#172033"
+UI_MUTED = "#64748b"
+UI_BLUE = "#2563eb"
+UI_BLUE_HOVER = "#1d4ed8"
+FONT_BODY = (UI_FONT, 12)
+FONT_TITLE = (UI_FONT, 14, "bold")
+FONT_BUTTON = (UI_FONT, 12, "bold")
+CTK_COMBO_STYLE = {
+    "fg_color": UI_PANEL,
+    "border_color": UI_BORDER,
+    "button_color": "#dbeafe",
+    "button_hover_color": "#bfdbfe",
+    "dropdown_fg_color": "#ffffff",
+    "dropdown_hover_color": "#eff6ff",
+    "dropdown_text_color": UI_TEXT,
+    "text_color": UI_TEXT,
+}
 
 LEGACY_SCRIPT = "sinposmart_1.py"
 PACKAGED_PROJECT_DIR = "duty_sheet_legacy"
@@ -90,7 +113,7 @@ def load_legacy_module(project_dir: Path) -> ModuleType:
     return module
 
 
-def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "") -> tk.Toplevel | None:
+def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "") -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_duty_sheet_dialog", None)
     if existing is not None:
         try:
@@ -128,12 +151,12 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
     hidden_opts.setdefault("attack", [])
     hidden_opts.setdefault("amb", [])
 
-    dialog = tk.Toplevel(parent)
+    dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_duty_sheet_dialog", dialog)
     dialog.title("SinpoSmart - 勤務表登打")
-    dialog.geometry("460x700")
-    dialog.minsize(430, 680)
-    dialog.configure(bg="#f8fafc")
+    dialog.geometry("430x600")
+    dialog.minsize(410, 580)
+    dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
     def close_dialog() -> None:
@@ -142,21 +165,22 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
 
     dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = tk.Frame(dialog, bg="#f8fafc")
+    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
     root.pack(fill=tk.BOTH, expand=True)
 
-    header = tk.Frame(root, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
     header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    tk.Label(header, text="勤務表登打", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    ctk.CTkLabel(header, text="勤務表登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = tk.Frame(root, bg="#f8fafc")
-    body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
+    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
+    body.pack(fill=tk.X, padx=10, pady=(8, 4))
 
     status_var = tk.StringVar(value="準備就緒。")
 
-    def card(title: str) -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(body, text=title, padding=8)
+    def card(title: str) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         frame.pack(fill=tk.X, pady=(0, 8))
+        ctk.CTkLabel(frame, text=title, text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(10, 4))
         frame.columnconfigure(1, weight=1)
         return frame
 
@@ -168,11 +192,11 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
     saved_workbook = Path(str(last.get("workbook_path", "")))
     default_workbook = saved_workbook if saved_workbook.exists() else next(project_dir.glob("*.xlsm"), None)
     file_var = tk.StringVar(value=str(default_workbook) if default_workbook else "")
-    ttk.Label(file_card, text="Excel").grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=3)
-    file_row = ttk.Frame(file_card)
-    file_row.grid(row=0, column=1, sticky=tk.EW, pady=3)
+    ctk.CTkLabel(file_card, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+    file_row = ctk.CTkFrame(file_card, fg_color="transparent")
+    file_row.grid(row=1, column=1, sticky=tk.EW, padx=(0, 12), pady=4)
     file_row.columnconfigure(0, weight=1)
-    ttk.Entry(file_row, textvariable=file_var, width=12).grid(row=0, column=0, sticky=tk.EW)
+    ctk.CTkEntry(file_row, textvariable=file_var, height=34, font=FONT_BODY, fg_color=UI_PANEL, border_color=UI_BORDER).grid(row=0, column=0, sticky=tk.EW)
 
     def browse_file() -> None:
         current_file = Path(file_var.get().strip())
@@ -182,55 +206,52 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
             file_var.set(path)
             set_status("已選擇勤務表檔案。")
 
-    def bind_button_hover(button: tk.Button, normal_bg: str, hover_bg: str) -> None:
-        button.bind("<Enter>", lambda _event: button.configure(bg=hover_bg))
-        button.bind("<Leave>", lambda _event: button.configure(bg=normal_bg))
-
-    browse_button = tk.Button(
+    browse_button = ctk.CTkButton(
         file_row,
         text="選擇",
         command=browse_file,
-        bg="#2563eb",
-        fg="#ffffff",
-        activebackground="#1d4ed8",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        width=5,
+        width=64,
+        height=30,
+        font=FONT_BUTTON,
+        fg_color=UI_BLUE,
+        hover_color=UI_BLUE_HOVER,
     )
-    bind_button_hover(browse_button, "#2563eb", "#1d4ed8")
     browse_button.grid(row=0, column=1, padx=(6, 0))
 
-    try:
-        from tkcalendar import DateEntry
+    date_var = tk.StringVar(value=(datetime.now() + timedelta(days=1)).strftime("%Y/%m/%d"))
+    date_row = ctk.CTkFrame(file_card, fg_color="transparent")
+    date_row.grid(row=2, column=1, sticky=tk.W, padx=(0, 12), pady=4)
+    date_entry = ctk.CTkEntry(date_row, textvariable=date_var, width=112, height=34, font=FONT_BODY, fg_color=UI_PANEL, border_color=UI_BORDER)
+    date_entry.pack(side=tk.LEFT)
 
-        default_date = datetime.now() + timedelta(days=1)
-        date_widget = DateEntry(file_card, width=12, date_pattern="yyyy/mm/dd", year=default_date.year, month=default_date.month, day=default_date.day)
-        date_widget.grid(row=1, column=1, sticky=tk.W, pady=3)
-        get_selected_date = date_widget.get_date
-    except Exception:
-        date_var = tk.StringVar(value=(datetime.now() + timedelta(days=1)).strftime("%Y/%m/%d"))
-        ttk.Entry(file_card, textvariable=date_var, width=14).grid(row=1, column=1, sticky=tk.W, pady=3)
+    def get_selected_date() -> datetime:
+        return datetime.strptime(date_var.get().strip(), "%Y/%m/%d")
 
-        def get_selected_date() -> datetime:
-            return datetime.strptime(date_var.get().strip(), "%Y/%m/%d")
+    def shift_selected_date(days: int) -> None:
+        try:
+            current = get_selected_date()
+        except ValueError:
+            current = datetime.now() + timedelta(days=1)
+        date_var.set((current + timedelta(days=days)).strftime("%Y/%m/%d"))
 
-    ttk.Label(file_card, text="日期").grid(row=1, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+    ctk.CTkButton(date_row, text="<", width=32, height=34, font=FONT_BUTTON, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: shift_selected_date(-1)).pack(side=tk.LEFT, padx=(6, 0))
+    ctk.CTkButton(date_row, text=">", width=32, height=34, font=FONT_BUTTON, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: shift_selected_date(1)).pack(side=tk.LEFT, padx=(4, 0))
+
+    ctk.CTkLabel(file_card, text="日期", text_color=UI_MUTED, font=FONT_BODY).grid(row=2, column=0, sticky=tk.W, padx=(12, 8), pady=4)
     send_group_var = tk.BooleanVar(value=bool(current_config.get("notification", {}).get("enabled", True)))
-    tk.Checkbutton(
+    ctk.CTkCheckBox(
         file_card,
         text="完成後發送勤務表截圖",
         variable=send_group_var,
-        bg="#f8fafc",
-        activebackground="#f8fafc",
-        fg="#334155",
-        activeforeground="#334155",
-        selectcolor="#ffffff",
-        indicatoron=True,
-        font=("Microsoft JhengHei", 9),
-    ).grid(row=2, column=1, sticky=tk.W, pady=(2, 3))
+        font=FONT_BODY,
+        text_color=UI_TEXT,
+        fg_color=UI_BLUE,
+        hover_color=UI_BLUE_HOVER,
+        checkbox_width=18,
+        checkbox_height=18,
+    ).grid(row=3, column=1, sticky=tk.W, pady=(4, 10))
 
     car_card = card("主力車設定")
-    combo_width = 14
     attack_var = tk.StringVar(value=last.get("attack", ""))
     stop_var = tk.StringVar(value=last.get("stop", ""))
     amb1_var = tk.StringVar(value=last.get("amb1", ""))
@@ -241,11 +262,20 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         ("救護 1 車", amb1_var, opts.get("amb", [])),
         ("救護 2 車", amb2_var, opts.get("amb", [])),
     ]
-    car_combos: dict[str, list[ttk.Combobox]] = {"attack": [], "amb": []}
+    car_combos: dict[str, list[ctk.CTkComboBox]] = {"attack": [], "amb": []}
     for row, (label, variable, values) in enumerate(car_rows):
-        ttk.Label(car_card, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=3)
-        combo = ttk.Combobox(car_card, textvariable=variable, values=values, width=combo_width)
-        combo.grid(row=row, column=1, sticky=tk.EW, pady=3)
+        ctk.CTkLabel(car_card, text=label, text_color=UI_MUTED, font=FONT_BODY).grid(row=row + 1, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        combo = ctk.CTkComboBox(
+            car_card,
+            variable=variable,
+            values=values,
+            width=128,
+            height=32,
+            font=FONT_BODY,
+            dropdown_font=FONT_BODY,
+            **CTK_COMBO_STYLE,
+        )
+        combo.grid(row=row + 1, column=1, sticky=tk.EW, padx=(0, 12), pady=4)
         if label == "攻擊車":
             car_combos["attack"].append(combo)
         elif label.startswith("救護"):
@@ -275,14 +305,14 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
 
     def refresh_vehicle_options() -> None:
         for combo in car_combos["attack"]:
-            combo["values"] = opts.get("attack", [])
+            combo.configure(values=opts.get("attack", []))
         amb_values = opts.get("amb", [])
         for combo in car_combos["amb"]:
-            combo["values"] = amb_values
+            combo.configure(values=amb_values)
 
     def open_add_vehicle_dialog() -> tuple[str, str] | None:
         result: dict[str, str] = {}
-        add_dialog = tk.Toplevel(dialog)
+        add_dialog = ctk.CTkToplevel(dialog)
         add_dialog.title("新增車輛")
         add_dialog.transient(dialog)
         add_dialog.grab_set()
@@ -293,7 +323,17 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         plate_var = tk.StringVar()
 
         ttk.Label(add_dialog, text="車輛類型").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
-        ttk.Combobox(add_dialog, textvariable=vehicle_type_var, values=list(vehicle_groups.keys()), state="readonly", width=16).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
+        ctk.CTkComboBox(
+            add_dialog,
+            variable=vehicle_type_var,
+            values=list(vehicle_groups.keys()),
+            state="readonly",
+            width=170,
+            height=36,
+            font=FONT_BODY,
+            dropdown_font=FONT_BODY,
+            **CTK_COMBO_STYLE,
+        ).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
         ttk.Label(add_dialog, text="車輛代號").grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
         code_entry = ttk.Entry(add_dialog, textvariable=code_var, width=20)
         code_entry.grid(row=1, column=1, sticky=tk.EW, padx=12, pady=4)
@@ -313,8 +353,8 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
             result["value"] = f"{code}/{plate}"
             add_dialog.destroy()
 
-        ttk.Button(button_row, text="確定", command=confirm).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(button_row, text="取消", command=add_dialog.destroy).pack(side=tk.LEFT)
+        ctk.CTkButton(button_row, text="確定", width=82, height=36, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=confirm).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(button_row, text="取消", width=82, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color=UI_TEXT, hover_color="#cbd5e1", command=add_dialog.destroy).pack(side=tk.LEFT)
         code_entry.focus_set()
         dialog.wait_window(add_dialog)
         if result:
@@ -349,7 +389,7 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
             return None
 
         result: dict[str, tuple[str, str]] = {}
-        remove_dialog = tk.Toplevel(dialog)
+        remove_dialog = ctk.CTkToplevel(dialog)
         remove_dialog.title("移除車輛")
         remove_dialog.transient(dialog)
         remove_dialog.grab_set()
@@ -357,7 +397,17 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
 
         selected_var = tk.StringVar(value=choices[0])
         ttk.Label(remove_dialog, text="車輛代號/車牌號碼").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
-        ttk.Combobox(remove_dialog, textvariable=selected_var, values=choices, state="readonly", width=24).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
+        ctk.CTkComboBox(
+            remove_dialog,
+            variable=selected_var,
+            values=choices,
+            state="readonly",
+            width=220,
+            height=36,
+            font=FONT_BODY,
+            dropdown_font=FONT_BODY,
+            **CTK_COMBO_STYLE,
+        ).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
 
         button_row = ttk.Frame(remove_dialog)
         button_row.grid(row=1, column=0, columnspan=2, sticky=tk.E, padx=12, pady=(8, 12))
@@ -368,8 +418,8 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
                 result["selected"] = choice_map[selected_value]
             remove_dialog.destroy()
 
-        ttk.Button(button_row, text="確定", command=confirm).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(button_row, text="取消", command=remove_dialog.destroy).pack(side=tk.LEFT)
+        ctk.CTkButton(button_row, text="確定", width=82, height=36, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=confirm).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(button_row, text="取消", width=82, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color=UI_TEXT, hover_color="#cbd5e1", command=remove_dialog.destroy).pack(side=tk.LEFT)
         dialog.wait_window(remove_dialog)
         return result.get("selected")
 
@@ -398,46 +448,38 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         persist_vehicle_options()
         set_status(f"已移除車輛：{value}")
 
-    vehicle_button_row = tk.Frame(car_card, bg="#f8fafc")
-    vehicle_button_row.grid(row=4, column=1, sticky=tk.EW, pady=(6, 0))
+    vehicle_button_row = ctk.CTkFrame(car_card, fg_color="transparent")
+    vehicle_button_row.grid(row=5, column=1, sticky=tk.EW, padx=(0, 12), pady=(6, 10))
     vehicle_button_row.columnconfigure(0, weight=1)
-    add_vehicle_button = tk.Button(
+    vehicle_button_row.columnconfigure(1, weight=1)
+    add_vehicle_button = ctk.CTkButton(
         vehicle_button_row,
         text="新增車輛",
         command=add_vehicle_option,
-        bg="#2563eb",
-        fg="#ffffff",
-        activebackground="#1d4ed8",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        cursor="hand2",
-        width=18,
-        pady=5,
+        height=32,
+        font=FONT_BUTTON,
+        fg_color=UI_BLUE,
+        hover_color=UI_BLUE_HOVER,
     )
-    bind_button_hover(add_vehicle_button, "#2563eb", "#1d4ed8")
-    add_vehicle_button.grid(row=0, column=0, sticky=tk.EW)
-    remove_vehicle_button = tk.Button(
+    add_vehicle_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
+    remove_vehicle_button = ctk.CTkButton(
         vehicle_button_row,
         text="移除車輛",
         command=remove_vehicle_option,
-        bg="#fff7ed",
-        fg="#9a3412",
-        activebackground="#ffedd5",
-        activeforeground="#7c2d12",
-        relief=tk.FLAT,
-        cursor="hand2",
-        width=18,
-        pady=5,
+        height=32,
+        font=FONT_BUTTON,
+        fg_color="#fff7ed",
+        text_color="#9a3412",
+        hover_color="#ffedd5",
     )
-    bind_button_hover(remove_vehicle_button, "#fff7ed", "#ffedd5")
-    remove_vehicle_button.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
+    remove_vehicle_button.grid(row=0, column=1, sticky=tk.EW, padx=(4, 0))
 
-    action_row = tk.Frame(body, bg="#f8fafc")
-    action_row.pack(fill=tk.X, pady=(6, 8))
+    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
+    action_row.pack(fill=tk.X, pady=(6, 4))
     action_row.columnconfigure(0, weight=1)
 
-    status_bar = ttk.Label(root, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
-    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    status_bar = ctk.CTkLabel(root, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
+    status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 6))
 
     def set_status(message: str) -> None:
         status_var.set(message)
@@ -504,34 +546,26 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    start_button = tk.Button(
+    start_button = ctk.CTkButton(
         action_row,
         text="啟動登打",
         command=run_automation,
-        bg="#16a34a",
-        fg="#ffffff",
-        activebackground="#15803d",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        height=2,
+        fg_color="#16a34a",
+        hover_color="#15803d",
+        font=FONT_BUTTON,
+        height=38,
     )
-    bind_button_hover(start_button, "#16a34a", "#15803d")
-    start_button.grid(row=0, column=0, sticky=tk.EW)
-    close_button = tk.Button(
+    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
+    close_button = ctk.CTkButton(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#475569",
-        fg="#ffffff",
-        activebackground="#334155",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        cursor="hand2",
-        font=("Microsoft JhengHei", 11, "bold"),
-        width=9,
-        height=2,
+        fg_color="#e2e8f0",
+        text_color=UI_TEXT,
+        hover_color="#cbd5e1",
+        font=FONT_BUTTON,
+        width=90,
+        height=38,
     )
-    bind_button_hover(close_button, "#475569", "#334155")
-    close_button.grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
+    close_button.grid(row=0, column=1, sticky=tk.E)
     return dialog

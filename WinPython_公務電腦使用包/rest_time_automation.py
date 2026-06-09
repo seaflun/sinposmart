@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
+import customtkinter as ctk
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -27,6 +28,18 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from duty_rehearsal import build_driver, js_click, login, open_ap
 
+UI_FONT = "Microsoft JhengHei UI"
+UI_BG = "#f5f7fb"
+UI_PANEL = "#ffffff"
+UI_PANEL_TINT = "#eef6ff"
+UI_BORDER = "#d7e2f0"
+UI_TEXT = "#172033"
+UI_MUTED = "#64748b"
+UI_BLUE = "#2563eb"
+UI_BLUE_HOVER = "#1d4ed8"
+FONT_BODY = (UI_FONT, 12)
+FONT_TITLE = (UI_FONT, 14, "bold")
+FONT_BUTTON = (UI_FONT, 12, "bold")
 
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
@@ -99,7 +112,7 @@ def format_automation_error(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> tk.Toplevel | None:
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
@@ -112,12 +125,12 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             pass
         setattr(parent, "_rest_time_dialog", None)
 
-    dialog = tk.Toplevel(parent)
+    dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_rest_time_dialog", dialog)
     dialog.title("SinpoSmart - 休息時間登打")
     dialog.geometry("430x300")
     dialog.minsize(430, 300)
-    dialog.configure(bg="#f8fafc")
+    dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
     def close_dialog() -> None:
@@ -126,26 +139,27 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
 
     dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = tk.Frame(dialog, bg="#f8fafc")
+    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
     root.pack(fill=tk.BOTH, expand=True)
 
-    header = tk.Frame(root, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
     header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    tk.Label(header, text="休息時間登打", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    ctk.CTkLabel(header, text="休息時間登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = tk.Frame(root, bg="#f8fafc")
+    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
     body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
 
-    form = ttk.LabelFrame(body, text="勤務表檔案", padding=8)
+    form = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
     form.pack(fill=tk.X, pady=(10, 8))
+    ctk.CTkLabel(form, text="勤務表檔案", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(10, 4))
     form.columnconfigure(1, weight=1)
 
     file_var = tk.StringVar(value=str(default_workbook_path()))
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
 
-    ttk.Label(form, text="Excel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-    file_entry = ttk.Entry(form, textvariable=file_var)
-    file_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
+    ctk.CTkLabel(form, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=(4, 12))
+    file_entry = ctk.CTkEntry(form, textvariable=file_var, height=34, font=FONT_BODY, fg_color=UI_PANEL, border_color=UI_BORDER)
+    file_entry.grid(row=1, column=1, sticky=tk.EW, pady=(4, 12))
 
     def browse_file() -> None:
         current_file = Path(file_var.get().strip())
@@ -156,29 +170,23 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             save_last_workbook_path(Path(path))
             status_var.set("已選擇勤務表 Excel。")
 
-    def bind_button_hover(button: tk.Button, normal_bg: str, hover_bg: str) -> None:
-        button.bind("<Enter>", lambda _event: button.configure(bg=hover_bg))
-        button.bind("<Leave>", lambda _event: button.configure(bg=normal_bg))
-
-    browse_button = tk.Button(
+    browse_button = ctk.CTkButton(
         form,
         text="選擇",
         command=browse_file,
-        bg="#2563eb",
-        fg="#ffffff",
-        activebackground="#1d4ed8",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        width=5,
+        width=64,
+        height=30,
+        font=FONT_BUTTON,
+        fg_color=UI_BLUE,
+        hover_color=UI_BLUE_HOVER,
     )
-    bind_button_hover(browse_button, "#2563eb", "#1d4ed8")
-    browse_button.grid(row=0, column=2, sticky=tk.E, padx=(8, 0), pady=4)
+    browse_button.grid(row=1, column=2, sticky=tk.E, padx=(8, 12), pady=(4, 12))
 
-    action_row = tk.Frame(body, bg="#f8fafc")
+    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
-    status_bar = ttk.Label(body, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
+    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
     status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def set_running(running: bool) -> None:
@@ -225,39 +233,32 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         messagebox.showinfo("完成", result, parent=dialog)
         close_dialog()
 
-    start_button = tk.Button(
+    start_button = ctk.CTkButton(
         action_row,
         text="啟動登打",
         command=run_automation,
-        bg="#16a34a",
-        fg="#ffffff",
-        activebackground="#15803d",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        height=2,
+        fg_color="#16a34a",
+        hover_color="#15803d",
+        font=FONT_BUTTON,
+        height=38,
     )
-    bind_button_hover(start_button, "#16a34a", "#15803d")
     start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = tk.Button(
+    close_button = ctk.CTkButton(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#e2e8f0",
-        fg="#0f172a",
-        activebackground="#cbd5e1",
-        activeforeground="#0f172a",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        width=8,
-        height=2,
+        fg_color="#e2e8f0",
+        text_color=UI_TEXT,
+        hover_color="#cbd5e1",
+        font=FONT_BUTTON,
+        width=90,
+        height=38,
     )
-    bind_button_hover(close_button, "#e2e8f0", "#cbd5e1")
     close_button.grid(row=0, column=1, sticky=tk.E)
     return dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> tk.Toplevel | None:
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
@@ -270,12 +271,12 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             pass
         setattr(parent, "_monthly_base_dialog", None)
 
-    dialog = tk.Toplevel(parent)
+    dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_monthly_base_dialog", dialog)
     dialog.title("SinpoSmart - 勤務基準表登打")
     dialog.geometry("430x280")
     dialog.minsize(430, 280)
-    dialog.configure(bg="#f8fafc")
+    dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
     def close_dialog() -> None:
@@ -284,32 +285,29 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
 
     dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = tk.Frame(dialog, bg="#f8fafc")
+    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
     root.pack(fill=tk.BOTH, expand=True)
 
-    header = tk.Frame(root, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
     header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    tk.Label(header, text="勤務基準表登打", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    ctk.CTkLabel(header, text="勤務基準表登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = tk.Frame(root, bg="#f8fafc")
+    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
     body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
 
-    info = ttk.LabelFrame(body, text="固定來源", padding=8)
+    info = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
     info.pack(fill=tk.X, pady=(10, 8))
+    ctk.CTkLabel(info, text="固定來源", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
     info.columnconfigure(0, weight=1)
-    ttk.Label(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W)
+    ctk.CTkLabel(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
 
-    action_row = tk.Frame(body, bg="#f8fafc")
+    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
-    status_bar = ttk.Label(body, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
+    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
     status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def bind_button_hover(button: tk.Button, normal_bg: str, hover_bg: str) -> None:
-        button.bind("<Enter>", lambda _event: button.configure(bg=hover_bg))
-        button.bind("<Leave>", lambda _event: button.configure(bg=normal_bg))
 
     def set_running(running: bool) -> None:
         start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
@@ -354,34 +352,27 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
 
         threading.Thread(target=worker, daemon=True).start()
 
-    start_button = tk.Button(
+    start_button = ctk.CTkButton(
         action_row,
         text="啟動登打",
         command=run_automation,
-        bg="#16a34a",
-        fg="#ffffff",
-        activebackground="#15803d",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        height=2,
+        fg_color="#16a34a",
+        hover_color="#15803d",
+        font=FONT_BUTTON,
+        height=38,
     )
-    bind_button_hover(start_button, "#16a34a", "#15803d")
     start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = tk.Button(
+    close_button = ctk.CTkButton(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#e2e8f0",
-        fg="#0f172a",
-        activebackground="#cbd5e1",
-        activeforeground="#0f172a",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        width=8,
-        height=2,
+        fg_color="#e2e8f0",
+        text_color=UI_TEXT,
+        hover_color="#cbd5e1",
+        font=FONT_BUTTON,
+        width=90,
+        height=38,
     )
-    bind_button_hover(close_button, "#e2e8f0", "#cbd5e1")
     close_button.grid(row=0, column=1, sticky=tk.E)
     return dialog
 
