@@ -26,6 +26,7 @@ import threading
 import time
 import tkinter as tk
 import zipfile
+import customtkinter as ctk
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -62,6 +63,9 @@ from selenium.webdriver.chrome.options import Options
 from daily_vehicle_automation import start_daily_vehicle_automation
 from duty_sheet_automation import open_duty_sheet_dialog
 from rest_time_automation import open_monthly_base_dialog, open_rest_time_dialog
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
 
 try:
     import pystray
@@ -121,6 +125,7 @@ from duty_rehearsal import (
     query_cases,
     query_duty_sheet,
     query_visible_table,
+    quit_driver,
     roc_date,
     save_work_log_defaults,
     slot_end,
@@ -349,6 +354,42 @@ def cleanup_old_json_files() -> None:
 
 DEFAULT_PREVIEW = latest_preview_file()
 SAVED_LOGIN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DutyAutomation" / "saved_login.json"
+UI_FONT = "Microsoft JhengHei UI"
+UI_BG = "#f5f7fb"
+UI_PANEL = "#ffffff"
+UI_PANEL_TINT = "#eef6ff"
+UI_BORDER = "#d7e2f0"
+UI_TEXT = "#172033"
+UI_MUTED = "#64748b"
+UI_BLUE = "#2563eb"
+UI_BLUE_HOVER = "#1d4ed8"
+UI_RED = "#dc2626"
+UI_RED_HOVER = "#b91c1c"
+UI_SOFT_ACTION = "#f1f5f9"
+UI_SOFT_ACTION_HOVER = "#e2e8f0"
+FONT_BODY = (UI_FONT, 12)
+FONT_SMALL = (UI_FONT, 11)
+FONT_TITLE = (UI_FONT, 14, "bold")
+FONT_SECTION = (UI_FONT, 12, "bold")
+FONT_BUTTON = (UI_FONT, 12, "bold")
+FONT_CLOCK = (UI_FONT, 30, "bold")
+FONT_DUTY_TIME = (UI_FONT, 18, "bold")
+FONT_TABLE = (UI_FONT, 12)
+FONT_TABLE_HEAD = (UI_FONT, 12, "bold")
+CTK_COMBO_STYLE = {
+    "fg_color": UI_PANEL,
+    "border_color": "#bfdbfe",
+    "button_color": "#dbeafe",
+    "button_hover_color": "#bfdbfe",
+    "dropdown_fg_color": "#ffffff",
+    "dropdown_hover_color": "#eff6ff",
+    "dropdown_text_color": UI_TEXT,
+    "text_color": UI_TEXT,
+}
+DUTY_TASK_COLUMN_WIDTHS = (82, 54, 160, 84, 96)
+DUTY_TASK_INNER_PAD_X = 4
+DUTY_TASK_INNER_PAD_Y = 2
+DUTY_TASK_GROW_COLUMN = 2
 
 
 def duty_window_dates(base_roc_date: str) -> list[str]:
@@ -367,13 +408,15 @@ class LoginSession:
 
 # Main GUI controller
 
-class DutyGui(tk.Tk):
+class DutyGui(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        self.option_add("*Font", FONT_BODY)
+        self.configure(fg_color=UI_BG)
         self.title(f"{APP_DISPLAY_NAME} - 值班模式")
         self.apply_window_icon(self)
-        self.geometry("440x720")
-        self.minsize(420, 700)
+        self.geometry("550x800")
+        self.minsize(530, 760)
 
         self.preview_path = tk.StringVar(value=str(DEFAULT_PREVIEW))
         self.audit_date = tk.StringVar(value=today_roc_date())
@@ -381,9 +424,11 @@ class DutyGui(tk.Tk):
         self.user_id = tk.StringVar()
         self.password = tk.StringVar()
         self.saved_account_choice = tk.StringVar()
-        self.remember_login = tk.BooleanVar(value=True)
+        self.remember_login = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="值班模式")
         self.login_status = tk.StringVar(value="未登入")
+        self.user_display_text = tk.StringVar(value="未登入")
+        self.shift_display_text = tk.StringVar(value="今日值班時段：-")
         self.filter_actor = tk.BooleanVar(value=False)
         self.simple_mode = tk.BooleanVar(value=True)
         self.status_filter = tk.StringVar(value="需處理")
@@ -399,7 +444,7 @@ class DutyGui(tk.Tk):
             "todo": tk.StringVar(value="未找到 0"),
             "review": tk.StringVar(value="人工確認 0"),
             "ready": tk.StringVar(value="尚未到點 0"),
-            "done": tk.StringVar(value="已存在 0"),
+            "done": tk.StringVar(value="已登打 0"),
         }
 
         self.staff: dict[str, dict[str, str]] = {}
@@ -423,6 +468,11 @@ class DutyGui(tk.Tk):
         self.submit_comparison_refresh_dates: set[str] = set()
         self.submit_comparison_refresh_scheduled = False
         self.duty_selection_anchor = ""
+        self.duty_selected_iids: set[str] = set()
+        self.duty_visible_iids: list[str] = []
+        self.duty_card_rows: dict[str, ctk.CTkFrame] = {}
+        self.duty_card_borders: dict[str, str] = {}
+        self.last_duty_refresh_minute = ""
         self.saved_accounts: list[dict[str, str]] = []
         self.work_log_defaults = load_work_log_defaults()
         self.review_widgets: list[tk.Widget] = []
@@ -442,6 +492,8 @@ class DutyGui(tk.Tk):
         self.saved_login_needs_backup = False
         self.login_running = False
         self.login_attempt_id = 0
+        self.active_webdrivers: set[Any] = set()
+        self.active_webdrivers_lock = threading.Lock()
         self.tray_icon: Any | None = None
         self.tray_available = bool(pystray and Image and ImageDraw)
         self.notification_id = 9100
@@ -464,13 +516,13 @@ class DutyGui(tk.Tk):
     def _build_layout(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TFrame", background="#f4f7fb")
-        style.configure("TLabelframe", background="#f4f7fb", bordercolor="#d5dde8")
-        style.configure("TLabelframe.Label", background="#f4f7fb", foreground="#22324a", font=("Microsoft JhengHei", 10, "bold"))
-        style.configure("TLabel", background="#f4f7fb", foreground="#233044", font=("Microsoft JhengHei", 10))
+        style.configure("TFrame", background=UI_BG)
+        style.configure("TLabelframe", background=UI_BG, bordercolor=UI_BORDER)
+        style.configure("TLabelframe.Label", background=UI_BG, foreground=UI_TEXT, font=FONT_SECTION)
+        style.configure("TLabel", background=UI_BG, foreground=UI_TEXT, font=FONT_BODY)
         style.configure("Login.TFrame", background="#ffffff")
-        style.configure("Login.TRadiobutton", background="#ffffff", foreground="#334155", font=("Microsoft JhengHei", 10))
-        style.configure("TButton", font=("Microsoft JhengHei", 10), padding=(10, 5))
+        style.configure("Login.TRadiobutton", background=UI_PANEL, foreground="#334155", font=FONT_BODY)
+        style.configure("TButton", font=FONT_BUTTON, padding=(10, 5))
         style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff")
         style.map("Accent.TButton", background=[("active", "#1d4ed8")])
         style.configure("Soft.TButton", background="#eef2ff", foreground="#243b75")
@@ -493,15 +545,20 @@ class DutyGui(tk.Tk):
         style.map("PanelTool.TButton", background=[("active", "#f8fafc")], foreground=[("active", "#0f172a")])
         style.configure("DangerTool.TButton", background="#ffffff", foreground="#b91c1c", padding=(8, 3), bordercolor="#fecaca")
         style.map("DangerTool.TButton", background=[("active", "#fef2f2")], foreground=[("active", "#991b1b")])
-        style.configure("AuditValue.TLabel", background="#f4f7fb", foreground="#1e3a8a", font=("Microsoft JhengHei", 10, "bold"))
-        style.configure("AuditCaption.TLabel", background="#f4f7fb", foreground="#64748b", font=("Microsoft JhengHei", 9))
-        style.configure("Treeview", rowheight=30, font=("Microsoft JhengHei", 10), background="#ffffff", fieldbackground="#ffffff")
-        style.configure("Treeview.Heading", font=("Microsoft JhengHei", 10, "bold"), background="#e8eef7", foreground="#1e2b3f")
+        style.configure("AuditValue.TLabel", background=UI_BG, foreground="#1e3a8a", font=FONT_SECTION)
+        style.configure("AuditCaption.TLabel", background=UI_BG, foreground=UI_MUTED, font=FONT_SMALL)
+        style.configure("Treeview", rowheight=38, font=FONT_TABLE, background=UI_PANEL, fieldbackground=UI_PANEL, bordercolor=UI_BORDER, lightcolor=UI_BORDER, darkcolor=UI_BORDER)
+        style.configure("Treeview.Heading", font=FONT_TABLE_HEAD, background="#edf3fb", foreground=UI_TEXT, relief=tk.FLAT, bordercolor=UI_BORDER)
+        style.configure("Audit.Treeview", rowheight=34, font=(UI_FONT, 11), background=UI_PANEL, fieldbackground=UI_PANEL, borderwidth=0, relief=tk.FLAT)
+        style.configure("Audit.Treeview.Heading", font=(UI_FONT, 11, "bold"), background="#f1f5f9", foreground="#0f172a", relief=tk.FLAT, borderwidth=0)
+        style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", UI_TEXT)])
 
-        root = ttk.Frame(self, padding=14)
-        root.pack(fill=tk.BOTH, expand=True)
+        root = ctk.CTkFrame(self, fg_color=UI_BG, corner_radius=0)
+        root.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+        self.root_panel = root
+        self.audit_panel = ctk.CTkFrame(root, fg_color="transparent")
 
-        top = ttk.LabelFrame(root, text="預演資料", padding=10)
+        top = ttk.LabelFrame(self.audit_panel, text="預演資料", padding=10)
         top.pack(fill=tk.X)
         self.top_frame = top
         self.review_widgets.append(top)
@@ -511,47 +568,51 @@ class DutyGui(tk.Tk):
         ttk.Button(top, text="載入", command=lambda: self.load_preview(Path(self.preview_path.get()))).grid(row=0, column=3)
         top.columnconfigure(1, weight=0)
 
-        login_box = ttk.LabelFrame(root, text="目前值班人員登入", padding=10)
+        login_box = ctk.CTkFrame(self.audit_panel, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         login_box.pack(fill=tk.X, pady=(10, 0))
         self.login_box = login_box
         self.review_widgets.append(login_box)
-        ttk.Label(login_box, text="番號").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(login_box, textvariable=self.actor_no, width=8).grid(row=0, column=1, sticky=tk.W, padx=(6, 12))
-        ttk.Label(login_box, text="帳號").grid(row=0, column=2, sticky=tk.W)
-        self.review_user_entry = ttk.Entry(login_box, textvariable=self.user_id, width=22, style="Login.TEntry")
-        self.review_user_entry.grid(row=0, column=3, sticky=tk.W, padx=(6, 8))
+        login_box.columnconfigure(1, weight=0)
+        login_box.columnconfigure(3, weight=1)
+        login_box.columnconfigure(5, weight=1)
+        ctk.CTkLabel(login_box, text="目前值班人員登入", text_color="#1e3a8a", font=FONT_SECTION).grid(row=0, column=0, columnspan=9, sticky=tk.W, padx=12, pady=(10, 6))
+        ctk.CTkLabel(login_box, text="番號", text_color=UI_MUTED, font=FONT_SMALL).grid(row=1, column=0, sticky=tk.W, padx=(12, 4), pady=(0, 8))
+        self.review_actor_entry = ctk.CTkEntry(login_box, textvariable=self.actor_no, width=58, height=34, font=FONT_BODY)
+        self.review_actor_entry.grid(row=1, column=1, sticky=tk.W, padx=(0, 10), pady=(0, 8))
+        ctk.CTkLabel(login_box, text="帳號", text_color=UI_MUTED, font=FONT_SMALL).grid(row=1, column=2, sticky=tk.W, padx=(0, 4), pady=(0, 8))
+        self.review_user_entry = ctk.CTkEntry(login_box, textvariable=self.user_id, width=132, height=34, font=FONT_BODY)
+        self.review_user_entry.grid(row=1, column=3, sticky=tk.EW, padx=(0, 10), pady=(0, 8))
         self.review_user_entry.bind("<Tab>", self.focus_review_password_from_user)
         self.review_user_entry.bind("<Return>", self.submit_login_from_entry)
-        self.review_manage_account_button = ttk.Button(login_box, text="帳號選擇", width=11, style="PanelTool.TButton", command=self.manage_saved_accounts, takefocus=False)
-        self.review_manage_account_button.grid(row=0, column=4, padx=(0, 12))
-        ttk.Label(login_box, text="密碼").grid(row=0, column=5, sticky=tk.W)
-        self.review_password_entry = ttk.Entry(login_box, textvariable=self.password, width=22, show="*", style="Login.TEntry")
-        self.review_password_entry.grid(row=0, column=6, sticky=tk.W, padx=(6, 0))
+        ctk.CTkLabel(login_box, text="密碼", text_color=UI_MUTED, font=FONT_SMALL).grid(row=1, column=4, sticky=tk.W, padx=(0, 4), pady=(0, 8))
+        self.review_password_entry = ctk.CTkEntry(login_box, textvariable=self.password, width=132, height=34, font=FONT_BODY, show="*")
+        self.review_password_entry.grid(row=1, column=5, sticky=tk.EW, padx=(0, 8), pady=(0, 8))
         self.review_password_entry.bind("<Return>", self.submit_login_from_entry)
-        tk.Checkbutton(
+        self.review_remember_login_check = ctk.CTkCheckBox(
             login_box,
             text="記住帳號密碼",
             variable=self.remember_login,
-            bg="#f4f7fb",
-            activebackground="#f4f7fb",
-            fg="#1e3a8a",
-            activeforeground="#1e3a8a",
-            selectcolor="#ffffff",
-            font=("Microsoft JhengHei", 9, "bold"),
-            width=11,
-        ).grid(row=0, column=7, sticky=tk.W, padx=(12, 0))
-        self.review_login_button = ttk.Button(login_box, text="測試登入", style="Accent.TButton", command=self.verify_login)
-        self.review_login_button.grid(row=0, column=8, padx=(12, 0))
-        self.review_secondary_row = ttk.Frame(login_box)
-        self.review_secondary_row.grid(row=1, column=0, columnspan=9, sticky=tk.W, pady=(8, 0))
-        ttk.Button(self.review_secondary_row, text="縮小", command=self.iconify).pack(side=tk.LEFT)
-        ttk.Button(self.review_secondary_row, text="登出/清除", command=self.clear_login).pack(side=tk.LEFT, padx=(8, 0))
-        self.review_tertiary_row = ttk.Frame(login_box)
-        self.review_tertiary_row.grid(row=2, column=0, columnspan=9, sticky=tk.W, pady=(6, 0))
-        ttk.Button(self.review_tertiary_row, text="查看此人任務", command=self.show_actor_tasks).pack(side=tk.LEFT)
-        ttk.Label(login_box, textvariable=self.login_status, foreground="#1f5f3f").grid(row=3, column=0, columnspan=9, sticky=tk.W, pady=(8, 0))
+            font=FONT_SMALL,
+            text_color="#1e3a8a",
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            checkbox_width=18,
+            checkbox_height=18,
+            width=112,
+        )
+        self.review_remember_login_check.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(0, 8))
+        self.review_login_button = ctk.CTkButton(login_box, text="測試登入", width=92, height=36, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=self.verify_login)
+        self.review_login_button.grid(row=2, column=5, columnspan=4, sticky=tk.E, padx=(0, 12), pady=(0, 8))
+        self.review_secondary_row = ctk.CTkFrame(login_box, fg_color="transparent")
+        self.review_secondary_row.grid(row=3, column=0, columnspan=9, sticky=tk.W, padx=12, pady=(0, 8))
+        ctk.CTkButton(self.review_secondary_row, text="縮小", width=74, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.iconify).pack(side=tk.LEFT)
+        ctk.CTkButton(self.review_secondary_row, text="登出/清除", width=102, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.clear_login).pack(side=tk.LEFT, padx=(8, 0))
+        self.review_tertiary_row = ctk.CTkFrame(login_box, fg_color="transparent")
+        self.review_tertiary_row.grid(row=4, column=0, columnspan=9, sticky=tk.W, padx=12, pady=(0, 8))
+        ctk.CTkButton(self.review_tertiary_row, text="查看此人任務", width=126, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.show_actor_tasks).pack(side=tk.LEFT)
+        ctk.CTkLabel(login_box, textvariable=self.login_status, text_color="#1f5f3f", font=FONT_SMALL).grid(row=5, column=0, columnspan=9, sticky=tk.W, padx=12, pady=(0, 10))
 
-        summary = ttk.Frame(root)
+        summary = ctk.CTkFrame(self.audit_panel, fg_color="transparent")
         summary.pack(fill=tk.X, pady=(10, 0))
         self.summary_frame = summary
         self.review_widgets.append(summary)
@@ -563,79 +624,93 @@ class DutyGui(tk.Tk):
                 "done": ("#ecfdf5", "#166534"),
             }
             bg, fg = colors[key]
-            card = tk.Frame(summary, bg=bg, highlightbackground="#d8e0ec", highlightthickness=1)
+            card = ctk.CTkFrame(summary, fg_color=bg, border_color="#d8e0ec", border_width=1, corner_radius=8)
             card.grid(row=0, column=idx, sticky=tk.EW, padx=(0 if idx == 0 else 6, 0))
-            tk.Label(card, textvariable=self.summary_vars[key], bg=bg, fg=fg, font=("Microsoft JhengHei", 12, "bold"), pady=8).pack(fill=tk.X)
+            ctk.CTkLabel(card, textvariable=self.summary_vars[key], text_color=fg, font=(UI_FONT, 16, "bold")).pack(fill=tk.X, padx=8, pady=8)
             summary.columnconfigure(idx, weight=1)
 
-        tools = ttk.Frame(root)
+        tools = ctk.CTkFrame(self.audit_panel, fg_color="transparent")
         tools.pack(fill=tk.X, pady=(10, 0))
         self.tools_frame = tools
         self.review_widgets.append(tools)
         tools.columnconfigure(0, weight=1)
         tools.columnconfigure(1, weight=1)
 
-        date_card = tk.Frame(tools, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+        date_card = ctk.CTkFrame(tools, fg_color="#eff6ff", border_color="#bfdbfe", border_width=1, corner_radius=8)
         date_card.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 5))
-        tk.Label(date_card, text="日期切換", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 10, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(10, 2))
-        tk.Label(date_card, text="勤務日期", bg="#eff6ff", fg="#475569", font=("Microsoft JhengHei", 9)).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 2))
-        self.audit_date_combo = ttk.Combobox(date_card, textvariable=self.audit_date, values=self.available_audit_dates(), width=8, state="readonly", style="AuditDate.TCombobox")
+        ctk.CTkLabel(date_card, text="日期切換", text_color="#1e3a8a", font=(UI_FONT, 14, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 0))
+        ctk.CTkLabel(date_card, text="勤務日期", text_color="#475569", font=(UI_FONT, 13)).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
+        self.audit_date_combo = ctk.CTkComboBox(
+            date_card,
+            variable=self.audit_date,
+            values=self.available_audit_dates(),
+            width=118,
+            height=36,
+            state="readonly",
+            font=(UI_FONT, 14),
+            dropdown_font=(UI_FONT, 14),
+            **CTK_COMBO_STYLE,
+            command=lambda _value: self.load_audit_date(),
+        )
         self.audit_date_combo.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 10))
-        self.audit_date_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_audit_date())
-        ttk.Button(date_card, text="◀", width=3, style="AuditNav.TButton", command=lambda: self.shift_audit_date(-1)).grid(row=2, column=1, padx=(4, 2), pady=(0, 10))
-        ttk.Button(date_card, text="▶", width=3, style="AuditNav.TButton", command=lambda: self.shift_audit_date(1)).grid(row=2, column=2, padx=2, pady=(0, 10))
-        self.refresh_compare_button = ttk.Button(date_card, text="重新查詢", style="AuditAction.TButton", command=self.refresh_current_comparison)
+        ctk.CTkButton(date_card, text="<", width=38, height=36, font=(UI_FONT, 14, "bold"), fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(-1)).grid(row=2, column=1, padx=(4, 2), pady=(0, 10))
+        ctk.CTkButton(date_card, text=">", width=38, height=36, font=(UI_FONT, 14, "bold"), fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(1)).grid(row=2, column=2, padx=2, pady=(0, 10))
+        self.refresh_compare_button = ctk.CTkButton(date_card, text="重新查詢", width=92, height=36, font=(UI_FONT, 14, "bold"), fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=self.refresh_current_comparison)
         self.refresh_compare_button.grid(row=2, column=3, sticky=tk.E, padx=(8, 12), pady=(0, 10))
         date_card.columnconfigure(3, weight=1)
 
-        filter_card = tk.Frame(tools, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+        filter_card = ctk.CTkFrame(tools, fg_color="#eff6ff", border_color="#bfdbfe", border_width=1, corner_radius=8)
         filter_card.grid(row=0, column=1, sticky=tk.NSEW, padx=(5, 0))
-        tk.Label(filter_card, text="篩選條件", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(10, 2))
-        ttk.Label(filter_card, text="狀態", style="AuditCaption.TLabel").grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 2))
-        ttk.Label(filter_card, text="類型", style="AuditCaption.TLabel").grid(row=1, column=1, sticky=tk.W, padx=(8, 12), pady=(0, 2))
-        ttk.Combobox(
+        ctk.CTkLabel(filter_card, text="篩選條件", text_color="#1e3a8a", font=(UI_FONT, 14, "bold")).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(8, 0))
+        ctk.CTkLabel(filter_card, text="狀態", text_color=UI_MUTED, font=(UI_FONT, 13)).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
+        ctk.CTkLabel(filter_card, text="類型", text_color=UI_MUTED, font=(UI_FONT, 13)).grid(row=1, column=1, sticky=tk.W, padx=(8, 12), pady=(0, 0))
+        ctk.CTkComboBox(
             filter_card,
-            textvariable=self.status_filter,
-            values=("需處理", "全部", "已存在", "手動", "尚未到點", "可能臨時調整", "時間近似", "人工確認"),
-            width=13,
+            variable=self.status_filter,
+            values=("需處理", "全部", "已登打", "手動", "尚未到點", "疑似異動", "時間近似", "人工確認"),
+            width=150,
+            height=36,
             state="readonly",
-            style="AuditDate.TCombobox",
+            font=(UI_FONT, 14),
+            dropdown_font=(UI_FONT, 14),
+            **CTK_COMBO_STYLE,
+            command=lambda _value: self.refresh_tasks(),
         ).grid(row=2, column=0, sticky=tk.EW, padx=12, pady=(0, 10))
-        ttk.Combobox(
+        ctk.CTkComboBox(
             filter_card,
-            textvariable=self.kind_filter,
+            variable=self.kind_filter,
             values=("全部", "工作", "出入", "案件工作"),
-            width=10,
+            width=130,
+            height=36,
             state="readonly",
-            style="AuditDate.TCombobox",
+            font=(UI_FONT, 14),
+            dropdown_font=(UI_FONT, 14),
+            **CTK_COMBO_STYLE,
+            command=lambda _value: self.refresh_tasks(),
         ).grid(row=2, column=1, sticky=tk.EW, padx=(8, 12), pady=(0, 10))
         filter_card.columnconfigure(0, weight=1)
         filter_card.columnconfigure(1, weight=1)
         self.status_filter.trace_add("write", lambda *_: self.refresh_tasks())
         self.kind_filter.trace_add("write", lambda *_: self.refresh_tasks())
 
-        self.audit_bottom_frame = ttk.Frame(root)
-        audit_bottom_left = ttk.Frame(self.audit_bottom_frame)
+        self.audit_bottom_frame = ctk.CTkFrame(self.audit_panel, fg_color="transparent")
+        audit_bottom_left = ctk.CTkFrame(self.audit_bottom_frame, fg_color="transparent")
         audit_bottom_left.pack(side=tk.LEFT)
-        audit_bottom_right = ttk.Frame(self.audit_bottom_frame)
+        audit_bottom_right = ctk.CTkFrame(self.audit_bottom_frame, fg_color="transparent")
         audit_bottom_right.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        ttk.Button(audit_bottom_left, text="值班模式", style="AuditMode.TButton", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
-        ttk.Button(audit_bottom_left, text="檢查更新", style="AuditMode.TButton", command=self.check_for_update).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(audit_bottom_left, text="匯出問題包", style="AuditMode.TButton", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
-        self.credential_export_button = ttk.Button(audit_bottom_left, text="匯出帳密JSON", style="AuditMode.TButton", command=self.sync_current_account_dialog)
+        ctk.CTkButton(audit_bottom_left, text="值班模式", width=92, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
+        ctk.CTkButton(audit_bottom_left, text="檢查更新", width=92, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.check_for_update).pack(side=tk.LEFT, padx=(8, 0))
+        ctk.CTkButton(audit_bottom_left, text="匯出問題包", width=106, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
+        self.credential_export_button = ctk.CTkButton(audit_bottom_left, text="匯出帳密JSON", width=124, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.sync_current_account_dialog)
         self.credential_export_button.pack(side=tk.LEFT, padx=(8, 0))
         self.update_credential_export_button_state()
-        ttk.Label(audit_bottom_right, textvariable=self.status_text, style="AuditValue.TLabel", anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
+        ctk.CTkLabel(audit_bottom_right, textvariable=self.status_text, text_color="#1e3a8a", font=FONT_SECTION, anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
 
-        columns = (
-            "compare",
-            "execute_time",
-            "actor",
-            "target",
-            "kind",
-            "summary",
-        )
-        self.tree = ttk.Treeview(root, columns=columns, show="headings", height=22)
+        self.audit_table_card = ctk.CTkFrame(self.audit_panel, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+        self.audit_table_body = ctk.CTkFrame(self.audit_table_card, fg_color=UI_PANEL, corner_radius=0)
+        self.audit_table_body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        columns = ("compare", "execute_time", "actor", "target", "kind", "summary")
+        self.tree = ttk.Treeview(self.audit_table_body, columns=columns, show="headings", height=16, style="Audit.Treeview")
         headings = {
             "compare": "比對",
             "execute_time": "登打時間",
@@ -645,163 +720,193 @@ class DutyGui(tk.Tk):
             "summary": "內容",
         }
         widths = {
-            "compare": 84,
+            "compare": 116,
             "execute_time": 92,
-            "actor": 64,
-            "target": 120,
-            "kind": 90,
-            "summary": 288,
+            "actor": 78,
+            "target": 112,
+            "kind": 78,
+            "summary": 266,
+        }
+        anchors = {
+            "compare": tk.CENTER,
+            "execute_time": tk.CENTER,
+            "actor": tk.CENTER,
+            "target": tk.CENTER,
+            "kind": tk.CENTER,
+            "summary": tk.CENTER,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], minwidth=widths[col], stretch=col in ("compare", "target", "summary"), anchor=tk.W)
-        self.tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.review_widgets.append(self.tree)
-        self.tree.tag_configure("todo", background="#fff1f2", foreground="#7f1d1d")
-        self.tree.tag_configure("review", background="#fff7ed", foreground="#7c2d12")
-        self.tree.tag_configure("near", background="#fefce8", foreground="#713f12")
+            self.tree.column(col, width=widths[col], minwidth=widths[col], stretch=col in ("target", "summary"), anchor=anchors[col])
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree.tag_configure("todo", background="#fff1f2", foreground="#991b1b")
+        self.tree.tag_configure("review", background="#FEF3C7", foreground="#92400E")
+        self.tree.tag_configure("near", background="#fefce8", foreground="#854d0e")
         self.tree.tag_configure("done", background="#ecfdf5", foreground="#14532d")
         self.tree.tag_configure("ready", background="#eff6ff", foreground="#1e3a8a")
         self.tree.tag_configure("future", background="#f8fafc", foreground="#475569")
-        self.tree.tag_configure("adjust", background="#eef2ff", foreground="#3730a3")
-        self.tree.tag_configure("manual", background="#fff7ed", foreground="#7c2d12")
-
-        scrollbar = ttk.Scrollbar(self.tree, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.tag_configure("adjust", background="#FEF3C7", foreground="#92400E")
+        self.tree.tag_configure("manual", background="#FEF3C7", foreground="#92400E")
+        scrollbar = ctk.CTkScrollbar(
+            self.audit_table_body,
+            orientation="vertical",
+            width=12,
+            command=self.tree.yview,
+            fg_color=UI_PANEL,
+            button_color="#cbd5e1",
+            button_hover_color="#94a3b8",
+        )
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.review_widgets.append(self.audit_table_card)
 
-        bottom = ttk.LabelFrame(root, text="選取項目明細", padding=10)
+        bottom = ttk.LabelFrame(self.audit_panel, text="選取項目明細", padding=10)
         bottom.pack(fill=tk.BOTH, pady=(10, 0))
         self.bottom_frame = bottom
         self.review_widgets.append(bottom)
-        self.detail = tk.Text(bottom, height=8, wrap=tk.WORD)
-        self.detail.configure(font=("Microsoft JhengHei", 10), bg="#ffffff", relief=tk.FLAT, padx=10, pady=8)
+        self.detail = ctk.CTkTextbox(bottom, height=118, wrap=tk.WORD, font=FONT_BODY, fg_color="#ffffff", border_width=0)
         self.detail.pack(fill=tk.BOTH, expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.show_selected_detail)
         self.build_duty_panel(root)
         self.apply_mode()
 
     def build_duty_panel(self, root: ttk.Frame) -> None:
-        panel = ttk.Frame(root)
+        panel = ctk.CTkFrame(root, fg_color="transparent")
+        self.duty_panel = panel
         self.duty_widgets.append(panel)
 
-        time_panel = tk.Frame(panel, bg="#0f172a", highlightbackground="#bfdbfe", highlightthickness=1)
+        time_panel = ctk.CTkFrame(panel, fg_color="#0f172a", border_color="#bfdbfe", border_width=1, corner_radius=8)
         time_panel.pack(fill=tk.X)
-        tk.Label(time_panel, textvariable=self.date_text, bg="#0f172a", fg="#cbd5e1", font=("Microsoft JhengHei", 12, "bold")).pack(anchor=tk.CENTER, pady=(6, 0))
-        tk.Label(time_panel, textvariable=self.time_text, bg="#0f172a", fg="#ffffff", font=("Microsoft JhengHei", 26, "bold")).pack(anchor=tk.CENTER, pady=(0, 6))
+        ctk.CTkLabel(time_panel, textvariable=self.time_text, text_color="#ffffff", font=FONT_DUTY_TIME).pack(anchor=tk.CENTER, pady=10)
 
-        login_card = tk.Frame(panel, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+        login_card = ctk.CTkFrame(panel, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         login_card.pack(fill=tk.X, pady=(10, 0))
-        login_panel = tk.Frame(login_card, bg="#eff6ff")
-        login_panel.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
-        duty_header = tk.Frame(login_panel, bg="#eff6ff")
+        login_panel = ctk.CTkFrame(login_card, fg_color=UI_PANEL)
+        login_panel.pack(fill=tk.BOTH, expand=True, padx=14, pady=(8, 6))
+        duty_header = ctk.CTkFrame(login_panel, fg_color="transparent")
         duty_header.pack(fill=tk.X)
-        tk.Label(duty_header, text="消防勤務管理系統", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 12, "bold")).pack(side=tk.LEFT)
-        self.work_log_settings_button = ttk.Button(duty_header, text="⚙", width=3, style="PanelTool.TButton", command=self.open_work_log_defaults_dialog, takefocus=False)
+        ctk.CTkLabel(duty_header, text="消防勤務管理系統", text_color="#1e3a8a", font=(UI_FONT, 16, "bold")).pack(side=tk.LEFT)
+        self.work_log_settings_button = ctk.CTkButton(duty_header, text="⚙", width=34, height=34, font=FONT_BUTTON, fg_color="transparent", text_color="#334155", hover_color="#eef2ff", border_width=0, command=self.open_work_log_defaults_dialog)
         self.work_log_settings_button.pack(side=tk.RIGHT)
         self.work_log_settings_button.pack_forget()
-        self.credentials_grid = tk.Frame(login_panel, bg="#eff6ff")
+
+        self.logged_in_profile = ctk.CTkFrame(login_panel, fg_color="transparent")
+        self.credentials_grid = ctk.CTkFrame(login_panel, fg_color="transparent")
         self.credentials_grid.pack(fill=tk.X, pady=(8, 0))
-        self.credentials_grid.columnconfigure(0, weight=1)
-        self.credentials_grid.columnconfigure(1, minsize=156)
-        self.user_label = tk.Label(self.credentials_grid, text="帳號", bg="#eff6ff", fg="#64748b", font=("Microsoft JhengHei", 9))
-        self.user_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 2))
+        self.credentials_grid.columnconfigure(0, minsize=34)
+        self.credentials_grid.columnconfigure(1, weight=1, minsize=180)
+        self.credentials_grid.columnconfigure(2, minsize=144)
+        self.user_label = ctk.CTkLabel(self.credentials_grid, text="帳號", text_color=UI_MUTED, font=FONT_SMALL)
+        self.user_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 2), pady=(0, 8))
         self.account_row = self.credentials_grid
-        self.user_entry = ttk.Entry(self.credentials_grid, textvariable=self.user_id, width=20, style="Login.TEntry")
-        self.user_entry.grid(row=1, column=0, sticky=tk.EW)
-        self.account_action_frame = tk.Frame(self.credentials_grid, bg="#eff6ff", width=156)
-        self.account_action_frame.grid(row=1, column=1, padx=(8, 0), sticky=tk.EW)
-        self.account_action_frame.grid_propagate(False)
-        self.manage_account_button = ttk.Button(self.account_action_frame, text="帳號選擇", width=11, style="PanelTool.TButton", command=self.manage_saved_accounts, takefocus=False)
-        self.manage_account_button.pack(fill=tk.X)
-        self.password_label = tk.Label(self.credentials_grid, text="密碼", bg="#eff6ff", fg="#64748b", font=("Microsoft JhengHei", 9))
-        self.password_label.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 2))
+        self.user_entry = ctk.CTkEntry(
+            self.credentials_grid,
+            textvariable=self.user_id,
+            height=38,
+            font=FONT_BODY,
+            fg_color=UI_PANEL,
+            border_color=UI_BORDER,
+            text_color=UI_TEXT,
+        )
+        self.user_entry.grid(row=0, column=1, sticky=tk.EW, pady=(0, 8))
+        self.user_entry.bind("<FocusOut>", self.sync_typed_account_choice, add="+")
+        self.manage_account_button = ctk.CTkButton(self.credentials_grid, text="帳號選擇", width=136, height=38, font=FONT_BUTTON, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", border_color="#93c5fd", border_width=1, command=self.manage_saved_accounts)
+        self.manage_account_button.grid(row=0, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
+        self.password_label = ctk.CTkLabel(self.credentials_grid, text="密碼", text_color=UI_MUTED, font=FONT_SMALL)
+        self.password_label.grid(row=1, column=0, sticky=tk.W, padx=(0, 2))
         self.password_row = self.credentials_grid
-        self.password_entry = ttk.Entry(self.credentials_grid, textvariable=self.password, width=20, show="*", style="Login.TEntry")
-        self.password_entry.grid(row=3, column=0, sticky=tk.EW)
+        self.password_entry = ctk.CTkEntry(self.credentials_grid, textvariable=self.password, height=36, font=FONT_BODY, show="*")
+        self.password_entry.grid(row=1, column=1, sticky=tk.EW)
         self.user_entry.bind("<Tab>", self.focus_password_from_user)
         self.user_entry.bind("<Return>", self.submit_login_from_entry)
         self.password_entry.bind("<Return>", self.submit_login_from_entry)
-        self.password_action_frame = tk.Frame(self.credentials_grid, bg="#eff6ff", width=156)
-        self.password_action_frame.grid(row=3, column=1, padx=(8, 0), sticky=tk.EW)
-        self.password_action_frame.grid_propagate(False)
-        self.remember_login_check = tk.Checkbutton(
-            self.password_action_frame,
+        self.remember_login_check = ctk.CTkCheckBox(
+            self.credentials_grid,
             text="記住帳號密碼",
             variable=self.remember_login,
-            bg="#eff6ff",
-            activebackground="#eff6ff",
-            fg="#1e3a8a",
-            activeforeground="#1e3a8a",
-            selectcolor="#ffffff",
-            font=("Microsoft JhengHei", 9, "bold"),
+            font=FONT_SMALL,
+            text_color="#1e3a8a",
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            checkbox_width=18,
+            checkbox_height=18,
         )
-        self.remember_login_check.pack(anchor=tk.W)
+        self.remember_login_check.grid(row=1, column=2, sticky=tk.W, padx=(10, 0))
         self.login_form_widgets.extend([
             self.credentials_grid,
         ])
 
-        self.button_row = tk.Frame(login_panel, bg="#eff6ff")
+        self.button_row = ctk.CTkFrame(login_panel, fg_color="transparent")
         self.button_row.pack(fill=tk.X, pady=(12, 0))
-        self.login_button = ttk.Button(self.button_row, text="登入", style="Accent.TButton", command=self.verify_login)
+        self.login_button = ctk.CTkButton(self.button_row, text="登入", height=38, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, text_color="#ffffff", text_color_disabled="#f8fafc", command=self.verify_login)
         self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.logout_button = ttk.Button(self.button_row, text="登出", style="Soft.TButton", command=self.clear_login)
-        self.logout_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         self.login_form_widgets.append(self.login_button)
+        self.login_status_row = ctk.CTkFrame(login_panel, fg_color="transparent")
+        self.login_status_row.pack(fill=tk.X, pady=(4, 0))
+        self.login_status_row.columnconfigure(0, weight=1)
+        self.login_status_label = ctk.CTkLabel(self.login_status_row, textvariable=self.login_status, text_color="#166534", font=(UI_FONT, 14), wraplength=430, justify=tk.LEFT, anchor=tk.W, height=24)
+        self.login_status_label.grid(row=0, column=0, sticky=tk.EW, pady=(0, 0))
+        self.logout_button = ctk.CTkButton(self.login_status_row, text="登出", width=74, height=30, font=FONT_BUTTON, fg_color=UI_PANEL, text_color="#b91c1c", hover_color="#fef2f2", border_color="#fecaca", border_width=1, command=self.clear_login)
         self.logout_widgets.append(self.logout_button)
-        self.login_status_label = tk.Label(login_panel, textvariable=self.login_status, bg="#eff6ff", fg="#166534", font=("Microsoft JhengHei", 9), wraplength=360, justify=tk.LEFT)
-        self.login_status_label.pack(anchor=tk.W, pady=(8, 0))
 
-        tools_card = tk.Frame(panel, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+        tools_card = ctk.CTkFrame(panel, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         tools_card.pack(fill=tk.X, pady=(10, 0))
         self.duty_sheet_tools_card = tools_card
-        tools_panel = tk.Frame(tools_card, bg="#eff6ff")
+        tools_panel = ctk.CTkFrame(tools_card, fg_color="transparent")
         tools_panel.pack(fill=tk.X, padx=10, pady=10)
-        tools_panel.columnconfigure(0, minsize=64)
+        tools_panel.columnconfigure(0, minsize=58)
         tools_panel.columnconfigure(1, weight=1, uniform="duty_tools")
         tools_panel.columnconfigure(2, weight=1, uniform="duty_tools")
-        tk.Label(tools_panel, text="每日作業", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 9, "bold")).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        self.duty_sheet_button = ttk.Button(tools_panel, text="勤務表登打", style="DailyTool.TButton", command=self.open_duty_sheet_automation)
+        ctk.CTkLabel(tools_panel, text="每日作業", text_color="#1D4ED8", font=(UI_FONT, 13, "bold")).grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=(0, 8))
+        self.duty_sheet_button = ctk.CTkButton(tools_panel, text="勤務表登打", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_duty_sheet_automation)
         self.duty_sheet_button.grid(row=0, column=1, sticky=tk.EW, pady=(0, 8), padx=(0, 4))
-        self.daily_vehicle_button = ttk.Button(tools_panel, text="車輛保養清點", style="DailyTool.TButton", command=self.open_daily_vehicle_automation)
+        self.daily_vehicle_button = ctk.CTkButton(tools_panel, text="車輛保養清點", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_daily_vehicle_automation)
         self.daily_vehicle_button.grid(row=0, column=2, sticky=tk.EW, pady=(0, 8), padx=(4, 0))
-        tk.Label(tools_panel, text="每月作業", bg="#eff6ff", fg="#991b1b", font=("Microsoft JhengHei", 9, "bold")).grid(row=1, column=0, sticky=tk.W, padx=(0, 8))
-        self.rest_time_button = ttk.Button(tools_panel, text="休息時間登打", style="MonthlyTool.TButton", command=self.open_rest_time_automation)
+        ctk.CTkLabel(tools_panel, text="每月作業", text_color="#3730A3", font=(UI_FONT, 13, "bold")).grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
+        self.rest_time_button = ctk.CTkButton(tools_panel, text="休息時間登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=self.open_rest_time_automation)
         self.rest_time_button.grid(row=1, column=1, sticky=tk.EW, padx=(0, 4))
-        self.monthly_base_button = ttk.Button(tools_panel, text="勤務基準表登打", style="MonthlyTool.TButton", command=self.open_monthly_base_automation)
+        self.monthly_base_button = ctk.CTkButton(tools_panel, text="勤務基準表登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=self.open_monthly_base_automation)
         self.monthly_base_button.grid(row=1, column=2, sticky=tk.EW, padx=(4, 0))
 
-        controls = ttk.Frame(panel)
+        controls = ctk.CTkFrame(panel, fg_color="transparent")
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         self.duty_controls = controls
-        controls_left = ttk.Frame(controls)
+        controls_left = ctk.CTkFrame(controls, fg_color="transparent")
         controls_left.pack(side=tk.LEFT)
-        controls_right = ttk.Frame(controls)
+        controls_right = ctk.CTkFrame(controls, fg_color="transparent")
         controls_right.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        self.audit_mode_button = ttk.Button(controls_left, text="審核模式", style="AuditMode.TButton", command=lambda: self.switch_mode("審核模式"))
+        self.audit_mode_button = ctk.CTkButton(controls_left, text="審核模式", width=112, height=38, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", border_color="#cbd5e1", border_width=1, command=lambda: self.switch_mode("審核模式"))
         self.audit_mode_button.pack(side=tk.LEFT)
-        self.early_submit_button = ttk.Button(controls_right, text="手動登打", style="Accent.TButton", command=self.save_selected_work_log_test)
+
+        self.duty_task_area = ctk.CTkFrame(panel, fg_color="#ffffff", border_color=UI_BORDER, border_width=1, corner_radius=8)
+        self.duty_task_area.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        self.early_submit_button = ctk.CTkButton(controls_right, text="手動登打", width=104, height=38, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=self.save_selected_work_log_test)
         self.early_submit_button.pack(side=tk.RIGHT)
 
-        columns = ("time", "summary", "status")
-        self.duty_tree = ttk.Treeview(panel, columns=columns, show="headings", height=12, selectmode="extended")
-        headings = {
-            "time": "時間",
-            "summary": "當班任務",
-            "status": "狀態",
-        }
-        widths = {"time": 96, "summary": 216, "status": 82}
-        for col in columns:
-            self.duty_tree.heading(col, text=headings[col])
-            self.duty_tree.column(col, width=widths[col], anchor=tk.W)
-        self.duty_tree.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-        self.duty_tree.tag_configure("ready", background="#eff6ff", foreground="#1e3a8a")
-        self.duty_tree.tag_configure("waiting", background="#ffffff", foreground="#334155")
-        self.duty_tree.tag_configure("triggered", background="#ecfdf5", foreground="#14532d")
-        self.duty_tree.tag_configure("manual", background="#fff7ed", foreground="#9a3412")
-        self.duty_tree.bind("<Button-1>", self.handle_duty_tree_click, add="+")
+        self.duty_task_header = ctk.CTkFrame(self.duty_task_area, fg_color="transparent")
+        self.duty_task_header.pack(fill=tk.X, pady=(12, 4), padx=(12 + DUTY_TASK_INNER_PAD_X, 12 + DUTY_TASK_INNER_PAD_X))
+        for col, width in enumerate(DUTY_TASK_COLUMN_WIDTHS):
+            self.duty_task_header.grid_columnconfigure(col, minsize=width, weight=1 if col == DUTY_TASK_GROW_COLUMN else 0)
+        header_items = [
+            ("時間", DUTY_TASK_COLUMN_WIDTHS[0], tk.CENTER),
+            ("類型", DUTY_TASK_COLUMN_WIDTHS[1], tk.CENTER),
+            ("任務內容", DUTY_TASK_COLUMN_WIDTHS[2], tk.CENTER),
+            ("人員", DUTY_TASK_COLUMN_WIDTHS[3], tk.CENTER),
+            ("狀態", DUTY_TASK_COLUMN_WIDTHS[4], tk.CENTER),
+        ]
+        for col, (text, width, anchor) in enumerate(header_items):
+            ctk.CTkLabel(self.duty_task_header, text=text, text_color="#0f172a", font=FONT_SECTION, width=width, anchor=anchor).grid(row=0, column=col, sticky=tk.EW, padx=0)
+
+        self.duty_task_list = ctk.CTkScrollableFrame(self.duty_task_area, fg_color="#ffffff", corner_radius=0, height=315, scrollbar_fg_color="#f8fafc", scrollbar_button_color="#cbd5e1", scrollbar_button_hover_color="#94a3b8")
+        self.duty_task_list.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        self.hide_ctk_scrollbar(self.duty_task_list)
 
         self.update_login_panel()
+
+    def hide_ctk_scrollbar(self, scrollable_frame: ctk.CTkScrollableFrame) -> None:
+        scrollbar = getattr(scrollable_frame, "_scrollbar", None)
+        if scrollbar is not None:
+            scrollbar.grid_forget()
 
     # Review data loading and date controls
 
@@ -845,7 +950,7 @@ class DutyGui(tk.Tk):
         month = int(value[3:5])
         selected = date(year, month, 1)
 
-        popup = tk.Toplevel(self)
+        popup = ctk.CTkToplevel(self)
         popup.title("選擇勤務日期")
         popup.resizable(False, False)
         popup.transient(self)
@@ -896,31 +1001,34 @@ class DutyGui(tk.Tk):
         render(selected)
 
     def show_login_dialog(self) -> None:
-        dialog = tk.Toplevel(self)
+        dialog = ctk.CTkToplevel(self)
         dialog.title("勤務系統登入")
         dialog.geometry("420x310")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
 
-        frame = ttk.Frame(dialog, padding=18)
-        frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="登入勤務自動化", font=("Microsoft JhengHei", 15, "bold")).pack(anchor=tk.W)
+        frame = ctk.CTkFrame(dialog, fg_color="#f4f7fb", corner_radius=0)
+        frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+        ctk.CTkLabel(frame, text="登入勤務自動化", text_color=UI_TEXT, font=FONT_TITLE).pack(anchor=tk.W)
 
-        form = ttk.Frame(frame)
+        form = ctk.CTkFrame(frame, fg_color="transparent")
         form.pack(fill=tk.X, pady=(16, 0))
-        ttk.Label(form, text="帳號").grid(row=0, column=0, sticky=tk.W, pady=6)
-        ttk.Entry(form, textvariable=self.user_id, width=28).grid(row=0, column=1, sticky=tk.EW, pady=6)
-        ttk.Label(form, text="密碼").grid(row=1, column=0, sticky=tk.W, pady=6)
-        ttk.Entry(form, textvariable=self.password, width=28, show="*").grid(row=1, column=1, sticky=tk.EW, pady=6)
+        ctk.CTkLabel(form, text="帳號", text_color="#334155", font=FONT_BODY).grid(row=0, column=0, sticky=tk.W, pady=6)
+        ctk.CTkEntry(form, textvariable=self.user_id, height=36, font=FONT_BODY).grid(row=0, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
+        ctk.CTkLabel(form, text="密碼", text_color="#334155", font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, pady=6)
+        ctk.CTkEntry(form, textvariable=self.password, height=36, font=FONT_BODY, show="*").grid(row=1, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
         form.columnconfigure(1, weight=1)
 
-        modes = ttk.LabelFrame(frame, text="模式", padding=8)
+        modes = ctk.CTkFrame(frame, fg_color="#ffffff", border_color="#d5dde8", border_width=1, corner_radius=8)
         modes.pack(fill=tk.X, pady=(14, 0))
-        ttk.Radiobutton(modes, text="值班模式", variable=self.mode, value="值班模式").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(modes, text="審核模式", variable=self.mode, value="審核模式").pack(side=tk.LEFT)
+        ctk.CTkLabel(modes, text="模式", text_color="#22324a", font=FONT_SECTION).pack(anchor=tk.W, padx=10, pady=(8, 0))
+        mode_row = ctk.CTkFrame(modes, fg_color="transparent")
+        mode_row.pack(fill=tk.X, padx=10, pady=(6, 10))
+        ctk.CTkRadioButton(mode_row, text="值班模式", variable=self.mode, value="值班模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8").pack(side=tk.LEFT, padx=(0, 20))
+        ctk.CTkRadioButton(mode_row, text="審核模式", variable=self.mode, value="審核模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8").pack(side=tk.LEFT)
 
-        buttons = ttk.Frame(frame)
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
         buttons.pack(fill=tk.X, pady=(18, 0))
 
         def submit() -> None:
@@ -932,8 +1040,8 @@ class DutyGui(tk.Tk):
             dialog.destroy()
             self.verify_login()
 
-        ttk.Button(buttons, text="登入", style="Accent.TButton", command=submit).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(buttons, text="登入", width=76, height=32, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=submit).pack(side=tk.RIGHT)
+        ctk.CTkButton(buttons, text="取消", width=76, height=32, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
         dialog.bind("<Return>", lambda _event: submit())
         dialog.wait_window()
 
@@ -954,7 +1062,7 @@ class DutyGui(tk.Tk):
         self.verify_login()
         return "break"
 
-    def apply_window_icon(self, window: tk.Tk | tk.Toplevel) -> None:
+    def apply_window_icon(self, window: Any) -> None:
         try:
             if APP_ICON_ICO.exists():
                 window.iconbitmap(default=str(APP_ICON_ICO))
@@ -1029,16 +1137,37 @@ class DutyGui(tk.Tk):
         self.focus_force()
 
     def quit_from_tray(self) -> None:
+        self.cleanup_active_webdrivers()
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
         self.destroy()
 
+    def register_webdriver(self, driver: webdriver.Chrome) -> webdriver.Chrome:
+        with self.active_webdrivers_lock:
+            self.active_webdrivers.add(driver)
+        return driver
+
+    def quit_registered_webdriver(self, driver: webdriver.Chrome | None) -> None:
+        if not driver:
+            return
+        try:
+            quit_driver(driver)
+        finally:
+            with self.active_webdrivers_lock:
+                self.active_webdrivers.discard(driver)
+
+    def cleanup_active_webdrivers(self) -> None:
+        with self.active_webdrivers_lock:
+            drivers = list(self.active_webdrivers)
+        for driver in drivers:
+            self.quit_registered_webdriver(driver)
+
     def show_toast(self, title: str, message: str, duration_ms: int = 4500) -> None:
-        toast = tk.Toplevel(self)
+        toast = ctk.CTkToplevel(self)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
-        toast.configure(bg="#dbeafe")
+        toast.configure(fg_color="#dbeafe")
         frame = ttk.Frame(toast, style="Panel.TFrame", padding=(14, 10, 14, 10))
         frame.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor=tk.W)
@@ -1590,15 +1719,26 @@ class DutyGui(tk.Tk):
 
     def refresh_saved_account_choices(self) -> None:
         self.saved_accounts.sort(key=self.account_sort_key)
-        values = [str(account.get("user_id", "") or "").strip() for account in self.saved_accounts if str(account.get("user_id", "") or "").strip()]
-        if self.user_id.get().strip() and self.user_id.get().strip() not in values:
-            self.user_id.set(values[0] if values else "")
+        values = [self.account_display_name(account) for account in self.saved_accounts if self.account_display_name(account)]
+        if hasattr(self, "user_entry") and isinstance(self.user_entry, ctk.CTkComboBox):
+            self.user_entry.configure(values=values)
+        if self.saved_account_choice.get().strip() and self.saved_account_choice.get().strip() not in values:
+            self.saved_account_choice.set("")
 
     def selected_saved_account(self) -> dict[str, str] | None:
-        label = self.user_id.get().strip()
+        label = self.saved_account_choice.get().strip() or self.user_id.get().strip()
         for account in self.saved_accounts:
             account_user_id = str(account.get("user_id", "") or "").strip()
             if account_user_id == label or self.account_display_name(account) == label:
+                return account
+        return None
+
+    def saved_account_by_user_id(self, user_id: str) -> dict[str, str] | None:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return None
+        for account in self.saved_accounts:
+            if str(account.get("user_id", "") or "").strip() == user_id:
                 return account
         return None
 
@@ -1606,7 +1746,7 @@ class DutyGui(tk.Tk):
         for account in self.saved_accounts:
             if self.account_identity(account) != identity:
                 continue
-            self.user_id.set(str(account.get("user_id", "") or ""))
+            self.saved_account_choice.set(self.account_display_name(account))
             self.apply_saved_account(persist=persist)
             return
 
@@ -1616,9 +1756,40 @@ class DutyGui(tk.Tk):
             return
         self.actor_no.set(str(account.get("actor_no", "") or ""))
         self.user_id.set(str(account.get("user_id", "") or ""))
+        self.saved_account_choice.set(self.account_display_name(account))
         self.password.set(str(account.get("password", "") or ""))
         if persist:
             self.persist_saved_accounts(self.account_identity(account))
+
+    def select_account_from_combo(self, value: str) -> None:
+        self.saved_account_choice.set(str(value or ""))
+        self.apply_saved_account()
+
+    def filter_account_combo(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "user_entry") or not isinstance(self.user_entry, ctk.CTkComboBox):
+            return
+        query = self.saved_account_choice.get().strip().lower()
+        values = [
+            self.account_display_name(account)
+            for account in self.saved_accounts
+            if not query or query in self.account_display_name(account).lower()
+        ]
+        self.user_entry.configure(values=values)
+
+    def sync_typed_account_choice(self, _event: tk.Event | None = None) -> None:
+        typed = self.user_id.get().strip()
+        account = self.saved_account_by_user_id(typed)
+        if typed and account:
+            self.saved_account_choice.set(self.account_display_name(account))
+            self.apply_saved_account()
+            return
+        previous_account = self.selected_saved_account()
+        previous_password = str(previous_account.get("password", "") or "") if previous_account else ""
+        self.saved_account_choice.set("")
+        self.user_id.set(typed)
+        self.actor_no.set("")
+        if previous_password and self.password.get() == previous_password:
+            self.password.set("")
 
     def current_account_display_name(self, actor_no: str, user_id: str) -> str:
         actor_no = str(actor_no or "").strip()
@@ -1786,7 +1957,12 @@ class DutyGui(tk.Tk):
     def update_credential_export_button_state(self) -> None:
         button = getattr(self, "credential_export_button", None)
         if button is not None:
-            button.configure(state=tk.NORMAL if self.can_export_credentials() else tk.DISABLED)
+            if self.can_export_credentials():
+                if not button.winfo_manager():
+                    button.pack(side=tk.LEFT, padx=(8, 0))
+                button.configure(state=tk.NORMAL)
+            else:
+                button.pack_forget()
 
     def sync_current_account_dialog(self) -> None:
         if not self.can_export_credentials():
@@ -1847,86 +2023,92 @@ class DutyGui(tk.Tk):
         self.persist_saved_accounts(next_identity)
 
     def manage_saved_accounts(self) -> None:
+        existing = getattr(self, "_account_dialog", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+            self._account_dialog = None
+
         dialog = tk.Toplevel(self)
+        self._account_dialog = dialog
         dialog.title("帳號管理")
-        dialog.geometry("392x404")
         dialog.resizable(False, False)
+        dialog.configure(bg=UI_BG)
         dialog.transient(self)
         dialog.grab_set()
 
-        frame = ttk.Frame(dialog, padding=12)
+        def close_account_dialog() -> None:
+            self._account_dialog = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_account_dialog)
+
+        sorted_accounts = sorted(self.saved_accounts, key=self.account_sort_key)
+        account_groups = [sorted_accounts[index : index + 12] for index in range(0, len(sorted_accounts), 12)] or [[]]
+        max_rows = max((len(group) for group in account_groups), default=0)
+        column_count = max(1, len(account_groups))
+        list_height = max(60, max_rows * 48 + 4)
+        dialog_width = 44 + column_count * 196 + max(0, column_count - 1) * 8
+        dialog_height = 162 + list_height
+        dialog.geometry(f"{dialog_width}x{dialog_height}")
+
+        frame = tk.Frame(dialog, bg=UI_BG, padx=12, pady=12)
         frame.pack(fill=tk.BOTH, expand=True)
         header = tk.Frame(frame, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
         header.pack(fill=tk.X)
-        tk.Label(header, text="帳號選擇", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 2))
-        tk.Label(header, text="登入成功後會依目前設定自動更新。", bg="#eff6ff", fg="#64748b", font=("Microsoft JhengHei", 9)).pack(anchor=tk.W, padx=12, pady=(0, 10))
+        tk.Label(header, text="帳號選擇", bg="#eff6ff", fg="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(9, 2))
+        tk.Label(header, text="選擇已儲存帳號，或刪除不再使用的項目。", bg="#eff6ff", fg=UI_MUTED, font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(0, 9))
 
-        list_shell = tk.Frame(frame, bg="#f4f7fb", height=254)
+        footer = tk.Frame(frame, bg=UI_BG, height=52)
+        footer.pack(fill=tk.X, pady=(8, 0), side=tk.BOTTOM)
+        footer.pack_propagate(False)
+        ctk.CTkButton(footer, text="關閉", width=88, height=34, font=FONT_BUTTON, fg_color="#e2e8f0", text_color=UI_TEXT, hover_color="#cbd5e1", command=close_account_dialog).pack(side=tk.RIGHT, pady=(6, 0))
+
+        list_shell = tk.Frame(frame, bg=UI_BG, height=list_height)
         list_shell.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         list_shell.pack_propagate(False)
-        canvas = tk.Canvas(list_shell, bg="#f4f7fb", highlightthickness=0, bd=0)
-        list_body = ttk.Frame(canvas)
-        list_body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=list_body, anchor="nw")
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
-        canvas.pack(fill=tk.BOTH, expand=True)
+        columns = tk.Frame(list_shell, bg=UI_BG)
+        columns.pack(fill=tk.BOTH, expand=True)
+        for column_index, accounts in enumerate(account_groups):
+            columns.columnconfigure(column_index, weight=1, uniform="account_columns")
+            column = tk.Frame(columns, bg=UI_BG)
+            column.grid(row=0, column=column_index, sticky=tk.NSEW, padx=(0, 8) if column_index < column_count - 1 else (0, 0))
 
-        def on_mousewheel(event: tk.Event) -> str:
-            bbox = canvas.bbox("all")
-            if not bbox:
-                return "break"
-            content_height = bbox[3] - bbox[1]
-            viewport_height = max(canvas.winfo_height(), 1)
-            if content_height <= viewport_height:
-                return "break"
-            first, last = canvas.yview()
-            step = int(-event.delta / 120)
-            if step < 0 and first <= 0:
-                return "break"
-            if step > 0 and last >= 1:
-                return "break"
-            canvas.yview_scroll(step, "units")
-            return "break"
+            for account in accounts:
+                row = ctk.CTkFrame(column, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+                row.pack(fill=tk.X, pady=(0, 6))
+                row.columnconfigure(1, weight=1)
 
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        list_body.bind("<MouseWheel>", on_mousewheel)
-        dialog.bind("<MouseWheel>", on_mousewheel)
+                def choose_account(target: str = self.account_identity(account)) -> None:
+                    self.select_saved_account(target, persist=True)
+                    close_account_dialog()
 
-        for account in self.saved_accounts:
-            row = tk.Frame(list_body, bg="#ffffff", highlightbackground="#d8e0ec", highlightthickness=1)
-            row.pack(fill=tk.X, pady=(0, 6))
-            def choose_account(target: str = self.account_identity(account)) -> None:
-                self.select_saved_account(target, persist=True)
-                dialog.destroy()
+                def delete_account(target: str = self.account_identity(account)) -> None:
+                    self.saved_account_choice.set("")
+                    self.user_id.set(target)
+                    self.delete_selected_account()
+                    close_account_dialog()
+                    self.manage_saved_accounts()
 
-            def delete_account(target: str = self.account_identity(account)) -> None:
-                self.user_id.set(target)
-                self.delete_selected_account()
-                dialog.destroy()
-                self.manage_saved_accounts()
-
-            ttk.Button(row, text="✕", width=3, style="DangerTool.TButton", command=delete_account).pack(side=tk.LEFT, padx=(8, 6), pady=5)
-            tk.Label(
-                row,
-                text=self.account_display_name(account),
-                bg="#ffffff",
-                fg="#0f172a",
-                font=("Microsoft JhengHei", 9),
-                anchor="w",
-                padx=8,
-                pady=6,
-            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-            ttk.Button(row, text="選擇", width=6, style="PanelTool.TButton", command=choose_account).pack(side=tk.RIGHT, padx=8, pady=5)
+                ctk.CTkButton(row, text="X", width=26, height=28, font=FONT_BUTTON, fg_color=UI_PANEL, text_color="#b91c1c", hover_color="#fef2f2", border_color="#fecaca", border_width=1, command=delete_account).grid(row=0, column=0, padx=(7, 5), pady=6)
+                ctk.CTkLabel(
+                    row,
+                    text=self.account_display_name(account),
+                    text_color=UI_TEXT,
+                    font=FONT_SMALL,
+                    anchor="w",
+                ).grid(row=0, column=1, sticky=tk.EW, padx=(0, 5), pady=6)
+                ctk.CTkButton(row, text="選擇", width=48, height=28, font=FONT_BUTTON, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", border_color="#93c5fd", border_width=1, command=choose_account).grid(row=0, column=2, padx=(0, 7), pady=6)
 
         if not self.saved_accounts:
-            empty = tk.Frame(list_body, bg="#ffffff", highlightbackground="#d8e0ec", highlightthickness=1)
-            empty.pack(fill=tk.X)
-            tk.Label(empty, text="目前沒有已儲存帳號。", bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9), padx=12, pady=12).pack(anchor=tk.W)
-
-        footer = tk.Frame(frame, bg="#f4f7fb", height=38)
-        footer.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
-        footer.pack_propagate(False)
-        ttk.Button(footer, text="關閉", width=8, style="PanelTool.TButton", command=dialog.destroy).pack(side=tk.RIGHT)
+            empty = ctk.CTkFrame(columns, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+            empty.grid(row=1, column=0, columnspan=column_count, sticky=tk.EW, pady=(6, 0))
+            ctk.CTkLabel(empty, text="目前沒有已儲存帳號。", text_color=UI_MUTED, font=FONT_BODY).pack(anchor=tk.W, padx=12, pady=12)
 
     # Login, snapshots, and background refresh
 
@@ -1984,6 +2166,7 @@ class DutyGui(tk.Tk):
     def verify_login(self) -> None:
         if self.login_running:
             return
+        self.sync_typed_account_choice()
         actor_no = self.actor_no.get().strip()
         user_id = self.user_id.get().strip()
         password = self.password.get()
@@ -1995,7 +2178,7 @@ class DutyGui(tk.Tk):
         self.login_attempt_id += 1
         attempt_id = self.login_attempt_id
         self.set_login_buttons_enabled(False)
-        self.login_status.set("登入中...")
+        self.login_status.set("登入中")
         self.after(45000, lambda value=attempt_id: self._login_timed_out(value))
         thread = threading.Thread(target=self._verify_login_worker, args=(attempt_id, actor_no, user_id, password), daemon=True)
         thread.start()
@@ -2006,7 +2189,7 @@ class DutyGui(tk.Tk):
             options = Options()
             options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
-            driver = webdriver.Chrome(options=options)
+            driver = self.register_webdriver(webdriver.Chrome(options=options))
             driver.set_page_load_timeout(30)
             driver.set_script_timeout(30)
             login(driver, user_id, password)
@@ -2018,8 +2201,7 @@ class DutyGui(tk.Tk):
             self.after(0, lambda value=attempt_id, error=str(exc): self._login_failed(value, error))
             return
         finally:
-            if driver:
-                driver.quit()
+            self.quit_registered_webdriver(driver)
         self.after(0, lambda value=attempt_id: self._login_succeeded(value, actor_no, user_id, password))
 
     def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
@@ -2116,7 +2298,7 @@ class DutyGui(tk.Tk):
                 options = Options()
                 options.add_argument("--headless=new")
                 options.add_argument("--disable-popup-blocking")
-                driver = webdriver.Chrome(options=options)
+                driver = self.register_webdriver(webdriver.Chrome(options=options))
                 login(driver, session.user_id, session.password)
                 paths = [self.write_schedule_snapshot(driver, value, slot_label) for value in target_dates]
             except Exception as exc:
@@ -2124,8 +2306,7 @@ class DutyGui(tk.Tk):
                 self.after(0, lambda: self._schedule_failed(session.actor_no, session.user_id, error))
                 return
             finally:
-                if driver:
-                    driver.quit()
+                self.quit_registered_webdriver(driver)
             self.after(0, lambda: self._schedule_succeeded(session.actor_no, session.user_id, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2235,7 +2416,7 @@ class DutyGui(tk.Tk):
                 options = Options()
                 options.add_argument("--headless=new")
                 options.add_argument("--disable-popup-blocking")
-                driver = webdriver.Chrome(options=options)
+                driver = self.register_webdriver(webdriver.Chrome(options=options))
                 login(driver, session.user_id, session.password)
                 paths = [self.write_comparison_snapshot(driver, comparison_date, slot_label) for comparison_date in comparison_dates]
             except Exception as exc:
@@ -2243,8 +2424,7 @@ class DutyGui(tk.Tk):
                 self.after(0, lambda: self._comparison_failed(session.actor_no, session.user_id, error))
                 return
             finally:
-                if driver:
-                    driver.quit()
+                self.quit_registered_webdriver(driver)
             self.after(0, lambda: self._comparison_succeeded(session.actor_no, session.user_id, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2483,14 +2663,19 @@ class DutyGui(tk.Tk):
         self.notify_user(APP_DISPLAY_NAME, f"{label} 已自動登出")
 
     def set_logged_in_status(self, actor_no: str) -> None:
+        identity = self.logged_in_identity_label(actor_no)
+        self.user_display_text.set(identity)
         if self.snapshot_running and self.duty_data.get("target_date") != duty_business_roc_date():
-            self.login_status.set(f"已登入：{self.logged_in_identity_label(actor_no)}，正在查詢今日勤務表。")
+            self.shift_display_text.set("今日值班時段：查詢中")
+            self.login_status.set(f"已登入：{identity}，正在查詢今日勤務表。")
             return
         shift_label = self.duty_shift_label(actor_no)
         if shift_label == "今日無值班時段":
-            self.login_status.set(f"已登入：{self.logged_in_identity_label(actor_no)}，今日無值班時段。")
+            self.shift_display_text.set("今日無值班時段")
+            self.login_status.set(f"已登入：{identity}，今日無值班時段。")
             return
-        self.login_status.set(f"已登入：{self.logged_in_identity_label(actor_no)}，今日值班時段：{shift_label}。")
+        self.shift_display_text.set(f"今日值班時段：{shift_label}")
+        self.login_status.set(f"已登入：{identity}，今日值班時段：{shift_label}。")
 
     def sync_session_actor_from_user_id(self) -> None:
         if not (self.session and self.session.verified):
@@ -2508,6 +2693,7 @@ class DutyGui(tk.Tk):
         self.executed_due.clear()
         self.manual_completed_keys.clear()
         self.submitting_indices.clear()
+        self.duty_selected_iids.clear()
         self.failed_due_retry_after.clear()
         self.submit_queues = {"entry": [], "work": []}
         self.submit_worker_running = {"entry": False, "work": False}
@@ -2521,6 +2707,8 @@ class DutyGui(tk.Tk):
         self.actor_no.set("")
         self.user_id.set("")
         self.password.set("")
+        self.user_display_text.set("未登入")
+        self.shift_display_text.set("今日值班時段：-")
         self.logout_cleared = True
         self.login_status.set("已清除登入狀態。")
         if self.data.get("target_date"):
@@ -2539,22 +2727,32 @@ class DutyGui(tk.Tk):
         if not hasattr(self, "login_button"):
             return
         if self.session and self.session.verified:
+            if self.simple_mode.get():
+                    self.geometry("550x800")
+                    self.minsize(530, 760)
             for widget in self.login_form_widgets:
                 widget.pack_forget()
-            if not self.logout_button.winfo_manager():
-                self.logout_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.button_row.pack_forget()
+            self.logout_button.grid(row=0, column=1, sticky=tk.E, padx=(8, 0), pady=0)
             if hasattr(self, "work_log_settings_button") and not self.work_log_settings_button.winfo_manager():
                 self.work_log_settings_button.pack(side=tk.RIGHT)
             self.set_duty_action_buttons_visible(True)
         else:
+            if self.simple_mode.get():
+                self.geometry("550x360")
+                self.minsize(530, 340)
+            self.logout_button.grid_forget()
             self.credentials_grid.pack_forget()
-            self.credentials_grid.pack(fill=tk.X, before=self.button_row)
+            self.button_row.pack_forget()
+            self.credentials_grid.pack(fill=tk.X, pady=(8, 0), before=self.login_status_row)
+            self.button_row.pack(fill=tk.X, pady=(12, 0), before=self.login_status_row)
             if not self.login_button.winfo_manager():
-                self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True, before=self.logout_button)
-            self.logout_button.pack_forget()
+                self.login_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
             if hasattr(self, "work_log_settings_button"):
                 self.work_log_settings_button.pack_forget()
             self.set_duty_action_buttons_visible(False)
+        if self.simple_mode.get():
+            self.title(f"{APP_DISPLAY_NAME} - 值班模式" if self.session and self.session.verified else APP_DISPLAY_NAME)
         self.set_login_buttons_enabled(not self.login_running)
         self.update_credential_export_button_state()
 
@@ -2562,15 +2760,23 @@ class DutyGui(tk.Tk):
         if not hasattr(self, "audit_mode_button") or not hasattr(self, "early_submit_button"):
             return
         if visible:
+            if hasattr(self, "duty_controls") and not self.duty_controls.winfo_manager():
+                self.duty_controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
             if hasattr(self, "duty_sheet_tools_card") and not self.duty_sheet_tools_card.winfo_manager():
                 self.duty_sheet_tools_card.pack(fill=tk.X, pady=(10, 0), before=self.duty_controls)
+            if hasattr(self, "duty_task_area") and not self.duty_task_area.winfo_manager():
+                self.duty_task_area.pack(fill=tk.BOTH, expand=True, pady=(12, 0), before=self.duty_controls)
             if not self.audit_mode_button.winfo_manager():
                 self.audit_mode_button.pack(side=tk.RIGHT)
             if not self.early_submit_button.winfo_manager():
-                self.early_submit_button.pack(side=tk.RIGHT, padx=(0, 8))
+                self.early_submit_button.pack(side=tk.RIGHT)
         else:
             if hasattr(self, "duty_sheet_tools_card"):
                 self.duty_sheet_tools_card.pack_forget()
+            if hasattr(self, "duty_task_area"):
+                self.duty_task_area.pack_forget()
+            if hasattr(self, "duty_controls"):
+                self.duty_controls.pack_forget()
             self.audit_mode_button.pack_forget()
             self.early_submit_button.pack_forget()
 
@@ -2625,36 +2831,42 @@ class DutyGui(tk.Tk):
 
     def open_work_log_defaults_dialog(self) -> None:
         self.work_log_defaults = load_work_log_defaults()
-        dialog = tk.Toplevel(self)
+        dialog = ctk.CTkToplevel(self)
         dialog.title("工作紀錄預設內容")
         dialog.transient(self)
         dialog.grab_set()
-        dialog.configure(bg="#f4f7fb")
-        dialog.geometry("520x660")
-        dialog.minsize(500, 620)
+        dialog.configure(fg_color=UI_BG)
+        dialog.geometry("560x720")
+        dialog.minsize(540, 660)
         self.apply_window_icon(dialog)
 
-        container = tk.Frame(dialog, bg="#f4f7fb")
+        container = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
         container.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(1, weight=1)
 
-        header = tk.Frame(container, bg="#e0f2fe", highlightbackground="#bae6fd", highlightthickness=1)
-        header.pack(fill=tk.X)
-        tk.Label(header, text="工作紀錄預設內容", bg="#e0f2fe", fg="#0f172a", font=("Microsoft JhengHei", 13, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 2))
-        tk.Label(header, text="消防救護車出勤由未返隊案件帶入，例外可調整單筆案件台數。", bg="#e0f2fe", fg="#0369a1", font=("Microsoft JhengHei", 9)).pack(anchor=tk.W, padx=12, pady=(0, 10))
+        header = ctk.CTkFrame(container, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
+        header.grid(row=0, column=0, sticky=tk.EW)
+        ctk.CTkLabel(header, text="工作紀錄預設內容", text_color=UI_TEXT, font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 0))
+        ctk.CTkLabel(header, text="消防救護車出勤由未返隊案件帶入，例外可調整單筆案件台數。", text_color="#0369a1", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(0, 10))
 
-        form = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
+        content = ctk.CTkFrame(container, fg_color="transparent", corner_radius=0)
+        content.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
+        content.grid_columnconfigure(0, weight=1)
+
+        form = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         form.pack(fill=tk.X, pady=(10, 0))
         vars_by_key: dict[str, tk.StringVar] = {}
 
         def add_setting_spin(parent: tk.Widget, row: int, col: int, key: str, label: str, unit: str) -> None:
-            tk.Label(parent, text=label, bg="#ffffff", fg="#475569", font=("Microsoft JhengHei", 9)).grid(row=row, column=col, sticky=tk.W, padx=(8, 3), pady=6)
+            ctk.CTkLabel(parent, text=label, text_color="#475569", font=FONT_SMALL).grid(row=row, column=col, sticky=tk.W, padx=(8, 3), pady=6)
             var = tk.StringVar(value=str(int_setting(self.work_log_defaults, key, int_setting(DEFAULT_WORK_LOG_DEFAULTS, key, 0))))
             vars_by_key[key] = var
-            tk.Spinbox(parent, from_=0, to=99, width=4, textvariable=var, font=("Microsoft JhengHei", 9), justify=tk.CENTER).grid(row=row, column=col + 1, sticky=tk.W, pady=6)
-            tk.Label(parent, text=unit, bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).grid(row=row, column=col + 2, sticky=tk.W, padx=(2, 8), pady=6)
+            ctk.CTkEntry(parent, textvariable=var, width=48, height=30, font=FONT_SMALL, justify=tk.CENTER, fg_color=UI_PANEL, border_color=UI_BORDER).grid(row=row, column=col + 1, sticky=tk.W, pady=6)
+            ctk.CTkLabel(parent, text=unit, text_color=UI_MUTED, font=FONT_SMALL).grid(row=row, column=col + 2, sticky=tk.W, padx=(2, 8), pady=6)
 
         def add_item_label(row: int, text: str) -> None:
-            tk.Label(form, text=text, bg="#ffffff", fg="#0f172a", font=("Microsoft JhengHei", 9, "bold"), width=12, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, padx=(12, 2), pady=6)
+            ctk.CTkLabel(form, text=text, text_color=UI_TEXT, font=FONT_SMALL, width=72, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, padx=(12, 2), pady=6)
 
         add_item_label(0, "無線電")
         add_setting_spin(form, 0, 1, "radio_count", "良好", "支")
@@ -2671,36 +2883,36 @@ class DutyGui(tk.Tk):
         add_item_label(4, "TIC")
         add_setting_spin(form, 4, 1, "tic_count", "隊上", "支")
 
-        note_card = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
+        note_card = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
         note_card.pack(fill=tk.X, pady=(10, 0))
-        tk.Label(note_card, text="重要記事", bg="#ffffff", fg="#334155", font=("Microsoft JhengHei", 9, "bold")).pack(anchor=tk.W, padx=12, pady=(8, 2))
-        note_text = tk.Text(note_card, height=3, wrap=tk.WORD, font=("Microsoft JhengHei", 9), relief=tk.FLAT, highlightbackground="#cbd5e1", highlightthickness=1)
+        ctk.CTkLabel(note_card, text="重要記事", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(8, 2))
+        note_text = ctk.CTkTextbox(note_card, height=48, wrap=tk.WORD, font=FONT_SMALL, fg_color=UI_PANEL, border_width=1, border_color="#cbd5e1")
         note_text.pack(fill=tk.X, padx=12, pady=(0, 10))
         note_text.insert("1.0", str(self.work_log_defaults.get("important_note", "")))
 
-        case_card = tk.Frame(container, bg="#ffffff", highlightbackground="#dbeafe", highlightthickness=1)
-        case_card.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        tk.Label(case_card, text="未返隊案件出勤估算", bg="#ffffff", fg="#334155", font=("Microsoft JhengHei", 9, "bold")).pack(anchor=tk.W, padx=12, pady=(8, 4))
-        case_rows = tk.Frame(case_card, bg="#ffffff")
+        case_card = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+        case_card.pack(fill=tk.X, pady=(10, 0))
+        ctk.CTkLabel(case_card, text="未返隊案件出勤估算", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(8, 4))
+        case_rows = ctk.CTkFrame(case_card, fg_color=UI_PANEL)
         case_rows.pack(fill=tk.X, padx=12)
         case_vars: dict[str, tk.StringVar] = {}
         items = self.work_log_case_items()
         if not items:
-            tk.Label(case_rows, text="目前沒有查到未返隊案件；登入查詢後會由案件帶入。", bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).pack(anchor=tk.W, pady=(0, 8))
+            ctk.CTkLabel(case_rows, text="目前沒有查到未返隊案件；登入查詢後會由案件帶入。", text_color=UI_MUTED, font=FONT_SMALL).pack(anchor=tk.W, pady=(0, 8))
         for item in items:
-            row = tk.Frame(case_rows, bg="#ffffff")
+            row = ctk.CTkFrame(case_rows, fg_color=UI_PANEL)
             row.pack(fill=tk.X, pady=2)
             date_text = str(item.get("date", ""))
             if len(date_text) == 7 and date_text.isdigit():
                 date_text = f"{date_text[:3]}/{date_text[3:5]}/{date_text[5:7]}"
             label = f"{date_text} {item.get('report_time', '')} {item.get('category', '案件')}"
-            tk.Label(row, text=label, bg="#ffffff", fg="#0f172a", font=("Microsoft JhengHei", 9), width=40, anchor=tk.W).pack(side=tk.LEFT)
+            ctk.CTkLabel(row, text=label, text_color=UI_TEXT, font=FONT_SMALL, width=330, anchor=tk.W).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(item.get("count", item.get("default_count", 0))))
             case_vars[str(item["key"])] = var
-            tk.Spinbox(row, from_=0, to=9, width=3, textvariable=var, font=("Microsoft JhengHei", 9), justify=tk.CENTER).pack(side=tk.LEFT)
-            tk.Label(row, text="台", bg="#ffffff", fg="#64748b", font=("Microsoft JhengHei", 9)).pack(side=tk.LEFT, padx=(3, 0))
+            ctk.CTkEntry(row, textvariable=var, width=42, height=28, font=FONT_SMALL, justify=tk.CENTER, fg_color=UI_PANEL, border_color=UI_BORDER).pack(side=tk.LEFT)
+            ctk.CTkLabel(row, text="台", text_color=UI_MUTED, font=FONT_SMALL).pack(side=tk.LEFT, padx=(3, 0))
 
-        preview = tk.Label(case_card, text="", bg="#f8fafc", fg="#1e3a8a", font=("Microsoft JhengHei", 9), justify=tk.LEFT, anchor=tk.W, wraplength=460)
+        preview = ctk.CTkLabel(case_card, text="", fg_color="#f8fafc", text_color="#1e3a8a", font=FONT_SMALL, justify=tk.LEFT, anchor=tk.W, wraplength=500)
         preview.pack(fill=tk.X, padx=12, pady=(8, 10))
 
         def collect_settings() -> dict[str, Any]:
@@ -2730,15 +2942,15 @@ class DutyGui(tk.Tk):
                     total += max(0, int(var.get()))
                 except ValueError:
                     pass
-            preview.config(text=work_handoff_description(settings, total))
+            preview.configure(text=work_handoff_description(settings, total))
 
         for var in list(vars_by_key.values()) + list(case_vars.values()):
             var.trace_add("write", refresh_preview)
         note_text.bind("<KeyRelease>", refresh_preview)
         refresh_preview()
 
-        buttons = tk.Frame(container, bg="#f4f7fb")
-        buttons.pack(fill=tk.X, pady=(10, 0))
+        buttons = ctk.CTkFrame(container, fg_color=UI_BG)
+        buttons.grid(row=2, column=0, sticky=tk.EW, pady=(12, 0))
 
         def reset_defaults() -> None:
             for key, var in vars_by_key.items():
@@ -2759,9 +2971,9 @@ class DutyGui(tk.Tk):
             self.set_duty_status("已儲存工作紀錄預設內容。", hold_seconds=6)
             dialog.destroy()
 
-        ttk.Button(buttons, text="還原預設", style="PanelTool.TButton", command=reset_defaults).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="取消", style="PanelTool.TButton", command=dialog.destroy).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="儲存", style="Accent.TButton", command=save_settings).pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(buttons, text="還原預設", width=104, height=38, font=FONT_BUTTON, fg_color=UI_SOFT_ACTION, text_color=UI_TEXT, hover_color=UI_SOFT_ACTION_HOVER, command=reset_defaults).pack(side=tk.LEFT)
+        ctk.CTkButton(buttons, text="取消", width=86, height=38, font=FONT_BUTTON, fg_color=UI_SOFT_ACTION, text_color=UI_TEXT, hover_color=UI_SOFT_ACTION_HOVER, command=dialog.destroy).pack(side=tk.RIGHT)
+        ctk.CTkButton(buttons, text="儲存", width=86, height=38, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=save_settings).pack(side=tk.RIGHT, padx=(0, 8))
 
     def open_duty_sheet_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
@@ -2789,10 +3001,33 @@ class DutyGui(tk.Tk):
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
-        for attr in ("login_button", "review_login_button"):
-            button = getattr(self, attr, None)
-            if button is not None:
-                button.configure(state=state)
+        for attr in (
+            "login_button",
+            "review_login_button",
+            "manage_account_button",
+            "user_entry",
+            "password_entry",
+            "remember_login_check",
+            "review_actor_entry",
+            "review_user_entry",
+            "review_password_entry",
+            "review_remember_login_check",
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.configure(state=state)
+        if hasattr(self, "login_button"):
+            self.login_button.configure(
+                text="登入" if enabled else "登入中",
+                fg_color=UI_BLUE if enabled else "#94a3b8",
+                hover_color=UI_BLUE_HOVER if enabled else "#94a3b8",
+            )
+        if hasattr(self, "review_login_button"):
+            self.review_login_button.configure(
+                text="測試登入" if enabled else "登入中",
+                fg_color=UI_BLUE if enabled else "#94a3b8",
+                hover_color=UI_BLUE_HOVER if enabled else "#94a3b8",
+            )
 
     def show_actor_tasks(self) -> None:
         actor_no = self.actor_no.get().strip()
@@ -2811,10 +3046,13 @@ class DutyGui(tk.Tk):
         now = datetime.now()
         weekdays = "一二三四五六日"
         self.date_text.set(f"{now.year}/{now.month:02d}/{now.day:02d} ({weekdays[now.weekday()]})")
-        self.time_text.set(now.strftime("%H:%M:%S"))
+        self.time_text.set(f"{now.year}/{now.month:02d}/{now.day:02d}（{weekdays[now.weekday()]}） {now:%H:%M:%S}")
         if self.simple_mode.get():
-            self.refresh_duty_tasks()
             self.trigger_due_tasks(now)
+            minute_key = now.strftime("%Y%m%d%H%M")
+            if minute_key != self.last_duty_refresh_minute:
+                self.last_duty_refresh_minute = minute_key
+                self.refresh_duty_tasks()
         self.check_scheduled_screenshot_folders(now)
         self.after(1000, self.tick_clock)
 
@@ -2959,6 +3197,16 @@ class DutyGui(tk.Tk):
         fields = action.get("fields", {})
         value = fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")
         return self.format_action_time(action, value, self.duty_data.get("target_date") or today_roc_date())
+
+    def duty_task_card_time(self, display_time: str) -> str:
+        return str(display_time or "").strip()
+
+    def display_status_text(self, value: str) -> str:
+        return {
+            "已存在": "已登打",
+            "已存在(時間不同)": "已登打(時間不同)",
+            "可能臨時調整": "疑似異動",
+        }.get(str(value or ""), str(value or ""))
 
     def format_action_time(self, action: dict[str, Any], value: str, base_target_date: str) -> str:
         try:
@@ -3181,17 +3429,17 @@ class DutyGui(tk.Tk):
         action_at = self.action_datetime(action)
         is_auto_candidate = bool(actor_no and str(action.get("actor", "")) == str(actor_no) and self.is_auto_duty_action(action))
         if index in self.submitting_indices:
-            return "正在登打", "ready", False
+            return "正在登打", "running", False
         if compare.get("group") == "done":
-            return compare.get("compare") or "已存在", "triggered", False
+            return self.display_status_text(compare.get("compare") or "已存在"), "triggered", False
         if index in self.paused_due_indices:
-            return "暫停", "manual", False
+            return "未返隊暫停", "manual", False
         if index in self.executed_due:
             completion_key = self.action_completion_key(action)
             status = "已手動登打" if completion_key in self.manual_completed_keys else "已登打"
             return status, "triggered", False
         if self.compare_needs_manual_review(compare):
-            return compare.get("compare") or "人工確認", "manual", False
+            return self.display_status_text(compare.get("compare") or "人工確認"), "manual", False
         if is_previous_actor_item:
             return "前班手動", "waiting", False
         if compare.get("group") == "manual" or not self.is_auto_duty_action(action):
@@ -3199,11 +3447,16 @@ class DutyGui(tk.Tk):
         return ("到點待執行", "ready", True) if action_at <= now else ("等待", "waiting", is_auto_candidate)
 
     def refresh_duty_tasks(self) -> None:
-        if not hasattr(self, "duty_tree"):
+        if not hasattr(self, "duty_task_list"):
             return
+        self.last_duty_refresh_minute = datetime.now().strftime("%Y%m%d%H%M")
         self.sync_duty_compare_from_audit()
-        selected = set(self.duty_tree.selection())
-        self.duty_tree.delete(*self.duty_tree.get_children())
+        selected = set(self.duty_selected_iids)
+        for child in self.duty_task_list.winfo_children():
+            child.destroy()
+        self.duty_card_rows.clear()
+        self.duty_card_borders.clear()
+        self.duty_visible_iids = []
         if self.logout_cleared and not (self.session and self.session.verified):
             self.next_task_text.set("下一項任務：-")
             self.duty_status_text.set(self.active_duty_status_override() or "")
@@ -3218,23 +3471,22 @@ class DutyGui(tk.Tk):
             status, tag, is_next_candidate = self.resolve_duty_task_display(index, action, compare, actor_no, now)
             if next_item is None and is_next_candidate:
                 next_item = action
-            task_time = self.action_display_time(action)
-            self.duty_tree.insert(
-                "",
-                tk.END,
-                iid=f"duty-{index}",
-                values=(
-                    task_time,
-                    f"{'出入' if action.get('kind') == 'entry_log' else '工作'}｜{self.duty_action_summary(action)}"
-                    + (f"（{self.paused_due_indices[index]}）" if index in self.paused_due_indices else ""),
-                    status,
-                ),
-                tags=(tag,),
+            task_time = self.duty_task_card_time(self.action_display_time(action))
+            system_text, type_text, task_text, people_text = self.duty_task_columns(action)
+            iid = f"duty-{index}"
+            self.duty_visible_iids.append(iid)
+            self.create_duty_task_card(
+                iid=iid,
+                task_time=task_time,
+                system_text=system_text,
+                type_text=type_text,
+                task_text=task_text,
+                people_text=people_text,
+                status=status,
+                tag=tag,
             )
-        kept_selection = [iid for iid in selected if self.duty_tree.exists(iid)]
-        if kept_selection:
-            self.duty_tree.selection_set(kept_selection)
-            self.duty_tree.focus(kept_selection[0])
+        self.duty_selected_iids = {iid for iid in selected if iid in self.duty_visible_iids}
+        self.update_duty_card_selection()
         if next_item:
             next_at = self.action_datetime(next_item)
             delta = max(0, int((next_at - now).total_seconds() // 60))
@@ -3261,6 +3513,78 @@ class DutyGui(tk.Tk):
             self.duty_status_text.set(status_override or "")
         else:
             self.duty_status_text.set("尚未登入，所有任務不執行。")
+
+    def create_duty_task_card(self, iid: str, task_time: str, system_text: str, type_text: str, task_text: str, people_text: str, status: str, tag: str) -> None:
+        bg, border, status_bg, status_fg, status_border = self.duty_card_colors(tag)
+        card = ctk.CTkFrame(self.duty_task_list, fg_color=bg, border_color=border, border_width=1, corner_radius=4)
+        card.pack(fill=tk.X, pady=(0, 3), padx=0)
+        row = ctk.CTkFrame(card, fg_color="transparent", corner_radius=0)
+        row.pack(fill=tk.X, padx=DUTY_TASK_INNER_PAD_X, pady=DUTY_TASK_INNER_PAD_Y)
+        for col, width in enumerate(DUTY_TASK_COLUMN_WIDTHS):
+            row.grid_columnconfigure(col, minsize=width, weight=1 if col == DUTY_TASK_GROW_COLUMN else 0)
+        self.duty_card_rows[iid] = card
+        self.duty_card_borders[iid] = border
+
+        ctk.CTkLabel(row, text=task_time, text_color="#0f172a", font=(UI_FONT, 13, "bold"), width=DUTY_TASK_COLUMN_WIDTHS[0], anchor=tk.CENTER, justify=tk.CENTER).grid(row=0, column=0, sticky=tk.EW, padx=0, pady=5)
+        ctk.CTkLabel(row, text=system_text, text_color="#1d4ed8" if system_text == "出入" else "#047857", font=FONT_BUTTON, width=DUTY_TASK_COLUMN_WIDTHS[1], anchor=tk.CENTER).grid(row=0, column=1, sticky=tk.EW, padx=0, pady=5)
+        ctk.CTkLabel(row, text=task_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.W, justify=tk.LEFT, width=DUTY_TASK_COLUMN_WIDTHS[2], wraplength=DUTY_TASK_COLUMN_WIDTHS[2] - 4).grid(row=0, column=2, sticky=tk.EW, padx=0, pady=5)
+        ctk.CTkLabel(row, text=people_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.CENTER, width=DUTY_TASK_COLUMN_WIDTHS[3]).grid(row=0, column=3, sticky=tk.EW, padx=0, pady=5)
+        status_pill = self.create_status_pill(row, status, status_bg, status_fg, status_border, bg)
+        status_pill.grid(row=0, column=4, sticky=tk.EW, padx=0, pady=5)
+
+        self.bind_duty_card_click(card, iid)
+
+    def create_status_pill(self, parent: tk.Widget, text: str, fill: str, text_color: str, _outline: str, background: str) -> ctk.CTkLabel:
+        return ctk.CTkLabel(
+            parent,
+            text=text,
+            width=DUTY_TASK_COLUMN_WIDTHS[4],
+            height=28,
+            corner_radius=14,
+            bg_color=background,
+            fg_color=fill,
+            text_color=text_color,
+            font=FONT_SMALL,
+            anchor=tk.CENTER,
+        )
+
+    def bind_duty_card_click(self, widget: tk.Widget, iid: str) -> None:
+        widget.bind("<Button-1>", lambda event, value=iid: self.toggle_duty_card_selection(value, event), add="+")
+        for child in widget.winfo_children():
+            self.bind_duty_card_click(child, iid)
+
+    def duty_card_colors(self, tag: str) -> tuple[str, str, str, str, str]:
+        if tag == "running":
+            return "#ffffff", "#e2e8f0", UI_BLUE, "#ffffff", UI_BLUE
+        if tag == "ready":
+            return "#ffffff", "#e2e8f0", "#d1d5db", "#111827", "#cbd5e1"
+        if tag == "triggered":
+            return "#ffffff", "#e2e8f0", "#d1fae5", "#166534", "#a7f3d0"
+        if tag == "manual":
+            return "#ffffff", "#e2e8f0", "#FEF3C7", "#92400E", "#FDE68A"
+        return "#ffffff", "#e2e8f0", "#d1d5db", "#111827", "#cbd5e1"
+
+    def toggle_duty_card_selection(self, iid: str, event: tk.Event | None = None) -> str:
+        if event is not None and event.state & 0x0001 and self.duty_selection_anchor in self.duty_visible_iids:
+            anchor_index = self.duty_visible_iids.index(self.duty_selection_anchor)
+            item_index = self.duty_visible_iids.index(iid)
+            start = min(anchor_index, item_index)
+            end = max(anchor_index, item_index)
+            self.duty_selected_iids.update(self.duty_visible_iids[start : end + 1])
+        elif iid in self.duty_selected_iids:
+            self.duty_selected_iids.remove(iid)
+        else:
+            self.duty_selected_iids.add(iid)
+            self.duty_selection_anchor = iid
+        self.update_duty_card_selection()
+        return "break"
+
+    def update_duty_card_selection(self) -> None:
+        for iid, card in self.duty_card_rows.items():
+            if iid in self.duty_selected_iids:
+                card.configure(border_color=UI_BLUE, border_width=2)
+            else:
+                card.configure(border_color=self.duty_card_borders.get(iid, UI_BORDER), border_width=1)
 
     def handle_duty_tree_click(self, event: tk.Event) -> str | None:
         if not hasattr(self, "duty_tree"):
@@ -3334,7 +3658,7 @@ class DutyGui(tk.Tk):
                 self.submit_duty_action(index, action, save=True, visible=False, confirm=False, notify=False, trigger_type="due")
 
     def early_execute_selected(self) -> None:
-        selection = self.duty_tree.selection()
+        selection = list(self.duty_selected_iids)
         if not selection:
             messagebox.showinfo("手動登打", "請先選擇一筆當班任務。")
             return
@@ -3357,7 +3681,7 @@ class DutyGui(tk.Tk):
         self.start_submit_selected(save=True, visible=False)
 
     def start_submit_selected(self, save: bool, visible: bool) -> None:
-        selection = self.duty_tree.selection()
+        selection = list(self.duty_selected_iids)
         if not selection:
             messagebox.showinfo("手動登打", "請先選擇一筆或多筆工作紀錄任務。")
             return
@@ -3461,7 +3785,7 @@ class DutyGui(tk.Tk):
             return
         if not messagebox.askyesno(
             "檢查更新",
-            "將開啟更新視窗檢查 GitHub 是否有新版。\n\n若有更新，確認後會關閉背景程式、更新並重新啟動。是否繼續？",
+            "將開啟更新視窗檢查 GitHub 是否有新版。\n\n若有更新，確認後會自動關閉背景程式、安裝需求套件、更新並重新啟動。是否繼續？",
         ):
             return
         command = [
@@ -3469,9 +3793,9 @@ class DutyGui(tk.Tk):
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
-            "-NoExit",
             "-File",
             str(updater),
+            "-AssumeYes",
         ]
         creationflags = subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, "CREATE_NEW_CONSOLE") else 0
         try:
@@ -3561,7 +3885,7 @@ class DutyGui(tk.Tk):
             else:
                 options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
-            driver = webdriver.Chrome(options=options)
+            driver = self.register_webdriver(webdriver.Chrome(options=options))
             login(driver, session.user_id, session.password)
             job = first_job
             duplicate_cache: dict[tuple[str, str, str], list[str]] = {}
@@ -3633,8 +3957,7 @@ class DutyGui(tk.Tk):
             mirror_runtime_file_to_cloud(result_path, "form_tests")
             self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify, trigger_type))
         finally:
-            if driver:
-                driver.quit()
+            self.quit_registered_webdriver(driver)
             self.after(0, lambda value=lane: self._submit_worker_finished(value))
 
     def _save_work_log_item_succeeded(self, index: int, result_path: Path, notify: bool, trigger_type: str) -> None:
@@ -3673,8 +3996,8 @@ class DutyGui(tk.Tk):
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
         self.duty_action_compare[index] = {"compare": "已存在", "group": "done", "matched": []}
-        self.set_duty_status(f"已存在，略過登打：{result_path.name}", hold_seconds=8)
-        self.notify_user(APP_DISPLAY_NAME, f"已存在略過：{self.notification_action_summary(self.duty_actions[index])}")
+        self.set_duty_status(f"已登打，略過登打：{result_path.name}", hold_seconds=8)
+        self.notify_user(APP_DISPLAY_NAME, f"已登打略過：{self.notification_action_summary(self.duty_actions[index])}")
         if notify:
             messagebox.showinfo("防重複", f"查詢到既有紀錄，已略過登打。\n\n結果檔：{result_path.name}")
         if self.duty_data.get("target_date"):
@@ -3761,22 +4084,22 @@ class DutyGui(tk.Tk):
     # Mode switching and audit table rendering
 
     def apply_mode(self) -> None:
-        for widget in (self.top_frame, self.login_box, self.summary_frame, self.tools_frame, self.tree, self.bottom_frame):
+        self.audit_panel.pack_forget()
+        self.duty_panel.pack_forget()
+        for widget in (self.top_frame, self.login_box, self.summary_frame, self.tools_frame, self.audit_table_card, self.bottom_frame):
             widget.pack_forget()
         if self.audit_bottom_frame is not None:
             self.audit_bottom_frame.pack_forget()
-        for widget in self.duty_widgets:
-            widget.pack_forget()
 
         self.mode.set("值班模式" if self.simple_mode.get() else "審核模式")
         if self.simple_mode.get():
-            self.geometry("440x720")
-            self.minsize(420, 700)
+            self.geometry("550x800")
+            self.minsize(530, 760)
             self.filter_actor.set(True)
-            if self.status_filter.get() not in ("需處理", "全部", "已存在", "手動", "尚未到點", "可能臨時調整", "時間近似", "人工確認"):
+            if self.status_filter.get() not in ("需處理", "全部", "已登打", "已存在", "手動", "尚未到點", "疑似異動", "可能臨時調整", "時間近似", "人工確認"):
                 self.status_filter.set("需處理")
             self.title(f"{APP_DISPLAY_NAME} - 值班模式")
-            self.duty_widgets[0].pack(fill=tk.BOTH, expand=True)
+            self.duty_panel.pack(fill=tk.BOTH, expand=True)
         else:
             self.geometry("780x650")
             self.minsize(720, 560)
@@ -3785,11 +4108,13 @@ class DutyGui(tk.Tk):
             self.title(f"{APP_DISPLAY_NAME} - 審核模式")
             if self.data.get("target_date"):
                 self.audit_date.set(self.data["target_date"])
+            self.audit_panel.pack(fill=tk.BOTH, expand=True)
             self.tools_frame.pack(fill=tk.X, pady=(0, 10))
             self.summary_frame.pack(fill=tk.X, pady=(0, 10))
-            self.tree.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
             if self.audit_bottom_frame is not None:
                 self.audit_bottom_frame.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
+            self.audit_table_card.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
+        self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
 
@@ -3828,7 +4153,7 @@ class DutyGui(tk.Tk):
                 tk.END,
                 iid=str(index),
                 values=(
-                    compare.get("compare", ""),
+                    self.display_status_text(compare.get("compare", "")),
                     execute_time,
                     self.person_short_label(actor),
                     self.target_short_label(action),
@@ -3841,7 +4166,7 @@ class DutyGui(tk.Tk):
         self.summary_vars["todo"].set(f"未找到 {counts['todo']}")
         self.summary_vars["review"].set(f"人工確認 {counts['review']}")
         self.summary_vars["ready"].set(f"尚未到點 {counts['ready']}")
-        self.summary_vars["done"].set(f"已存在 {counts['done']}")
+        self.summary_vars["done"].set(f"已登打 {counts['done']}")
 
     def kind_matches_filter(self, action: dict[str, Any]) -> bool:
         value = self.kind_filter.get()
@@ -3876,7 +4201,7 @@ class DutyGui(tk.Tk):
             return True
         if value == "需處理":
             return compare.get("group") in ("todo", "review", "adjust", "manual")
-        if value == "已存在":
+        if value in ("已登打", "已存在"):
             return compare.get("group") == "done"
         if value == "時間近似":
             return compare.get("group") == "near"
@@ -3886,7 +4211,7 @@ class DutyGui(tk.Tk):
             return compare.get("group") == "manual"
         if value == "尚未到點":
             return compare.get("group") == "future"
-        if value == "可能臨時調整":
+        if value in ("疑似異動", "可能臨時調整"):
             return compare.get("group") == "adjust"
         return run_status == value
 
@@ -3917,7 +4242,8 @@ class DutyGui(tk.Tk):
             return "-"
         info = self.staff.get(str(number), {})
         name = info.get("name", "")
-        return f"{number}{name}" if name else str(number)
+        display_no = str(number).zfill(2) if str(number).isdigit() else str(number)
+        return f"{display_no} {name}" if name else display_no
 
     def target_label(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
@@ -3962,6 +4288,40 @@ class DutyGui(tk.Tk):
             return f"{self.action_summary(action)}｜{self.target_short_label(action)}"
         return f"{self.action_summary(action)}｜{self.target_short_label(action)}"
 
+    def duty_task_columns(self, action: dict[str, Any]) -> tuple[str, str, str, str]:
+        fields = action.get("fields", {})
+        if action.get("kind") == "entry_log":
+            direction = str(fields.get("出或入", "") or "-")
+            reason = str(fields.get("領用事由及地點", "") or "-")
+            people = self.target_short_label(action)
+            return "出入", direction, f"{direction} / {reason}", people
+
+        if action.get("source") in ("無線電試話", "無線電測試"):
+            return "工作", "其他", "其他 / 無線電測試", self.duty_standby_people_label(action)
+        duty_type = str(fields.get("勤務項目", "") or action.get("source", "") or "工作")
+        detail_parts = [
+            str(value).strip()
+            for value in (duty_type, fields.get("事由", ""), fields.get("訓練項目", ""))
+            if str(value).strip()
+        ]
+        detail = " / ".join(dict.fromkeys(detail_parts)) or duty_type
+        if action.get("source") == "在隊訓練":
+            topic = str(fields.get("訓練項目", "") or "").strip()
+            detail = f"在隊訓練 / {topic}" if topic else "在隊訓練"
+        people = self.duty_standby_people_label(action)
+        return "工作", "工作", detail, people
+
+    def duty_standby_people_label(self, action: dict[str, Any]) -> str:
+        if action.get("source") == "在隊訓練":
+            return "備勤人員"
+        fields = action.get("fields", {})
+        people = fields.get("服勤人員", [])
+        if isinstance(people, list) and len(people) > 1:
+            return f"備勤人員 {len(people)}人"
+        if isinstance(people, list) and len(people) == 1:
+            return self.person_short_label(str(people[0]))
+        return self.target_short_label(action)
+
     def notification_action_summary(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
         action_time = self.action_display_time(action)
@@ -3979,8 +4339,9 @@ class DutyGui(tk.Tk):
         selection = self.tree.selection()
         if not selection:
             return
-        action = self.actions[int(selection[0])]
-        compare = self.action_compare.get(int(selection[0]), {})
+        index = int(selection[0])
+        action = self.actions[index]
+        compare = self.action_compare.get(index, {})
         self.detail.delete("1.0", tk.END)
         if action.get("kind") == "entry_log":
             headline = summarize_entry(action, self.staff)

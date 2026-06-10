@@ -73,7 +73,11 @@ def get_default_config():
         "car_options": {
             "attack": ["新坡15/KES-5922", "新坡16/981-S5"],
             "stop": ["新坡11/KEC-2608"],
-            "amb": ["新坡91/BGV-2310", "新坡92/BXB-7593", "新坡93/BSL-9230"]
+            "amb": ["新坡91/BGV-2310", "新坡92/BXB-7593", "新坡93/BSL-9230", "新坡95/BPE-5951"]
+        },
+        "hidden_car_options": {
+            "attack": [],
+            "amb": []
         },
         "notification": {
             "enabled": True,
@@ -93,6 +97,32 @@ def merge_config(defaults, loaded):
         elif isinstance(value, dict) and isinstance(loaded[key], dict):
             loaded[key] = merge_config(value, loaded[key])
     return loaded
+
+def normalize_car_options(config):
+    default_config = get_default_config()
+    car_options = config.setdefault("car_options", {})
+    hidden_options = config.setdefault("hidden_car_options", {})
+    if not isinstance(hidden_options, dict):
+        hidden_options = {}
+        config["hidden_car_options"] = hidden_options
+
+    for group, default_values in default_config.get("car_options", {}).items():
+        values = car_options.get(group, [])
+        if not isinstance(values, list):
+            values = []
+        hidden_values = hidden_options.get(group, [])
+        if not isinstance(hidden_values, list):
+            hidden_values = []
+
+        hidden_set = set(hidden_values)
+        merged_values = []
+        for item in values + default_values:
+            if item and item not in hidden_set and item not in merged_values:
+                merged_values.append(item)
+        car_options[group] = merged_values
+        hidden_options[group] = [item for item in hidden_values if item]
+
+    return config
 
 def resolve_config_path(path_value):
     if not path_value:
@@ -125,16 +155,20 @@ def load_config():
     default_config = get_default_config()
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return merge_config(default_config, json.load(f))
-    return default_config
+            return normalize_car_options(merge_config(default_config, json.load(f)))
+    return normalize_car_options(default_config)
 
-def save_config(selection, login_settings=None, notification_settings=None):
+def save_config(selection, login_settings=None, notification_settings=None, car_options=None, hidden_car_options=None):
     """儲存本次選擇、登入資訊與通知設定到設定檔"""
     config = load_config()
     if login_settings is None:
         login_settings = config.get("login", get_default_config()["login"])
     config["login"] = login_settings
     config["last_selection"] = selection
+    if car_options is not None:
+        config["car_options"] = car_options
+    if hidden_car_options is not None:
+        config["hidden_car_options"] = hidden_car_options
     if notification_settings is None:
         notification_settings = config.get("notification", get_default_config()["notification"])
     config["notification"] = notification_settings
@@ -1168,7 +1202,13 @@ def on_submit():
         'amb2': amb2_car_var.get()
     }
     # 按下啟動時，自動記憶這次選了什麼
-    save_config(cars_config, login_settings=login_config, notification_settings=notification_config)
+    save_config(
+        cars_config,
+        login_settings=login_config,
+        notification_settings=notification_config,
+        car_options=opts,
+        hidden_car_options=hidden_opts
+    )
     
     if not f_path: 
         messagebox.showwarning("提示", "請選擇 Excel 檔案！")
@@ -1195,6 +1235,7 @@ if __name__ == "__main__":
     login = current_config["login"]
     last = current_config["last_selection"]
     opts = current_config["car_options"]
+    hidden_opts = current_config["hidden_car_options"]
 
     root = tk.Tk()
     root.title("🚒 新坡全自動勤務分配表及救災任務編組表V2.0")
@@ -1296,6 +1337,167 @@ if __name__ == "__main__":
     amb2_car_var = tk.StringVar(value=last['amb2'])
     amb2_combo = ttk.Combobox(frame_car, textvariable=amb2_car_var, values=opts['amb'], width=combo_width)
     amb2_combo.grid(row=3, column=1, sticky="w", padx=5, pady=6)
+
+    def persist_car_options():
+        login_config = {
+            "user_id": entry_user.get().strip(),
+            "user_pwd": entry_pwd.get()
+        }
+        notification_config = load_config().get("notification", get_default_config()["notification"]).copy()
+        notification_config["enabled"] = bool(send_group_var.get())
+        cars_config = {
+            'attack': attack_car_var.get(),
+            'stop': stop_car_var.get(),
+            'amb1': amb1_car_var.get(),
+            'amb2': amb2_car_var.get()
+        }
+        save_config(
+            cars_config,
+            login_settings=login_config,
+            notification_settings=notification_config,
+            car_options=opts,
+            hidden_car_options=hidden_opts
+        )
+
+    vehicle_groups = {
+        "消防車": "attack",
+        "救護車": "amb"
+    }
+
+    def refresh_vehicle_options():
+        attack_combo["values"] = opts.get("attack", [])
+        amb_values = opts.get("amb", [])
+        amb1_combo["values"] = amb_values
+        amb2_combo["values"] = amb_values
+
+    def open_add_vehicle_dialog():
+        result = {}
+        dialog = tk.Toplevel(root)
+        dialog.title("新增車輛")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        vehicle_type_var = tk.StringVar(value="救護車")
+        code_var = tk.StringVar()
+        plate_var = tk.StringVar()
+
+        ttk.Label(dialog, text="車輛類型").grid(row=0, column=0, sticky="e", padx=10, pady=(12, 6))
+        type_combo = ttk.Combobox(dialog, textvariable=vehicle_type_var, values=list(vehicle_groups.keys()), state="readonly", width=18)
+        type_combo.grid(row=0, column=1, sticky="w", padx=10, pady=(12, 6))
+
+        ttk.Label(dialog, text="車輛代號").grid(row=1, column=0, sticky="e", padx=10, pady=6)
+        code_entry = ttk.Entry(dialog, textvariable=code_var, width=22)
+        code_entry.grid(row=1, column=1, sticky="w", padx=10, pady=6)
+
+        ttk.Label(dialog, text="車牌號碼").grid(row=2, column=0, sticky="e", padx=10, pady=6)
+        plate_entry = ttk.Entry(dialog, textvariable=plate_var, width=22)
+        plate_entry.grid(row=2, column=1, sticky="w", padx=10, pady=6)
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 12))
+
+        def confirm():
+            vehicle_type = vehicle_type_var.get().strip()
+            code = code_var.get().strip()
+            plate = plate_var.get().strip()
+            if not code or not plate:
+                messagebox.showwarning("資料不足", "請輸入車輛代號與車牌號碼。", parent=dialog)
+                return
+            result["type"] = vehicle_type
+            result["value"] = f"{code}/{plate}"
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="確定", command=confirm).pack(side="left", padx=(0, 6))
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="left")
+        code_entry.focus_set()
+        root.wait_window(dialog)
+        return result
+
+    def add_vehicle_option():
+        result = open_add_vehicle_dialog()
+        if not result:
+            return
+        group = vehicle_groups[result["type"]]
+        value = result["value"]
+        options = opts.setdefault(group, [])
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value in hidden_values:
+            hidden_values.remove(value)
+        if value not in options:
+            options.append(value)
+        refresh_vehicle_options()
+        persist_car_options()
+        messagebox.showinfo("已新增", f"已加入{result['type']}選項：{value}", parent=root)
+
+    def open_remove_vehicle_dialog():
+        choices = []
+        choice_map = {}
+        for vehicle_type, group in vehicle_groups.items():
+            for value in opts.get(group, []):
+                label = f"{vehicle_type} {value}"
+                choices.append(label)
+                choice_map[label] = (vehicle_type, group, value)
+        if not choices:
+            messagebox.showwarning("沒有車輛", "目前沒有可移除的車輛。", parent=root)
+            return None
+
+        result = {}
+        dialog = tk.Toplevel(root)
+        dialog.title("移除車輛")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        selected_var = tk.StringVar(value=choices[0])
+        ttk.Label(dialog, text="車輛代號/車牌號碼").grid(row=0, column=0, sticky="e", padx=10, pady=(12, 6))
+        select_combo = ttk.Combobox(dialog, textvariable=selected_var, values=choices, state="readonly", width=34)
+        select_combo.grid(row=0, column=1, sticky="w", padx=10, pady=(12, 6))
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=1, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 12))
+
+        def confirm():
+            selected = selected_var.get()
+            if selected in choice_map:
+                result["vehicle"] = choice_map[selected]
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="確定", command=confirm).pack(side="left", padx=(0, 6))
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="left")
+        select_combo.focus_set()
+        root.wait_window(dialog)
+        return result.get("vehicle")
+
+    def remove_vehicle_option():
+        selected = open_remove_vehicle_dialog()
+        if not selected:
+            return
+        vehicle_type, group, value = selected
+        options = opts.setdefault(group, [])
+        if value not in options:
+            messagebox.showwarning("找不到車輛", f"車輛清單中沒有：{value}", parent=root)
+            return
+        options.remove(value)
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value not in hidden_values:
+            hidden_values.append(value)
+        fallback = options[0] if options else ""
+        if group == "attack" and attack_car_var.get().strip() == value:
+            attack_car_var.set(fallback)
+        if group == "amb":
+            if amb1_car_var.get().strip() == value:
+                amb1_car_var.set(fallback)
+            if amb2_car_var.get().strip() == value:
+                amb2_car_var.set(fallback)
+        refresh_vehicle_options()
+        persist_car_options()
+        messagebox.showinfo("已移除", f"已從{vehicle_type}選項移除：{value}", parent=root)
+
+    vehicle_button_frame = ttk.Frame(frame_car)
+    vehicle_button_frame.grid(row=4, column=1, sticky="w", padx=5, pady=(0, 6))
+    ttk.Button(vehicle_button_frame, text="新增車輛", command=add_vehicle_option).pack(side="left", padx=(0, 6))
+    ttk.Button(vehicle_button_frame, text="移除車輛", command=remove_vehicle_option).pack(side="left")
 
     # ==========================================
     # 區塊 4：執行

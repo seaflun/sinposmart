@@ -117,6 +117,53 @@ function Restart-DutyGuiIfRunning {
     return $false
 }
 
+function Get-WinPythonExe {
+    $finder = Join-Path $packageDir "find_winpython.ps1"
+    $python = ""
+    if (Test-Path -LiteralPath $finder -PathType Leaf) {
+        $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
+    }
+    if (-not $python) {
+        $command = Get-Command "python.exe" -ErrorAction SilentlyContinue
+        if ($command) {
+            $python = $command.Source
+        }
+    }
+    if (-not $python) {
+        throw "Could not run setup because python.exe was not found."
+    }
+    return [string]$python
+}
+
+function Invoke-SetupAfterUpdate {
+    $requirementsPath = Join-Path $packageDir "requirements.txt"
+    if (-not (Test-Path -LiteralPath $requirementsPath -PathType Leaf)) {
+        Write-Warning "Skipped setup because requirements.txt was not found."
+        return
+    }
+
+    $python = Get-WinPythonExe
+    Push-Location $packageDir
+    try {
+        Write-Host "Installing or refreshing Python requirements..."
+        & $python -m pip install -r $requirementsPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip install failed with exit code $LASTEXITCODE."
+        }
+
+        $environmentCheck = Join-Path $packageDir "check_environment.py"
+        if (Test-Path -LiteralPath $environmentCheck -PathType Leaf) {
+            Write-Host "Running environment check..."
+            & $python $environmentCheck
+            if ($LASTEXITCODE -ne 0) {
+                throw "Environment check failed with exit code $LASTEXITCODE."
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Copy-UpdateTree {
     param(
         [string]$SourceDir,
@@ -238,6 +285,7 @@ try {
 
     $wasRunning = Stop-RunningDutyGui
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
+    Invoke-SetupAfterUpdate
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
     if ($wasRunning) {
         Start-DutyGui
