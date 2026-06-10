@@ -3785,7 +3785,7 @@ class DutyGui(ctk.CTk):
             return
         if not messagebox.askyesno(
             "檢查更新",
-            "將開啟更新視窗檢查 GitHub 是否有新版。\n\n若有更新，確認後會關閉背景程式、更新並重新啟動。是否繼續？",
+            "將開啟更新視窗檢查 GitHub 是否有新版。\n\n若有更新，確認後會自動關閉背景程式、安裝需求套件、更新並重新啟動。是否繼續？",
         ):
             return
         command = [
@@ -3793,9 +3793,9 @@ class DutyGui(ctk.CTk):
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
-            "-NoExit",
             "-File",
             str(updater),
+            "-AssumeYes",
         ]
         creationflags = subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, "CREATE_NEW_CONSOLE") else 0
         try:
