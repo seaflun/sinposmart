@@ -25,6 +25,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 import zipfile
 import customtkinter as ctk
 from dataclasses import asdict, dataclass
@@ -32,6 +34,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
+from uuid import uuid4
 
 DAILY_SCREENSHOT_DIR = "每日勤務表"
 NIGHT_SCREENSHOT_DIR = "夜間勤務"
@@ -135,9 +138,35 @@ from duty_rehearsal import (
 )
 
 
+def load_package_env() -> None:
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_package_env()
+
+
 APP_USER_MODEL_ID = "TYFD.DutyAutomation"
 APP_DISPLAY_NAME = "SinpoSmart"
-CREDENTIAL_EXPORT_USER_ID = "tyfd01510"
+CREDENTIAL_EXPORT_USER_ID = os.environ.get("SINPOSMART_CREDENTIAL_EXPORT_USER_ID", "").strip().lower()
+CREDENTIAL_SYNC_URL = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_URL", "http://100.114.126.58:8080/api/credential-sync").strip()
+CREDENTIAL_SYNC_TOKEN = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
+SINPOSMART_BACKEND_EVENT_URL = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "http://10.30.65.30:8080/api/sinposmart/events").strip()
+SINPOSMART_BACKEND_EVENT_PENDING_PATH = RUNTIME_OUTPUT_DIR / "sinposmart_backend_events_pending.jsonl"
 APP_ICON_PNG = Path(__file__).with_name("duty_tray_icon.png")
 APP_ICON_ICO = Path(__file__).with_name("duty_tray_icon.ico")
 APP_ICON_GIF = Path(__file__).with_name("duty_tray_icon.gif")
@@ -290,6 +319,156 @@ def append_runtime_jsonl_to_cloud(filename: str, line: str) -> None:
             f.write(line)
     except Exception:
         pass
+
+
+def credential_sync_enabled() -> bool:
+    return bool(CREDENTIAL_SYNC_URL and CREDENTIAL_SYNC_TOKEN)
+
+
+def credential_sync_timeout_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TIMEOUT_SECONDS", "8")))
+    except ValueError:
+        return 8
+
+
+def post_credential_sync_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not credential_sync_enabled():
+        raise RuntimeError("尚未設定 NAS 帳密同步 URL 或 token。")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        CREDENTIAL_SYNC_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Credential-Sync-Token": CREDENTIAL_SYNC_TOKEN,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=credential_sync_timeout_seconds()) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"NAS 帳密同步被拒絕或失敗：HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(f"NAS 帳密同步連線失敗：{reason}") from exc
+    try:
+        result = json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("NAS 帳密同步未回報成功。")
+    return result
+
+
+def sinposmart_backend_event_enabled() -> bool:
+    return bool(SINPOSMART_BACKEND_EVENT_URL and CREDENTIAL_SYNC_TOKEN)
+
+
+def sinposmart_backend_event_timeout_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("SINPOSMART_BACKEND_EVENT_TIMEOUT_SECONDS", "5")))
+    except ValueError:
+        return 5
+
+
+def post_sinposmart_backend_event(payload: dict[str, Any]) -> dict[str, Any]:
+    if not sinposmart_backend_event_enabled():
+        raise RuntimeError("尚未設定 SinpoSmart 後台事件 URL 或 token。")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        SINPOSMART_BACKEND_EVENT_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Credential-Sync-Token": CREDENTIAL_SYNC_TOKEN,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=sinposmart_backend_event_timeout_seconds()) as response:
+        response_body = response.read().decode("utf-8")
+    try:
+        result = json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("SinpoSmart 後台事件未回報成功。")
+    return result
+
+
+def load_pending_sinposmart_backend_events() -> list[dict[str, Any]]:
+    if not SINPOSMART_BACKEND_EVENT_PENDING_PATH.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        for line in SINPOSMART_BACKEND_EVENT_PENDING_PATH.read_text(encoding="utf-8").splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                entries.append(payload)
+    except OSError:
+        return []
+    return entries
+
+
+def write_pending_sinposmart_backend_events(entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        try:
+            SINPOSMART_BACKEND_EVENT_PENDING_PATH.unlink()
+        except OSError:
+            pass
+        return
+    SINPOSMART_BACKEND_EVENT_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n"
+    SINPOSMART_BACKEND_EVENT_PENDING_PATH.write_text(body, encoding="utf-8")
+
+
+def enqueue_sinposmart_backend_event(payload: dict[str, Any]) -> None:
+    if not sinposmart_backend_event_enabled():
+        return
+    threading.Thread(target=send_sinposmart_backend_event_worker, args=(payload,), daemon=True).start()
+
+
+def send_sinposmart_backend_event_worker(payload: dict[str, Any]) -> None:
+    pending = load_pending_sinposmart_backend_events()
+    pending.append(payload)
+    sent_count = 0
+    try:
+        for index, entry in enumerate(pending, start=1):
+            response = post_sinposmart_backend_event(entry)
+            ack_id = str(response.get("ack_id") or "").strip()
+            if ack_id != str(entry.get("event_id") or "").strip():
+                break
+            sent_count = index
+    except Exception:
+        write_pending_sinposmart_backend_events(pending[sent_count:])
+    else:
+        write_pending_sinposmart_backend_events(pending[sent_count:])
+
+
+def sinposmart_fire_day(value: datetime | None = None) -> str:
+    value = value or datetime.now()
+    business_date = value.date() if value.hour >= 8 else value.date() - timedelta(days=1)
+    return business_date.isoformat()
+
+
+def compact_action_snapshot(action: dict[str, Any]) -> dict[str, Any]:
+    fields = action.get("fields", {}) if isinstance(action.get("fields"), dict) else {}
+    return {
+        "kind": str(action.get("kind", "")),
+        "time": str(fields.get("系統寫入時間") or fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")),
+        "source": str(action.get("source", "")),
+        "actor": str(action.get("actor", "")),
+        "target": str(action.get("target", "")),
+        "item": str(fields.get("勤務項目") or fields.get("出或入") or ""),
+        "content": str(fields.get("工作內容") or fields.get("領用事由及地點") or "")[:240],
+    }
 
 
 def latest_preview_file() -> Path:
@@ -490,6 +669,7 @@ class DutyGui(ctk.CTk):
         self.auto_logout_deadline: datetime | None = None
         self.auto_logout_actor_no = ""
         self.saved_login_needs_backup = False
+        self.saved_login_can_persist = True
         self.login_running = False
         self.login_attempt_id = 0
         self.active_webdrivers: set[Any] = set()
@@ -1598,7 +1778,10 @@ class DutyGui(ctk.CTk):
     def account_password_from_payload(self, account: dict[str, Any]) -> str:
         encrypted_password = str(account.get("password_dpapi", "") or "")
         if encrypted_password:
-            return self.unprotect_password(encrypted_password)
+            password = self.unprotect_password(encrypted_password)
+            if not password:
+                self.saved_login_can_persist = False
+            return password
         return str(account.get("password", "") or "")
 
     def backup_invalid_saved_login(self) -> None:
@@ -1621,6 +1804,7 @@ class DutyGui(ctk.CTk):
     def load_saved_login(self) -> None:
         if not SAVED_LOGIN_PATH.exists():
             return
+        self.saved_login_can_persist = win32crypt is not None
         try:
             payload = json.loads(SAVED_LOGIN_PATH.read_text(encoding="utf-8"))
         except Exception:
@@ -1664,13 +1848,15 @@ class DutyGui(ctk.CTk):
         self.refresh_saved_account_choices()
         if last_selected:
             self.select_saved_account(last_selected, persist=False)
-        if payload.get("accounts") != normalized or "accounts" not in payload:
+        if self.saved_login_can_persist and (payload.get("accounts") != normalized or "accounts" not in payload):
             self.persist_saved_accounts(last_selected)
 
     def save_login_locally(self, actor_no: str, user_id: str, password: str, display_name: str = "") -> None:
         identity = user_id or actor_no
         if not identity:
             return
+        if password and win32crypt is not None:
+            self.saved_login_can_persist = True
         updated = {
             "actor_no": actor_no,
             "user_id": user_id,
@@ -1689,6 +1875,9 @@ class DutyGui(ctk.CTk):
         self.select_saved_account(identity, persist=False)
 
     def persist_saved_accounts(self, last_selected: str = "") -> None:
+        if win32crypt is None or not self.saved_login_can_persist:
+            self.login_status.set("無法儲存帳號：缺少 Windows DPAPI 模組或既有密碼無法解密。")
+            return
         SAVED_LOGIN_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.backup_invalid_saved_login()
         payload = {
@@ -1800,6 +1989,94 @@ class DutyGui(ctk.CTk):
                 return f"{actor_no}番 {resolved}"
             return f"{actor_no}番 {user_id}" if user_id else f"{actor_no}番"
         return user_id
+
+    def sinposmart_identity_fields(self, actor_no: str = "", user_id: str = "") -> dict[str, str]:
+        session = self.session
+        actor_no = str(actor_no or (session.actor_no if session else "") or self.actor_no.get()).strip()
+        user_id = str(user_id or (session.user_id if session else "") or self.user_id.get()).strip()
+        display_name = self.current_account_display_name(actor_no, user_id) if actor_no or user_id else ""
+        return {"actor_no": actor_no, "user_id": user_id, "display_name": display_name}
+
+    def sinposmart_action_fields(self, action: dict[str, Any] | None) -> dict[str, str]:
+        action = action or {}
+        fields = action.get("fields", {}) if isinstance(action.get("fields"), dict) else {}
+        item_kind = "出入" if action.get("kind") == "entry_log" else "工作" if action.get("kind") == "work_log" else str(action.get("kind", ""))
+        target_no = str(action.get("target") or "").strip()
+        target_label = self.person_label(target_no) if target_no else ""
+        return {
+            "item_kind": item_kind,
+            "item_title": self.duty_action_summary(action) if action else "",
+            "content": str(fields.get("工作內容") or fields.get("領用事由及地點") or action.get("source") or "")[:1000],
+            "target": target_label,
+            "target_time": str(fields.get("系統寫入時間") or fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")),
+        }
+
+    def send_sinposmart_backend_event(
+        self,
+        record_type: str,
+        status: str = "",
+        trigger_type: str = "",
+        action: dict[str, Any] | None = None,
+        error: str = "",
+        result_ref: str = "",
+        snapshot: dict[str, Any] | None = None,
+        actor_no: str = "",
+        user_id: str = "",
+    ) -> None:
+        identity = self.sinposmart_identity_fields(actor_no=actor_no, user_id=user_id)
+        action_fields = self.sinposmart_action_fields(action)
+        payload = {
+            "event_id": f"sinposmart-{datetime.now():%Y%m%d%H%M%S%f}-{uuid4().hex}",
+            "occurred_at": datetime.now().isoformat(timespec="seconds"),
+            "fire_day": sinposmart_fire_day(),
+            "record_type": record_type,
+            "trigger_type": trigger_type,
+            "status": status,
+            "source": APP_DISPLAY_NAME,
+            "error": error,
+            "result_ref": result_ref,
+            "snapshot": snapshot or {},
+            **identity,
+            **action_fields,
+        }
+        enqueue_sinposmart_backend_event(payload)
+
+    def schedule_snapshot_summary(self, paths: list[Path]) -> dict[str, Any]:
+        days = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            actions = payload.get("actions", []) if isinstance(payload, dict) else []
+            days.append(
+                {
+                    "target_date": str(payload.get("target_date", "")),
+                    "action_count": len(actions) if isinstance(actions, list) else 0,
+                    "actions": [compact_action_snapshot(action) for action in actions[:80] if isinstance(action, dict)],
+                }
+            )
+        return {"paths": [path.name for path in paths], "days": days}
+
+    def comparison_snapshot_summary(self, paths: list[Path]) -> dict[str, Any]:
+        days = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            work_rows = payload.get("visible_work_rows", []) if isinstance(payload, dict) else []
+            entry_rows = payload.get("visible_entry_rows", []) if isinstance(payload, dict) else []
+            days.append(
+                {
+                    "target_date": str(payload.get("target_date", "")),
+                    "work_count": len(work_rows) if isinstance(work_rows, list) else 0,
+                    "entry_count": len(entry_rows) if isinstance(entry_rows, list) else 0,
+                    "work_rows": [str(row)[:260] for row in work_rows[:50]] if isinstance(work_rows, list) else [],
+                    "entry_rows": [str(row)[:260] for row in entry_rows[:50]] if isinstance(entry_rows, list) else [],
+                }
+            )
+        return {"paths": [path.name for path in paths], "days": days}
 
     def collect_json_texts(self, value: Any, texts: list[str]) -> None:
         if isinstance(value, dict):
@@ -1949,6 +2226,8 @@ class DutyGui(ctk.CTk):
 
     def can_export_credentials(self) -> bool:
         return bool(
+            CREDENTIAL_EXPORT_USER_ID
+            and
             self.session
             and self.session.verified
             and self.session.user_id.strip().lower() == CREDENTIAL_EXPORT_USER_ID
@@ -1966,7 +2245,10 @@ class DutyGui(ctk.CTk):
 
     def sync_current_account_dialog(self) -> None:
         if not self.can_export_credentials():
-            messagebox.showwarning("權限不足", f"只有 {CREDENTIAL_EXPORT_USER_ID} 登入後才能匯出帳密 JSON。")
+            if not CREDENTIAL_EXPORT_USER_ID:
+                messagebox.showwarning("功能未啟用", "尚未設定帳密 JSON 匯出授權帳號。")
+            else:
+                messagebox.showwarning("權限不足", "目前登入帳號沒有匯出帳密 JSON 權限。")
             return
 
         accounts = self.saved_accounts_for_credential_sync()
@@ -1977,6 +2259,19 @@ class DutyGui(ctk.CTk):
         account_names = "、".join(account["user_id"] for account in accounts[:5])
         if len(accounts) > 5:
             account_names += f" 等 {len(accounts)} 組"
+        payload = self.credential_sync_payload(accounts, sync_code=f"sinposmart-{datetime.now():%Y%m%d%H%M%S}-{uuid4().hex}")
+        if credential_sync_enabled():
+            if not messagebox.askyesno(
+                "傳送帳密同步",
+                f"將透過 NAS relay 傳送 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號。\n\n"
+                f"帳號：{account_names}\n\n"
+                "NAS 只作為中繼暫存，公務電腦 worker 拉取後會刪除暫存資料。確定傳送？",
+            ):
+                return
+            self.status_text.set("帳密同步傳送中。")
+            threading.Thread(target=self._credential_sync_send_worker, args=(payload, len(accounts)), daemon=True).start()
+            return
+
         if not messagebox.askyesno(
             "匯出帳密 JSON",
             f"將匯出 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號。\n\n"
@@ -1995,11 +2290,28 @@ class DutyGui(ctk.CTk):
         if not path:
             return
 
-        payload = self.credential_sync_payload(accounts)
         export_path = Path(path)
         export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.status_text.set(f"帳密 JSON 已匯出：{export_path.name}")
         messagebox.showinfo("匯出完成", f"已匯出 {len(accounts)} 組帳密 JSON：\n{export_path}")
+
+    def _credential_sync_send_worker(self, payload: dict[str, Any], count: int) -> None:
+        try:
+            result = post_credential_sync_payload(payload)
+        except Exception as exc:
+            self.after(0, lambda error=str(exc): self._credential_sync_send_failed(error))
+            return
+        self.after(0, lambda response=result: self._credential_sync_send_succeeded(count, response))
+
+    def _credential_sync_send_succeeded(self, count: int, response: dict[str, Any]) -> None:
+        ack_id = str(response.get("ack_id") or "")
+        suffix = f"；同步代碼 {ack_id}" if ack_id else ""
+        self.status_text.set(f"帳密同步已送到 NAS relay：{count} 組{suffix}")
+        messagebox.showinfo("傳送完成", f"已送出 {count} 組帳密同步資料，等待公務電腦 worker 拉取。")
+
+    def _credential_sync_send_failed(self, error: str) -> None:
+        self.status_text.set(f"帳密同步傳送失敗：{error}")
+        messagebox.showerror("傳送失敗", f"帳密同步未送出：{error}")
 
     def delete_selected_account(self) -> None:
         account = self.selected_saved_account()
@@ -2313,6 +2625,14 @@ class DutyGui(ctk.CTk):
 
     def _schedule_succeeded(self, actor_no: str, user_id: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.snapshot_running = False
+        self.send_sinposmart_backend_event(
+            "schedule_snapshot",
+            status="ok",
+            trigger_type="schedule",
+            snapshot=self.schedule_snapshot_summary(paths),
+            actor_no=actor_no,
+            user_id=user_id,
+        )
         if not self.current_session_matches(user_id):
             return
         self.snapshot_completed_slots.add(key)
@@ -2353,6 +2673,14 @@ class DutyGui(ctk.CTk):
 
     def _schedule_failed(self, actor_no: str, user_id: str, error: str) -> None:
         self.snapshot_running = False
+        self.send_sinposmart_backend_event(
+            "error",
+            status="failed",
+            trigger_type="schedule",
+            error=error,
+            actor_no=actor_no,
+            user_id=user_id,
+        )
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
 
@@ -2440,6 +2768,14 @@ class DutyGui(ctk.CTk):
 
     def _comparison_succeeded(self, actor_no: str, user_id: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.comparison_running = False
+        self.send_sinposmart_backend_event(
+            "comparison_snapshot",
+            status="ok",
+            trigger_type="comparison",
+            snapshot=self.comparison_snapshot_summary(paths),
+            actor_no=actor_no,
+            user_id=user_id,
+        )
         if not self.current_session_matches(user_id):
             self.run_pending_hourly_comparison()
             return
@@ -2456,6 +2792,14 @@ class DutyGui(ctk.CTk):
 
     def _comparison_failed(self, actor_no: str, user_id: str, error: str) -> None:
         self.comparison_running = False
+        self.send_sinposmart_backend_event(
+            "error",
+            status="failed",
+            trigger_type="comparison",
+            error=error,
+            actor_no=actor_no,
+            user_id=user_id,
+        )
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         self.run_pending_hourly_comparison()
@@ -2518,6 +2862,7 @@ class DutyGui(ctk.CTk):
         self.submit_comparison_refresh_scheduled = False
         self.cancel_auto_logout()
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
+        self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
         if self.remember_login.get():
             self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
         if self.data.get("target_date"):
@@ -2553,6 +2898,7 @@ class DutyGui(ctk.CTk):
         self.set_login_buttons_enabled(True)
         self.session = None
         self.login_status.set(f"登入失敗：{error}")
+        self.send_sinposmart_backend_event("login_failed", status="failed", trigger_type="login", error=error)
         messagebox.showerror("登入失敗", error)
         self.update_login_panel()
         self.refresh_tasks()
@@ -2633,8 +2979,8 @@ class DutyGui(ctk.CTk):
             return False
         fields = action.get("fields", {})
         outin = str(fields.get("出或入", "")).strip()
-        reason = str(fields.get("領用事由及地點", "")).strip()
-        return outin == "值退" or reason in ("退勤", "休息後退勤")
+        source = str(action.get("source", "")).strip()
+        return source == "值班交接" and outin == "值退"
 
     def schedule_auto_logout(self, actor_no: str, action: dict[str, Any]) -> None:
         self.cancel_auto_logout()
@@ -3204,7 +3550,7 @@ class DutyGui(ctk.CTk):
     def display_status_text(self, value: str) -> str:
         return {
             "已存在": "已登打",
-            "已存在(時間不同)": "已登打(時間不同)",
+            "已存在(時間不同)": "已登打",
             "可能臨時調整": "疑似異動",
         }.get(str(value or ""), str(value or ""))
 
@@ -3452,12 +3798,12 @@ class DutyGui(ctk.CTk):
         self.last_duty_refresh_minute = datetime.now().strftime("%Y%m%d%H%M")
         self.sync_duty_compare_from_audit()
         selected = set(self.duty_selected_iids)
-        for child in self.duty_task_list.winfo_children():
-            child.destroy()
-        self.duty_card_rows.clear()
-        self.duty_card_borders.clear()
-        self.duty_visible_iids = []
         if self.logout_cleared and not (self.session and self.session.verified):
+            for child in self.duty_task_list.winfo_children():
+                child.destroy()
+            self.duty_card_rows.clear()
+            self.duty_card_borders.clear()
+            self.duty_visible_iids = []
             self.next_task_text.set("下一項任務：-")
             self.duty_status_text.set(self.active_duty_status_override() or "")
             return
@@ -3465,26 +3811,56 @@ class DutyGui(ctk.CTk):
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         next_item = None
         pending_previous = self.pending_previous_duty_count(actor_no) if actor_no else 0
-        for index in self.duty_task_indices():
-            action = self.duty_actions[index]
-            compare = self.duty_action_compare.get(index, {})
-            status, tag, is_next_candidate = self.resolve_duty_task_display(index, action, compare, actor_no, now)
-            if next_item is None and is_next_candidate:
-                next_item = action
-            task_time = self.duty_task_card_time(self.action_display_time(action))
-            system_text, type_text, task_text, people_text = self.duty_task_columns(action)
-            iid = f"duty-{index}"
-            self.duty_visible_iids.append(iid)
-            self.create_duty_task_card(
-                iid=iid,
-                task_time=task_time,
-                system_text=system_text,
-                type_text=type_text,
-                task_text=task_text,
-                people_text=people_text,
-                status=status,
-                tag=tag,
-            )
+        try:
+            card_rows = []
+            visible_iids = []
+            for index in self.duty_task_indices():
+                action = self.duty_actions[index]
+                compare = self.duty_action_compare.get(index, {})
+                status, tag, is_next_candidate = self.resolve_duty_task_display(index, action, compare, actor_no, now)
+                if next_item is None and is_next_candidate:
+                    next_item = action
+                task_time = self.duty_task_card_time(self.action_display_time(action))
+                system_text, type_text, task_text, people_text = self.duty_task_columns(action)
+                iid = f"duty-{index}"
+                visible_iids.append(iid)
+                card_rows.append((iid, task_time, system_text, type_text, task_text, people_text, status, tag))
+        except Exception as exc:
+            self.duty_status_text.set(f"任務列表更新失敗：{exc}")
+            return
+
+        for child in self.duty_task_list.winfo_children():
+            child.destroy()
+        self.duty_card_rows.clear()
+        self.duty_card_borders.clear()
+        self.duty_visible_iids = visible_iids
+        try:
+            for iid, task_time, system_text, type_text, task_text, people_text, status, tag in card_rows:
+                self.create_duty_task_card(
+                    iid=iid,
+                    task_time=task_time,
+                    system_text=system_text,
+                    type_text=type_text,
+                    task_text=task_text,
+                    people_text=people_text,
+                    status=status,
+                    tag=tag,
+                )
+        except Exception as exc:
+            self.duty_card_rows.clear()
+            self.duty_card_borders.clear()
+            self.duty_visible_iids = []
+            ctk.CTkLabel(
+                self.duty_task_list,
+                text=f"任務列表顯示失敗：{exc}",
+                text_color=UI_RED,
+                font=FONT_SMALL,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=460,
+            ).pack(fill=tk.X, padx=8, pady=8)
+            self.duty_status_text.set(f"任務列表顯示失敗：{exc}")
+            return
         self.duty_selected_iids = {iid for iid in selected if iid in self.duty_visible_iids}
         self.update_duty_card_selection()
         if next_item:
@@ -3970,6 +4346,13 @@ class DutyGui(ctk.CTk):
         elif trigger_type == "due":
             self.executed_due.add(index)
         self.log_trigger(index, self.duty_actions[index], trigger_type, status="submitted", completion_key=completion_key)
+        self.send_sinposmart_backend_event(
+            "action_result",
+            status="submitted",
+            trigger_type=trigger_type,
+            action=self.duty_actions[index],
+            result_ref=result_path.name,
+        )
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
@@ -3992,6 +4375,13 @@ class DutyGui(ctk.CTk):
         if trigger_type == "manual":
             self.manual_completed_keys.add(completion_key)
         self.log_trigger(index, self.duty_actions[index], trigger_type, status="skipped_duplicate", completion_key=completion_key)
+        self.send_sinposmart_backend_event(
+            "action_result",
+            status="skipped_duplicate",
+            trigger_type=trigger_type,
+            action=self.duty_actions[index],
+            result_ref=result_path.name,
+        )
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
             self.schedule_auto_logout(self.session.actor_no, self.duty_actions[index])
@@ -4009,6 +4399,14 @@ class DutyGui(ctk.CTk):
     def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
         self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed")
+        self.send_sinposmart_backend_event(
+            "action_result",
+            status="failed",
+            trigger_type=trigger_type,
+            action=self.duty_actions[index],
+            error=error,
+            result_ref=result_path.name,
+        )
         if trigger_type == "due":
             self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)
         try:
@@ -4080,6 +4478,14 @@ class DutyGui(ctk.CTk):
         with Path("duty_trigger_log.jsonl").open("a", encoding="utf-8") as f:
             f.write(line)
         append_runtime_jsonl_to_cloud("duty_trigger_log.jsonl", line)
+        if status in {"pending_write_automation", "manual_marked"}:
+            self.send_sinposmart_backend_event(
+                "action_queued",
+                status=status,
+                trigger_type=trigger_type,
+                action=action,
+                snapshot={"completion_key": record["completion_key"]},
+            )
 
     # Mode switching and audit table rendering
 
