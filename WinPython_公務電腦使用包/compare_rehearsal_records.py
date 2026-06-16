@@ -33,15 +33,24 @@ def names_for(staff: dict[str, dict[str, str]], numbers: list[str]) -> list[str]
     return [staff.get(str(no), {}).get("name", "") for no in numbers]
 
 
-def flatten_rows(rows: list[list[str]], target_date: str) -> list[str]:
+def flatten_rows(rows: list[list[str] | str], target_date: str) -> list[str]:
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
+    date_pattern = rf"(?:{re.escape(target_date)}|{re.escape(roc_slash)})"
     out = []
     for row in rows:
-        text = " | ".join(str(x) for x in row if str(x).strip())
+        if isinstance(row, str):
+            text = row
+        else:
+            text = " | ".join(str(x) for x in row if str(x).strip())
+        parts = [part.strip() for part in text.replace("\xa0", " ").split("|")]
+        if len(parts) >= 2 and re.fullmatch(date_pattern, parts[0]) and re.fullmatch(r"\d{1,2}:\d{2}", parts[1]):
+            text = f"{parts[0]} {parts[1]}"
+            if len(parts) > 2:
+                text = f"{text} | {' | '.join(parts[2:])}"
         normalized = text.replace("\xa0", " ").strip()
-        if re.match(rf"^(?:{re.escape(target_date)}|{re.escape(roc_slash)})\s+\d{{1,2}}:\d{{2}}", normalized):
+        if re.match(rf"^{date_pattern}\s+\d{{1,2}}:\d{{2}}", normalized):
             out.append(normalized)
-        elif re.match(rf"^{re.escape(target_date)}\s*\n\d{{1,2}}:\d{{2}}", normalized):
+        elif re.match(rf"^{date_pattern}\s*\n\d{{1,2}}:\d{{2}}", normalized):
             out.append(text.replace("\xa0", " "))
     return out
 
@@ -64,10 +73,17 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     if f"{roc_slash} {time_value}" in row or f"{target_date}\n{time_value}" in row:
         return True
+    try:
+        hour, minute = [int(part) for part in time_value.split(":", 1)]
+    except ValueError:
+        return False
+    target_min = hour * 60 + minute
+    actual_min = row_minutes(row, target_date)
+    if actual_min == target_min:
+        return True
     if not allow_near:
         return False
-    target_min = int(time_value[:2]) * 60 + int(time_value[3:])
-    for match in re.finditer(rf"{re.escape(roc_slash)}\s+(\d{{2}}):(\d{{2}})", row):
+    for match in re.finditer(rf"{re.escape(roc_slash)}\s+(\d{{1,2}}):(\d{{2}})", row):
         actual_min = int(match.group(1)) * 60 + int(match.group(2))
         if abs(actual_min - target_min) <= near_minutes:
             return True
@@ -76,7 +92,7 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
 
 def row_minutes(row: str, target_date: str) -> int | None:
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
-    match = re.search(rf"(?:{re.escape(roc_slash)}|{re.escape(target_date)})\s*(?:\n|\s+)(\d{{2}}):(\d{{2}})", row)
+    match = re.search(rf"(?:{re.escape(roc_slash)}|{re.escape(target_date)})\s*(?:\n|\s+)(\d{{1,2}}):(\d{{2}})", row)
     if not match:
         return None
     return int(match.group(1)) * 60 + int(match.group(2))
@@ -255,6 +271,7 @@ def find_work_matches(
     time_value = fields.get("工作時間", action["time"])
     item = fields.get("勤務項目", "")
     source = action.get("source", "")
+    is_radio_test = source in ("無線電試話", "無線電測試")
     matches = []
     for row in rows:
         c = clean(row)
@@ -262,6 +279,9 @@ def find_work_matches(
             continue
         if item and item not in row:
             continue
+        if is_radio_test:
+            if "無線電" not in c:
+                continue
         matches.append(row)
     return matches
 
@@ -398,7 +418,7 @@ def summarize_work(action: dict[str, Any], staff: dict[str, dict[str, str]]) -> 
 # Report builder
 
 def compare(json_path: Path, out_path: Path | None = None) -> Path:
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     target_date = data["target_date"]
     all_actions = data.get("actions", []) + build_case_work_audits(data)
     staff = {
@@ -411,7 +431,7 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
         comparison_file = json_path.with_name(f"comparison_output_{action_date}.json")
         payload: dict[str, Any] = {}
         if comparison_file.exists():
-            payload = json.loads(comparison_file.read_text(encoding="utf-8"))
+            payload = json.loads(comparison_file.read_text(encoding="utf-8-sig"))
         comparison_sources[action_date] = {
             "entry_rows": flatten_rows(payload.get("visible_entry_rows", data.get("visible_entry_rows", [])), action_date),
             "work_rows": flatten_rows(payload.get("visible_work_rows", data.get("visible_work_rows", [])), action_date),
@@ -484,7 +504,12 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
         external_targets.setdefault(key, set()).add(staff.get(str(action["target"]), {}).get("name", ""))
     external_extra = []
     external_extra_seen = set()
-    for row in entry_rows:
+    visible_entry_rows = [
+        row
+        for source in comparison_sources.values()
+        for row in source.get("entry_rows", [])
+    ]
+    for row in visible_entry_rows:
         if "防溺" not in row and "車巡" not in row:
             continue
         parts = [part.strip() for part in row.split("|")]
@@ -531,7 +556,16 @@ def main() -> int:
     parser.add_argument("json_path", type=Path)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
-    path = compare(args.json_path, args.out)
+    if not args.json_path.exists():
+        parser.error(f"找不到 JSON 檔案：{args.json_path}")
+    if not args.json_path.is_file():
+        parser.error(f"JSON 路徑不是檔案：{args.json_path}")
+    try:
+        path = compare(args.json_path, args.out)
+    except json.JSONDecodeError as exc:
+        parser.error(f"JSON 格式錯誤：{exc}")
+    except KeyError as exc:
+        parser.error(f"JSON 缺少必要欄位：{exc}")
     print(path)
     return 0
 

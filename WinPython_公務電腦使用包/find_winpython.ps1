@@ -65,10 +65,4 @@ foreach ($root in $folderRoots | Where-Object { $_ } | Select-Object -Unique) {
     }
 }
 
-$pathCommand = Get-Command $exeName -ErrorAction SilentlyContinue
-if ($pathCommand) {
-    Write-Output $pathCommand.Source
-    exit 0
-}
-
 exit 1

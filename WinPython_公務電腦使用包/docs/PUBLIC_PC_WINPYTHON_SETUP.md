@@ -43,12 +43,13 @@ SETUP_WINPYTHON.bat
 ## 檔案用途
 
 - `find_winpython.ps1`：尋找 WinPython 的 `python.exe` 或 `pythonw.exe`。
-- `SETUP_WINPYTHON.bat`：安裝 Selenium 並檢查環境。
+- `SETUP_WINPYTHON.bat`：用 WinPython 安裝 `requirements.txt` 內所有套件並檢查環境。
 - `RUN_DUTY_GUI_WINPYTHON.bat`：用 WinPython 啟動 GUI，除錯時可直接執行。
 - `RUN_DUTY_GUI_WINPYTHON.vbs`：正式啟動，隱藏小黑窗。
 
 ## 注意事項
 
 - 帳號清單存在各電腦本機，不會跟著 Google Drive 共用。
+- 需要啟用帳密 JSON 匯出時，請在該電腦設定 `SINPOSMART_CREDENTIAL_EXPORT_USER_ID`，不要把授權帳號寫進程式碼。
 - 勤務表與比對資料仍會留在專案資料夾內，兩台電腦可透過 Google Drive 同步。
-- 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 Selenium；這時需要先在可連網電腦準備離線 wheel。
+- 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 `requirements.txt` 內的套件；這時需要先在可連網電腦準備離線 wheel。

@@ -8,14 +8,13 @@ import platform
 import sys
 import tkinter as tk
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-
 
 REQUIRED_MODULES = [
+    "customtkinter",
     "selenium",
     "pystray",
     "PIL",
+    "win32crypt",
     "win32com",
     "win11toast",
     "openpyxl",
@@ -43,6 +42,12 @@ def main() -> int:
     if missing:
         fail(f"Missing Python packages: {', '.join(missing)}. Run SETUP_WINPYTHON.bat.")
     ok("Required Python packages are installed.")
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except Exception as exc:
+        fail(f"Selenium import failed: {exc}")
 
     try:
         root = tk.Tk()

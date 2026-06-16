@@ -50,6 +50,43 @@ function Get-Sha256FromText {
     return $firstToken.ToLowerInvariant()
 }
 
+$skipDirs = @("logs", "runtime_outputs", "tmp", "snapshots", "__pycache__", "artifacts")
+$alwaysSkipFiles = @(
+    "duty_sheet_legacy\config.json",
+    "duty_sheet_legacy/effortless-leaf-353501-63492cc3ece4.json",
+    "duty_sheet_legacy\effortless-leaf-353501-63492cc3ece4.json",
+    "daily_vehicle_legacy\.env",
+    "daily_vehicle_legacy/.env"
+)
+$preserveIfExistsFiles = @(
+    "rest_time_automation_config.json"
+)
+$skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token")
+
+function Test-SkipPackagePath {
+    param([string]$RelativePath)
+
+    $relativeSlash = $RelativePath -replace "\\", "/"
+    $parts = $relativeSlash -split "/"
+    if ($parts | Where-Object { $skipDirs -contains $_ }) {
+        return $true
+    }
+    if (($alwaysSkipFiles -contains $RelativePath) -or ($alwaysSkipFiles -contains $relativeSlash)) {
+        return $true
+    }
+
+    $fileName = [System.IO.Path]::GetFileName($RelativePath)
+    if ($fileName -eq "desktop.ini") {
+        return $true
+    }
+    if ($fileName -eq ".env" -or ($fileName.StartsWith(".env.") -and $fileName -ne ".env.example")) {
+        return $true
+    }
+
+    $extension = [System.IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    return $skipExtensions -contains $extension
+}
+
 function Get-RunningDutyGuiProcesses {
     $packagePath = $packageDir.TrimEnd([char]92)
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -95,13 +132,7 @@ function Start-DutyGui {
         $pythonw = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder -Windowed | Select-Object -First 1)
     }
     if (-not $pythonw) {
-        $command = Get-Command "pythonw.exe" -ErrorAction SilentlyContinue
-        if ($command) {
-            $pythonw = $command.Source
-        }
-    }
-    if (-not $pythonw) {
-        Write-Warning "Could not restart app because pythonw.exe was not found."
+        Write-Warning "Could not restart app because WinPython pythonw.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
         return
     }
 
@@ -124,13 +155,7 @@ function Get-WinPythonExe {
         $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
     }
     if (-not $python) {
-        $command = Get-Command "python.exe" -ErrorAction SilentlyContinue
-        if ($command) {
-            $python = $command.Source
-        }
-    }
-    if (-not $python) {
-        throw "Could not run setup because python.exe was not found."
+        throw "Could not run setup because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
     }
     return [string]$python
 }
@@ -170,26 +195,12 @@ function Copy-UpdateTree {
         [string]$DestDir
     )
 
-    $skipDirs = @("logs", "runtime_outputs", "tmp", "snapshots", "__pycache__", "artifacts")
-    $alwaysSkipFiles = @(
-        "duty_sheet_legacy\config.json",
-        "duty_sheet_legacy\effortless-leaf-353501-63492cc3ece4.json",
-        "daily_vehicle_legacy\.env"
-    )
-    $preserveIfExistsFiles = @(
-        "rest_time_automation_config.json"
-    )
-
     $slash = [string][char]92
     $sourceRoot = $SourceDir.TrimEnd([char]92) + $slash
     Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force | ForEach-Object {
         $relative = $_.FullName.Substring($sourceRoot.Length)
-        $parts = $relative -split "[\\/]"
-        if ($parts | Where-Object { $skipDirs -contains $_ }) {
-            return
-        }
         $target = Join-Path $DestDir $relative
-        if ($alwaysSkipFiles -contains $relative) {
+        if (Test-SkipPackagePath -RelativePath $relative) {
             Write-Host "Skipped local-only file: $relative"
             return
         }
@@ -205,6 +216,68 @@ function Copy-UpdateTree {
         Copy-Item -LiteralPath $_.FullName -Destination $target -Force
         Write-Host "Updated: $relative"
     }
+}
+
+function New-PackageBackup {
+    param(
+        [string]$SourceDir,
+        [string]$BackupZip,
+        [string]$StageDir
+    )
+
+    if (Test-Path -LiteralPath $StageDir) {
+        Remove-Item -LiteralPath $StageDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
+
+    $backupFiles = @(
+        "VERSION.txt",
+        "update_package.ps1",
+        "UPDATE_PACKAGE.bat",
+        "RUN_DUTY_GUI_WINPYTHON.bat",
+        "RUN_DUTY_GUI_WINPYTHON.vbs",
+        "duty_gui.py",
+        "duty_gui.pyw",
+        "duty_sheet_automation.py",
+        "daily_vehicle_automation.py",
+        "rest_time_automation.py",
+        "duty_rehearsal.py",
+        "compare_rehearsal_records.py",
+        "check_environment.py",
+        "requirements.txt",
+        "work_log_defaults.json"
+    )
+
+    $copied = 0
+    foreach ($relative in $backupFiles) {
+        if (Test-SkipPackagePath -RelativePath $relative) {
+            continue
+        }
+        $source = Join-Path $SourceDir $relative
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            continue
+        }
+
+        $target = Join-Path $StageDir $relative
+        $targetDir = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        $copied += 1
+    }
+
+    $manifestPath = Join-Path $StageDir "backup-manifest.txt"
+    @(
+        "Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "Source: $SourceDir",
+        "Files: $copied",
+        "",
+        ($backupFiles -join [Environment]::NewLine)
+    ) | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+    Compress-Archive -LiteralPath (Join-Path $StageDir "*") -DestinationPath $BackupZip -Force
+    Write-Host "Backup completed: $copied files"
 }
 
 if (-not (Test-Path -LiteralPath $localVersionPath)) {
@@ -256,7 +329,7 @@ try {
 
     $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
     Write-Host "Creating backup: $backupZip"
-    Compress-Archive -LiteralPath (Join-Path $packageDir "*") -DestinationPath $backupZip -Force
+    New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir (Join-Path $tempDir "backup-stage")
 
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force

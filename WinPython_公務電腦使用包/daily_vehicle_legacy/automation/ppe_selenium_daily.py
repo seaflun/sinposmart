@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
@@ -38,6 +39,13 @@ TEXT_REVIEW = "\u6aa2\u8996"
 TEXT_FINISH_EQUIP_CHECK = "\u5b8c\u6210\u6e05\u9ede"
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run PPE daily vehicle maintenance and equipment Selenium automation."
+    )
+    return parser.parse_args(argv)
+
+
 def read_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -50,7 +58,7 @@ def load_config() -> dict[str, object]:
     username = os.getenv("PPE_ACCOUNT", "").strip()
     password = os.getenv("PPE_PASSWORD", "").strip()
     if not username or not password:
-        raise RuntimeError("Missing PPE_ACCOUNT or PPE_PASSWORD in .env")
+        raise RuntimeError("Missing PPE_ACCOUNT or PPE_PASSWORD in environment or .env")
 
     return {
         "username": username,
@@ -397,7 +405,8 @@ def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
         print(f"[artifacts] skipped screenshot/html capture: {error}")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parse_args(argv)
     config = load_config()
     driver = None
 
@@ -440,14 +449,14 @@ def main() -> None:
         save_artifacts(driver, "last-run")
         print("[done] automation finished")
         if config["send_line_result"]:
-            send_line_push(config, f"PPE ?芸??歇摰?\n??: {today.strftime('%Y/%m/%d %H:%M:%S')}\n蝯?: ??")
+            send_line_push(config, f"PPE 自動化完成\n時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n結果: 成功")
     except Exception as error:
         if driver is not None:
             save_artifacts(driver, "error")
         message = (
-            f"PPE ?芸??仃?n"
-            f"??: {today.strftime('%Y/%m/%d %H:%M:%S')}\n"
-            f"?航炊: {type(error).__name__}: {error}"
+            "PPE 自動化失敗\n"
+            f"時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n"
+            f"錯誤: {type(error).__name__}: {error}"
         )
         if config["send_line_result"]:
             try:

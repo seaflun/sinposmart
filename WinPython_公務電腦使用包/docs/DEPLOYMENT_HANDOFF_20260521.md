@@ -134,7 +134,10 @@ When continuing work, first read:
 Then run:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\sync_project_skills_before_use.ps1
+$cloudSkillRoot = "I:\我的雲端硬碟\專案\skill"
+$localSkillRoot = Join-Path $env:USERPROFILE ".codex\skills"
+New-Item -ItemType Directory -Force -Path $localSkillRoot
+Copy-Item -LiteralPath (Join-Path $cloudSkillRoot "*") -Destination $localSkillRoot -Recurse -Force
 ```
 
 Use `karpathy-guidelines` before code changes.

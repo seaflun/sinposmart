@@ -15,7 +15,7 @@ import tempfile
 import shutil
 from datetime import datetime, timedelta
 from urllib.parse import quote
-from selenium.common.exceptions import UnexpectedAlertPresentException
+from selenium.common.exceptions import NoAlertPresentException, NoSuchFrameException, TimeoutException, UnexpectedAlertPresentException
 import threading
 from pathlib import Path
 from openpyxl.utils import get_column_letter
@@ -51,7 +51,8 @@ def sync_status_to_gui(msg):
 # [區塊二] 設定、日期、Excel 截圖與通知工具 (Config, Excel, Notification)
 # 放置不直接操作勤務網站的共用工具；網站 Selenium 動作集中在區塊四、五。
 # ==========================================
-CONFIG_FILE = "config.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = SCRIPT_DIR / "config.json"
 DEFAULT_CAPTURE_TOP_ROW = 3
 DEFAULT_CAPTURE_BOTTOM_ROW = 36
 DAILY_SCREENSHOT_DIR = "每日勤務表"
@@ -61,8 +62,8 @@ NIGHT_SCREENSHOT_DIR = "夜間勤務"
 def get_default_config():
     return {
         "login": {
-            "user_id": "tyfd01510",
-            "user_pwd": "alan810730@Aggggg"
+            "user_id": "",
+            "user_pwd": ""
         },
         "last_selection": {
             "attack": "新坡15/KES-5922",
@@ -80,11 +81,11 @@ def get_default_config():
             "amb": []
         },
         "notification": {
-            "enabled": True,
+            "enabled": False,
             "provider": "line",
-            "line_channel_access_token": "5nA7PYBlQ+qzF+gPXXRqhn7bRaSuaqOFBakk2/ODCgw3p7K6JIf2jHSfuYqFvhC8LAXWQQeHM1SM4O774xdTPi0ibcT6gSYDbmyzmppHAvt0TP4fdmJTq/ZS1fO3iIcYQ1O0TunlRV+8l7Xrz4DSBwdB04t89/1O/w1cDnyilFU=",
-            "line_to_id": "Uf2573574f8594fea56067df935a2542d",
-            "line_group_id": "Uf2573574f8594fea56067df935a2542d",
+            "line_channel_access_token": "",
+            "line_to_id": "",
+            "line_group_id": "",
             "gcs_bucket_name": "sinpo-duty-schedule-images",
             "gcs_service_account_json": "effortless-leaf-353501-63492cc3ece4.json"
         }
@@ -131,7 +132,7 @@ def resolve_config_path(path_value):
     path_obj = Path(path_text)
     if path_obj.is_absolute():
         return str(path_obj)
-    return str((Path.cwd() / path_obj).resolve())
+    return str((CONFIG_FILE.parent / path_obj).resolve())
 
 def screenshot_archive_root():
     script_dir = Path(__file__).resolve().parent
@@ -257,16 +258,19 @@ def resolve_night_capture_range(sheet):
 def fit_summary_cells_for_screenshot(worksheet, sheet_values, min_col, min_row, max_col, max_row):
     """截圖前微調右下角假別統計，避免窄欄把 10 顯示成 1。"""
     summary_labels = {"輪休", "月補", "補休", "請休", "公假", "婚假", "喪假", "身心假", "陪產假"}
-    for row in range(min_row, max_row + 1):
-        for col in range(min_col, max_col + 1):
+    summary_start_row = max(min_row, max_row - 7)
+    summary_start_col = max(min_col, max_col - 12)
+    for row in range(summary_start_row, max_row + 1):
+        for col in range(summary_start_col, max_col + 1):
             value = worksheet.Cells(row, col).Value
             if value is None or str(value).strip() not in summary_labels:
                 continue
             end_col = min(max_col, col + 6)
+            if end_col <= col:
+                continue
             summary_range = worksheet.Range(worksheet.Cells(row, col + 1), worksheet.Cells(row, end_col))
-            summary_range.ShrinkToFit = True
+            summary_range.ShrinkToFit = False
             summary_range.WrapText = False
-            summary_range.Font.Size = 10
             for value_col in range(col + 1, end_col + 1):
                 original_value = sheet_values.cell(row=row, column=value_col).value
                 if original_value is None or str(original_value).strip() == "":
@@ -626,23 +630,32 @@ def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
 
 def super_js_execute(driver, element_id, action="click", value=""):
     """地毯式搜尋全網頁 ID 並執行動作 (支援存在檢查)"""
-    js_code = f"""
-    function deepScan(win) {{
-        var el = win.document.getElementById('{element_id}');
-        if (el) {{
-            if ('{action}' == 'click') {{ el.click(); if (el.onclick) el.onclick(); return true; }}
-            else if ('{action}' == 'set') {{ el.value = '{value}'; el.dispatchEvent(new Event('change')); return true; }}
-            else if ('{action}' == 'exists') {{ return (el.offsetWidth > 0 || el.offsetHeight > 0); }}
+    js_code = """
+    const targetId = arguments[0];
+    const action = arguments[1];
+    const value = arguments[2];
+    function deepScan(win) {
+        var el = win.document.getElementById(targetId);
+        if (el) {
+            if (action == 'click') { el.click(); if (el.onclick) el.onclick(); return true; }
+            else if (action == 'set') {
+                el.value = value;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                return true;
+            }
+            else if (action == 'exists') { return (el.offsetWidth > 0 || el.offsetHeight > 0); }
             return true;
-        }}
-        for (var i = 0; i < win.frames.length; i++) {{
-            try {{ if (deepScan(win.frames[i])) return true; }} catch(e) {{}}
-        }}
+        }
+        for (var i = 0; i < win.frames.length; i++) {
+            try { if (deepScan(win.frames[i])) return true; } catch(e) {}
+        }
         return false;
-    }}
+    }
     return deepScan(window.top);
     """
-    return driver.execute_script(js_code)
+    return driver.execute_script(js_code, element_id, action, value)
 
 
 # ==========================================
@@ -711,7 +724,8 @@ def step_prepare_content(driver, wait):
         try:
             wait.until(EC.frame_to_be_available_and_switch_to_it("contentFrame"))
             return True
-        except: time.sleep(2)
+        except TimeoutException:
+            time.sleep(2)
     return False
 
 def step_config_popups(driver, wait, out_duty_names, daily_commander):
@@ -723,8 +737,10 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
     # 🌟 恢復使用最強 JS 點擊，避免 Selenium 找不到框架崩潰
     super_js_execute(driver, "_btnOpenWinTaskCode", "click")
     
-    try: wait.until(lambda d: len(d.window_handles) > 1)
-    except: pass
+    try:
+        wait.until(lambda d: len(d.window_handles) > 1)
+    except TimeoutException:
+        log_status("   ⚠️ 外勤設定視窗未在時間內開啟")
     
     for h in driver.window_handles:
         if h != main_window:
@@ -746,11 +762,14 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                 try:
                     WebDriverWait(driver, 3).until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
-                except: pass
+                except TimeoutException:
+                    pass
                 
                 # 確保存檔後視窗真的關閉
-                try: wait.until(lambda d: len(d.window_handles) == 1)
-                except: pass
+                try:
+                    wait.until(lambda d: len(d.window_handles) == 1)
+                except TimeoutException:
+                    log_status("   ⚠️ 外勤設定視窗未自動關閉")
             except Exception as e:
                 log_status(f"   ❌ 外勤設定發生錯誤: {e}")
             break
@@ -771,8 +790,10 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
     # 🌟 恢復使用最強 JS 點擊
     super_js_execute(driver, "_btnOpenWinUserNo", "click")
     
-    try: wait.until(lambda d: len(d.window_handles) > 1)
-    except: pass
+    try:
+        wait.until(lambda d: len(d.window_handles) > 1)
+    except TimeoutException:
+        log_status("   ⚠️ 勤務番號設定視窗未在時間內開啟")
     
     for h in driver.window_handles:
         if h != main_window:
@@ -810,10 +831,13 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                 try:
                     WebDriverWait(driver, 3).until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
-                except: pass
+                except TimeoutException:
+                    pass
                 
-                try: wait.until(lambda d: len(d.window_handles) == 1)
-                except: pass
+                try:
+                    wait.until(lambda d: len(d.window_handles) == 1)
+                except TimeoutException:
+                    log_status("   ⚠️ 勤務番號設定視窗未自動關閉")
             except Exception as e: 
                 log_status(f"   ❌ 指揮官小視窗操作失敗: {e}")
             break
@@ -874,64 +898,64 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
 def step_batch_fill_duty(driver, duty_map):
     """批次填寫勤務基準表"""
     if not duty_map: return
-    js_data = str(duty_map).replace("'", '"')
-    js_fill = f"""
-    function deepBatchFill(win, data) {{
+    js_fill = """
+    const data = arguments[0] || {};
+    function deepBatchFill(win, data) {
         var oldAlert = win.alert; var oldConfirm = win.confirm;
-        win.alert = function(msg) {{ console.log("攔截: " + msg); }};
-        win.confirm = function(msg) {{ return true; }};
+        win.alert = function(msg) { console.log("攔截: " + msg); };
+        win.confirm = function(msg) { return true; };
         var count = 0;
-        for (var id in data) {{
+        for (var id in data) {
             var el = win.document.getElementById(id);
-            if (el && data[id] !== "") {{
+            if (el && data[id] !== "") {
                 el.focus(); el.value = data[id];
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                el.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                try {{ if(typeof el.onchange === 'function') el.onchange({{target: el, type: 'change'}}); }} catch(e){{}}
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                try { if(typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch(e){}
                 count++;
-            }}
-        }}
-        for(var i=0; i<win.frames.length; i++) {{
-            try {{ count += deepBatchFill(win.frames[i], data); }} catch(e){{}}
-        }}
+            }
+        }
+        for(var i=0; i<win.frames.length; i++) {
+            try { count += deepBatchFill(win.frames[i], data); } catch(e){}
+        }
         win.alert = oldAlert; win.confirm = oldConfirm;
         return count;
-    }}
-    return deepBatchFill(window.top, {js_data});
+    }
+    return deepBatchFill(window.top, data);
     """
     try:
-        count = driver.execute_script(js_fill)
+        count = driver.execute_script(js_fill, duty_map)
     except Exception as e: log_status(f"   ❌ 批次填寫異常: {e}")
 
 def step_fill_mission_cells(driver, mission_map):
     """批次填寫救災任務編組表"""
-    js_data = str(mission_map).replace("'", '"')
-    js_fill_and_save = f"""
-    function deepProcess(win, data) {{
+    js_fill_and_save = """
+    const data = arguments[0] || {};
+    function deepProcess(win, data) {
         var foundAny = false;
-        for (var id in data) {{
+        for (var id in data) {
             var el = win.document.getElementById(id);
-            if (el) {{
+            if (el) {
                 el.value = data[id];
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                el.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
                 if(typeof el.onchange === 'function') el.onchange();
                 foundAny = true;
-            }}
-        }}
+            }
+        }
         var btn = win.document.getElementById('_btnSave');
-        if (btn) {{ btn.click(); return "SUCCESS_WITH_SAVE"; }}
-        for(var i=0; i<win.frames.length; i++) {{
-            try {{ var res = deepProcess(win.frames[i], data); if (res) return res; }} catch(e){{}}
-        }}
+        if (btn) { btn.click(); return "SUCCESS_WITH_SAVE"; }
+        for(var i=0; i<win.frames.length; i++) {
+            try { var res = deepProcess(win.frames[i], data); if (res) return res; } catch(e){}
+        }
         return foundAny ? "SUCCESS_NO_SAVE" : null;
-    }}
-    return deepProcess(window.top, {js_data});
+    }
+    return deepProcess(window.top, data);
     """
     try:
-        result = driver.execute_script(js_fill_and_save)
+        result = driver.execute_script(js_fill_and_save, mission_map)
     except Exception as e: log_status(f"   ❌ 任務填寫報錯: {e}")
 
 
@@ -1063,7 +1087,8 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                     wait_alert.until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
                     time.sleep(1)
-                except: break
+                except (NoAlertPresentException, TimeoutException):
+                    break
             time.sleep(2)
             
             # --- 進入救災任務編組表 ---
@@ -1128,13 +1153,17 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 time.sleep(5) 
                 driver.switch_to.default_content()
                 for frame_name in ['main', 'Content', 'contents', 'ehrFrame', 'contentFrame']:
-                    try: driver.switch_to.frame(frame_name)
-                    except: continue
+                    try:
+                        driver.switch_to.frame(frame_name)
+                    except NoSuchFrameException:
+                        continue
 
                 step_fill_mission_cells(driver, mission_map)
                 time.sleep(1)
-                try: driver.switch_to.alert.accept()
-                except: pass
+                try:
+                    driver.switch_to.alert.accept()
+                except NoAlertPresentException:
+                    pass
             
             notification_status = ""
             notification_config = load_config().get("notification", {})
@@ -1174,6 +1203,8 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
 
     except Exception as e:
         log_status(f"❌ 流程中斷：{e}")
+    finally:
+        wb.close()
 
 
 # ==========================================
