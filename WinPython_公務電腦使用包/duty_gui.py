@@ -2011,6 +2011,17 @@ class DutyGui(ctk.CTk):
             "target_time": str(fields.get("系統寫入時間") or fields.get("登打時間") or fields.get("工作時間") or action.get("time", "")),
         }
 
+    def send_tool_start_event(self, tool_name: str, tool_label: str) -> None:
+        self.send_sinposmart_backend_event(
+            "tool_action_started",
+            status="started",
+            trigger_type="tool_start",
+            snapshot={
+                "tool_name": tool_name,
+                "tool_label": tool_label,
+            },
+        )
+
     def send_sinposmart_backend_event(
         self,
         record_type: str,
@@ -3324,26 +3335,50 @@ class DutyGui(ctk.CTk):
     def open_duty_sheet_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
-        open_duty_sheet_dialog(self, user_id=user_id, password=password)
+        open_duty_sheet_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            on_start=lambda: self.send_tool_start_event("duty_sheet", "勤務表登打"),
+        )
 
     def open_rest_time_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
-        open_rest_time_dialog(self, user_id=user_id, password=password, actor_no=actor_no, display_name=display_name)
+        open_rest_time_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            actor_no=actor_no,
+            display_name=display_name,
+            on_start=lambda: self.send_tool_start_event("rest_time", "休息時間登打"),
+        )
 
     def open_monthly_base_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
-        open_monthly_base_dialog(self, user_id=user_id, password=password, actor_no=actor_no, display_name=display_name)
+        open_monthly_base_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            actor_no=actor_no,
+            display_name=display_name,
+            on_start=lambda: self.send_tool_start_event("monthly_base", "勤務基準表登打"),
+        )
 
     def open_daily_vehicle_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
-        start_daily_vehicle_automation(self, user_id=user_id, password=password)
+        start_daily_vehicle_automation(
+            self,
+            user_id=user_id,
+            password=password,
+            on_start=lambda: self.send_tool_start_event("daily_vehicle", "車輛保養清點"),
+        )
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED

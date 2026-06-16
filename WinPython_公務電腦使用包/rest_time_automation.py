@@ -112,7 +112,7 @@ def format_automation_error(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> ctk.CTkToplevel | None:
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
@@ -213,6 +213,8 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             messagebox.showwarning("找不到 Excel", "請選擇勤務表 Excel 檔案。", parent=dialog)
             return
         save_last_workbook_path(workbook_path)
+        if on_start is not None:
+            on_start()
         set_running(True)
         set_status("開啟瀏覽器登打休息時間...")
 
@@ -258,7 +260,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     return dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> ctk.CTkToplevel | None:
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
@@ -341,6 +343,8 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
 
         def worker() -> None:
             try:
+                if on_start is not None:
+                    on_start()
                 result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:

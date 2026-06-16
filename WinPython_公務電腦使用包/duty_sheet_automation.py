@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 import customtkinter as ctk
 from types import ModuleType
-from typing import Iterator
+from typing import Callable, Iterator
 
 UI_FONT = "Microsoft JhengHei UI"
 UI_BG = "#f5f7fb"
@@ -113,7 +113,7 @@ def load_legacy_module(project_dir: Path) -> ModuleType:
     return module
 
 
-def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "") -> ctk.CTkToplevel | None:
+def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_duty_sheet_dialog", None)
     if existing is not None:
         try:
@@ -514,6 +514,8 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "")
         notification_config = current_config.get("notification", legacy.get_default_config()["notification"]).copy()
         notification_config["enabled"] = bool(send_group_var.get())
 
+        if on_start is not None:
+            on_start()
         start_button.configure(state=tk.DISABLED, text="執行中...")
         set_status(f"開始勤務表登打：{target_date}")
 

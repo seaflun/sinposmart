@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from tkinter import messagebox
 import tkinter as tk
+from typing import Callable
 
 
 PACKAGED_PROJECT_DIR = "daily_vehicle_legacy"
@@ -145,7 +146,7 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
         clear_running_pid(project_dir, pid)
 
 
-def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "") -> None:
+def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None) -> None:
     base_dir = Path(__file__).resolve().parent
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
@@ -171,6 +172,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
     if not messagebox.askyesno(WINDOW_TITLE, "將開啟瀏覽器執行車輛保養清點，是否繼續？", parent=parent):
         return
 
+    if on_start is not None:
+        on_start()
     default_env = load_dotenv_like(project_dir / ENV_EXAMPLE)
     current_env = {**default_env, **load_dotenv_like(project_dir / ".env")}
     env_values = {
