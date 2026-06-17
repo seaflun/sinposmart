@@ -3,7 +3,7 @@
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
-4. 每次在本專案開始工作前，先確認雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills，並全部同步到本機 `%USERPROFILE%\.codex\skills` 後再使用。
+4. 每次在本專案開始工作前，先確認雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills，並全部同步到本機 `%USERPROFILE%\.codex\skills` 後再使用。同步必須保留子資料夾內容並驗證雲端/本機 `SKILL.md` hash 一致；PowerShell 不要用 `Copy-Item -LiteralPath ...\*` 當作萬用字元同步。
 
 ## Language
 
@@ -21,6 +21,14 @@
 - `duty_sheet_legacy/`: 勤務表舊版流程與設定。
 - `daily_vehicle_legacy/`: 每日車輛舊版 Selenium 流程。
 - `WinPython_公務電腦使用包/`: 公務電腦可攜執行包。
+
+## Repository boundaries
+
+- 本 repo `I:\我的雲端硬碟\專案\值班勤務系統自動化` 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
+- SinpoSmart 後台網頁 APP 目前在 `I:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `I:\我的雲端硬碟\專案\IOS\ambulance_return_bot` 僅作為歷史路徑，不要新增命令或文件指向舊路徑。
+- 提到「值班 GUI、勤務表登打、休息時間登打、勤務基準表登打、車輛保養清點、WinPython 公務電腦使用包、UPDATE、GITHUB RELEASE」時，優先在本 repo 工作。
+- 提到「後台事件、後台 UI、admin_sinposmart、狀態 pill、快照內容、NAS 後台網頁」時，優先切到 `救護返隊小幫手\ambulance_return_bot` repo 工作。
+- 若一次任務同時跨 SinpoSmart WinPython 包與救護返隊小幫手後台網頁，必須分開檢查、測試、commit、push；不要把兩個 repo 的工作混成同一個提交或 release。
 
 ## Current work
 
@@ -53,6 +61,7 @@
 - 不要新增 dependency，除非使用者明確同意。
 - 不要修改程式邏輯，除非任務明確要求。
 - 啟動 SinpoSmart GUI 時，預設使用無黑窗模式：優先用 `WinPython_公務電腦使用包\RUN_DUTY_GUI_WINPYTHON.bat`、`duty_gui.pyw` 或 `pythonw.exe`；不要直接用 `py duty_gui.py`、`python duty_gui.py` 或會留下黑色 console 視窗的方式啟動，除非正在做明確的 console 除錯。
+- 若 tracked config 因本機執行變成 dirty，例如 `WinPython_公務電腦使用包\duty_sheet_legacy\config.json`，預設不要 stage、不要讀內容，只回報檔名與風險；除非使用者明確要求，否則不把 runtime config 納入 commit 或 release。
 
 ## Python file policy
 
@@ -104,6 +113,7 @@
 - 未經使用者要求，不要自動建立 commit。
 - 若使用者要求 commit，先測試或說明無法測試的原因，再提交。
 - commit 後回報 commit hash 與提交檔案摘要。
+- 若遇到 `.git/*.lock`，先檢查是否仍有 `git` process；若沒有 process 且 lock 檔看起來是 stale，仍需先請使用者確認才能刪除。若 commit、push 或 release 不受影響，保留 lock 檔並在完成回報列為風險。
 
 ## Completion report
 
