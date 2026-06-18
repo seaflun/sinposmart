@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## Superpowers Skills
+
+- 本專案已在 `project_skills/superpowers/` 保存 Superpowers skills。
+- 每次開始本專案工作時，優先使用 `using-superpowers` skill 判斷是否需要啟用其他 Superpowers skills。
+- 若任務涉及規劃、除錯、測試、分支收尾、code review 或驗證完成狀態，依情境使用對應 Superpowers skill。
+- 使用 Superpowers 時仍必須遵守本 `AGENTS.md` 與使用者直接指示；本檔案與使用者指示優先於 skill 內容。
+
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
