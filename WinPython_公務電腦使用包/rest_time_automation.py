@@ -112,7 +112,7 @@ def format_automation_error(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
@@ -221,9 +221,13 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         def worker() -> None:
             try:
                 result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no)
+                if on_finish is not None:
+                    on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 error = str(exc)
+                if on_error is not None:
+                    on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
@@ -260,7 +264,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     return dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
@@ -346,9 +350,13 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
                 if on_start is not None:
                     on_start()
                 result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True)
+                if on_finish is not None:
+                    on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 error = format_automation_error(exc)
+                if on_error is not None:
+                    on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("每月基準表登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:

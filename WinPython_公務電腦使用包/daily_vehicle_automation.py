@@ -146,7 +146,7 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
         clear_running_pid(project_dir, pid)
 
 
-def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None) -> None:
+def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> None:
     base_dir = Path(__file__).resolve().parent
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
@@ -212,12 +212,18 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
             output, _ = process.communicate()
             return_code = process.returncode
             if return_code == 0:
+                if on_finish is not None:
+                    on_finish("車輛保養清點已完成。")
                 run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
                 detail = output_tail(output)
+                if on_error is not None:
+                    on_error(f"車輛保養清點執行失敗，代碼：{return_code}；{detail}")
                 run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點執行失敗，代碼：{return_code}\n\n輸出尾端：\n{detail}", parent=parent))
         except Exception as exc:
             error = str(exc)
+            if on_error is not None:
+                on_error(error)
             run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點啟動失敗：{error}", parent=parent))
         finally:
             set_running(project_dir, False, process.pid if process else None)

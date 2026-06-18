@@ -113,7 +113,7 @@ def load_legacy_module(project_dir: Path) -> ModuleType:
     return module
 
 
-def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None) -> ctk.CTkToplevel | None:
+def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_duty_sheet_dialog", None)
     if existing is not None:
         try:
@@ -536,8 +536,12 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
                     )
                     legacy.start_automation(uid, pwd, target_date, excel_path, cars_config)
                 success = True
+                if on_finish is not None:
+                    on_finish(f"勤務表登打完成：{target_date}")
             except Exception as exc:
                 error = str(exc)
+                if on_error is not None:
+                    on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("勤務表登打失敗", error, parent=dialog))
                 run_on_dialog(lambda: set_status(f"失敗：{error}"))
             finally:

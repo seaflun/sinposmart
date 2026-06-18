@@ -2031,6 +2031,19 @@ class DutyGui(ctk.CTk):
             },
         )
 
+    def send_tool_finish_event(self, tool_name: str, tool_label: str, status: str, result: str = "", error: str = "") -> None:
+        self.send_sinposmart_backend_event(
+            "tool_action_finished",
+            status=status,
+            trigger_type="tool_finish",
+            content=result,
+            error=error,
+            snapshot={
+                "tool_name": tool_name,
+                "tool_label": tool_label,
+            },
+        )
+
     def send_sinposmart_backend_event(
         self,
         record_type: str,
@@ -3043,7 +3056,7 @@ class DutyGui(ctk.CTk):
             self.cancel_auto_logout()
             return
         label = self.logged_in_identity_label(expected_actor)
-        self.clear_login()
+        self.clear_login(trigger_type="system")
         self.login_status.set(f"已自動登出：{label}")
         self.set_duty_status("值班段落結束 10 分鐘，已自動登出。", hold_seconds=10)
         self.notify_user(APP_DISPLAY_NAME, f"{label} 已自動登出")
@@ -3072,7 +3085,16 @@ class DutyGui(ctk.CTk):
         self.session.actor_no = resolved
         self.actor_no.set(resolved)
 
-    def clear_login(self) -> None:
+    def clear_login(self, trigger_type: str = "manual") -> None:
+        logout_session = self.session if self.session and self.session.verified else None
+        if logout_session:
+            self.send_sinposmart_backend_event(
+                "logout",
+                status="ok",
+                trigger_type=trigger_type,
+                actor_no=logout_session.actor_no,
+                user_id=logout_session.user_id,
+            )
         self.cancel_auto_logout()
         self.clear_duty_status_override()
         self.session = None
@@ -3369,6 +3391,8 @@ class DutyGui(ctk.CTk):
             user_id=user_id,
             password=password,
             on_start=lambda: self.send_tool_start_event("duty_sheet", "勤務表登打"),
+            on_finish=lambda result: self.send_tool_finish_event("duty_sheet", "勤務表登打", "completed", result=result),
+            on_error=lambda error: self.send_tool_finish_event("duty_sheet", "勤務表登打", "failed", error=error),
         )
 
     def open_rest_time_automation(self) -> None:
@@ -3383,6 +3407,8 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             display_name=display_name,
             on_start=lambda: self.send_tool_start_event("rest_time", "休息時間登打"),
+            on_finish=lambda result: self.send_tool_finish_event("rest_time", "休息時間登打", "completed", result=result),
+            on_error=lambda error: self.send_tool_finish_event("rest_time", "休息時間登打", "failed", error=error),
         )
 
     def open_monthly_base_automation(self) -> None:
@@ -3397,6 +3423,8 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             display_name=display_name,
             on_start=lambda: self.send_tool_start_event("monthly_base", "勤務基準表登打"),
+            on_finish=lambda result: self.send_tool_finish_event("monthly_base", "勤務基準表登打", "completed", result=result),
+            on_error=lambda error: self.send_tool_finish_event("monthly_base", "勤務基準表登打", "failed", error=error),
         )
 
     def open_daily_vehicle_automation(self) -> None:
@@ -3407,6 +3435,8 @@ class DutyGui(ctk.CTk):
             user_id=user_id,
             password=password,
             on_start=lambda: self.send_tool_start_event("daily_vehicle", "車輛保養清點"),
+            on_finish=lambda result: self.send_tool_finish_event("daily_vehicle", "車輛保養清點", "completed", result=result),
+            on_error=lambda error: self.send_tool_finish_event("daily_vehicle", "車輛保養清點", "failed", error=error),
         )
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
