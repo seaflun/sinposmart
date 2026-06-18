@@ -772,6 +772,13 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
           return rows;
         }
         function findDayControl(row, day) {
+          const controls = editableControls(row);
+          const dayPattern = new RegExp(`^_pln_\\d+_${day}$`);
+          const paddedDayPattern = new RegExp(`^_pln_\\d+_${String(day).padStart(2, '0')}$`);
+          for (const el of controls) {
+            const key = el.id || el.name || '';
+            if (dayPattern.test(key) || paddedDayPattern.test(key)) return el;
+          }
           const candidates = [
             `[name$="_${day}"]`,
             `[name$="_${String(day).padStart(2, '0')}"]`,
@@ -781,11 +788,11 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
             `[id$="_${String(day).padStart(2, '0')}"]`,
           ];
           for (const selector of candidates) {
-            const el = row.querySelector(selector);
+            const el = controls.find((control) => control.matches(selector));
             if (el) return el;
           }
-          const controls = editableControls(row);
-          if (controls.length >= Number(day)) return controls[Number(day) - 1];
+          const planControls = controls.filter((el) => /^_pln_\\d+_\\d+$/.test(el.id || el.name || ''));
+          if (planControls.length >= Number(day)) return planControls[Number(day) - 1];
           return null;
         }
         function setRowValues(row, data) {
