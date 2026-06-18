@@ -2692,6 +2692,8 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             user_id=user_id,
         )
+        if self.handle_relogin_required(user_id, error):
+            return
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
 
@@ -2811,9 +2813,27 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             user_id=user_id,
         )
+        if self.handle_relogin_required(user_id, error):
+            self.run_pending_hourly_comparison()
+            return
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         self.run_pending_hourly_comparison()
+
+    def handle_relogin_required(self, user_id: str, error: str) -> bool:
+        if not self.current_session_matches(user_id):
+            return False
+        if not any(keyword in error for keyword in ("登入狀態失效", "密碼可能已變更", "重新輸入新密碼")):
+            return False
+        self.cancel_auto_logout()
+        self.session = None
+        self.login_status.set("登入狀態失效：請重新輸入新密碼登入。")
+        self.set_duty_status("勤務系統登入失效，已停止背景查詢與自動登打。請登出/清除後用新密碼重新登入。", hold_seconds=15)
+        self.send_sinposmart_backend_event("login_expired", status="failed", trigger_type="login", error=error, user_id=user_id)
+        self.update_login_panel()
+        self.refresh_tasks()
+        self.refresh_duty_tasks()
+        return True
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
         texts = [self.page_identity_text(driver)]

@@ -1485,6 +1485,19 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         return result;
         """
     )
+    if not data.get("rows"):
+        page_text = driver.execute_script(
+            """
+            const body = document.body ? document.body.innerText : '';
+            const controls = Array.from(document.querySelectorAll('input,select,textarea'))
+              .map(el => [el.id || '', el.name || '', el.value || ''].join(' '))
+              .join('\\n');
+            return [location.href || '', document.title || '', body, controls].join('\\n');
+            """
+        ) or ""
+        if "login119" in page_text or "_txtUsername" in page_text or "_txtPassword" in page_text:
+            raise RuntimeError("勤務表讀取失敗：登入狀態失效或密碼可能已變更，請登出/清除後重新輸入新密碼登入。")
+        raise RuntimeError("勤務表讀取失敗：未讀到勤務表資料，已停止產生空白勤務資料。請確認勤務系統頁面是否正常。")
     sheet = DutySheet(
         roc_date=target_roc_date,
         unit=data.get("unit", ""),
