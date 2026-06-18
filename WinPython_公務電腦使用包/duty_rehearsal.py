@@ -1139,15 +1139,87 @@ def fill_entry_log_form_for_test(
           }
           return false;
         }
+        function selectedOptionText(el) {
+          return String(el?.options?.[el.selectedIndex]?.text || '').trim();
+        }
+        function setOutinControl(el) {
+          if (!el || el.tagName.toLowerCase() !== 'select') return false;
+          const key = el.id || el.name || `${el.tagName}:outin`;
+          if (used.has(key)) return false;
+          const wantedValue = String(values.outin_value || '').trim();
+          const wantedText = String(values.outin_text || values.outin || '').trim();
+          const options = Array.from(el.options || []);
+          const option = options.find(opt => wantedValue && String(opt.value || '').trim() === wantedValue) ||
+            options.find(opt => wantedText && String(opt.text || '').trim() === wantedText) ||
+            options.find(opt => wantedText && String(opt.text || '').replace(/\\s+/g, '') === wantedText);
+          if (!option) return false;
+          el.value = option.value;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          used.add(key);
+          const actualText = selectedOptionText(el);
+          const confirmed = (
+            (wantedValue && String(el.value || '').trim() === wantedValue) ||
+            (wantedText && actualText === wantedText)
+          );
+          result.outin = {
+            id: el.id || '',
+            name: el.name || '',
+            value: el.value || '',
+            text: actualText,
+            confirmed,
+          };
+          result.set.push({id: el.id || '', name: el.name || '', value: el.value || '', text: actualText, field: 'outin'});
+          return confirmed;
+        }
+        function byOutinIds(ids) {
+          for (const id of ids) {
+            if (setOutinControl(document.getElementById(id))) return true;
+          }
+          return false;
+        }
+        function byNearbyOutin(label) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const candidates = cells.slice(labelIndex + 1).flatMap(cell =>
+              Array.from(cell.querySelectorAll('select'))
+            );
+            for (const control of candidates) {
+              if (setOutinControl(control)) return true;
+            }
+          }
+          return false;
+        }
+        function byOutinSignature() {
+          const candidates = controls().filter(control => {
+            if (control.tagName.toLowerCase() !== 'select') return false;
+            const signature = String(`${control.id || ''} ${control.name || ''}`).toLowerCase();
+            return signature.includes('isout') || signature.includes('outin') ||
+              signature.includes('out_in') || signature.includes('inout') || signature === 'io';
+          });
+          for (const control of candidates) {
+            if (setOutinControl(control)) return true;
+          }
+          return false;
+        }
 
         if (!byIds(['_selMan'], values.man)) result.missing.push('man');
         byIds(['_txtMan'], values.man_name);
         if (values.title) byIds(['_selTitle'], values.title);
         if (values.title_text) byIds(['_txtTitle'], values.title_text);
-        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin_value || values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
-        const outinEl = document.getElementById('_selIsout');
-        const outinText = outinEl?.options?.[outinEl.selectedIndex]?.text || '';
-        if (values.outin_text && outinEl && outinEl.value !== values.outin_value && outinText.trim() !== values.outin_text) result.missing.push('outin_confirm');
+        if (values.outin || values.outin_value) {
+          const outinSet = byOutinIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT']) ||
+            byNearbyOutin('出或入') || byOutinSignature();
+          if (!outinSet) {
+            result.missing.push('outin');
+          } else if (!result.outin?.confirmed) {
+            result.missing.push('outin_confirm');
+          }
+        }
         if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
         if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;

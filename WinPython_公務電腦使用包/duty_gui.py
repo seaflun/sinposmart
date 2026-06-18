@@ -1700,6 +1700,15 @@ class DutyGui(ctk.CTk):
                 compare[index] = {"compare": "已手動登打", "group": "done", "matched": []}
         return compare
 
+    def action_already_completed_for_submit(self, index: int, action: dict[str, Any]) -> bool:
+        compare = self.duty_action_compare.get(index, {})
+        completion_key = self.action_completion_key(action)
+        return (
+            compare.get("group") == "done"
+            or index in self.executed_due
+            or completion_key in self.manual_completed_keys
+        )
+
     def clear_duty_status_override(self) -> None:
         self.duty_status_override_text = ""
         self.duty_status_override_until = None
@@ -4130,9 +4139,31 @@ class DutyGui(ctk.CTk):
         if not self.session or not self.session.verified:
             messagebox.showwarning("尚未登入", "請先登入後再手動登打。")
             return
+        ready_actions: list[tuple[int, dict[str, Any]]] = []
+        skipped_completed = 0
+        skipped_running = 0
+        for index, action in selected_actions:
+            if self.action_already_completed_for_submit(index, action):
+                skipped_completed += 1
+                continue
+            if index in self.submitting_indices:
+                skipped_running += 1
+                continue
+            ready_actions.append((index, action))
+        if not ready_actions:
+            if skipped_completed:
+                messagebox.showinfo("防重複", "選取項目已登打或已手動登打，已略過重複登打。")
+                self.set_duty_status("選取項目已登打，略過重複登打。", hold_seconds=6)
+            elif skipped_running:
+                messagebox.showinfo("手動登打", "選取項目正在登打中。")
+            self.refresh_duty_tasks()
+            return
+        selected_actions = ready_actions
         summaries = "\n".join(f"- {self.duty_action_summary(action)}" for _, action in selected_actions[:8])
         if len(selected_actions) > 8:
             summaries += f"\n...另 {len(selected_actions) - 8} 筆"
+        if skipped_completed or skipped_running:
+            summaries += f"\n\n已略過：已登打 {skipped_completed} 筆，登打中 {skipped_running} 筆"
         if save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統 {len(selected_actions)} 筆：\n{summaries}\n\n確定要繼續？"):
             return
         for index, action in sorted(selected_actions, key=lambda item: self.submit_order_key(item[0], item[1])):
@@ -4145,6 +4176,10 @@ class DutyGui(ctk.CTk):
         if action.get("kind") not in ("work_log", "entry_log"):
             return
         if index in self.submitting_indices:
+            return
+        if save and self.action_already_completed_for_submit(index, action):
+            self.set_duty_status("已登打，略過重複登打。", hold_seconds=6)
+            self.refresh_duty_tasks()
             return
         submit_kind = "出入" if action.get("kind") == "entry_log" else "工作"
         if confirm and save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
