@@ -1006,6 +1006,14 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     driver = webdriver.Chrome()
+    try:
+        driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
     wait = WebDriverWait(driver, 20)
 
     try:

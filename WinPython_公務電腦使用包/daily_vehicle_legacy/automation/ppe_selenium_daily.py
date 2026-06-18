@@ -433,6 +433,7 @@ def main(argv: list[str] | None = None) -> None:
 
     wait = WebDriverWait(driver, int(config["timeout_seconds"]))
     driver.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
+    driver.set_script_timeout(max(15, int(config["timeout_seconds"])))
 
     today = dt.datetime.now()
     today_strings = build_today_strings(today)

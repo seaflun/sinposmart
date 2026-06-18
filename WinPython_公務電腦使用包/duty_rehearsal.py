@@ -2474,7 +2474,16 @@ def build_driver(headless: bool) -> webdriver.Chrome:
         options.add_argument("--headless=new")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--window-size=1280,900")
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    try:
+        driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    return driver
 
 
 def main() -> int:

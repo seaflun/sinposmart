@@ -21,6 +21,7 @@ ENV_EXAMPLE = ".env.example"
 RUNNING_PID_FILE = ".daily_vehicle_runner.pid"
 WINDOW_TITLE = "SinpoSmart - 車輛保養清點"
 OUTPUT_TAIL_LIMIT = 3000
+DEFAULT_AUTOMATION_TIMEOUT_SECONDS = 15 * 60
 
 _RUNNING_PROJECTS: set[str] = set()
 _RUNNING_LOCK = threading.Lock()
@@ -72,6 +73,14 @@ def output_tail(output: str, limit: int = OUTPUT_TAIL_LIMIT) -> str:
     if len(output) <= limit:
         return output
     return "...\n" + output[-limit:]
+
+
+def automation_timeout_seconds() -> int:
+    raw_value = os.environ.get("SINPOSMART_DAILY_VEHICLE_TIMEOUT_SECONDS") or os.environ.get("SINPOSMART_TOOL_TIMEOUT_SECONDS", "")
+    try:
+        return max(60, int(raw_value or DEFAULT_AUTOMATION_TIMEOUT_SECONDS))
+    except ValueError:
+        return DEFAULT_AUTOMATION_TIMEOUT_SECONDS
 
 
 def running_pid_path(project_dir: Path) -> Path:
@@ -209,7 +218,12 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                 errors="replace",
             )
             set_running(project_dir, True, process.pid)
-            output, _ = process.communicate()
+            try:
+                output, _ = process.communicate(timeout=automation_timeout_seconds())
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                raise RuntimeError(f"車輛保養清點逾時未完成，已超過 {automation_timeout_seconds()} 秒。")
             return_code = process.returncode
             if return_code == 0:
                 if on_finish is not None:

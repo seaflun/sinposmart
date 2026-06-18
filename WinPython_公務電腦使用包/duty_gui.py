@@ -167,6 +167,9 @@ CREDENTIAL_SYNC_URL = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_URL", "http://1
 CREDENTIAL_SYNC_TOKEN = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
 SINPOSMART_BACKEND_EVENT_URL = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "http://10.30.65.30:8080/api/sinposmart/events").strip()
 SINPOSMART_BACKEND_EVENT_PENDING_PATH = RUNTIME_OUTPUT_DIR / "sinposmart_backend_events_pending.jsonl"
+DEFAULT_SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS = 45
+DEFAULT_SELENIUM_SCRIPT_TIMEOUT_SECONDS = 45
+DEFAULT_TOOL_TIMEOUT_SECONDS = 15 * 60
 APP_ICON_PNG = Path(__file__).with_name("duty_tray_icon.png")
 APP_ICON_ICO = Path(__file__).with_name("duty_tray_icon.ico")
 APP_ICON_GIF = Path(__file__).with_name("duty_tray_icon.gif")
@@ -371,6 +374,38 @@ def sinposmart_backend_event_timeout_seconds() -> int:
         return max(1, int(os.environ.get("SINPOSMART_BACKEND_EVENT_TIMEOUT_SECONDS", "5")))
     except ValueError:
         return 5
+
+
+def selenium_page_load_timeout_seconds() -> int:
+    try:
+        return max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", str(DEFAULT_SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS))))
+    except ValueError:
+        return DEFAULT_SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS
+
+
+def selenium_script_timeout_seconds() -> int:
+    try:
+        return max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", str(DEFAULT_SELENIUM_SCRIPT_TIMEOUT_SECONDS))))
+    except ValueError:
+        return DEFAULT_SELENIUM_SCRIPT_TIMEOUT_SECONDS
+
+
+def configure_webdriver_timeouts(driver: webdriver.Chrome) -> None:
+    try:
+        driver.set_page_load_timeout(selenium_page_load_timeout_seconds())
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(selenium_script_timeout_seconds())
+    except Exception:
+        pass
+
+
+def sinposmart_tool_timeout_seconds() -> int:
+    try:
+        return max(60, int(os.environ.get("SINPOSMART_TOOL_TIMEOUT_SECONDS", str(DEFAULT_TOOL_TIMEOUT_SECONDS))))
+    except ValueError:
+        return DEFAULT_TOOL_TIMEOUT_SECONDS
 
 
 def post_sinposmart_backend_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2044,6 +2079,48 @@ class DutyGui(ctk.CTk):
             },
         )
 
+    def sinposmart_tool_event_callbacks(self, tool_name: str, tool_label: str):
+        state = {"started": False, "finished": False, "timer": None}
+        lock = threading.Lock()
+
+        def finish_once(status: str, result: str = "", error: str = "") -> None:
+            timer = None
+            with lock:
+                if state["finished"]:
+                    return
+                state["finished"] = True
+                timer = state.get("timer")
+                state["timer"] = None
+            if timer is not None:
+                timer.cancel()
+            self.send_tool_finish_event(tool_name, tool_label, status, result=result, error=error)
+
+        def timeout() -> None:
+            seconds = sinposmart_tool_timeout_seconds()
+            finish_once("failed", error=f"{tool_label}逾時未完成，已超過 {seconds} 秒。")
+
+        def start() -> None:
+            with lock:
+                if state["started"]:
+                    return
+                state["started"] = True
+            self.send_tool_start_event(tool_name, tool_label)
+            timer = threading.Timer(sinposmart_tool_timeout_seconds(), timeout)
+            timer.daemon = True
+            with lock:
+                if state["finished"]:
+                    return
+                state["timer"] = timer
+            timer.start()
+
+        def finish(result: str) -> None:
+            finish_once("completed", result=result)
+
+        def fail(error: str) -> None:
+            finish_once("failed", error=error)
+
+        return start, finish, fail
+
     def send_sinposmart_backend_event(
         self,
         record_type: str,
@@ -2535,8 +2612,7 @@ class DutyGui(ctk.CTk):
             options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
             driver = self.register_webdriver(webdriver.Chrome(options=options))
-            driver.set_page_load_timeout(30)
-            driver.set_script_timeout(30)
+            configure_webdriver_timeouts(driver)
             login(driver, user_id, password)
             detected_actor_no, actor_name = self.identify_logged_in_actor(driver)
             actor_no = detected_actor_no or self.actor_no_from_user_id(user_id) or actor_no
@@ -2644,6 +2720,7 @@ class DutyGui(ctk.CTk):
                 options.add_argument("--headless=new")
                 options.add_argument("--disable-popup-blocking")
                 driver = self.register_webdriver(webdriver.Chrome(options=options))
+                configure_webdriver_timeouts(driver)
                 login(driver, session.user_id, session.password)
                 paths = [self.write_schedule_snapshot(driver, value, slot_label) for value in target_dates]
             except Exception as exc:
@@ -2780,6 +2857,7 @@ class DutyGui(ctk.CTk):
                 options.add_argument("--headless=new")
                 options.add_argument("--disable-popup-blocking")
                 driver = self.register_webdriver(webdriver.Chrome(options=options))
+                configure_webdriver_timeouts(driver)
                 login(driver, session.user_id, session.password)
                 paths = [self.write_comparison_snapshot(driver, comparison_date, slot_label) for comparison_date in comparison_dates]
             except Exception as exc:
@@ -3386,13 +3464,14 @@ class DutyGui(ctk.CTk):
     def open_duty_sheet_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("duty_sheet", "勤務表登打")
         open_duty_sheet_dialog(
             self,
             user_id=user_id,
             password=password,
-            on_start=lambda: self.send_tool_start_event("duty_sheet", "勤務表登打"),
-            on_finish=lambda result: self.send_tool_finish_event("duty_sheet", "勤務表登打", "completed", result=result),
-            on_error=lambda error: self.send_tool_finish_event("duty_sheet", "勤務表登打", "failed", error=error),
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
         )
 
     def open_rest_time_automation(self) -> None:
@@ -3400,15 +3479,16 @@ class DutyGui(ctk.CTk):
         password = self.session.password if self.session and self.session.verified else self.password.get()
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("rest_time", "休息時間登打")
         open_rest_time_dialog(
             self,
             user_id=user_id,
             password=password,
             actor_no=actor_no,
             display_name=display_name,
-            on_start=lambda: self.send_tool_start_event("rest_time", "休息時間登打"),
-            on_finish=lambda result: self.send_tool_finish_event("rest_time", "休息時間登打", "completed", result=result),
-            on_error=lambda error: self.send_tool_finish_event("rest_time", "休息時間登打", "failed", error=error),
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
         )
 
     def open_monthly_base_automation(self) -> None:
@@ -3416,27 +3496,29 @@ class DutyGui(ctk.CTk):
         password = self.session.password if self.session and self.session.verified else self.password.get()
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("monthly_base", "勤務基準表登打")
         open_monthly_base_dialog(
             self,
             user_id=user_id,
             password=password,
             actor_no=actor_no,
             display_name=display_name,
-            on_start=lambda: self.send_tool_start_event("monthly_base", "勤務基準表登打"),
-            on_finish=lambda result: self.send_tool_finish_event("monthly_base", "勤務基準表登打", "completed", result=result),
-            on_error=lambda error: self.send_tool_finish_event("monthly_base", "勤務基準表登打", "failed", error=error),
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
         )
 
     def open_daily_vehicle_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("daily_vehicle", "車輛保養清點")
         start_daily_vehicle_automation(
             self,
             user_id=user_id,
             password=password,
-            on_start=lambda: self.send_tool_start_event("daily_vehicle", "車輛保養清點"),
-            on_finish=lambda result: self.send_tool_finish_event("daily_vehicle", "車輛保養清點", "completed", result=result),
-            on_error=lambda error: self.send_tool_finish_event("daily_vehicle", "車輛保養清點", "failed", error=error),
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
         )
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
@@ -4382,6 +4464,7 @@ class DutyGui(ctk.CTk):
                 options.add_argument("--headless=new")
             options.add_argument("--disable-popup-blocking")
             driver = self.register_webdriver(webdriver.Chrome(options=options))
+            configure_webdriver_timeouts(driver)
             login(driver, session.user_id, session.password)
             job = first_job
             duplicate_cache: dict[tuple[str, str, str], list[str]] = {}
