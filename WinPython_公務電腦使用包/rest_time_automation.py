@@ -773,19 +773,14 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
         }
         function findDayControl(row, day) {
           const controls = editableControls(row);
-          const dayPattern = new RegExp(`^_pln_\\d+_${day}$`);
-          const paddedDayPattern = new RegExp(`^_pln_\\d+_${String(day).padStart(2, '0')}$`);
           for (const el of controls) {
             const key = el.id || el.name || '';
-            if (dayPattern.test(key) || paddedDayPattern.test(key)) return el;
+            const match = key.match(/^_pln_(\\d+)_(\\d+)$/);
+            if (match && Number(match[2]) === Number(day)) return el;
           }
           const candidates = [
-            `[name$="_${day}"]`,
-            `[name$="_${String(day).padStart(2, '0')}"]`,
             `#_pln_${day}`,
             `#_pln_${String(day).padStart(2, '0')}`,
-            `[id$="_${day}"]`,
-            `[id$="_${String(day).padStart(2, '0')}"]`,
           ];
           for (const selector of candidates) {
             const el = controls.find((control) => control.matches(selector));
