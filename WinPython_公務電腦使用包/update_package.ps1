@@ -61,7 +61,7 @@ $alwaysSkipFiles = @(
 $preserveIfExistsFiles = @(
     "rest_time_automation_config.json"
 )
-$skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token")
+$skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token", ".jsonl")
 
 function Test-SkipPackagePath {
     param([string]$RelativePath)

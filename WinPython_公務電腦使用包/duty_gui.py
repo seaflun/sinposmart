@@ -157,6 +157,16 @@ def load_package_env() -> None:
         os.environ[key] = value.strip().strip('"').strip("'")
 
 
+def current_app_version() -> str:
+    version_path = Path(__file__).with_name("VERSION.txt")
+    try:
+        if version_path.exists():
+            return version_path.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        pass
+    return ""
+
+
 load_package_env()
 
 
@@ -2135,6 +2145,8 @@ class DutyGui(ctk.CTk):
     ) -> None:
         identity = self.sinposmart_identity_fields(actor_no=actor_no, user_id=user_id)
         action_fields = self.sinposmart_action_fields(action)
+        snapshot_data = dict(snapshot or {})
+        snapshot_data.setdefault("app_version", current_app_version())
         payload = {
             "event_id": f"sinposmart-{datetime.now():%Y%m%d%H%M%S%f}-{uuid4().hex}",
             "occurred_at": datetime.now().isoformat(timespec="seconds"),
@@ -2145,7 +2157,7 @@ class DutyGui(ctk.CTk):
             "source": APP_DISPLAY_NAME,
             "error": error,
             "result_ref": result_ref,
-            "snapshot": snapshot or {},
+            "snapshot": snapshot_data,
             **identity,
             **action_fields,
         }

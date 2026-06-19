@@ -10,7 +10,7 @@
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
-4. 每次在本專案開始工作前，先確認雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills，並全部同步到本機 `%USERPROFILE%\.codex\skills` 後再使用。同步必須保留子資料夾內容並驗證雲端/本機 `SKILL.md` hash 一致；PowerShell 不要用 `Copy-Item -LiteralPath ...\*` 當作萬用字元同步。
+4. 每次在本專案開始工作前，先從目前 repo 往上搜尋 `專案\SKILL\install-skills-from-cloud.ps1` 或 `專案\skill\install-skills-from-cloud.ps1`，找到後執行 `powershell -NoProfile -ExecutionPolicy Bypass -File "<找到的腳本路徑>"`，由腳本同步雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills 到本機 `%USERPROFILE%\.codex\skills`，並驗證雲端/本機 `SKILL.md` hash 一致；若找不到腳本或腳本失敗，先停止工作。
 
 ## Language
 
@@ -68,7 +68,7 @@
 - 不要新增 dependency，除非使用者明確同意。
 - 不要修改程式邏輯，除非任務明確要求。
 - 啟動 SinpoSmart GUI 時，預設使用無黑窗模式：優先用 `WinPython_公務電腦使用包\RUN_DUTY_GUI_WINPYTHON.bat`、`duty_gui.pyw` 或 `pythonw.exe`；不要直接用 `py duty_gui.py`、`python duty_gui.py` 或會留下黑色 console 視窗的方式啟動，除非正在做明確的 console 除錯。
-- 若 tracked config 因本機執行變成 dirty，例如 `WinPython_公務電腦使用包\duty_sheet_legacy\config.json`，預設不要 stage、不要讀內容，只回報檔名與風險；除非使用者明確要求，否則不把 runtime config 納入 commit 或 release。
+- 若 tracked config 因本機執行變成 dirty，例如 `WinPython_公務電腦使用包\duty_sheet_legacy\config.json`，預設不要 stage、不要讀內容；除非使用者明確要求，否則不把 runtime config 納入 commit 或 release。這類已知 runtime config 若與本次任務無關，不必在一般完成回報重複列為風險；只有在使用者詢問 git 狀態、dirty 檔、設定檔，或它影響 staging、測試、打包、release 時才提。
 
 ## Python file policy
 
@@ -120,7 +120,7 @@
 - 未經使用者要求，不要自動建立 commit。
 - 若使用者要求 commit，先測試或說明無法測試的原因，再提交。
 - commit 後回報 commit hash 與提交檔案摘要。
-- 若遇到 `.git/*.lock`，先檢查是否仍有 `git` process；若沒有 process 且 lock 檔看起來是 stale，仍需先請使用者確認才能刪除。若 commit、push 或 release 不受影響，保留 lock 檔並在完成回報列為風險。
+- 若遇到 `.git/*.lock`，可自動搜尋本 repo `.git` 內的 lock 檔；先檢查是否仍有 `git` 寫入程序（例如 commit、push、fetch、merge、rebase、gc、pack-refs），若沒有且 lock 檔看起來是 stale，可直接刪除 stale lock，不需再次詢問使用者。若仍有寫入程序，保留 lock 檔並回報風險。
 
 ## Completion report
 
