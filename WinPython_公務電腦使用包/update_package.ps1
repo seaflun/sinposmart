@@ -97,6 +97,48 @@ function Get-RunningDutyGuiProcesses {
         }
 }
 
+function Send-UpdateLogoutEvent {
+    $client = $null
+    $stream = $null
+    $asyncResult = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $asyncResult = $client.BeginConnect("127.0.0.1", 47631, $null, $null)
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne(1500)) {
+            Write-Warning "Could not report update logout: command server timeout."
+            return $false
+        }
+
+        $client.EndConnect($asyncResult)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 5000
+        $stream.WriteTimeout = 5000
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("update_logout`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+
+        $buffer = New-Object byte[] 64
+        $count = $stream.Read($buffer, 0, $buffer.Length)
+        if ($count -gt 0) {
+            $response = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count).Trim()
+            Write-Host "Update logout event: $response"
+        }
+        return $true
+    } catch {
+        Write-Warning "Could not report update logout: $_"
+        return $false
+    } finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+        if ($client) {
+            $client.Close()
+        }
+        if ($asyncResult -and $asyncResult.AsyncWaitHandle) {
+            $asyncResult.AsyncWaitHandle.Dispose()
+        }
+    }
+}
+
 function Stop-RunningDutyGui {
     $processes = @(Get-RunningDutyGuiProcesses)
     if (-not $processes) {
@@ -356,6 +398,7 @@ try {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
 
+    Send-UpdateLogoutEvent | Out-Null
     $wasRunning = Stop-RunningDutyGui
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
     Invoke-SetupAfterUpdate

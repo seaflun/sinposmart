@@ -65,6 +65,30 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn('snapshot_data.setdefault("app_version", current_app_version())', source)
         self.assertIn('"snapshot": snapshot_data', source)
 
+    def test_update_logout_command_reports_logout_synchronously(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn('elif message == "update_logout":', source)
+        self.assertIn("def report_update_logout(self) -> bool:", source)
+        self.assertIn('"logout"', source)
+        self.assertIn('trigger_type="update"', source)
+        self.assertIn("immediate=True", source)
+
+    def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertLess(
+            source.index("write_pending_sinposmart_backend_events(pending)"),
+            source.index("response = post_sinposmart_backend_event(entry)"),
+        )
+
+    def test_update_package_requests_logout_before_stopping_gui(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("function Send-UpdateLogoutEvent", script)
+        self.assertIn("update_logout", script)
+        self.assertLess(script.index("Send-UpdateLogoutEvent"), script.index("$wasRunning = Stop-RunningDutyGui"))
+
     def test_powershell_scripts_parse(self) -> None:
         root = package_dir()
         scripts = [

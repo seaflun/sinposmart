@@ -248,8 +248,16 @@ def start_single_instance_command_server(app: "DutyGui") -> None:
                         message = conn.recv(64).decode("utf-8", errors="ignore").strip().lower()
                     except OSError:
                         message = ""
-                if message == "show":
-                    app.after(0, app.show_from_tray)
+                    response = "ignored\n"
+                    if message == "show":
+                        app.after(0, app.show_from_tray)
+                        response = "ok\n"
+                    elif message == "update_logout":
+                        response = "ok\n" if app.report_update_logout() else "skipped\n"
+                    try:
+                        conn.sendall(response.encode("utf-8"))
+                    except OSError:
+                        pass
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -483,6 +491,7 @@ def enqueue_sinposmart_backend_event(payload: dict[str, Any]) -> None:
 def send_sinposmart_backend_event_worker(payload: dict[str, Any]) -> None:
     pending = load_pending_sinposmart_backend_events()
     pending.append(payload)
+    write_pending_sinposmart_backend_events(pending)
     sent_count = 0
     try:
         for index, entry in enumerate(pending, start=1):
@@ -2142,6 +2151,7 @@ class DutyGui(ctk.CTk):
         snapshot: dict[str, Any] | None = None,
         actor_no: str = "",
         user_id: str = "",
+        immediate: bool = False,
     ) -> None:
         identity = self.sinposmart_identity_fields(actor_no=actor_no, user_id=user_id)
         action_fields = self.sinposmart_action_fields(action)
@@ -2161,7 +2171,10 @@ class DutyGui(ctk.CTk):
             **identity,
             **action_fields,
         }
-        enqueue_sinposmart_backend_event(payload)
+        if immediate:
+            send_sinposmart_backend_event_worker(payload)
+        else:
+            enqueue_sinposmart_backend_event(payload)
 
     def schedule_snapshot_summary(self, paths: list[Path]) -> dict[str, Any]:
         days = []
@@ -3220,6 +3233,20 @@ class DutyGui(ctk.CTk):
         self.refresh_duty_tasks()
         self.next_task_text.set("下一項任務：-")
         self.duty_status_text.set("")
+
+    def report_update_logout(self) -> bool:
+        logout_session = self.session if self.session and self.session.verified else None
+        if not logout_session:
+            return False
+        self.send_sinposmart_backend_event(
+            "logout",
+            status="ok",
+            trigger_type="update",
+            actor_no=logout_session.actor_no,
+            user_id=logout_session.user_id,
+            immediate=True,
+        )
+        return True
 
     def update_login_panel(self) -> None:
         if not hasattr(self, "login_button"):
