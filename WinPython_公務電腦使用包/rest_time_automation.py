@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
@@ -112,6 +113,74 @@ def format_automation_error(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
+def current_roc_year_month() -> tuple[int, int]:
+    today = date.today()
+    return today.year - 1911, today.month
+
+
+def year_options(center_year: int | None = None) -> list[str]:
+    center = center_year or current_roc_year_month()[0]
+    return [str(year) for year in range(center - 1, center + 2)]
+
+
+def month_options() -> list[str]:
+    return [f"{month:02d}" for month in range(1, 13)]
+
+
+def selected_year_month(year_text: str, month_text: str) -> tuple[int, int]:
+    try:
+        roc_year = int(str(year_text).strip())
+        month = int(str(month_text).strip())
+    except ValueError as exc:
+        raise RuntimeError("請選擇正確的年月。") from exc
+    if roc_year < 1 or not 1 <= month <= 12:
+        raise RuntimeError("請選擇正確的年月。")
+    return roc_year, month
+
+
+def format_roc_year_month(roc_year: int, month: int) -> str:
+    return f"{int(roc_year)}年{int(month):02d}月"
+
+
+def validate_selected_year_month(source_label: str, selected_year: int, selected_month: int, actual_year: int, actual_month: int) -> None:
+    if int(selected_year) == int(actual_year) and int(selected_month) == int(actual_month):
+        return
+    raise RuntimeError(
+        f"選擇年月為 {format_roc_year_month(selected_year, selected_month)}，"
+        f"但{source_label}為 {format_roc_year_month(actual_year, actual_month)}，請確認後再執行。"
+    )
+
+
+def workbook_year_month(workbook_path: Path) -> tuple[int, int]:
+    wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
+    try:
+        roc_year, month, _days = workbook_date_info(wb)
+        return roc_year, month
+    finally:
+        wb.close()
+
+
+def workbook_default_year_month(workbook_path: Path) -> tuple[int, int]:
+    try:
+        if workbook_path.exists():
+            return workbook_year_month(workbook_path)
+    except Exception:
+        pass
+    return current_roc_year_month()
+
+
+def validate_workbook_year_month(workbook_path: Path, selected_year: int, selected_month: int) -> None:
+    actual_year, actual_month = workbook_year_month(workbook_path)
+    validate_selected_year_month("Excel", selected_year, selected_month, actual_year, actual_month)
+
+
+def extract_base_month_from_text(text: str) -> tuple[int, int] | None:
+    match = re.search(r"目前編輯月份為[:：]?\s*(\d{2,3})年\s*(\d{1,2})月", str(text or ""))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
@@ -128,8 +197,8 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_rest_time_dialog", dialog)
     dialog.title("SinpoSmart - 休息時間登打")
-    dialog.geometry("430x300")
-    dialog.minsize(430, 300)
+    dialog.geometry("430x350")
+    dialog.minsize(430, 350)
     dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
@@ -155,6 +224,9 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     form.columnconfigure(1, weight=1)
 
     file_var = tk.StringVar(value=str(default_workbook_path()))
+    default_year, default_month = workbook_default_year_month(Path(file_var.get().strip()))
+    year_var = tk.StringVar(value=str(default_year))
+    month_var = tk.StringVar(value=f"{default_month:02d}")
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
 
     ctk.CTkLabel(form, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=(4, 12))
@@ -168,6 +240,9 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if path:
             file_var.set(path)
             save_last_workbook_path(Path(path))
+            file_year, file_month = workbook_default_year_month(Path(path))
+            year_var.set(str(file_year))
+            month_var.set(f"{file_month:02d}")
             status_var.set("已選擇勤務表 Excel。")
 
     browse_button = ctk.CTkButton(
@@ -181,6 +256,14 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         hover_color=UI_BLUE_HOVER,
     )
     browse_button.grid(row=1, column=2, sticky=tk.E, padx=(8, 12), pady=(4, 12))
+
+    ctk.CTkLabel(form, text="年月", text_color=UI_MUTED, font=FONT_BODY).grid(row=2, column=0, sticky=tk.W, padx=(12, 8), pady=(0, 12))
+    month_row = ctk.CTkFrame(form, fg_color="transparent")
+    month_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(0, 12))
+    ctk.CTkOptionMenu(month_row, variable=year_var, values=year_options(default_year), width=92, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
+    ctk.CTkOptionMenu(month_row, variable=month_var, values=month_options(), width=78, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
     action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
@@ -212,6 +295,11 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if not workbook_path.exists():
             messagebox.showwarning("找不到 Excel", "請選擇勤務表 Excel 檔案。", parent=dialog)
             return
+        try:
+            expected_roc_year, expected_month = selected_year_month(year_var.get(), month_var.get())
+        except RuntimeError as exc:
+            messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
+            return
         save_last_workbook_path(workbook_path)
         if on_start is not None:
             on_start()
@@ -220,7 +308,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
 
         def worker() -> None:
             try:
-                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no)
+                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
                     on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
@@ -280,8 +368,8 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
     dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_monthly_base_dialog", dialog)
     dialog.title("SinpoSmart - 勤務基準表登打")
-    dialog.geometry("430x280")
-    dialog.minsize(430, 280)
+    dialog.geometry("430x330")
+    dialog.minsize(430, 330)
     dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
@@ -306,6 +394,17 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
     ctk.CTkLabel(info, text="固定來源", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
     info.columnconfigure(0, weight=1)
     ctk.CTkLabel(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
+
+    default_year, default_month = current_roc_year_month()
+    year_var = tk.StringVar(value=str(default_year))
+    month_var = tk.StringVar(value=f"{default_month:02d}")
+    month_row = ctk.CTkFrame(info, fg_color="transparent")
+    month_row.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 12))
+    ctk.CTkLabel(month_row, text="年月", text_color=UI_MUTED, font=FONT_BODY).pack(side=tk.LEFT, padx=(0, 8))
+    ctk.CTkOptionMenu(month_row, variable=year_var, values=year_options(default_year), width=92, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
+    ctk.CTkOptionMenu(month_row, variable=month_var, values=month_options(), width=78, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
     action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
@@ -342,6 +441,11 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         if not actor:
             messagebox.showwarning("缺少番號", "請先在主視窗確認番號，再啟動每月基準表登打。", parent=dialog)
             return
+        try:
+            expected_roc_year, expected_month = selected_year_month(year_var.get(), month_var.get())
+        except RuntimeError as exc:
+            messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
+            return
         set_running(True)
         set_status("讀取輪休基準表並開啟勤務基準表...")
 
@@ -349,7 +453,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             try:
                 if on_start is not None:
                     on_start()
-                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True)
+                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
                     on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
@@ -434,8 +538,12 @@ def submit_rest_entries(
     status: Callable[[str], None] | None = None,
     keep_browser_open: bool = False,
     actor_no: str = "",
+    expected_roc_year: int | None = None,
+    expected_month: int | None = None,
 ) -> str:
     status = status or (lambda _message: None)
+    if expected_roc_year is not None and expected_month is not None:
+        validate_workbook_year_month(workbook_path, expected_roc_year, expected_month)
     target_name = workbook_person_name(workbook_path, actor_no)
     driver = build_driver(headless=headless)
     inserted = 0
@@ -447,6 +555,9 @@ def submit_rest_entries(
         status("登入完成，開啟勤務基準表...")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
+        if expected_roc_year is not None and expected_month is not None:
+            status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
+            select_base_month(driver, expected_roc_year, expected_month)
         person = find_person_link(driver, user_id, target_no=actor_no, target_name=target_name)
         status(f"找到個人連結：{person.name}（系統儲存列 {person.staff_no}）")
         entries = parse_rest_entries(workbook_path, target_name=person.name, target_no=person.staff_no)
@@ -481,10 +592,14 @@ def submit_monthly_base_entries(
     headless: bool,
     status: Callable[[str], None] | None = None,
     keep_browser_open: bool = False,
+    expected_roc_year: int | None = None,
+    expected_month: int | None = None,
 ) -> str:
     status = status or (lambda _message: None)
     actor_no = str(actor_no or "").strip()
     plan = fetch_monthly_base_plan(actor_no)
+    if expected_roc_year is not None and expected_month is not None:
+        validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
     driver = build_driver(headless=headless)
     success = False
     try:
@@ -754,8 +869,14 @@ def select_base_month(driver, roc_year: int, month: int) -> None:
         raise RuntimeError("勤務基準表找不到年月與查詢欄位。")
     if not result.get("okYear") or not result.get("okMonth"):
         raise RuntimeError(f"勤務基準表無法切換到 {roc_year}年{month:02d}月。")
-    expected_pattern = re.compile(rf"目前編輯月份為:\s*{roc_year}年{month:02d}月")
-    WebDriverWait(driver, 20).until(lambda d: expected_pattern.search(current_page_text(d)))
+    try:
+        WebDriverWait(driver, 20).until(lambda d: extract_base_month_from_text(current_page_text(d)) is not None)
+    except TimeoutException as exc:
+        raise RuntimeError("網站沒有顯示目前編輯月份，無法確認年月。") from exc
+    actual = extract_base_month_from_text(current_page_text(driver))
+    if not actual:
+        raise RuntimeError("網站沒有顯示目前編輯月份，無法確認年月。")
+    validate_selected_year_month("網站", roc_year, month, actual[0], actual[1])
     time.sleep(0.8)
 
 
@@ -779,7 +900,7 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
           rows.sort((a, b) => a.querySelectorAll('input, textarea, select, button').length - b.querySelectorAll('input, textarea, select, button').length);
           return rows;
         }
-        function findDayControl(row, day) {
+        function findDayControl(row, day, days) {
           const controls = editableControls(row);
           for (const el of controls) {
             const key = el.id || el.name || '';
@@ -794,15 +915,46 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
             const el = controls.find((control) => control.matches(selector));
             if (el) return el;
           }
-          const planControls = controls.filter((el) => /^_pln_\\d+_\\d+$/.test(el.id || el.name || ''));
+          const planControls = dayPlanControls(row, days);
           if (planControls.length >= Number(day)) return planControls[Number(day) - 1];
           return null;
+        }
+        function dayPlanControls(row, days) {
+          return editableControls(row).filter((el) => {
+            const match = (el.id || el.name || '').match(/^_pln_(\\d+)_(\\d+)$/);
+            if (!match) return false;
+            const day = Number(match[2]);
+            return Number(match[2]) >= 1 && day <= Number(days);
+          });
+        }
+        function missingDayControls(row, data) {
+          const missing = [];
+          for (const day in data) {
+            if (!findDayControl(row, day, Object.keys(data).length)) missing.push(day);
+          }
+          return missing;
+        }
+        function dispatchPlanInput(el) {
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          el.dispatchEvent(new Event('blur', {bubbles: true}));
+          try { if (typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch (_error) {}
+        }
+        function clearRowValues(row, days) {
+          const controls = dayPlanControls(row, days);
+          for (const el of controls) {
+            try {
+              el.focus();
+              el.value = '';
+              dispatchPlanInput(el);
+            } catch (_error) {}
+          }
         }
         function setRowValues(row, data) {
           let count = 0;
           const missing = [];
           for (const day in data) {
-            const el = findDayControl(row, day);
+            const el = findDayControl(row, day, Object.keys(data).length);
             if (!el) {
               missing.push(day);
               continue;
@@ -810,10 +962,7 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
             try {
               el.focus();
               el.value = data[day];
-              el.dispatchEvent(new Event('input', {bubbles: true}));
-              el.dispatchEvent(new Event('change', {bubbles: true}));
-              el.dispatchEvent(new Event('blur', {bubbles: true}));
-              try { if (typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch (_error) {}
+              dispatchPlanInput(el);
               count += 1;
             } catch (_error) {
               missing.push(day);
@@ -824,6 +973,9 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
         function deepFillByName(win, personName, data) {
           try {
             for (const row of personRows(win, personName)) {
+              const missingBeforeClear = missingDayControls(row, data);
+              if (missingBeforeClear.length) return {count: 0, missing: missingBeforeClear};
+              clearRowValues(row, Object.keys(data).length);
               return setRowValues(row, data);
             }
           } catch (_error) {}

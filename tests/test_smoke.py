@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import subprocess
 import sys
+import tempfile
 import unittest
 import os
 from pathlib import Path
@@ -16,6 +18,13 @@ def package_dir() -> Path:
     if len(candidates) != 1:
         raise AssertionError(f"expected one WinPython package directory, found {len(candidates)}")
     return candidates[0]
+
+
+def rest_time_module():
+    root = package_dir()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return importlib.import_module("rest_time_automation")
 
 
 class PackageSmokeTests(unittest.TestCase):
@@ -94,6 +103,52 @@ class PackageSmokeTests(unittest.TestCase):
         for callback_name in ("on_start=on_start", "on_finish=on_finish", "on_error=on_error"):
             with self.subTest(callback_name=callback_name):
                 self.assertGreaterEqual(source.count(callback_name), 4)
+
+    def test_rest_and_monthly_base_dialogs_have_year_month_controls(self) -> None:
+        source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("year_var", source)
+        self.assertIn("month_var", source)
+        self.assertIn("selected_year_month", source)
+        self.assertIn("expected_roc_year", source)
+        self.assertIn("expected_month", source)
+
+    def test_rest_time_rejects_workbook_month_mismatch(self) -> None:
+        module = rest_time_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.cell(row=2, column=4).value = 115
+        sheet.cell(row=2, column=5).value = 7
+        sheet.cell(row=2, column=7).value = 31
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "rest.xlsx"
+            workbook.save(path)
+
+            with self.assertRaisesRegex(RuntimeError, "Excel.*115年07月"):
+                module.validate_workbook_year_month(path, 115, 6)
+
+    def test_monthly_base_rejects_selected_month_mismatch(self) -> None:
+        module = rest_time_module()
+
+        with self.assertRaisesRegex(RuntimeError, "勤務基準表.*115年07月"):
+            module.validate_selected_year_month("勤務基準表", 115, 6, 115, 7)
+
+    def test_base_month_text_can_detect_site_month_mismatch(self) -> None:
+        module = rest_time_module()
+
+        self.assertEqual(module.extract_base_month_from_text("目前編輯月份為: 115年07月"), (115, 7))
+        with self.assertRaisesRegex(RuntimeError, "網站.*115年07月"):
+            module.validate_selected_year_month("網站", 115, 6, 115, 7)
+
+    def test_monthly_base_fill_clears_existing_values_before_rewrite(self) -> None:
+        source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("function clearRowValues(row, days)", source)
+        self.assertIn("function dayPlanControls(row, days)", source)
+        self.assertIn("Number(match[2]) >= 1", source)
+        self.assertIn("el.value = ''", source)
+        self.assertLess(source.index("clearRowValues(row, Object.keys(data).length)"), source.index("return setRowValues(row, data)"))
 
     def test_update_logout_command_reports_logout_synchronously(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
