@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 import unittest
@@ -64,6 +65,35 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("snapshot_data = dict(snapshot or {})", source)
         self.assertIn('snapshot_data.setdefault("app_version", current_app_version())', source)
         self.assertIn('"snapshot": snapshot_data', source)
+
+    def test_sinposmart_backend_event_call_keywords_match_signature(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        signature_keywords: set[str] = set()
+        call_keywords: set[str] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "send_sinposmart_backend_event":
+                signature_keywords = {arg.arg for arg in node.args.args[2:]}
+                signature_keywords.update(arg.arg for arg in node.args.kwonlyargs)
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "send_sinposmart_backend_event":
+                call_keywords.update(keyword.arg for keyword in node.keywords if keyword.arg)
+
+        self.assertIn("send_sinposmart_backend_event", source)
+        self.assertFalse(call_keywords - signature_keywords)
+
+    def test_four_tool_entries_register_sinposmart_callbacks(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        for tool_name in ("duty_sheet", "rest_time", "monthly_base", "daily_vehicle"):
+            with self.subTest(tool_name=tool_name):
+                self.assertIn(f'self.sinposmart_tool_event_callbacks("{tool_name}"', source)
+        for callback_name in ("on_start=on_start", "on_finish=on_finish", "on_error=on_error"):
+            with self.subTest(callback_name=callback_name):
+                self.assertGreaterEqual(source.count(callback_name), 4)
 
     def test_update_logout_command_reports_logout_synchronously(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")

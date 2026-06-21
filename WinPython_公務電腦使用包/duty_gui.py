@@ -2149,32 +2149,38 @@ class DutyGui(ctk.CTk):
         error: str = "",
         result_ref: str = "",
         snapshot: dict[str, Any] | None = None,
+        content: str | None = None,
         actor_no: str = "",
         user_id: str = "",
         immediate: bool = False,
     ) -> None:
-        identity = self.sinposmart_identity_fields(actor_no=actor_no, user_id=user_id)
-        action_fields = self.sinposmart_action_fields(action)
-        snapshot_data = dict(snapshot or {})
-        snapshot_data.setdefault("app_version", current_app_version())
-        payload = {
-            "event_id": f"sinposmart-{datetime.now():%Y%m%d%H%M%S%f}-{uuid4().hex}",
-            "occurred_at": datetime.now().isoformat(timespec="seconds"),
-            "fire_day": sinposmart_fire_day(),
-            "record_type": record_type,
-            "trigger_type": trigger_type,
-            "status": status,
-            "source": APP_DISPLAY_NAME,
-            "error": error,
-            "result_ref": result_ref,
-            "snapshot": snapshot_data,
-            **identity,
-            **action_fields,
-        }
-        if immediate:
-            send_sinposmart_backend_event_worker(payload)
-        else:
-            enqueue_sinposmart_backend_event(payload)
+        try:
+            identity = self.sinposmart_identity_fields(actor_no=actor_no, user_id=user_id)
+            action_fields = self.sinposmart_action_fields(action)
+            if content is not None:
+                action_fields["content"] = str(content)[:1000]
+            snapshot_data = dict(snapshot or {})
+            snapshot_data.setdefault("app_version", current_app_version())
+            payload = {
+                "event_id": f"sinposmart-{datetime.now():%Y%m%d%H%M%S%f}-{uuid4().hex}",
+                "occurred_at": datetime.now().isoformat(timespec="seconds"),
+                "fire_day": sinposmart_fire_day(),
+                "record_type": record_type,
+                "trigger_type": trigger_type,
+                "status": status,
+                "source": APP_DISPLAY_NAME,
+                "error": error,
+                "result_ref": result_ref,
+                "snapshot": snapshot_data,
+                **identity,
+                **action_fields,
+            }
+            if immediate:
+                send_sinposmart_backend_event_worker(payload)
+            else:
+                enqueue_sinposmart_backend_event(payload)
+        except Exception as exc:
+            print(f"SinpoSmart backend event skipped: {exc}", file=sys.stderr)
 
     def schedule_snapshot_summary(self, paths: list[Path]) -> dict[str, Any]:
         days = []
