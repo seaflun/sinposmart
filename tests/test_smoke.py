@@ -27,6 +27,13 @@ def rest_time_module():
     return importlib.import_module("rest_time_automation")
 
 
+def duty_rehearsal_module():
+    root = package_dir()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return importlib.import_module("duty_rehearsal")
+
+
 class PackageSmokeTests(unittest.TestCase):
     def test_package_entry_files_exist(self) -> None:
         root = package_dir()
@@ -175,6 +182,32 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertLess(
             source.index("write_pending_sinposmart_backend_events(pending)"),
             source.index("response = post_sinposmart_backend_event(entry)"),
+        )
+
+    def test_next_morning_0600_rest_includes_manual_return_at_0800(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150621",
+            rows=[
+                module.DutyRow("06-08", {"值班": ["28"], "休息": ["16"]}),
+                module.DutyRow("08-10", {"值班": ["12"], "休息": []}),
+                module.DutyRow("22-24", {"值班": ["28"], "休息": []}),
+            ],
+            summary={"在勤": ["16", "28"]},
+        )
+        yesterday = module.DutySheet(roc_date="1150620", summary={"在勤": ["28"]})
+        tomorrow = module.DutySheet(roc_date="1150622", summary={"在勤": ["16", "28"]})
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150621"), [], tomorrow)
+        rest_actions = [
+            action
+            for action in actions
+            if action.kind == "entry_log" and action.target == "16" and action.fields.get("領用事由及地點") in ("休息", "休息返隊")
+        ]
+
+        self.assertEqual(
+            [(action.time, action.actor, action.fields["出或入"], action.fields["領用事由及地點"], action.date_offset) for action in rest_actions],
+            [("06:00", "28", "出", "休息", 1), ("08:00", "28", "入", "休息返隊", 1)],
         )
 
     def test_update_package_requests_logout_before_stopping_gui(self) -> None:

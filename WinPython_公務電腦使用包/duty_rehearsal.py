@@ -2181,8 +2181,6 @@ def planned_actions(
         )
         if end is None:
             continue
-        if end_offset and start == 6:
-            continue
         end_hour = 0 if end == 24 else end
         end_time = f"{end_hour:02d}:00"
         end_actor = next_morning_entry_actor(today, end) if end_offset else entry_actor_at(today, yesterday, end, 0)
