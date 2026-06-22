@@ -41,6 +41,16 @@ UI_BLUE_HOVER = "#1d4ed8"
 FONT_BODY = (UI_FONT, 12)
 FONT_TITLE = (UI_FONT, 14, "bold")
 FONT_BUTTON = (UI_FONT, 12, "bold")
+CTK_COMBO_STYLE = {
+    "fg_color": UI_PANEL,
+    "border_color": UI_BORDER,
+    "button_color": "#dbeafe",
+    "button_hover_color": "#bfdbfe",
+    "dropdown_fg_color": "#ffffff",
+    "dropdown_hover_color": "#eff6ff",
+    "dropdown_text_color": UI_TEXT,
+    "text_color": UI_TEXT,
+}
 
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
@@ -118,13 +128,9 @@ def current_roc_year_month() -> tuple[int, int]:
     return today.year - 1911, today.month
 
 
-def year_options(center_year: int | None = None) -> list[str]:
-    center = center_year or current_roc_year_month()[0]
-    return [str(year) for year in range(center - 1, center + 2)]
-
-
-def month_options() -> list[str]:
-    return [f"{month:02d}" for month in range(1, 13)]
+def nearby_month_options(center_month: int | None = None) -> list[str]:
+    center = center_month or current_roc_year_month()[1]
+    return [f"{((center + offset - 1) % 12) + 1:02d}" for offset in (-1, 0, 1)]
 
 
 def selected_year_month(year_text: str, month_text: str) -> tuple[int, int]:
@@ -224,9 +230,11 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     form.columnconfigure(1, weight=1)
 
     file_var = tk.StringVar(value=str(default_workbook_path()))
-    default_year, default_month = workbook_default_year_month(Path(file_var.get().strip()))
-    year_var = tk.StringVar(value=str(default_year))
-    month_var = tk.StringVar(value=f"{default_month:02d}")
+    fixed_roc_year, current_month = current_roc_year_month()
+    _default_year, default_month = workbook_default_year_month(Path(file_var.get().strip()))
+    allowed_months = nearby_month_options(current_month)
+    default_month_text = f"{default_month:02d}"
+    month_var = tk.StringVar(value=default_month_text if default_month_text in allowed_months else f"{current_month:02d}")
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
 
     ctk.CTkLabel(form, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=(4, 12))
@@ -240,9 +248,10 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if path:
             file_var.set(path)
             save_last_workbook_path(Path(path))
-            file_year, file_month = workbook_default_year_month(Path(path))
-            year_var.set(str(file_year))
-            month_var.set(f"{file_month:02d}")
+            _file_year, file_month = workbook_default_year_month(Path(path))
+            file_month_text = f"{file_month:02d}"
+            if file_month_text in allowed_months:
+                month_var.set(file_month_text)
             status_var.set("已選擇勤務表 Excel。")
 
     browse_button = ctk.CTkButton(
@@ -260,9 +269,19 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     ctk.CTkLabel(form, text="年月", text_color=UI_MUTED, font=FONT_BODY).grid(row=2, column=0, sticky=tk.W, padx=(12, 8), pady=(0, 12))
     month_row = ctk.CTkFrame(form, fg_color="transparent")
     month_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(0, 12))
-    ctk.CTkOptionMenu(month_row, variable=year_var, values=year_options(default_year), width=92, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
-    ctk.CTkOptionMenu(month_row, variable=month_var, values=month_options(), width=78, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkComboBox(
+        month_row,
+        variable=month_var,
+        values=allowed_months,
+        state="readonly",
+        width=78,
+        height=32,
+        font=FONT_BODY,
+        dropdown_font=FONT_BODY,
+        **CTK_COMBO_STYLE,
+    ).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
     action_row = ctk.CTkFrame(body, fg_color=UI_BG)
@@ -296,7 +315,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             messagebox.showwarning("找不到 Excel", "請選擇勤務表 Excel 檔案。", parent=dialog)
             return
         try:
-            expected_roc_year, expected_month = selected_year_month(year_var.get(), month_var.get())
+            expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
         except RuntimeError as exc:
             messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
             return
@@ -395,15 +414,25 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
     info.columnconfigure(0, weight=1)
     ctk.CTkLabel(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
 
-    default_year, default_month = current_roc_year_month()
-    year_var = tk.StringVar(value=str(default_year))
-    month_var = tk.StringVar(value=f"{default_month:02d}")
+    fixed_roc_year, current_month = current_roc_year_month()
+    allowed_months = nearby_month_options(current_month)
+    month_var = tk.StringVar(value=f"{current_month:02d}")
     month_row = ctk.CTkFrame(info, fg_color="transparent")
     month_row.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 12))
     ctk.CTkLabel(month_row, text="年月", text_color=UI_MUTED, font=FONT_BODY).pack(side=tk.LEFT, padx=(0, 8))
-    ctk.CTkOptionMenu(month_row, variable=year_var, values=year_options(default_year), width=92, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
-    ctk.CTkOptionMenu(month_row, variable=month_var, values=month_options(), width=78, height=32, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkComboBox(
+        month_row,
+        variable=month_var,
+        values=allowed_months,
+        state="readonly",
+        width=78,
+        height=32,
+        font=FONT_BODY,
+        dropdown_font=FONT_BODY,
+        **CTK_COMBO_STYLE,
+    ).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
     action_row = ctk.CTkFrame(body, fg_color=UI_BG)
@@ -442,7 +471,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             messagebox.showwarning("缺少番號", "請先在主視窗確認番號，再啟動每月基準表登打。", parent=dialog)
             return
         try:
-            expected_roc_year, expected_month = selected_year_month(year_var.get(), month_var.get())
+            expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
         except RuntimeError as exc:
             messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
             return

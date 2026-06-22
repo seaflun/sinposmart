@@ -104,14 +104,22 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(callback_name=callback_name):
                 self.assertGreaterEqual(source.count(callback_name), 4)
 
-    def test_rest_and_monthly_base_dialogs_have_year_month_controls(self) -> None:
+    def test_rest_and_monthly_base_dialogs_use_fixed_year_and_three_month_combo(self) -> None:
         source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
 
-        self.assertIn("year_var", source)
         self.assertIn("month_var", source)
+        self.assertIn("nearby_month_options", source)
+        self.assertIn("CTK_COMBO_STYLE", source)
+        self.assertIn("ctk.CTkComboBox", source)
+        self.assertNotIn("ctk.CTkOptionMenu", source)
+        self.assertNotIn("year_var", source)
         self.assertIn("selected_year_month", source)
         self.assertIn("expected_roc_year", source)
         self.assertIn("expected_month", source)
+
+        module = rest_time_module()
+        self.assertEqual(module.nearby_month_options(6), ["05", "06", "07"])
+        self.assertEqual(module.nearby_month_options(12), ["11", "12", "01"])
 
     def test_rest_time_rejects_workbook_month_mismatch(self) -> None:
         module = rest_time_module()
@@ -155,6 +163,8 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertIn('elif message == "update_logout":', source)
         self.assertIn("def report_update_logout(self) -> bool:", source)
+        self.assertIn("def update_logout_identity(self)", source)
+        self.assertIn("last_update_logout_identity", source)
         self.assertIn('"logout"', source)
         self.assertIn('trigger_type="update"', source)
         self.assertIn("immediate=True", source)

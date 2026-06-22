@@ -689,6 +689,7 @@ class DutyGui(ctk.CTk):
         self.duty_data: dict[str, Any] = {}
         self.duty_action_compare: dict[int, dict[str, Any]] = {}
         self.session: LoginSession | None = None
+        self.last_update_logout_identity: dict[str, str] = {"actor_no": "", "user_id": ""}
         self.executed_due: set[int] = set()
         self.manual_completed_keys: set[str] = set()
         self.paused_due_indices: dict[int, str] = {}
@@ -3024,6 +3025,7 @@ class DutyGui(ctk.CTk):
         self.submit_comparison_refresh_scheduled = False
         self.cancel_auto_logout()
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
+        self.last_update_logout_identity = {"actor_no": actor_no, "user_id": user_id}
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
         if self.remember_login.get():
             self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
@@ -3240,16 +3242,29 @@ class DutyGui(ctk.CTk):
         self.next_task_text.set("下一項任務：-")
         self.duty_status_text.set("")
 
+    def update_logout_identity(self) -> tuple[str, str]:
+        if self.session and self.session.verified:
+            return self.session.actor_no, self.session.user_id
+        actor_no = self.actor_no.get().strip()
+        user_id = self.user_id.get().strip()
+        if actor_no or user_id:
+            return actor_no, user_id
+        return (
+            str(self.last_update_logout_identity.get("actor_no", "") or "").strip(),
+            str(self.last_update_logout_identity.get("user_id", "") or "").strip(),
+        )
+
     def report_update_logout(self) -> bool:
-        logout_session = self.session if self.session and self.session.verified else None
-        if not logout_session:
+        actor_no, user_id = self.update_logout_identity()
+        if not actor_no and not user_id:
             return False
         self.send_sinposmart_backend_event(
             "logout",
             status="ok",
             trigger_type="update",
-            actor_no=logout_session.actor_no,
-            user_id=logout_session.user_id,
+            actor_no=actor_no,
+            user_id=user_id,
+            content="更新前登出",
             immediate=True,
         )
         return True
@@ -4600,6 +4615,7 @@ class DutyGui(ctk.CTk):
             trigger_type=trigger_type,
             action=self.duty_actions[index],
             result_ref=result_path.name,
+            snapshot={"completion_key": completion_key},
         )
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
@@ -4629,6 +4645,7 @@ class DutyGui(ctk.CTk):
             trigger_type=trigger_type,
             action=self.duty_actions[index],
             result_ref=result_path.name,
+            snapshot={"completion_key": completion_key},
         )
         self.failed_due_retry_after.pop(index, None)
         if self.should_schedule_auto_logout(self.duty_actions[index], trigger_type) and self.session and self.session.verified:
@@ -4646,7 +4663,8 @@ class DutyGui(ctk.CTk):
 
     def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool, trigger_type: str) -> None:
         self.submitting_indices.discard(index)
-        self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed")
+        completion_key = self.action_completion_key(self.duty_actions[index])
+        self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed", completion_key=completion_key)
         self.send_sinposmart_backend_event(
             "action_result",
             status="failed",
@@ -4654,6 +4672,7 @@ class DutyGui(ctk.CTk):
             action=self.duty_actions[index],
             error=error,
             result_ref=result_path.name,
+            snapshot={"completion_key": completion_key},
         )
         if trigger_type == "due":
             self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)
