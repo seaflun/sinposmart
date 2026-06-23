@@ -7,6 +7,7 @@ import json
 import csv
 import io
 import re
+import sys
 import threading
 import time
 import traceback
@@ -70,6 +71,36 @@ MONTHLY_BASE_SYMBOLS = {
     "喪": "喪",
     "心": "❤",
 }
+FRONTEND_ERROR_MESSAGES = {
+    "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+    "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+    "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+}
+LOGIN_FAILURE_MARKERS = (
+    "登入失敗",
+    "登入狀態失效",
+    "密碼可能已變更",
+    "帳號密碼有誤",
+    "尚未申請帳號權限",
+    "帳號或密碼",
+    "重新登入",
+    "login119",
+    "_txtusername",
+    "_txtpassword",
+    "登入後元素",
+    "仍停留在登入頁",
+)
+UNSAFE_ERROR_MARKERS = (
+    "stacktrace",
+    "stack trace",
+    "traceback",
+    "chromedriver",
+    "selenium.common.exceptions",
+    "session token",
+    "cookie",
+    "password",
+)
 
 
 @dataclass(frozen=True)
@@ -115,12 +146,29 @@ class MonthlyBasePlan:
 
 def format_automation_error(exc: Exception) -> str:
     text = str(exc).strip()
+    lowered = text.lower()
+    if any(marker in lowered or marker in text for marker in LOGIN_FAILURE_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["login_failed"]
+    if "timeoutexception" in lowered or "timeout" in lowered or "timed out" in lowered or "逾時" in text:
+        return FRONTEND_ERROR_MESSAGES["timeout"]
+    if "nosuchelementexception" in lowered or "no such element" in lowered or "unable to locate element" in lowered:
+        return FRONTEND_ERROR_MESSAGES["no_such_element"]
+    if any(marker in lowered for marker in UNSAFE_ERROR_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["unknown_error"]
     if text:
         return text
     details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    lowered_details = details.lower()
+    if any(marker in lowered_details for marker in UNSAFE_ERROR_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["unknown_error"]
     if details:
         return details
-    return exc.__class__.__name__
+    return FRONTEND_ERROR_MESSAGES["unknown_error"]
+
+
+def log_automation_exception(context: str, exc: BaseException) -> None:
+    print(f"[automation-error] {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    traceback.print_exc()
 
 
 def current_roc_year_month() -> tuple[int, int]:
@@ -332,7 +380,8 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
                     on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
-                error = str(exc)
+                log_automation_exception("rest_time", exc)
+                error = format_automation_error(exc)
                 if on_error is not None:
                     on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
@@ -487,6 +536,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
                     on_finish(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
+                log_automation_exception("monthly_base", exc)
                 error = format_automation_error(exc)
                 if on_error is not None:
                     on_error(error)

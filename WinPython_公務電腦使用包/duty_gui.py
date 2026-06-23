@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -61,6 +62,7 @@ AUTO_CLEAN_RULES = (
 )
 
 from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 
 from daily_vehicle_automation import start_daily_vehicle_automation
@@ -424,6 +426,138 @@ def sinposmart_tool_timeout_seconds() -> int:
         return max(60, int(os.environ.get("SINPOSMART_TOOL_TIMEOUT_SECONDS", str(DEFAULT_TOOL_TIMEOUT_SECONDS))))
     except ValueError:
         return DEFAULT_TOOL_TIMEOUT_SECONDS
+
+
+class LoginFailedError(RuntimeError):
+    pass
+
+
+FRONTEND_ERROR_MESSAGES = {
+    "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+    "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+    "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+}
+LOGIN_FAILURE_MARKERS = (
+    "登入失敗",
+    "登入狀態失效",
+    "密碼可能已變更",
+    "帳號密碼有誤",
+    "尚未申請帳號權限",
+    "帳號或密碼",
+    "重新登入",
+    "重新輸入新密碼",
+    "login119",
+    "_txtusername",
+    "_txtpassword",
+    "登入後頁面",
+    "登入後元素",
+    "仍停留在登入頁",
+)
+UNSAFE_ERROR_MARKERS = (
+    "stacktrace",
+    "stack trace",
+    "traceback",
+    "chromedriver",
+    "selenium.common.exceptions",
+    "session token",
+    "cookie",
+    "password",
+)
+SENSITIVE_KEY_PARTS = (
+    "password",
+    "passwd",
+    "pwd",
+    "cookie",
+    "session",
+    "token",
+    "authorization",
+    "credential",
+    "secret",
+    "密碼",
+)
+
+
+def automation_error_code(error: BaseException | str | None, context: str = "") -> str:
+    text = str(error or "")
+    lowered = text.lower()
+    if isinstance(error, LoginFailedError):
+        return "login_failed"
+    if isinstance(error, TimeoutException):
+        return "timeout"
+    if isinstance(error, NoSuchElementException):
+        return "no_such_element"
+    if any(marker in lowered or marker in text for marker in LOGIN_FAILURE_MARKERS):
+        return "login_failed"
+    if context == "login" and any(marker in lowered for marker in ("no such element", "unable to locate element")):
+        return "login_failed"
+    if "timeout" in lowered or "timed out" in lowered or "逾時" in text:
+        return "timeout"
+    if "no such element" in lowered or "unable to locate element" in lowered or "找不到網頁元素" in text:
+        return "no_such_element"
+    return "unknown_error"
+
+
+def frontend_error_payload(error: BaseException | str | None, context: str = "") -> dict[str, str]:
+    code = automation_error_code(error, context=context)
+    return {
+        "error_code": code,
+        "message": FRONTEND_ERROR_MESSAGES[code],
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def contains_unsafe_error_detail(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in UNSAFE_ERROR_MARKERS)
+
+
+def is_sensitive_json_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(part in lowered for part in SENSITIVE_KEY_PARTS)
+
+
+def sanitize_frontend_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_frontend_json(item)
+            for key, item in value.items()
+            if not is_sensitive_json_key(str(key))
+        }
+    if isinstance(value, list):
+        return [sanitize_frontend_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_frontend_json(item) for item in value]
+    if isinstance(value, str) and contains_unsafe_error_detail(value):
+        return "已隱藏敏感或技術性錯誤內容"
+    return value
+
+
+def automation_failure_result(
+    error: BaseException | str,
+    action_index: int,
+    action: dict[str, Any],
+    save: bool,
+    visible: bool,
+    context: str = "",
+) -> dict[str, Any]:
+    safe_error = frontend_error_payload(error, context=context)
+    return {
+        "stage": "failed",
+        "timestamp": safe_error["timestamp"],
+        "updated_at": safe_error["timestamp"],
+        "action_index": action_index,
+        "action": sanitize_frontend_json(action),
+        "error_code": safe_error["error_code"],
+        "message": safe_error["message"],
+        "save": save,
+        "visible": visible,
+    }
+
+
+def log_automation_exception(context: str, error: BaseException) -> None:
+    print(f"[automation-error] {context}: {type(error).__name__}: {error}", file=sys.stderr)
+    traceback.print_exc()
 
 
 def post_sinposmart_backend_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2087,6 +2221,13 @@ class DutyGui(ctk.CTk):
         )
 
     def send_tool_finish_event(self, tool_name: str, tool_label: str, status: str, result: str = "", error: str = "") -> None:
+        error_snapshot: dict[str, str] = {}
+        if error:
+            if contains_unsafe_error_detail(error):
+                print(f"[automation-error] tool_finish {tool_name}: {error}", file=sys.stderr)
+            safe_error = frontend_error_payload(error)
+            error = safe_error["message"]
+            error_snapshot = safe_error
         self.send_sinposmart_backend_event(
             "tool_action_finished",
             status=status,
@@ -2096,6 +2237,7 @@ class DutyGui(ctk.CTk):
             snapshot={
                 "tool_name": tool_name,
                 "tool_label": tool_label,
+                **error_snapshot,
             },
         )
 
@@ -2160,7 +2302,10 @@ class DutyGui(ctk.CTk):
             action_fields = self.sinposmart_action_fields(action)
             if content is not None:
                 action_fields["content"] = str(content)[:1000]
-            snapshot_data = dict(snapshot or {})
+            if error and contains_unsafe_error_detail(error):
+                print(f"[automation-error] backend_event {record_type}: {error}", file=sys.stderr)
+                error = frontend_error_payload(error)["message"]
+            snapshot_data = sanitize_frontend_json(dict(snapshot or {}))
             snapshot_data.setdefault("app_version", current_app_version())
             payload = {
                 "event_id": f"sinposmart-{datetime.now():%Y%m%d%H%M%S%f}-{uuid4().hex}",
@@ -2649,9 +2794,11 @@ class DutyGui(ctk.CTk):
             detected_actor_no, actor_name = self.identify_logged_in_actor(driver)
             actor_no = detected_actor_no or self.actor_no_from_user_id(user_id) or actor_no
             if not actor_no:
-                raise RuntimeError("帳號或密碼可能錯誤，或登入後頁面沒有顯示可辨識的姓名。")
+                raise LoginFailedError("登入後頁面沒有顯示可辨識的姓名。")
         except Exception as exc:
-            self.after(0, lambda value=attempt_id, error=str(exc): self._login_failed(value, error))
+            log_automation_exception("verify_login", exc)
+            safe_error = frontend_error_payload(exc, context="login")
+            self.after(0, lambda value=attempt_id, payload=safe_error: self._login_failed(value, payload["message"], payload["error_code"], payload["timestamp"]))
             return
         finally:
             self.quit_registered_webdriver(driver)
@@ -2756,8 +2903,9 @@ class DutyGui(ctk.CTk):
                 login(driver, session.user_id, session.password)
                 paths = [self.write_schedule_snapshot(driver, value, slot_label) for value in target_dates]
             except Exception as exc:
-                error = str(exc)
-                self.after(0, lambda: self._schedule_failed(session.actor_no, session.user_id, error))
+                log_automation_exception("schedule_snapshot", exc)
+                safe_error = frontend_error_payload(exc)
+                self.after(0, lambda payload=safe_error: self._schedule_failed(session.actor_no, session.user_id, payload["message"], payload["error_code"], payload["timestamp"]))
                 return
             finally:
                 self.quit_registered_webdriver(driver)
@@ -2813,13 +2961,15 @@ class DutyGui(ctk.CTk):
             self.preview_path.set(str(selected_path))
             self.load_preview(selected_path, update_duty=False)
 
-    def _schedule_failed(self, actor_no: str, user_id: str, error: str) -> None:
+    def _schedule_failed(self, actor_no: str, user_id: str, error: str, error_code: str = "", error_timestamp: str = "") -> None:
         self.snapshot_running = False
+        snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
         self.send_sinposmart_backend_event(
             "error",
             status="failed",
             trigger_type="schedule",
             error=error,
+            snapshot=snapshot,
             actor_no=actor_no,
             user_id=user_id,
         )
@@ -2893,8 +3043,9 @@ class DutyGui(ctk.CTk):
                 login(driver, session.user_id, session.password)
                 paths = [self.write_comparison_snapshot(driver, comparison_date, slot_label) for comparison_date in comparison_dates]
             except Exception as exc:
-                error = str(exc)
-                self.after(0, lambda: self._comparison_failed(session.actor_no, session.user_id, error))
+                log_automation_exception("comparison_snapshot", exc)
+                safe_error = frontend_error_payload(exc)
+                self.after(0, lambda payload=safe_error: self._comparison_failed(session.actor_no, session.user_id, payload["message"], payload["error_code"], payload["timestamp"]))
                 return
             finally:
                 self.quit_registered_webdriver(driver)
@@ -2935,13 +3086,15 @@ class DutyGui(ctk.CTk):
             self.set_logged_in_status(self.session.actor_no)
         self.run_pending_hourly_comparison()
 
-    def _comparison_failed(self, actor_no: str, user_id: str, error: str) -> None:
+    def _comparison_failed(self, actor_no: str, user_id: str, error: str, error_code: str = "", error_timestamp: str = "") -> None:
         self.comparison_running = False
+        snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
         self.send_sinposmart_backend_event(
             "error",
             status="failed",
             trigger_type="comparison",
             error=error,
+            snapshot=snapshot,
             actor_no=actor_no,
             user_id=user_id,
         )
@@ -3055,14 +3208,15 @@ class DutyGui(ctk.CTk):
             self.set_logged_in_status(actor_no)
             self.refresh_comparison_background(login_target_date, "login", comparison_dates=duty_window_dates(login_target_date))
 
-    def _login_failed(self, attempt_id: int, error: str) -> None:
+    def _login_failed(self, attempt_id: int, error: str, error_code: str = "", error_timestamp: str = "") -> None:
         if attempt_id != self.login_attempt_id:
             return
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = None
-        self.login_status.set(f"登入失敗：{error}")
-        self.send_sinposmart_backend_event("login_failed", status="failed", trigger_type="login", error=error)
+        self.login_status.set(error)
+        snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
+        self.send_sinposmart_backend_event("login_failed", status="failed", trigger_type="login", error=error, snapshot=snapshot)
         messagebox.showerror("登入失敗", error)
         self.update_login_panel()
         self.refresh_tasks()
@@ -4563,38 +4717,35 @@ class DutyGui(ctk.CTk):
                     mirror_runtime_file_to_cloud(result_path, "form_tests")
                     self.after(0, lambda idx=index, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_succeeded(idx, path, note, origin))
                 except Exception as exc:
-                    error = str(exc)
-                    failure_result = {
-                        "stage": "failed",
-                        "updated_at": datetime.now().isoformat(timespec="seconds"),
-                        "action_index": index,
-                        "action": action,
-                        "error": error,
-                        "save": save,
-                        "visible": job_visible,
-                    }
+                    log_automation_exception("submit_action", exc)
+                    failure_result = automation_failure_result(exc, index, action, save, job_visible)
+                    error = failure_result["message"]
                     result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
                     mirror_runtime_file_to_cloud(result_path, "form_tests")
-                    self.after(0, lambda idx=index, err=error, path=result_path, note=notify, origin=trigger_type: self._save_work_log_item_failed(idx, err, path, note, origin))
+                    self.after(
+                        0,
+                        lambda idx=index, err=error, path=result_path, note=notify, origin=trigger_type,
+                        code=failure_result["error_code"], ts=failure_result["timestamp"]: self._save_work_log_item_failed(
+                            idx, err, path, note, origin, code, ts
+                        ),
+                    )
                 job = self.next_queued_submit_job(lane)
         except Exception as exc:
-            error = str(exc)
+            log_automation_exception("submit_worker", exc)
             index, action, result_path, save, job_visible, notify, trigger_type = first_job
+            failure_result = automation_failure_result(exc, index, action, save, job_visible, context="login")
+            error = failure_result["message"]
             if lane == "work":
                 self.after(0, lambda raw=(index, action, save, job_visible, notify, trigger_type), err=error: self.fallback_work_submit_to_entry(raw, err))
                 return
-            failure_result = {
-                "stage": "failed",
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "action_index": index,
-                "action": action,
-                "error": error,
-                "save": save,
-                "visible": job_visible,
-            }
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
             mirror_runtime_file_to_cloud(result_path, "form_tests")
-            self.after(0, lambda: self._save_work_log_item_failed(index, error, result_path, notify, trigger_type))
+            self.after(
+                0,
+                lambda code=failure_result["error_code"], ts=failure_result["timestamp"]: self._save_work_log_item_failed(
+                    index, error, result_path, notify, trigger_type, code, ts
+                ),
+            )
         finally:
             self.quit_registered_webdriver(driver)
             self.after(0, lambda value=lane: self._submit_worker_finished(value))
@@ -4661,10 +4812,22 @@ class DutyGui(ctk.CTk):
         self.refresh_duty_tasks()
         self.refresh_tasks()
 
-    def _save_work_log_item_failed(self, index: int, error: str, result_path: Path, notify: bool, trigger_type: str) -> None:
+    def _save_work_log_item_failed(
+        self,
+        index: int,
+        error: str,
+        result_path: Path,
+        notify: bool,
+        trigger_type: str,
+        error_code: str = "",
+        error_timestamp: str = "",
+    ) -> None:
         self.submitting_indices.discard(index)
         completion_key = self.action_completion_key(self.duty_actions[index])
         self.log_trigger(index, self.duty_actions[index], trigger_type, status="failed", completion_key=completion_key)
+        snapshot = {"completion_key": completion_key}
+        if error_code:
+            snapshot.update({"error_code": error_code, "message": error, "timestamp": error_timestamp})
         self.send_sinposmart_backend_event(
             "action_result",
             status="failed",
@@ -4672,7 +4835,7 @@ class DutyGui(ctk.CTk):
             action=self.duty_actions[index],
             error=error,
             result_ref=result_path.name,
-            snapshot={"completion_key": completion_key},
+            snapshot=snapshot,
         )
         if trigger_type == "due":
             self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)

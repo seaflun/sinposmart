@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,20 @@ def duty_rehearsal_module():
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     return importlib.import_module("duty_rehearsal")
+
+
+def duty_gui_module():
+    root = package_dir()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return importlib.import_module("duty_gui")
+
+
+def package_module(name: str):
+    root = package_dir()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return importlib.import_module(name)
 
 
 class PackageSmokeTests(unittest.TestCase):
@@ -78,7 +93,7 @@ class PackageSmokeTests(unittest.TestCase):
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("def current_app_version(", source)
-        self.assertIn("snapshot_data = dict(snapshot or {})", source)
+        self.assertIn("snapshot_data = sanitize_frontend_json(dict(snapshot or {}))", source)
         self.assertIn('snapshot_data.setdefault("app_version", current_app_version())', source)
         self.assertIn('"snapshot": snapshot_data', source)
 
@@ -100,6 +115,82 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertIn("send_sinposmart_backend_event", source)
         self.assertFalse(call_keywords - signature_keywords)
+
+    def test_frontend_error_payload_sanitizes_selenium_and_sensitive_details(self) -> None:
+        module = duty_gui_module()
+        from selenium.common.exceptions import NoSuchElementException, TimeoutException
+
+        cases = (
+            (
+                TimeoutException("Timed out receiving message from renderer\nStacktrace:\nChromeDriver"),
+                "timeout",
+                "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+            ),
+            (
+                NoSuchElementException("no such element: Unable to locate element\nStacktrace:\nChromeDriver"),
+                "no_such_element",
+                "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+            ),
+            (
+                RuntimeError("仍停留在 login119，找不到 _txtUsername 以外的登入後元素"),
+                "login_failed",
+                "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+            ),
+            (
+                RuntimeError("帳號密碼有誤或尚未申請帳號權限,請確認後再重新登入"),
+                "login_failed",
+                "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+            ),
+            (
+                RuntimeError("unexpected failure\ntraceback\nsession token abc\ncookie xyz\npassword secret\nChromeDriver"),
+                "unknown_error",
+                "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+            ),
+        )
+
+        for exc, error_code, message in cases:
+            with self.subTest(error_code=error_code):
+                payload = module.frontend_error_payload(exc)
+                self.assertEqual(payload["error_code"], error_code)
+                self.assertEqual(payload["message"], message)
+                self.assertRegex(payload["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+                rendered = json.dumps(payload, ensure_ascii=False).lower()
+                for forbidden in ("stacktrace", "traceback", "chromedriver", "cookie", "session token", "password secret"):
+                    self.assertNotIn(forbidden, rendered)
+
+    def test_automation_failure_result_uses_safe_error_fields(self) -> None:
+        module = duty_gui_module()
+        error = RuntimeError("raw traceback\nChromeDriver\ncookie=abc\nsession token=def\npassword secret")
+        result = module.automation_failure_result(
+            error,
+            action_index=3,
+            action={"kind": "work_log", "password": "secret", "headers": {"Cookie": "abc"}},
+            save=True,
+            visible=False,
+        )
+
+        self.assertEqual(result["stage"], "failed")
+        self.assertEqual(result["error_code"], "unknown_error")
+        self.assertEqual(result["message"], "執行失敗：系統發生未預期錯誤，請查看後端日誌。")
+        self.assertIn("timestamp", result)
+        rendered = json.dumps(result, ensure_ascii=False).lower()
+        for forbidden in ("stacktrace", "traceback", "chromedriver", "cookie", "session token", "password secret"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_tool_dialog_error_formatters_hide_selenium_details(self) -> None:
+        expected = {
+            "TimeoutException: timed out receiving message from renderer\nStacktrace:\nChromeDriver": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+            "NoSuchElementException: no such element: Unable to locate element\nStacktrace:\nChromeDriver": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+            "仍停留在 login119，找不到 _txtUsername 以外的登入後元素": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+            "帳號密碼有誤或尚未申請帳號權限,請確認後再重新登入": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+            "Traceback\nChromeDriver\ncookie=abc\nsession token=def\npassword secret": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+        }
+
+        for module_name in ("duty_sheet_automation", "rest_time_automation", "daily_vehicle_automation"):
+            module = package_module(module_name)
+            for raw, safe in expected.items():
+                with self.subTest(module=module_name, safe=safe):
+                    self.assertEqual(module.format_automation_error(RuntimeError(raw)), safe)
 
     def test_four_tool_entries_register_sinposmart_callbacks(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
