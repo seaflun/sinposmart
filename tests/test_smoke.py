@@ -275,6 +275,39 @@ class PackageSmokeTests(unittest.TestCase):
             source.index("response = post_sinposmart_backend_event(entry)"),
         )
 
+    def test_login_success_auto_syncs_credentials_without_export_gate(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        login_fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_login_succeeded"
+        )
+
+        self.assertNotIn("CREDENTIAL_EXPORT_USER_ID", source)
+        self.assertNotIn("self.credential_export_button = ctk.CTkButton", source)
+        self.assertIn("sync_credentials_after_login", {node.func.attr for node in ast.walk(login_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)})
+
+    def test_auto_credential_sync_uses_current_login_only(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        sync_fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "sync_credentials_after_login"
+        )
+        calls = {node.func.attr for node in ast.walk(sync_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+
+        self.assertIn("account_for_credential_sync", calls)
+        self.assertNotIn("saved_accounts_for_credential_sync", calls)
+
+    def test_credential_sync_worker_supports_silent_background_mode(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("notify_user: bool = True", source)
+        self.assertIn("notify_user=False", source)
+        self.assertIn("if notify_user:", source)
+
     def test_next_morning_0600_rest_includes_manual_return_at_0800(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(

