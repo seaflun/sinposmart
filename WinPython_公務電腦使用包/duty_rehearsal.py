@@ -43,7 +43,6 @@ WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 WORK_LOG_DEFAULTS_PATH = Path(__file__).with_name("work_log_defaults.json")
 
-HANDOFF_HOURS = [8, 10, 12, 14, 16, 18, 20, 22]
 OFF_DUTY_SUMMARY_KEYS = {
     "公假",
     "請休",
@@ -1919,9 +1918,34 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
 
 
 def prev_slot_duty(today: DutySheet, yesterday: DutySheet | None, handoff_hour: int) -> list[str]:
+    if handoff_hour == 0:
+        previous = people_at(today, 23, "值班")
+        return previous or (people_at(yesterday, 23, "值班") if yesterday else [])
     if handoff_hour == 8:
-        return people_at(yesterday, 6, "值班") if yesterday else []
-    return people_at(today, handoff_hour - 2, "值班")
+        previous = people_at(today, handoff_hour - 1, "值班")
+        return previous or (people_at(yesterday, 6, "值班") if yesterday else [])
+    return people_at(today, handoff_hour - 1, "值班")
+
+
+def handoff_hours_for_sheet(sheet: DutySheet) -> list[int]:
+    dynamic_hours: set[int] = set()
+    for row in sheet.rows:
+        start = slot_start(row.slot)
+        if start is None:
+            continue
+        if row.columns.get("值班"):
+            dynamic_hours.add(start)
+    return sorted(dynamic_hours)
+
+
+def handoff_start_hour(today: DutySheet, hour: int) -> int:
+    if hour == 0:
+        return 22
+    if hour == 8:
+        return 22
+    previous_row = row_for_hour(today, hour - 1)
+    previous_start = slot_start(previous_row.slot) if previous_row else None
+    return previous_start if previous_start is not None else hour - 2
 
 
 def case_counts(cases: list[CaseRecord], start_hour: int, end_hour: int) -> dict[str, int]:
@@ -2254,9 +2278,13 @@ def planned_actions(
         )
 
     # Duty handoff entry log and work log.
-    for hour in HANDOFF_HOURS:
+    for hour in handoff_hours_for_sheet(today):
         outgoing = prev_slot_duty(today, yesterday, hour)
         incoming = people_at(today, hour, "值班")
+        outgoing_entries = [no for no in outgoing if no not in set(incoming)]
+        incoming_entries = [no for no in incoming if no not in set(outgoing)]
+        if not outgoing_entries and not incoming_entries:
+            continue
         actor = outgoing[0] if outgoing else duty_actor_at(today, yesterday, hour)
         if hour == 8:
             time_range = "22-08"
@@ -2264,12 +2292,12 @@ def planned_actions(
             vehicle_items = unreturned_case_vehicle_items(yesterday_cases, work_log_defaults, roc_date(target - timedelta(days=1)))
             vehicle_items.extend(unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=8))
         else:
-            start_hour = hour - 2
+            start_hour = handoff_start_hour(today, hour)
             time_range = f"{start_hour:02d}-{hour:02d}"
             counts = case_counts(today_cases, start_hour, hour)
             vehicle_items = unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=hour)
         vehicle_out_count = sum(int(item.get("count", 0)) for item in vehicle_items)
-        for no in outgoing:
+        for no in outgoing_entries:
             actions.append(
                 PlannedAction(
                     kind="entry_log",
@@ -2289,7 +2317,7 @@ def planned_actions(
                     duplicate_key=f"entry:{target}:{hour}:值退:{no}",
                 )
             )
-        for no in incoming:
+        for no in incoming_entries:
             actions.append(
                 PlannedAction(
                     kind="entry_log",
@@ -2334,7 +2362,7 @@ def planned_actions(
         for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
             if action.source not in next_morning_sources:
                 continue
-            if action.time not in ("06:00", "07:55", "08:00", "08:05"):
+            if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
                 continue
             action.date_offset = 1
             actions.append(action)
