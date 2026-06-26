@@ -462,6 +462,107 @@ class PackageSmokeTests(unittest.TestCase):
             ],
         )
 
+    def test_0800_handoff_uses_previous_fire_day_not_today_0700(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150626",
+            rows=[
+                module.DutyRow("07-08", {"值班": ["27"]}),
+                module.DutyRow("08-09", {"值班": ["15"]}),
+            ],
+            summary={"在勤": ["15", "26", "27"]},
+        )
+        yesterday = module.DutySheet(
+            roc_date="1150625",
+            rows=[
+                module.DutyRow("22-23", {"值班": ["26"]}),
+                module.DutyRow("07-08", {"值班": ["26"]}),
+            ],
+            summary={"在勤": ["15", "26", "27"]},
+        )
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150626"), [], None)
+        handoff_0800 = [
+            (action.kind, action.time, action.actor, action.target, action.fields.get("出或入"), action.source)
+            for action in actions
+            if action.source == "值班交接" and action.time == "08:00"
+        ]
+
+        self.assertEqual(
+            handoff_0800,
+            [
+                ("entry_log", "08:00", "26", "26", "值退", "值班交接"),
+                ("entry_log", "08:00", "26", "15", "值班", "值班交接"),
+                ("work_log", "08:00", "26", "26", None, "值班交接"),
+            ],
+        )
+
+    def test_0800_handoff_uses_previous_day_0700_before_2200(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150625",
+            rows=[module.DutyRow("08-09", {"值班": ["28"]})],
+            summary={"在勤": ["4", "13", "28"]},
+        )
+        yesterday = module.DutySheet(
+            roc_date="1150624",
+            rows=[
+                module.DutyRow("22-23", {"值班": ["13"]}),
+                module.DutyRow("07-08", {"值班": ["4"]}),
+            ],
+            summary={"在勤": ["4", "13", "28"]},
+        )
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150625"), [], None)
+        handoff_0800 = [
+            (action.kind, action.time, action.actor, action.target, action.fields.get("出或入"), action.source)
+            for action in actions
+            if action.source == "值班交接" and action.time == "08:00"
+        ]
+
+        self.assertEqual(
+            handoff_0800,
+            [
+                ("entry_log", "08:00", "4", "4", "值退", "值班交接"),
+                ("entry_log", "08:00", "4", "28", "值班", "值班交接"),
+                ("work_log", "08:00", "4", "4", None, "值班交接"),
+            ],
+        )
+
+    def test_handoff_uses_continuous_duty_segment_for_work_period(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150624",
+            rows=[
+                module.DutyRow("22-24", {"值班": ["13"]}),
+                module.DutyRow("0-7", {"值班": ["13"]}),
+                module.DutyRow("7-8", {"值班": ["4"]}),
+            ],
+            summary={"在勤": ["4", "13"]},
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150624"), [], None)
+        handoff_0700 = [
+            (action.kind, action.time, action.actor, action.target, action.fields.get("出或入"), action.source)
+            for action in actions
+            if action.source == "值班交接" and action.time == "07:00"
+        ]
+        work_log = next(
+            action
+            for action in actions
+            if action.source == "值班交接" and action.time == "07:00" and action.kind == "work_log"
+        )
+
+        self.assertEqual(
+            handoff_0700,
+            [
+                ("entry_log", "07:00", "13", "13", "值退", "值班交接"),
+                ("entry_log", "07:00", "13", "4", "值班", "值班交接"),
+                ("work_log", "07:00", "13", "13", None, "值班交接"),
+            ],
+        )
+        self.assertIn("時間:22-07", work_log.fields["處理情形"])
+
     def test_update_package_requests_logout_before_stopping_gui(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
 

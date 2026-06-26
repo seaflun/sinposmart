@@ -1742,6 +1742,55 @@ def people_at(sheet: DutySheet, hour: int, column: str) -> list[str]:
     return row.columns.get(column, []) if row else []
 
 
+def fire_day_hour(hour: int) -> int:
+    return hour if hour >= 8 else hour + 24
+
+
+def fire_day_slot_bounds(slot: str) -> tuple[int, int] | None:
+    start = slot_start(slot)
+    end = slot_end(slot)
+    if start is None or end is None:
+        return None
+    fire_start = fire_day_hour(start)
+    fire_end = fire_day_hour(end)
+    if end == 24:
+        fire_end = 24
+    if fire_end <= fire_start:
+        fire_end += 24
+    return fire_start, fire_end
+
+
+def duty_segments(sheet: DutySheet) -> list[tuple[int, int, tuple[str, ...]]]:
+    rows: list[tuple[int, int, tuple[str, ...]]] = []
+    for row in sheet.rows:
+        bounds = fire_day_slot_bounds(row.slot)
+        people = tuple(row.columns.get("值班", []))
+        if not bounds or not people:
+            continue
+        rows.append((bounds[0], bounds[1], people))
+    rows.sort(key=lambda item: item[0])
+
+    segments: list[tuple[int, int, tuple[str, ...]]] = []
+    for start, end, people in rows:
+        if segments and segments[-1][1] == start and segments[-1][2] == people:
+            prev_start, _, _ = segments[-1]
+            segments[-1] = (prev_start, end, people)
+        else:
+            segments.append((start, end, people))
+    return segments
+
+
+def duty_segment_before_fire_hour(sheet: DutySheet, fire_hour: int) -> tuple[int, int, tuple[str, ...]] | None:
+    for start, end, people in duty_segments(sheet):
+        if start < fire_hour <= end:
+            return start, end, people
+    return None
+
+
+def clock_hour(fire_hour: int) -> int:
+    return fire_hour % 24
+
+
 def is_active_checkout_column(column: str) -> bool:
     return column not in OFF_DUTY_SUMMARY_KEYS and column != "檢核欄"
 
@@ -1918,12 +1967,24 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
 
 
 def prev_slot_duty(today: DutySheet, yesterday: DutySheet | None, handoff_hour: int) -> list[str]:
-    if handoff_hour == 0:
-        previous = people_at(today, 23, "值班")
-        return previous or (people_at(yesterday, 23, "值班") if yesterday else [])
+    source = yesterday if handoff_hour == 8 and yesterday else today
+    fire_hour = 32 if source is yesterday and handoff_hour == 8 else fire_day_hour(handoff_hour)
+    segment = duty_segment_before_fire_hour(source, fire_hour)
+    if segment:
+        return list(segment[2])
     if handoff_hour == 8:
-        previous = people_at(today, handoff_hour - 1, "值班")
-        return previous or (people_at(yesterday, 22, "值班") or people_at(yesterday, 6, "值班") if yesterday else [])
+        previous_fire_day = (
+            people_at(yesterday, 7, "值班")
+            or people_at(yesterday, 6, "值班")
+            or people_at(yesterday, 22, "值班")
+            if yesterday
+            else []
+        )
+        if previous_fire_day:
+            return previous_fire_day
+        return people_at(today, handoff_hour - 1, "值班")
+    if handoff_hour == 0:
+        return people_at(today, 23, "值班") or (people_at(yesterday, 23, "值班") if yesterday else [])
     return people_at(today, handoff_hour - 1, "值班")
 
 
@@ -1938,14 +1999,19 @@ def handoff_hours_for_sheet(sheet: DutySheet) -> list[int]:
     return sorted(dynamic_hours)
 
 
-def handoff_start_hour(today: DutySheet, hour: int) -> int:
+def handoff_period(today: DutySheet, yesterday: DutySheet | None, hour: int) -> tuple[int, int]:
+    source = yesterday if hour == 8 and yesterday else today
+    fire_hour = 32 if source is yesterday and hour == 8 else fire_day_hour(hour)
+    segment = duty_segment_before_fire_hour(source, fire_hour)
+    if segment:
+        return clock_hour(segment[0]), clock_hour(segment[1])
     if hour == 0:
-        return 22
+        return 22, 0
     if hour == 8:
-        return 22
+        return 22, 8
     previous_row = row_for_hour(today, hour - 1)
     previous_start = slot_start(previous_row.slot) if previous_row else None
-    return previous_start if previous_start is not None else hour - 2
+    return previous_start if previous_start is not None else hour - 2, hour
 
 
 def case_counts(cases: list[CaseRecord], start_hour: int, end_hour: int) -> dict[str, int]:
@@ -2286,15 +2352,14 @@ def planned_actions(
         if not outgoing_entries and not incoming_entries:
             continue
         actor = outgoing[0] if outgoing else duty_actor_at(today, yesterday, hour)
-        if hour == 8:
-            time_range = "22-08"
+        start_hour, end_hour = handoff_period(today, yesterday, hour)
+        time_range = f"{start_hour:02d}-{end_hour:02d}"
+        if hour == 8 and start_hour > end_hour:
             counts = case_counts_overnight(yesterday_cases, today_cases)
             vehicle_items = unreturned_case_vehicle_items(yesterday_cases, work_log_defaults, roc_date(target - timedelta(days=1)))
             vehicle_items.extend(unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=8))
         else:
-            start_hour = handoff_start_hour(today, hour)
-            time_range = f"{start_hour:02d}-{hour:02d}"
-            counts = case_counts(today_cases, start_hour, hour)
+            counts = case_counts(today_cases, start_hour, end_hour) if start_hour < end_hour else {"救護": 0, "火警": 0}
             vehicle_items = unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=hour)
         vehicle_out_count = sum(int(item.get("count", 0)) for item in vehicle_items)
         for no in outgoing_entries:
