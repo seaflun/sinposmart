@@ -856,6 +856,8 @@ class DutyGui(ctk.CTk):
         self.auto_logout_after_id: str | None = None
         self.auto_logout_deadline: datetime | None = None
         self.auto_logout_actor_no = ""
+        self.pending_auto_logout_deadline: datetime | None = None
+        self.pending_auto_logout_actor_no = ""
         self.saved_login_needs_backup = False
         self.saved_login_can_persist = True
         self.login_running = False
@@ -2125,6 +2127,15 @@ class DutyGui(ctk.CTk):
                 return account
         return None
 
+    def should_save_successful_login(self, actor_no: str, user_id: str) -> bool:
+        if self.remember_login.get():
+            return True
+        user_id = str(user_id or "").strip()
+        if user_id and self.saved_account_by_user_id(user_id):
+            return True
+        actor_no = str(actor_no or "").strip()
+        return bool(actor_no and any(str(account.get("actor_no", "") or "").strip() == actor_no for account in self.saved_accounts))
+
     def select_saved_account(self, identity: str, persist: bool = True) -> None:
         for account in self.saved_accounts:
             if self.account_identity(account) != identity:
@@ -2161,13 +2172,17 @@ class DutyGui(ctk.CTk):
 
     def sync_typed_account_choice(self, _event: tk.Event | None = None) -> None:
         typed = self.user_id.get().strip()
+        previous_account = self.selected_saved_account()
+        previous_identity = self.account_identity(previous_account) if previous_account else ""
+        previous_password = str(previous_account.get("password", "") or "") if previous_account else ""
         account = self.saved_account_by_user_id(typed)
         if typed and account:
+            if previous_identity and previous_identity != self.account_identity(account) and previous_password and self.password.get() == previous_password:
+                self.password.set("")
+            self.actor_no.set(str(account.get("actor_no", "") or ""))
+            self.user_id.set(str(account.get("user_id", "") or typed))
             self.saved_account_choice.set(self.account_display_name(account))
-            self.apply_saved_account()
             return
-        previous_account = self.selected_saved_account()
-        previous_password = str(previous_account.get("password", "") or "") if previous_account else ""
         self.saved_account_choice.set("")
         self.user_id.set(typed)
         self.actor_no.set("")
@@ -3202,7 +3217,7 @@ class DutyGui(ctk.CTk):
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
         self.last_update_logout_identity = {"actor_no": actor_no, "user_id": user_id}
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
-        if self.remember_login.get():
+        if self.should_save_successful_login(actor_no, user_id):
             self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
         self.sync_credentials_after_login(actor_no, user_id, password)
         if self.data.get("target_date"):
@@ -3314,6 +3329,8 @@ class DutyGui(ctk.CTk):
         self.auto_logout_after_id = None
         self.auto_logout_deadline = None
         self.auto_logout_actor_no = ""
+        self.pending_auto_logout_deadline = None
+        self.pending_auto_logout_actor_no = ""
 
     def should_schedule_auto_logout(self, action: dict[str, Any], trigger_type: str) -> bool:
         if trigger_type != "due" or action.get("kind") != "entry_log":
@@ -3327,6 +3344,14 @@ class DutyGui(ctk.CTk):
         self.cancel_auto_logout()
         action_at = self.action_datetime(action)
         deadline = action_at + timedelta(minutes=10)
+        if self.submit_queue_has_active_items():
+            self.pending_auto_logout_deadline = deadline
+            self.pending_auto_logout_actor_no = str(actor_no)
+            self.duty_status_text.set("已排定登打完成後自動登出。")
+            return
+        self.set_auto_logout_timer(actor_no, deadline)
+
+    def set_auto_logout_timer(self, actor_no: str, deadline: datetime) -> None:
         delay_ms = max(0, int((deadline - datetime.now()).total_seconds() * 1000))
         self.auto_logout_deadline = deadline
         self.auto_logout_actor_no = str(actor_no)
@@ -3336,12 +3361,30 @@ class DutyGui(ctk.CTk):
         )
         self.duty_status_text.set(f"已排定 {deadline:%H:%M} 自動登出。")
 
+    def schedule_pending_auto_logout_if_idle(self) -> None:
+        if not self.pending_auto_logout_actor_no or self.pending_auto_logout_deadline is None:
+            return
+        if self.submit_queue_has_active_items():
+            return
+        actor_no = self.pending_auto_logout_actor_no
+        deadline = self.pending_auto_logout_deadline
+        self.pending_auto_logout_actor_no = ""
+        self.pending_auto_logout_deadline = None
+        self.set_auto_logout_timer(actor_no, deadline)
+
     def run_auto_logout(self, expected_actor: str, expected_deadline: datetime) -> None:
         self.auto_logout_after_id = None
         if self.auto_logout_deadline != expected_deadline or self.auto_logout_actor_no != str(expected_actor):
             return
         if not (self.session and self.session.verified) or str(self.session.actor_no) != str(expected_actor):
             self.cancel_auto_logout()
+            return
+        if self.submit_queue_has_active_items():
+            self.auto_logout_deadline = None
+            self.auto_logout_actor_no = ""
+            self.pending_auto_logout_deadline = expected_deadline
+            self.pending_auto_logout_actor_no = str(expected_actor)
+            self.duty_status_text.set("仍有登打項目執行中，延後自動登出。")
             return
         label = self.logged_in_identity_label(expected_actor)
         self.clear_login(trigger_type="system")
@@ -4554,6 +4597,9 @@ class DutyGui(ctk.CTk):
     def submit_queue_has_items(self) -> bool:
         return any(self.submit_queues.get(lane) for lane in ("entry", "work"))
 
+    def submit_queue_has_active_items(self) -> bool:
+        return self.submit_queue_has_items() or any(self.submit_worker_running.get(lane) for lane in ("entry", "work"))
+
     def start_next_submit_job(self, lane: str = "entry") -> None:
         if lane not in self.submit_queues:
             lane = "entry"
@@ -4883,7 +4929,9 @@ class DutyGui(ctk.CTk):
 
     def _submit_worker_finished(self, lane: str = "entry") -> None:
         self.submit_worker_running[lane] = False
-        if self.submit_needs_comparison_refresh and not self.submit_queue_has_items() and self.duty_data.get("target_date"):
+        if not self.submit_queue_has_active_items():
+            self.schedule_pending_auto_logout_if_idle()
+        if self.submit_needs_comparison_refresh and not self.submit_queue_has_active_items() and self.duty_data.get("target_date"):
             self.submit_needs_comparison_refresh = False
             self.schedule_submit_comparison_refresh()
         self.refresh_duty_tasks()

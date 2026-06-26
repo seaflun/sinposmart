@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import os
+from datetime import datetime
 from pathlib import Path
 
 
@@ -266,6 +267,115 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn('"logout"', source)
         self.assertIn('trigger_type="update"', source)
         self.assertIn("immediate=True", source)
+
+    def test_auto_logout_waits_until_submit_queues_are_idle(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class StatusText:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        scheduled: list[tuple[int, object]] = []
+        gui.auto_logout_after_id = None
+        gui.auto_logout_deadline = None
+        gui.auto_logout_actor_no = ""
+        gui.pending_auto_logout_actor_no = ""
+        gui.pending_auto_logout_deadline = None
+        gui.submit_queues = {"entry": [("queued",)], "work": []}
+        gui.submit_worker_running = {"entry": True, "work": False}
+        gui.duty_status_text = StatusText()
+        gui.after = lambda delay_ms, callback: scheduled.append((delay_ms, callback)) or "after-id"
+        gui.after_cancel = lambda _after_id: None
+        gui.action_datetime = lambda _action: datetime(2026, 6, 26, 12, 0)
+        action = {"kind": "entry_log", "time": "12:00", "fields": {"出或入": "值退"}}
+
+        gui.schedule_auto_logout("10", action)
+
+        self.assertIsNone(gui.auto_logout_after_id)
+        self.assertEqual(gui.pending_auto_logout_actor_no, "10")
+        self.assertEqual(scheduled, [])
+
+        gui.submit_queues = {"entry": [], "work": []}
+        gui.submit_worker_running = {"entry": False, "work": False}
+        gui.schedule_pending_auto_logout_if_idle()
+
+        self.assertEqual(gui.auto_logout_after_id, "after-id")
+        self.assertEqual(gui.auto_logout_actor_no, "10")
+        self.assertEqual(gui.pending_auto_logout_actor_no, "")
+        self.assertEqual(len(scheduled), 1)
+
+    def test_typed_saved_account_does_not_replace_manual_password(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class Var:
+            def __init__(self, value: str = "") -> None:
+                self.value = value
+
+            def get(self) -> str:
+                return self.value
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        gui.saved_accounts = [{"actor_no": "10", "user_id": "tyfd01000", "password": "old-pass"}]
+        gui.actor_no = Var("")
+        gui.user_id = Var("tyfd01000")
+        gui.password = Var("new-pass")
+        gui.saved_account_choice = Var("")
+
+        gui.sync_typed_account_choice()
+
+        self.assertEqual(gui.actor_no.get(), "10")
+        self.assertEqual(gui.user_id.get(), "tyfd01000")
+        self.assertEqual(gui.password.get(), "new-pass")
+        self.assertEqual(gui.saved_account_choice.get(), "tyfd01000 / 10番")
+
+    def test_select_saved_account_still_fills_saved_password(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class Var:
+            def __init__(self, value: str = "") -> None:
+                self.value = value
+
+            def get(self) -> str:
+                return self.value
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        gui.saved_accounts = [{"actor_no": "10", "user_id": "tyfd01000", "password": "old-pass"}]
+        gui.actor_no = Var("")
+        gui.user_id = Var("")
+        gui.password = Var("")
+        gui.saved_account_choice = Var("")
+
+        gui.select_saved_account("tyfd01000", persist=False)
+
+        self.assertEqual(gui.actor_no.get(), "10")
+        self.assertEqual(gui.user_id.get(), "tyfd01000")
+        self.assertEqual(gui.password.get(), "old-pass")
+
+    def test_successful_existing_account_login_is_saved_even_when_remember_is_off(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class BoolVar:
+            def __init__(self, value: bool = False) -> None:
+                self.value = value
+
+            def get(self) -> bool:
+                return self.value
+
+        gui.saved_accounts = [{"actor_no": "10", "user_id": "tyfd01000", "password": "old-pass"}]
+        gui.remember_login = BoolVar(False)
+
+        self.assertTrue(gui.should_save_successful_login("10", "tyfd01000"))
+        self.assertFalse(gui.should_save_successful_login("11", "tyfd01100"))
 
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
