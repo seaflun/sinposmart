@@ -1923,7 +1923,7 @@ def prev_slot_duty(today: DutySheet, yesterday: DutySheet | None, handoff_hour: 
         return previous or (people_at(yesterday, 23, "值班") if yesterday else [])
     if handoff_hour == 8:
         previous = people_at(today, handoff_hour - 1, "值班")
-        return previous or (people_at(yesterday, 6, "值班") if yesterday else [])
+        return previous or (people_at(yesterday, 22, "值班") or people_at(yesterday, 6, "值班") if yesterday else [])
     return people_at(today, handoff_hour - 1, "值班")
 
 
