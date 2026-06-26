@@ -307,6 +307,71 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(gui.pending_auto_logout_actor_no, "")
         self.assertEqual(len(scheduled), 1)
 
+    def test_submit_login_failure_expires_session_and_stops_queues(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class Var:
+            def __init__(self, value: str = "") -> None:
+                self.value = value
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+            def get(self) -> str:
+                return self.value
+
+        sent_events: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        status_messages: list[str] = []
+        notifications: list[tuple[str, str]] = []
+        gui.session = module.LoginSession(actor_no="10", user_id="tyfd01000", password="old-pass", verified=True)
+        gui.login_status = Var()
+        gui.duty_actions = [{"kind": "entry_log", "time": "20:00", "fields": {}}]
+        gui.submitting_indices = {0, 1}
+        gui.submit_queues = {"entry": [("queued-entry",)], "work": [("queued-work",)]}
+        gui.submit_worker_running = {"entry": True, "work": True}
+        gui.work_submit_parallel_enabled = False
+        gui.submit_needs_comparison_refresh = True
+        gui.submit_comparison_refresh_dates = {"1150626"}
+        gui.submit_comparison_refresh_scheduled = True
+        gui.failed_due_retry_after = {}
+        gui.auto_logout_after_id = None
+        gui.auto_logout_deadline = None
+        gui.auto_logout_actor_no = ""
+        gui.pending_auto_logout_actor_no = ""
+        gui.pending_auto_logout_deadline = None
+        gui.action_completion_key = lambda _action: "completion-key"
+        gui.log_trigger = lambda *_args, **_kwargs: None
+        gui.send_sinposmart_backend_event = lambda *args, **kwargs: sent_events.append((args, kwargs))
+        gui.export_issue_package = lambda **_kwargs: Path("issue.zip")
+        gui.set_duty_status = lambda message, **_kwargs: status_messages.append(message)
+        gui.notify_user = lambda title, message, **_kwargs: notifications.append((title, message))
+        gui.update_login_panel = lambda: None
+        gui.refresh_tasks = lambda: None
+        gui.refresh_duty_tasks = lambda: None
+        gui.after_cancel = lambda _after_id: None
+        result_path = Path("runtime_outputs/form_tests/login_failed.json")
+
+        gui._save_work_log_item_failed(
+            0,
+            "登入失敗：帳號或密碼可能已變更，請重新登入系統。",
+            result_path,
+            False,
+            "due",
+            "login_failed",
+            "2026-06-26T20:00:00",
+        )
+
+        self.assertIsNone(gui.session)
+        self.assertEqual(gui.submit_queues, {"entry": [], "work": []})
+        self.assertEqual(gui.submit_worker_running, {"entry": False, "work": False})
+        self.assertEqual(gui.submitting_indices, set())
+        self.assertNotIn(0, gui.failed_due_retry_after)
+        self.assertIn("登入狀態失效", gui.login_status.get())
+        self.assertTrue(any(args and args[0] == "login_expired" for args, _kwargs in sent_events))
+        self.assertTrue(any("登入失效" in message for message in status_messages))
+        self.assertTrue(any("重新登入" in message for _title, message in notifications))
+
     def test_typed_saved_account_does_not_replace_manual_password(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)

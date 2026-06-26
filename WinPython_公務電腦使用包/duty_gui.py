@@ -3010,7 +3010,7 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             user_id=user_id,
         )
-        if self.handle_relogin_required(user_id, error):
+        if self.handle_relogin_required(user_id, error, error_code):
             return
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
@@ -3135,23 +3135,36 @@ class DutyGui(ctk.CTk):
             actor_no=actor_no,
             user_id=user_id,
         )
-        if self.handle_relogin_required(user_id, error):
+        if self.handle_relogin_required(user_id, error, error_code):
             self.run_pending_hourly_comparison()
             return
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         self.run_pending_hourly_comparison()
 
-    def handle_relogin_required(self, user_id: str, error: str) -> bool:
+    def is_login_failure_error(self, error: str, error_code: str = "") -> bool:
+        if error_code == "login_failed":
+            return True
+        return automation_error_code(error) == "login_failed"
+
+    def handle_relogin_required(self, user_id: str, error: str, error_code: str = "") -> bool:
         if not self.current_session_matches(user_id):
             return False
-        if not any(keyword in error for keyword in ("登入狀態失效", "密碼可能已變更", "重新輸入新密碼")):
+        if not self.is_login_failure_error(error, error_code):
             return False
         self.cancel_auto_logout()
+        self.submit_queues = {"entry": [], "work": []}
+        self.submit_worker_running = {"entry": False, "work": False}
+        self.submitting_indices.clear()
+        self.work_submit_parallel_enabled = True
+        self.submit_needs_comparison_refresh = False
+        self.submit_comparison_refresh_dates.clear()
+        self.submit_comparison_refresh_scheduled = False
         self.session = None
         self.login_status.set("登入狀態失效：請重新輸入新密碼登入。")
         self.set_duty_status("勤務系統登入失效，已停止背景查詢與自動登打。請登出/清除後用新密碼重新登入。", hold_seconds=15)
         self.send_sinposmart_backend_event("login_expired", status="failed", trigger_type="login", error=error, user_id=user_id)
+        self.notify_user(APP_DISPLAY_NAME, "勤務系統登入失效，已停止背景查詢與自動登打。請重新登入。", duration_ms=7000)
         self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
@@ -4798,13 +4811,15 @@ class DutyGui(ctk.CTk):
                             idx, err, path, note, origin, code, ts
                         ),
                     )
+                    if failure_result["error_code"] == "login_failed":
+                        break
                 job = self.next_queued_submit_job(lane)
         except Exception as exc:
             log_automation_exception("submit_worker", exc)
             index, action, result_path, save, job_visible, notify, trigger_type = first_job
             failure_result = automation_failure_result(exc, index, action, save, job_visible, context="login")
             error = failure_result["message"]
-            if lane == "work":
+            if lane == "work" and failure_result["error_code"] != "login_failed":
                 self.after(0, lambda raw=(index, action, save, job_visible, notify, trigger_type), err=error: self.fallback_work_submit_to_entry(raw, err))
                 return
             result_path.write_text(json.dumps(failure_result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4906,6 +4921,11 @@ class DutyGui(ctk.CTk):
             result_ref=result_path.name,
             snapshot=snapshot,
         )
+        user_id = self.session.user_id if self.session and self.session.verified else ""
+        if self.handle_relogin_required(user_id, error, error_code):
+            if notify:
+                messagebox.showerror("登入失效", f"{error}\n\n已停止背景查詢與自動登打，請重新登入。")
+            return
         if trigger_type == "due":
             self.failed_due_retry_after[index] = datetime.now() + timedelta(minutes=1)
         try:
