@@ -178,6 +178,7 @@ CREDENTIAL_SYNC_URL = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_URL", "http://1
 CREDENTIAL_SYNC_TOKEN = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
 SINPOSMART_BACKEND_EVENT_URL = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "http://10.30.65.30:8080/api/sinposmart/events").strip()
 SINPOSMART_BACKEND_EVENT_PENDING_PATH = RUNTIME_OUTPUT_DIR / "sinposmart_backend_events_pending.jsonl"
+SINPOSMART_BACKEND_EVENT_LOCK = threading.Lock()
 DEFAULT_SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS = 45
 DEFAULT_SELENIUM_SCRIPT_TIMEOUT_SECONDS = 45
 DEFAULT_TOOL_TIMEOUT_SECONDS = 15 * 60
@@ -622,21 +623,22 @@ def enqueue_sinposmart_backend_event(payload: dict[str, Any]) -> None:
 
 
 def send_sinposmart_backend_event_worker(payload: dict[str, Any]) -> None:
-    pending = load_pending_sinposmart_backend_events()
-    pending.append(payload)
-    write_pending_sinposmart_backend_events(pending)
-    sent_count = 0
-    try:
-        for index, entry in enumerate(pending, start=1):
-            response = post_sinposmart_backend_event(entry)
-            ack_id = str(response.get("ack_id") or "").strip()
-            if ack_id != str(entry.get("event_id") or "").strip():
-                break
-            sent_count = index
-    except Exception:
-        write_pending_sinposmart_backend_events(pending[sent_count:])
-    else:
-        write_pending_sinposmart_backend_events(pending[sent_count:])
+    with SINPOSMART_BACKEND_EVENT_LOCK:
+        pending = load_pending_sinposmart_backend_events()
+        pending.append(payload)
+        write_pending_sinposmart_backend_events(pending)
+        sent_count = 0
+        try:
+            for index, entry in enumerate(pending, start=1):
+                response = post_sinposmart_backend_event(entry)
+                ack_id = str(response.get("ack_id") or "").strip()
+                if ack_id != str(entry.get("event_id") or "").strip():
+                    break
+                sent_count = index
+        except Exception:
+            write_pending_sinposmart_backend_events(pending[sent_count:])
+        else:
+            write_pending_sinposmart_backend_events(pending[sent_count:])
 
 
 def sinposmart_fire_day(value: datetime | None = None) -> str:

@@ -2165,6 +2165,20 @@ def next_morning_entry_actor(today: DutySheet, hour: int) -> str:
     return (people_at(today, 22, "值班") or people_at(today, hour, "值班") or [""])[0]
 
 
+def physical_entry_key(base_date: date, action: PlannedAction) -> tuple[str, date, str, str, str, str] | None:
+    if action.kind != "entry_log":
+        return None
+    fields = action.fields
+    return (
+        action.kind,
+        base_date + timedelta(days=action.date_offset),
+        action.time,
+        action.target,
+        str(fields.get("出或入", "")),
+        str(fields.get("領用事由及地點", "")),
+    )
+
+
 def planned_actions(
     today: DutySheet,
     yesterday: DutySheet | None,
@@ -2430,12 +2444,17 @@ def planned_actions(
     if sheet_has_duty_data(tomorrow):
         next_target = target + timedelta(days=1)
         next_morning_sources = {"今日在勤且昨日未在勤", "昨日在勤且今日未在勤", "值班交接"}
+        existing_entry_keys = {physical_entry_key(target, action) for action in actions}
         for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
             if action.source not in next_morning_sources:
                 continue
             if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
                 continue
             action.date_offset = 1
+            entry_key = physical_entry_key(target, action)
+            if entry_key in existing_entry_keys:
+                continue
+            existing_entry_keys.add(entry_key)
             actions.append(action)
 
     # Radio test at 11:10, entered by 10-12 duty.

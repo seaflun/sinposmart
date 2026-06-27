@@ -449,6 +449,11 @@ class PackageSmokeTests(unittest.TestCase):
             source.index("write_pending_sinposmart_backend_events(pending)"),
             source.index("response = post_sinposmart_backend_event(entry)"),
         )
+        self.assertIn("SINPOSMART_BACKEND_EVENT_LOCK = threading.Lock()", source)
+        self.assertLess(
+            source.index("with SINPOSMART_BACKEND_EVENT_LOCK:"),
+            source.index("pending = load_pending_sinposmart_backend_events()"),
+        )
 
     def test_login_success_auto_syncs_credentials_without_export_gate(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
@@ -569,6 +574,36 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(
             [(action.time, action.actor, action.fields[direction], action.fields[reason_key], action.date_offset) for action in rest_actions],
             [("04:00", "8", "出", "休息後退勤", 1)],
+        )
+
+    def test_next_morning_0608_rest_checkout_is_not_duplicated_by_tomorrow_preview(self) -> None:
+        module = duty_rehearsal_module()
+        duty = "\u503c\u73ed"
+        rest = "\u4f11\u606f"
+        on_duty = "\u5728\u52e4"
+        direction = "\u51fa\u6216\u5165"
+        reason_key = "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede"
+        today = module.DutySheet(
+            roc_date="1150627",
+            rows=[
+                module.DutyRow("06-08", {duty: ["8"], rest: ["19"]}),
+                module.DutyRow("08-10", {duty: ["12"], rest: []}),
+                module.DutyRow("22-24", {duty: ["8"], "\u6551\u8b77": ["19"], rest: []}),
+            ],
+            summary={on_duty: ["8", "12", "19"]},
+        )
+        tomorrow = module.DutySheet(roc_date="1150628", rows=[module.DutyRow("08-10", {duty: ["12"]})], summary={on_duty: ["12"]})
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150627"), [], tomorrow)
+        rest_checkouts = [
+            action
+            for action in actions
+            if action.kind == "entry_log" and action.target == "19" and action.fields.get(reason_key) == "休息後退勤"
+        ]
+
+        self.assertEqual(
+            [(action.time, action.actor, action.fields[direction], action.fields[reason_key], action.date_offset, action.source) for action in rest_checkouts],
+            [("06:00", "8", "出", "休息後退勤", 1, "休息後退勤")],
         )
 
     def test_continuous_0408_rest_is_not_treated_as_0600_rest_start(self) -> None:
