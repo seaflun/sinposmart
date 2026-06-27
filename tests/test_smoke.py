@@ -509,6 +509,53 @@ class PackageSmokeTests(unittest.TestCase):
             [("06:00", "28", "出", "休息", 1), ("08:00", "28", "入", "休息返隊", 1)],
         )
 
+    def test_next_morning_0408_rest_for_off_duty_tomorrow_does_not_create_rest_actions(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150627",
+            rows=[
+                module.DutyRow("04-06", {"值班": ["4"], "休息": ["4"]}),
+                module.DutyRow("06-08", {"值班": ["4"], "休息": ["4"]}),
+                module.DutyRow("08-10", {"值班": ["12"], "休息": []}),
+                module.DutyRow("22-24", {"值班": ["4"], "休息": []}),
+            ],
+            summary={"在勤": ["4", "12"]},
+        )
+        tomorrow = module.DutySheet(roc_date="1150628", rows=[module.DutyRow("08-10", {"值班": ["12"]})], summary={"在勤": ["12"]})
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150627"), [], tomorrow)
+        rest_actions = [
+            action
+            for action in actions
+            if action.kind == "entry_log" and action.target == "4" and action.fields.get("領用事由及地點") in ("休息", "休息返隊")
+        ]
+
+        self.assertEqual(rest_actions, [])
+
+    def test_continuous_0408_rest_is_not_treated_as_0600_rest_start(self) -> None:
+        module = duty_rehearsal_module()
+        yesterday = module.DutySheet(
+            roc_date="1150627",
+            rows=[
+                module.DutyRow("04-06", {"值班": ["4"], "休息": ["4"]}),
+                module.DutyRow("06-08", {"值班": ["4"], "休息": ["4"]}),
+                module.DutyRow("08-10", {"值班": ["12"], "休息": []}),
+                module.DutyRow("22-24", {"值班": ["4"], "休息": []}),
+            ],
+            summary={"在勤": ["4", "12"]},
+        )
+        today = module.DutySheet(roc_date="1150628", rows=[module.DutyRow("08-10", {"值班": ["12"]})], summary={"在勤": ["12"]})
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150628"), [], None)
+        checkout_actions = [
+            (action.time, action.fields["領用事由及地點"], action.source)
+            for action in actions
+            if action.kind == "entry_log" and action.target == "4" and action.source == "昨日在勤且今日未在勤"
+        ]
+
+        self.assertNotIn("4", module.rest_starting_at(yesterday, 6, today))
+        self.assertEqual(checkout_actions, [("08:00", "退勤", "昨日在勤且今日未在勤")])
+
     def test_dynamic_0700_handoff_from_duty_rows(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(

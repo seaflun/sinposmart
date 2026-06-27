@@ -1809,7 +1809,10 @@ def rest_starting_at(sheet: DutySheet, hour: int, next_sheet: DutySheet | None =
         start = slot_start(row.slot)
         end = slot_end(row.slot)
         if start == hour and end is not None:
+            previous = row_for_hour(sheet, start - 1) if start > 0 else None
             for no in row.columns.get("休息", []):
+                if previous and no in previous.columns.get("休息", []):
+                    continue
                 block_end = end
                 probe = end
                 while True:
@@ -2177,6 +2180,7 @@ def planned_actions(
     # 08 boundary, including rest-start exceptions.
     today_on = set(today.summary.get("在勤", []))
     yesterday_on = set(yesterday.summary.get("在勤", [])) if yesterday else set()
+    tomorrow_on = set(tomorrow.summary.get("在勤", [])) if tomorrow else set()
     today_rest_start_08 = rest_starting_at(today, 8, tomorrow)
     yesterday_rest_start_06 = rest_starting_at(yesterday, 6, today) if yesterday else {}
 
@@ -2247,7 +2251,7 @@ def planned_actions(
             continue
         start_offset = 1 if start < 8 else 0
         end_offset = 1 if end is not None and (end <= 8 or end == 24) else 0
-        if start == 6 and start_offset == 1 and tomorrow and no not in set(tomorrow.summary.get("在勤", [])):
+        if start_offset == 1 and tomorrow and no not in tomorrow_on:
             continue
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         actions.append(
