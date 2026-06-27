@@ -509,28 +509,67 @@ class PackageSmokeTests(unittest.TestCase):
             [("06:00", "28", "出", "休息", 1), ("08:00", "28", "入", "休息返隊", 1)],
         )
 
-    def test_next_morning_0408_rest_for_off_duty_tomorrow_does_not_create_rest_actions(self) -> None:
+    def test_next_morning_0002_rest_creates_return_even_when_off_duty_tomorrow(self) -> None:
         module = duty_rehearsal_module()
+        duty = "\u503c\u73ed"
+        rest = "\u4f11\u606f"
+        on_duty = "\u5728\u52e4"
+        direction = "\u51fa\u6216\u5165"
+        reason_key = "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede"
         today = module.DutySheet(
             roc_date="1150627",
             rows=[
-                module.DutyRow("04-06", {"值班": ["4"], "休息": ["4"]}),
-                module.DutyRow("06-08", {"值班": ["4"], "休息": ["4"]}),
-                module.DutyRow("08-10", {"值班": ["12"], "休息": []}),
-                module.DutyRow("22-24", {"值班": ["4"], "休息": []}),
+                module.DutyRow("0-1", {duty: ["8"], rest: ["2"]}),
+                module.DutyRow("1-2", {duty: ["8"], rest: ["2"]}),
+                module.DutyRow("2-3", {duty: ["8"], rest: []}),
+                module.DutyRow("22-24", {duty: ["8"], rest: []}),
             ],
-            summary={"在勤": ["4", "12"]},
+            summary={on_duty: ["2", "8"]},
         )
-        tomorrow = module.DutySheet(roc_date="1150628", rows=[module.DutyRow("08-10", {"值班": ["12"]})], summary={"在勤": ["12"]})
+        tomorrow = module.DutySheet(roc_date="1150628", rows=[], summary={})
 
         actions = module.planned_actions(today, None, [], module.parse_roc_date("1150627"), [], tomorrow)
         rest_actions = [
             action
             for action in actions
-            if action.kind == "entry_log" and action.target == "4" and action.fields.get("領用事由及地點") in ("休息", "休息返隊")
+            if action.kind == "entry_log" and action.target == "2" and action.fields.get(reason_key) in ("休息", "休息返隊")
         ]
 
-        self.assertEqual(rest_actions, [])
+        self.assertEqual(
+            [(action.time, action.actor, action.fields[direction], action.fields[reason_key], action.date_offset) for action in rest_actions],
+            [("00:00", "8", "出", "休息", 1), ("02:00", "8", "入", "休息返隊", 1)],
+        )
+
+    def test_next_morning_0408_rest_for_off_duty_tomorrow_creates_rest_checkout(self) -> None:
+        module = duty_rehearsal_module()
+        duty = "\u503c\u73ed"
+        rest = "\u4f11\u606f"
+        on_duty = "\u5728\u52e4"
+        direction = "\u51fa\u6216\u5165"
+        reason_key = "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede"
+        today = module.DutySheet(
+            roc_date="1150627",
+            rows=[
+                module.DutyRow("04-06", {duty: ["4"], rest: ["4"]}),
+                module.DutyRow("06-08", {duty: ["4"], rest: ["4"]}),
+                module.DutyRow("08-10", {duty: ["12"], rest: []}),
+                module.DutyRow("22-24", {duty: ["8"], rest: []}),
+            ],
+            summary={on_duty: ["4", "8", "12"]},
+        )
+        tomorrow = module.DutySheet(roc_date="1150628", rows=[module.DutyRow("08-10", {duty: ["12"]})], summary={on_duty: ["12"]})
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150627"), [], tomorrow)
+        rest_actions = [
+            action
+            for action in actions
+            if action.kind == "entry_log" and action.target == "4" and action.fields.get(reason_key) in ("休息", "休息返隊", "休息後退勤")
+        ]
+
+        self.assertEqual(
+            [(action.time, action.actor, action.fields[direction], action.fields[reason_key], action.date_offset) for action in rest_actions],
+            [("04:00", "8", "出", "休息後退勤", 1)],
+        )
 
     def test_continuous_0408_rest_is_not_treated_as_0600_rest_start(self) -> None:
         module = duty_rehearsal_module()

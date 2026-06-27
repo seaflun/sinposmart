@@ -2251,9 +2251,9 @@ def planned_actions(
             continue
         start_offset = 1 if start < 8 else 0
         end_offset = 1 if end is not None and (end <= 8 or end == 24) else 0
-        if start_offset == 1 and tomorrow and no not in tomorrow_on:
-            continue
+        rest_checkout = start_offset == 1 and tomorrow and no not in tomorrow_on and (end is None or end >= 8)
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
+        start_reason = "休息後退勤" if rest_checkout else "休息"
         actions.append(
             PlannedAction(
                 kind="entry_log",
@@ -2264,15 +2264,17 @@ def planned_actions(
                     "登打時間": f"{start:02d}:00",
                     "系統寫入時間": f"{start:02d}:00",
                     "出或入": "出",
-                    "領用事由及地點": "休息",
-                    "手提無線電編號": "",
-                    "是否歸還": "",
+                    "領用事由及地點": start_reason,
+                    "手提無線電編號": handheld_radio(no) if rest_checkout else "",
+                    "是否歸還": "是" if rest_checkout else "",
                 },
-                source="休息簽出",
-                duplicate_key=f"entry:{target}:{start}:out:{no}:休息",
+                source="休息後退勤" if rest_checkout else "休息簽出",
+                duplicate_key=f"entry:{target}:{start}:out:{no}:{start_reason}",
                 date_offset=start_offset,
             )
         )
+        if rest_checkout:
+            continue
         if end is None:
             continue
         end_hour = 0 if end == 24 else end
