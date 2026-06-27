@@ -31,11 +31,18 @@
 
 ## Repository boundaries
 
-- 本 repo `I:\我的雲端硬碟\專案\值班勤務系統自動化` 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
-- SinpoSmart 後台網頁 APP 目前在 `I:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `I:\我的雲端硬碟\專案\IOS\ambulance_return_bot` 僅作為歷史路徑，不要新增命令或文件指向舊路徑。
+- 本 repo `G:\我的雲端硬碟\專案\值班勤務系統自動化` 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
+- SinpoSmart 後台網頁 APP 目前在 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `G:\我的雲端硬碟\專案\IOS\ambulance_return_bot` 僅作為歷史路徑，不要新增命令或文件指向舊路徑。
 - 提到「值班 GUI、勤務表登打、休息時間登打、勤務基準表登打、車輛保養清點、WinPython 公務電腦使用包、UPDATE、GITHUB RELEASE」時，優先在本 repo 工作。
 - 提到「後台事件、後台 UI、admin_sinposmart、狀態 pill、快照內容、NAS 後台網頁」時，優先切到 `救護返隊小幫手\ambulance_return_bot` repo 工作。
 - 若一次任務同時跨 SinpoSmart WinPython 包與救護返隊小幫手後台網頁，必須分開檢查、測試、commit、push；不要把兩個 repo 的工作混成同一個提交或 release。
+- SinpoSmart 專案不再直接部署或覆蓋 NAS runtime；NAS runtime 唯一來源是 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`。
+- 不得從本 repo 直接覆蓋 `\\100.114.126.58\docker\ambulance_return_bot`，也不得把值班後台使用的 NAS 檔案手動複製到本 repo 後再部署。
+- 本 repo 只負責：公務電腦 GUI、值班 GUI / 值班模式流程、值班登入/登打流程、送到 NAS 的事件資料 payload、SinpoSmart 公務電腦更新包。
+- 只要是值班後台會用到的 NAS 檔案，都必須切到 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot` 修改、測試、打 NAS 包、同步 NAS、重啟容器。
+- 值班後台 NAS 檔案包含但不限於：NAS 後台 Flask app、`/admin/sinposmart`、`/api/sinposmart/events`、值班後台模板、`admin_sinposmart.html`、值班後台 CSS / JS / template include、`sinposmart_backend.py`、值班資料整理、分組、顯示、保留邏輯，以及任何會被複製到 `\\100.114.126.58\docker\ambulance_return_bot` 的檔案。
+- 如果一次需求同時需要改 GUI 送出資料與值班後台使用的 NAS 檔案：本 repo 只修改 GUI payload 或公務電腦更新包；值班後台 NAS 檔案必須在救護返隊小幫手 repo 修改、測試、打 NAS 包、同步 NAS、重啟容器。
+- 本 repo 若出現 NAS deploy/copy script、`NAS包`、或任何準備覆蓋 `\\100.114.126.58\docker\ambulance_return_bot` 的命令，必須停止執行並提示：`值班後台使用的 NAS 檔案請到 G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot 修改與部署。`
 
 ## Current work
 
