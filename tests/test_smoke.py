@@ -502,6 +502,31 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertEqual(calls, [0])
 
+    def test_post_submit_verification_requeries_without_cache_and_fails_when_missing(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        cache_args: list[object] = []
+
+        def duplicate_matches(_driver: object, _action: dict[str, object], _target_date: str, duplicate_cache: object = None) -> list[str]:
+            cache_args.append(duplicate_cache)
+            return []
+
+        gui.duplicate_matches_before_submit = duplicate_matches
+
+        with self.assertRaisesRegex(RuntimeError, "登打後.*查到"):
+            gui.verify_action_saved_after_submit(None, {"kind": "work_log"}, "1150628")
+
+        self.assertEqual(cache_args, [None])
+
+    def test_submit_worker_verifies_saved_record_before_marking_success(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("def verify_action_saved_after_submit", source)
+        self.assertLess(
+            source.index("self.verify_action_saved_after_submit(driver, action, target_date)"),
+            source.index('result["stage"] = "submitted" if save else "filled"'),
+        )
+
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
 

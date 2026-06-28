@@ -1825,6 +1825,17 @@ class DutyGui(ctk.CTk):
             return find_case_work_matches(rows, target_roc_date, action)
         return find_work_matches(rows, target_roc_date, self.duty_staff, action)
 
+    def verify_action_saved_after_submit(
+        self,
+        driver: webdriver.Chrome,
+        action: dict[str, Any],
+        target_roc_date: str,
+    ) -> list[str]:
+        matches = self.duplicate_matches_before_submit(driver, action, target_roc_date, None)
+        if matches:
+            return matches
+        raise RuntimeError("登打後未在勤務系統查到已登打資料，將重新嘗試。")
+
     def load_audit_date(self) -> None:
         value = "".join(ch for ch in self.audit_date.get() if ch.isdigit())
         if len(value) != 7:
@@ -4880,6 +4891,8 @@ class DutyGui(ctk.CTk):
                         result = fill_entry_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
                     else:
                         result = fill_work_log_form_for_test(driver, action, self.duty_staff, target_date, save=save)
+                    if save:
+                        result["post_submit_matches"] = self.verify_action_saved_after_submit(driver, action, target_date)[:3]
                     result["stage"] = "submitted" if save else "filled"
                     result["action_index"] = index
                     result["action"] = action
