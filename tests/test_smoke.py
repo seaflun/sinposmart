@@ -484,6 +484,24 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(data["actions"])
         self.assertTrue(any(str(action.get("actor")) == "11" for action in data["actions"]))
 
+    def test_reset_duty_task_scroll_moves_hidden_canvas_to_top(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        calls: list[float] = []
+
+        class Canvas:
+            def yview_moveto(self, fraction: float) -> None:
+                calls.append(fraction)
+
+        class TaskList:
+            _parent_canvas = Canvas()
+
+        gui.duty_task_list = TaskList()
+
+        gui.reset_duty_task_scroll()
+
+        self.assertEqual(calls, [0])
+
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
 

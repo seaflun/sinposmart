@@ -4396,6 +4396,7 @@ class DutyGui(ctk.CTk):
                     status=status,
                     tag=tag,
                 )
+            self.reset_duty_task_scroll()
         except Exception as exc:
             self.duty_card_rows.clear()
             self.duty_card_borders.clear()
@@ -4439,6 +4440,15 @@ class DutyGui(ctk.CTk):
             self.duty_status_text.set(status_override or "")
         else:
             self.duty_status_text.set("尚未登入，所有任務不執行。")
+
+    def reset_duty_task_scroll(self) -> None:
+        canvas = getattr(getattr(self, "duty_task_list", None), "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.yview_moveto(0)
+        except Exception:
+            pass
 
     def create_duty_task_card(self, iid: str, task_time: str, system_text: str, type_text: str, task_text: str, people_text: str, status: str, tag: str) -> None:
         bg, border, status_bg, status_fg, status_border = self.duty_card_colors(tag)
