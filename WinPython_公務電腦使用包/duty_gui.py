@@ -117,6 +117,8 @@ from compare_rehearsal_records import (
 from duty_rehearsal import (
     CaseRecord,
     DEFAULT_WORK_LOG_DEFAULTS,
+    DutyRow,
+    DutySheet,
     ENTRY_LOG_AP,
     OFF_DUTY_SUMMARY_KEYS,
     WORK_LOG_AP,
@@ -1625,7 +1627,73 @@ class DutyGui(ctk.CTk):
         self.refresh_tasks()
         self.refresh_duty_tasks()
 
+    def ensure_schedule_actions(self, data: dict[str, Any]) -> None:
+        if data.get("actions"):
+            return
+        target_roc_date = str(data.get("target_date", "") or "")
+        if not target_roc_date or not data.get("today", {}).get("rows"):
+            return
+        try:
+            target_date = parse_roc_date(target_roc_date)
+        except ValueError:
+            return
+
+        def sheet_from_payload(key: str) -> DutySheet:
+            payload = data.get(key, {}) or {}
+            rows = [
+                DutyRow(
+                    slot=str(row.get("slot", "") or ""),
+                    columns={
+                        str(name): [str(value) for value in values]
+                        for name, values in (row.get("columns", {}) or {}).items()
+                        if isinstance(values, list)
+                    },
+                )
+                for row in payload.get("rows", [])
+            ]
+            summary = {
+                str(name): [str(value) for value in values]
+                for name, values in (payload.get("summary", {}) or {}).items()
+                if isinstance(values, list)
+            }
+            return DutySheet(
+                roc_date=str(payload.get("roc_date", "") or ""),
+                unit=str(payload.get("unit", "") or ""),
+                rows=rows,
+                summary=summary,
+                staff=payload.get("staff", {}) or {},
+            )
+
+        def cases_from_payload(key: str) -> list[CaseRecord]:
+            records = []
+            for item in data.get(key, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                records.append(
+                    CaseRecord(
+                        report_time=str(item.get("report_time", "") or ""),
+                        return_time=str(item.get("return_time", "") or ""),
+                        category=str(item.get("category", "") or ""),
+                        raw=[str(value) for value in item.get("raw", [])],
+                    )
+                )
+            return records
+
+        today_sheet = sheet_from_payload("today")
+        yesterday_sheet = sheet_from_payload("yesterday")
+        tomorrow_sheet = sheet_from_payload("tomorrow") if data.get("tomorrow") else None
+        actions = planned_actions(
+            today_sheet,
+            yesterday_sheet,
+            cases_from_payload("cases"),
+            target_date,
+            cases_from_payload("yesterday_cases"),
+            tomorrow_sheet,
+        )
+        data["actions"] = [asdict(action) for action in actions]
+
     def sanitize_schedule_data(self, data: dict[str, Any]) -> None:
+        self.ensure_schedule_actions(data)
         for sheet_key in ("yesterday", "today", "tomorrow"):
             sheet = data.get(sheet_key, {})
             for row in sheet.get("rows", []):

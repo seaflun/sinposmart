@@ -453,6 +453,37 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("8 番", str(context.exception))
         self.assertIn("11 番", str(context.exception))
 
+    def test_sanitize_rebuilds_missing_schedule_actions(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        duty = "\u503c\u73ed"
+        standby = "\u5099\u52e4"
+        on_duty = "\u5728\u52e4"
+        data = {
+            "target_date": "1150628",
+            "today": {
+                "roc_date": "1150628",
+                "rows": [{"slot": "08-12", "columns": {duty: ["11"], standby: ["3"]}}],
+                "summary": {on_duty: ["3", "11"]},
+                "staff": {"3": {"name": "三號"}, "11": {"name": "十一號"}},
+            },
+            "yesterday": {
+                "roc_date": "1150627",
+                "rows": [{"slot": "08-12", "columns": {duty: ["8"], standby: ["4"]}}],
+                "summary": {on_duty: ["4", "8"]},
+                "staff": {"4": {"name": "四號"}, "8": {"name": "八號"}},
+            },
+            "tomorrow": {"roc_date": "1150629", "rows": [], "summary": {}, "staff": {}},
+            "cases": [],
+            "yesterday_cases": [],
+            "actions": [],
+        }
+
+        gui.sanitize_schedule_data(data)
+
+        self.assertTrue(data["actions"])
+        self.assertTrue(any(str(action.get("actor")) == "11" for action in data["actions"]))
+
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
 
