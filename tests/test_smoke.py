@@ -442,6 +442,17 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertTrue(gui.should_save_successful_login("10", "tyfd01000"))
         self.assertFalse(gui.should_save_successful_login("11", "tyfd01100"))
 
+    def test_login_rejects_mismatched_detected_actor_no(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.actor_no_from_user_id = lambda _user_id: ""
+
+        with self.assertRaises(module.LoginFailedError) as context:
+            gui.resolve_verified_actor_no("11", "tyfd01510", "8")
+
+        self.assertIn("8 番", str(context.exception))
+        self.assertIn("11 番", str(context.exception))
+
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
 

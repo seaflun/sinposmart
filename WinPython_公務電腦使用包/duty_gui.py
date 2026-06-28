@@ -2801,6 +2801,19 @@ class DutyGui(ctk.CTk):
                         return str(no)
         return ""
 
+    def resolve_verified_actor_no(self, typed_actor_no: str, user_id: str, detected_actor_no: str) -> str:
+        typed_actor_no = str(typed_actor_no or "").strip()
+        detected_actor_no = str(detected_actor_no or "").strip()
+        account_actor_no = str(self.actor_no_from_user_id(user_id) or "").strip()
+        resolved_actor_no = detected_actor_no or account_actor_no or typed_actor_no
+        if typed_actor_no and resolved_actor_no and typed_actor_no != resolved_actor_no:
+            raise LoginFailedError(
+                f"登入帳號辨識為 {resolved_actor_no} 番，與輸入的 {typed_actor_no} 番不一致。請選擇正確番號或帳號。"
+            )
+        if not resolved_actor_no:
+            raise LoginFailedError("登入後頁面沒有顯示可辨識的姓名。")
+        return resolved_actor_no
+
     def verify_login(self) -> None:
         if self.login_running:
             return
@@ -2831,9 +2844,7 @@ class DutyGui(ctk.CTk):
             configure_webdriver_timeouts(driver)
             login(driver, user_id, password)
             detected_actor_no, actor_name = self.identify_logged_in_actor(driver)
-            actor_no = detected_actor_no or self.actor_no_from_user_id(user_id) or actor_no
-            if not actor_no:
-                raise LoginFailedError("登入後頁面沒有顯示可辨識的姓名。")
+            actor_no = self.resolve_verified_actor_no(actor_no, user_id, detected_actor_no)
         except Exception as exc:
             log_automation_exception("verify_login", exc)
             safe_error = frontend_error_payload(exc, context="login")
