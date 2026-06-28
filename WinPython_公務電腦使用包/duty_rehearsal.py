@@ -1908,6 +1908,17 @@ def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | Non
     return has_external_duty(before, no) or has_external_duty(after, no)
 
 
+def rest_checkout_targets(sheet: DutySheet | None, next_sheet: DutySheet | None) -> set[str]:
+    if not sheet or not next_sheet:
+        return set()
+    next_on = set(next_sheet.summary.get("在勤", []))
+    targets: set[str] = set()
+    for no, start, end in rest_blocks(sheet, next_sheet):
+        if start < 8 and no not in next_on and (end is None or end >= 8) and not rest_is_external_route(sheet, no, start, end):
+            targets.add(no)
+    return targets
+
+
 def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None, int]]:
     blocks: list[tuple[str, str, int, int | None, int]] = []
     active: dict[tuple[str, str], int] = {}
@@ -2197,6 +2208,8 @@ def planned_actions(
     tomorrow_on = set(tomorrow.summary.get("在勤", [])) if tomorrow else set()
     today_rest_start_08 = rest_starting_at(today, 8, tomorrow)
     yesterday_rest_start_06 = rest_starting_at(yesterday, 6, today) if yesterday else {}
+    today_rest_checkouts = rest_checkout_targets(today, tomorrow)
+    yesterday_rest_checkouts = rest_checkout_targets(yesterday, today)
 
     for no in sorted(today_on - yesterday_on, key=int):
         if no in today_rest_start_08:
@@ -2234,6 +2247,8 @@ def planned_actions(
             minute = 0
             reason = "休息後退勤"
             actor = entry_actor_at(today, yesterday, at, minute)
+        elif no in yesterday_rest_checkouts:
+            continue
         else:
             at = 8
             minute = 0
@@ -2367,7 +2382,8 @@ def planned_actions(
     for hour in handoff_hours_for_sheet(today):
         outgoing = prev_slot_duty(today, yesterday, hour)
         incoming = people_at(today, hour, "值班")
-        outgoing_entries = [no for no in outgoing if no not in set(incoming)]
+        suppressed_outgoing = yesterday_rest_checkouts if hour == 8 else set()
+        outgoing_entries = [no for no in outgoing if no not in set(incoming) and no not in suppressed_outgoing]
         incoming_entries = [no for no in incoming if no not in set(outgoing)]
         if not outgoing_entries and not incoming_entries:
             continue
@@ -2449,6 +2465,8 @@ def planned_actions(
             if action.source not in next_morning_sources:
                 continue
             if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
+                continue
+            if action.kind == "entry_log" and action.target in today_rest_checkouts and action.fields.get("出或入") in ("出", "值退"):
                 continue
             action.date_offset = 1
             entry_key = physical_entry_key(target, action)

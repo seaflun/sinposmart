@@ -575,6 +575,14 @@ class PackageSmokeTests(unittest.TestCase):
             [(action.time, action.actor, action.fields[direction], action.fields[reason_key], action.date_offset) for action in rest_actions],
             [("04:00", "8", "出", "休息後退勤", 1)],
         )
+        self.assertEqual(
+            [
+                (action.time, action.fields[direction], action.fields[reason_key], action.source, action.date_offset)
+                for action in actions
+                if action.kind == "entry_log" and action.target == "4" and action.date_offset == 1
+            ],
+            [("04:00", "出", "休息後退勤", "休息後退勤", 1)],
+        )
 
     def test_next_morning_0608_rest_checkout_is_not_duplicated_by_tomorrow_preview(self) -> None:
         module = duty_rehearsal_module()
@@ -606,7 +614,7 @@ class PackageSmokeTests(unittest.TestCase):
             [("06:00", "8", "出", "休息後退勤", 1, "休息後退勤")],
         )
 
-    def test_continuous_0408_rest_is_not_treated_as_0600_rest_start(self) -> None:
+    def test_continuous_0408_rest_checkout_suppresses_0800_checkout(self) -> None:
         module = duty_rehearsal_module()
         yesterday = module.DutySheet(
             roc_date="1150627",
@@ -624,11 +632,11 @@ class PackageSmokeTests(unittest.TestCase):
         checkout_actions = [
             (action.time, action.fields["領用事由及地點"], action.source)
             for action in actions
-            if action.kind == "entry_log" and action.target == "4" and action.source == "昨日在勤且今日未在勤"
+            if action.kind == "entry_log" and action.target == "4" and action.fields.get("領用事由及地點") in ("退勤", "值退")
         ]
 
         self.assertNotIn("4", module.rest_starting_at(yesterday, 6, today))
-        self.assertEqual(checkout_actions, [("08:00", "退勤", "昨日在勤且今日未在勤")])
+        self.assertEqual(checkout_actions, [])
 
     def test_dynamic_0700_handoff_from_duty_rows(self) -> None:
         module = duty_rehearsal_module()
