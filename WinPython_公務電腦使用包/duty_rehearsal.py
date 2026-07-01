@@ -2460,7 +2460,8 @@ def planned_actions(
     if sheet_has_duty_data(tomorrow):
         next_target = target + timedelta(days=1)
         next_morning_sources = {"今日在勤且昨日未在勤", "昨日在勤且今日未在勤", "值班交接"}
-        existing_entry_keys = {physical_entry_key(target, action) for action in actions}
+        existing_entry_keys = {key for action in actions if (key := physical_entry_key(target, action)) is not None}
+        existing_work_keys = {action.duplicate_key for action in actions if action.kind == "work_log" and action.duplicate_key}
         for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
             if action.source not in next_morning_sources:
                 continue
@@ -2469,10 +2470,16 @@ def planned_actions(
             if action.kind == "entry_log" and action.target in today_rest_checkouts and action.fields.get("出或入") in ("出", "值退"):
                 continue
             action.date_offset = 1
-            entry_key = physical_entry_key(target, action)
-            if entry_key in existing_entry_keys:
-                continue
-            existing_entry_keys.add(entry_key)
+            if action.kind == "entry_log":
+                entry_key = physical_entry_key(target, action)
+                if entry_key is not None and entry_key in existing_entry_keys:
+                    continue
+                if entry_key is not None:
+                    existing_entry_keys.add(entry_key)
+            elif action.kind == "work_log" and action.duplicate_key:
+                if action.duplicate_key in existing_work_keys:
+                    continue
+                existing_work_keys.add(action.duplicate_key)
             actions.append(action)
 
     # Radio test at 11:10, entered by 10-12 duty.

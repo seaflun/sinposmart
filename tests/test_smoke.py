@@ -972,6 +972,35 @@ class PackageSmokeTests(unittest.TestCase):
             ],
         )
 
+    def test_next_morning_0800_handoff_preview_includes_work_log(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150628",
+            rows=[module.DutyRow("22-24", {"值班": ["8"]})],
+            summary={"在勤": ["8"]},
+        )
+        tomorrow = module.DutySheet(
+            roc_date="1150629",
+            rows=[module.DutyRow("08-10", {"值班": ["11"]})],
+            summary={"在勤": ["11"]},
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150628"), [], tomorrow)
+        next_handoff_0800 = [
+            (action.kind, action.time, action.actor, action.target, action.fields.get("出或入"), action.source, action.date_offset)
+            for action in actions
+            if action.source == "值班交接" and action.time == "08:00" and action.date_offset == 1
+        ]
+
+        self.assertEqual(
+            next_handoff_0800,
+            [
+                ("entry_log", "08:00", "8", "8", "值退", "值班交接", 1),
+                ("entry_log", "08:00", "8", "11", "值班", "值班交接", 1),
+                ("work_log", "08:00", "8", "8", None, "值班交接", 1),
+            ],
+        )
+
     def test_0800_handoff_uses_previous_fire_day_not_today_0700(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(
