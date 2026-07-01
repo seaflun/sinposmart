@@ -469,7 +469,7 @@ class PackageSmokeTests(unittest.TestCase):
             },
             "yesterday": {
                 "roc_date": "1150627",
-                "rows": [{"slot": "08-12", "columns": {duty: ["8"], standby: ["4"]}}],
+                "rows": [{"slot": "22-24", "columns": {duty: ["8"], standby: ["4"]}}],
                 "summary": {on_duty: ["4", "8"]},
                 "staff": {"4": {"name": "四號"}, "8": {"name": "八號"}},
             },
@@ -483,6 +483,127 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertTrue(data["actions"])
         self.assertTrue(any(str(action.get("actor")) == "11" for action in data["actions"]))
+
+    def test_sanitize_merges_missing_schedule_actions_when_actions_partial(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        duty = "\u503c\u73ed"
+        standby = "\u5099\u52e4"
+        on_duty = "\u5728\u52e4"
+        handoff = "\u503c\u73ed\u4ea4\u63a5"
+        duty_end = "\u503c\u9000"
+        data = {
+            "target_date": "1150628",
+            "today": {
+                "roc_date": "1150628",
+                "rows": [{"slot": "08-12", "columns": {duty: ["11"], standby: ["3"]}}],
+                "summary": {on_duty: ["3", "11"]},
+                "staff": {"3": {"name": "三號"}, "11": {"name": "十一號"}},
+            },
+            "yesterday": {
+                "roc_date": "1150627",
+                "rows": [{"slot": "22-24", "columns": {duty: ["8"], standby: ["4"]}}],
+                "summary": {on_duty: ["4", "8"]},
+                "staff": {"4": {"name": "四號"}, "8": {"name": "八號"}},
+            },
+            "tomorrow": {"roc_date": "1150629", "rows": [], "summary": {}, "staff": {}},
+            "cases": [],
+            "yesterday_cases": [],
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "8",
+                    "target": "8",
+                    "fields": {
+                        "\u767b\u6253\u6642\u9593": "08:00",
+                        "\u7cfb\u7d71\u5beb\u5165\u6642\u9593": "08:00",
+                        "\u52e4\u52d9\u9805\u76ee": "\u503c\u73ed(\u5bbf)",
+                        "\u51fa\u6216\u5165": duty_end,
+                        "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede": duty_end,
+                    },
+                    "source": handoff,
+                    "duplicate_key": f"entry:2026-06-28:8:{duty_end}:8",
+                }
+            ],
+        }
+
+        gui.sanitize_schedule_data(data)
+
+        self.assertEqual(
+            sum(1 for action in data["actions"] if action.get("duplicate_key") == f"entry:2026-06-28:8:{duty_end}:8"),
+            1,
+        )
+        self.assertTrue(
+            any(action.get("duplicate_key") == f"entry:2026-06-28:8:{duty}:11" for action in data["actions"])
+        )
+        self.assertTrue(
+            any(action.get("duplicate_key") == f"work:2026-06-28:8:{handoff}:8" for action in data["actions"])
+        )
+
+    def test_duty_tasks_show_previous_handoff_work_for_incoming_actor(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        handoff = "\u503c\u73ed\u4ea4\u63a5"
+        duty = "\u503c\u73ed"
+        duty_end = "\u503c\u9000"
+
+        class ActorNo:
+            def get(self) -> str:
+                return "11"
+
+        gui.session = None
+        gui.actor_no = ActorNo()
+        gui.duty_data = {"target_date": "1150628"}
+        gui.duty_action_compare = {}
+        gui.submitting_indices = set()
+        gui.paused_due_indices = {}
+        gui.executed_due = set()
+        gui.manual_completed_keys = set()
+        gui.duty_actions = [
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "8",
+                "target": "8",
+                "fields": {"\u51fa\u6216\u5165": duty_end, "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede": duty_end},
+                "source": handoff,
+            },
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "8",
+                "target": "11",
+                "fields": {"\u51fa\u6216\u5165": duty, "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede": duty},
+                "source": handoff,
+            },
+            {
+                "kind": "work_log",
+                "time": "08:00",
+                "actor": "8",
+                "target": "8",
+                "fields": {"\u5de5\u4f5c\u6642\u9593": "08:00", "\u52e4\u52d9\u9805\u76ee": "\u503c\u73ed(\u5bbf)"},
+                "source": handoff,
+            },
+        ]
+        gui.duty_action_compare = {
+            index: {"compare": "\u672a\u627e\u5230", "group": "todo", "matched": []}
+            for index in range(len(gui.duty_actions))
+        }
+
+        indices = gui.duty_task_indices()
+        status, tag, is_next_candidate = gui.resolve_duty_task_display(
+            2,
+            gui.duty_actions[2],
+            gui.duty_action_compare[2],
+            "11",
+            datetime(2026, 6, 28, 8, 1),
+        )
+
+        self.assertIn(2, indices)
+        self.assertEqual(status, "\u524d\u73ed\u624b\u52d5")
+        self.assertEqual(tag, "waiting")
+        self.assertFalse(is_next_candidate)
 
     def test_reset_duty_task_scroll_moves_hidden_canvas_to_top(self) -> None:
         module = duty_gui_module()

@@ -1628,8 +1628,6 @@ class DutyGui(ctk.CTk):
         self.refresh_duty_tasks()
 
     def ensure_schedule_actions(self, data: dict[str, Any]) -> None:
-        if data.get("actions"):
-            return
         target_roc_date = str(data.get("target_date", "") or "")
         if not target_roc_date or not data.get("today", {}).get("rows"):
             return
@@ -1690,7 +1688,51 @@ class DutyGui(ctk.CTk):
             cases_from_payload("yesterday_cases"),
             tomorrow_sheet,
         )
-        data["actions"] = [asdict(action) for action in actions]
+        planned_payloads = [asdict(action) for action in actions]
+        existing_actions = data.get("actions", [])
+        if not existing_actions:
+            data["actions"] = planned_payloads
+            return
+        if not isinstance(existing_actions, list):
+            data["actions"] = planned_payloads
+            return
+
+        def action_merge_key(action: Any) -> tuple[str, ...] | None:
+            if not isinstance(action, dict):
+                return None
+            duplicate_key = str(action.get("duplicate_key", "") or "").strip()
+            if duplicate_key:
+                return ("duplicate_key", duplicate_key)
+            fields = action.get("fields", {})
+            if not isinstance(fields, dict):
+                fields = {}
+            return (
+                "identity",
+                str(action.get("kind", "") or ""),
+                str(action.get("time", "") or ""),
+                str(action.get("source", "") or ""),
+                str(action.get("actor", "") or ""),
+                str(action.get("target", "") or ""),
+                str(action.get("date_offset", 0) or 0),
+                str(fields.get("登打時間") or fields.get("工作時間") or ""),
+                str(fields.get("出或入", "") or ""),
+                str(fields.get("領用事由及地點", "") or ""),
+                str(fields.get("勤務項目", "") or ""),
+            )
+
+        existing_keys = set()
+        for action in existing_actions:
+            key = action_merge_key(action)
+            if key:
+                existing_keys.add(key)
+        for action in planned_payloads:
+            key = action_merge_key(action)
+            if key and key in existing_keys:
+                continue
+            existing_actions.append(action)
+            if key:
+                existing_keys.add(key)
+        data["actions"] = existing_actions
 
     def sanitize_schedule_data(self, data: dict[str, Any]) -> None:
         self.ensure_schedule_actions(data)
@@ -4044,7 +4086,7 @@ class DutyGui(ctk.CTk):
         indices = []
         for index, action in enumerate(self.duty_actions):
             action_actor = str(action.get("actor", ""))
-            is_previous_actor_item = action_actor in previous_actor_nos and action.get("kind") == "entry_log"
+            is_previous_actor_item = self.is_previous_duty_item(action, actor_no, previous_actor_nos)
             if action_actor != actor_no and not is_previous_actor_item:
                 continue
             compare = self.duty_action_compare.get(index, {})
@@ -4059,6 +4101,17 @@ class DutyGui(ctk.CTk):
         if not compare:
             return True
         return compare.get("group") not in ("done", "near", "adjust", "future")
+
+    def is_previous_duty_item(self, action: dict[str, Any], actor_no: str, previous_actor_nos: set[str] | None = None) -> bool:
+        if not actor_no:
+            return False
+        previous_actor_nos = previous_actor_nos if previous_actor_nos is not None else self.previous_duty_actor_nos(actor_no)
+        action_actor = str(action.get("actor", ""))
+        if action_actor not in previous_actor_nos:
+            return False
+        if action.get("kind") == "entry_log":
+            return True
+        return action.get("kind") == "work_log" and action.get("source") == "值班交接"
 
     def previous_duty_actor_nos(self, actor_no: str) -> set[str]:
         previous: set[str] = set()
@@ -4332,7 +4385,11 @@ class DutyGui(ctk.CTk):
         actor_no: str,
         now: datetime,
     ) -> tuple[str, str, bool]:
-        is_previous_actor_item = actor_no and str(action.get("actor", "")) != str(actor_no)
+        is_previous_actor_item = bool(
+            actor_no
+            and str(action.get("actor", "")) != str(actor_no)
+            and self.is_previous_duty_item(action, actor_no)
+        )
         action_at = self.action_datetime(action)
         is_auto_candidate = bool(actor_no and str(action.get("actor", "")) == str(actor_no) and self.is_auto_duty_action(action))
         if index in self.submitting_indices:
