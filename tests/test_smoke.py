@@ -268,6 +268,33 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn('trigger_type="update"', source)
         self.assertIn("immediate=True", source)
 
+    def test_duty_control_buttons_keep_spacing(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn('self.manual_pause_button.pack(side=tk.RIGHT, padx=(0, 6))', source)
+        self.assertIn('self.resume_schedule_button.pack(side=tk.RIGHT, padx=(0, 6))', source)
+        self.assertTrue(
+            'self.early_submit_button.pack(side=tk.RIGHT, padx=(0, 6))' in source,
+            "手動登打按鈕右側需保留 6px 間距，避免貼住手動暫停按鈕。",
+        )
+        self.assertEqual(
+            source.count("self.early_submit_button.pack(side=tk.RIGHT)\n"),
+            0,
+            "手動登打按鈕不得用無 padx 的 pack 呼叫，登入後重新顯示也要保留間距。",
+        )
+
+    def test_logged_out_simple_mode_uses_compact_height(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertTrue(
+            'self.geometry("550x320")' in source,
+            "未登入值班模式視窗高度應貼近登入卡片內容，避免下方大片留白。",
+        )
+        self.assertTrue(
+            "self.minsize(530, 300)" in source,
+            "未登入值班模式最小高度應維持精簡。",
+        )
+
     def test_auto_logout_waits_until_submit_queues_are_idle(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)
@@ -305,6 +332,49 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(gui.auto_logout_after_id, "after-id")
         self.assertEqual(gui.auto_logout_actor_no, "10")
         self.assertEqual(gui.pending_auto_logout_actor_no, "")
+        self.assertEqual(len(scheduled), 1)
+
+    def test_auto_logout_waits_until_manual_pause_is_resumed(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class StatusText:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        scheduled: list[tuple[int, object]] = []
+        gui.auto_logout_after_id = None
+        gui.auto_logout_deadline = None
+        gui.auto_logout_actor_no = ""
+        gui.pending_auto_logout_actor_no = ""
+        gui.pending_auto_logout_deadline = None
+        gui.submit_queues = {"entry": [], "work": []}
+        gui.submit_worker_running = {"entry": False, "work": False}
+        gui.manual_paused_due_indices = {0: "10"}
+        gui.duty_status_text = StatusText()
+        gui.after = lambda delay_ms, callback: scheduled.append((delay_ms, callback)) or "after-id"
+        gui.after_cancel = lambda _after_id: None
+        gui.action_datetime = lambda _action: datetime(2026, 7, 2, 12, 0)
+        action = {"kind": "entry_log", "time": "12:00", "fields": {"出或入": "值退"}}
+
+        gui.schedule_auto_logout("10", action)
+
+        self.assertIsNone(gui.auto_logout_after_id)
+        self.assertEqual(gui.pending_auto_logout_actor_no, "10")
+        self.assertEqual(scheduled, [])
+        self.assertIn("人員手動暫停", gui.duty_status_text.value)
+
+        gui.schedule_pending_auto_logout_if_idle()
+
+        self.assertEqual(scheduled, [])
+
+        gui.manual_paused_due_indices.clear()
+        gui.schedule_pending_auto_logout_if_idle()
+
+        self.assertEqual(gui.auto_logout_after_id, "after-id")
+        self.assertEqual(gui.auto_logout_actor_no, "10")
         self.assertEqual(len(scheduled), 1)
 
     def test_submit_login_failure_expires_session_and_stops_queues(self) -> None:
@@ -604,6 +674,89 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(status, "\u524d\u73ed\u624b\u52d5")
         self.assertEqual(tag, "waiting")
         self.assertFalse(is_next_candidate)
+
+    def test_manual_pause_selected_marks_current_actor_task(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        status_messages: list[str] = []
+        refreshes: list[str] = []
+        gui.session = module.LoginSession(actor_no="10", user_id="tyfd01010", password="secret", verified=True)
+        gui.duty_selected_iids = {"duty-0"}
+        gui.duty_actions = [
+            {"kind": "work_log", "time": "08:00", "actor": "10", "fields": {"勤務項目": "巡邏"}}
+        ]
+        gui.duty_action_compare = {0: {"compare": "未找到", "group": "todo", "matched": []}}
+        gui.manual_paused_due_indices = {}
+        gui.executed_due = set()
+        gui.submitting_indices = set()
+        gui.manual_completed_keys = set()
+        gui.action_completion_key = lambda _action: "work-0"
+        gui.action_datetime = lambda _action: datetime(2026, 7, 2, 8, 0)
+        gui.is_auto_duty_action = lambda _action: True
+        gui.compare_needs_manual_review = lambda _compare: False
+        gui.set_duty_status = lambda message, **_kwargs: status_messages.append(message)
+        gui.refresh_duty_tasks = lambda: refreshes.append("refresh")
+
+        gui.manual_pause_selected()
+        status, tag, is_next_candidate = gui.resolve_duty_task_display(
+            0,
+            gui.duty_actions[0],
+            gui.duty_action_compare[0],
+            "10",
+            datetime(2026, 7, 2, 8, 1),
+        )
+
+        self.assertEqual(gui.manual_paused_due_indices, {0: "10"})
+        self.assertEqual(status, "人員手動暫停")
+        self.assertEqual(tag, "manual")
+        self.assertFalse(is_next_candidate)
+        self.assertTrue(any("人員手動暫停" in message for message in status_messages))
+        self.assertEqual(refreshes, ["refresh"])
+
+    def test_manual_pause_blocks_due_until_resume_schedule(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        submitted: list[tuple[int, str]] = []
+        logged: list[tuple[int, str]] = []
+        status_messages: list[str] = []
+        gui.session = module.LoginSession(actor_no="10", user_id="tyfd01010", password="secret", verified=True)
+        gui.duty_selected_iids = {"duty-0"}
+        gui.duty_actions = [
+            {"kind": "work_log", "time": "08:00", "actor": "10", "fields": {"勤務項目": "巡邏"}}
+        ]
+        gui.duty_action_compare = {0: {"compare": "未找到", "group": "todo", "matched": []}}
+        gui.manual_paused_due_indices = {0: "10"}
+        gui.paused_due_indices = {}
+        gui.executed_due = set()
+        gui.submitting_indices = set()
+        gui.failed_due_retry_after = {}
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.duty_task_indices = lambda: [0]
+        gui.action_datetime = lambda _action: datetime(2026, 7, 2, 8, 0)
+        gui.action_target_roc_date = lambda _action: "1150702"
+        gui.should_pause_due_action = lambda _action, _target_roc_date, now=None: ""
+        gui.is_auto_duty_action = lambda _action: True
+        gui.compare_needs_manual_review = lambda _compare: False
+        gui.log_trigger = lambda index, _action, trigger_type, **_kwargs: logged.append((index, trigger_type))
+        gui.submit_duty_action = lambda index, _action, **kwargs: submitted.append((index, kwargs["trigger_type"]))
+        gui.set_duty_status = lambda message, **_kwargs: status_messages.append(message)
+        gui.refresh_duty_tasks = lambda: None
+        gui.schedule_pending_auto_logout_if_idle = lambda: None
+
+        gui.trigger_due_tasks(datetime(2026, 7, 2, 8, 1))
+
+        self.assertEqual(logged, [])
+        self.assertEqual(submitted, [])
+
+        gui.resume_selected_schedule()
+        gui.trigger_due_tasks(datetime(2026, 7, 2, 8, 2))
+
+        self.assertEqual(gui.manual_paused_due_indices, {})
+        self.assertEqual(logged, [(0, "due")])
+        self.assertEqual(submitted, [(0, "due")])
+        self.assertTrue(any("繼續排程" in message for message in status_messages))
 
     def test_reset_duty_task_scroll_moves_hidden_canvas_to_top(self) -> None:
         module = duty_gui_module()
