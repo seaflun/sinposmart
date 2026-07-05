@@ -76,6 +76,37 @@ class PackageSmokeTests(unittest.TestCase):
                 source = path.read_text(encoding="utf-8-sig")
                 compile(source, str(path), "exec")
 
+    def test_background_chrome_options_have_offscreen_fallback(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        helper = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "background_chrome_options"
+        )
+        helper_args = [
+            node.args[0].value
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ]
+
+        self.assertIn("def background_chrome_options() -> Options:", source)
+        self.assertIn("--headless=new", helper_args)
+        self.assertIn("--window-size=1280,900", helper_args)
+        self.assertIn("--window-position=-32000,-32000", helper_args)
+        self.assertNotIn("--disable-popup-blocking", helper_args)
+        self.assertGreaterEqual(source.count("background_chrome_options()"), 5)
+
+    def test_readonly_background_queries_suppress_window_open(self) -> None:
+        source = (package_dir() / "duty_rehearsal.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("def suppress_window_open_for_background_query", source)
+        self.assertGreaterEqual(source.count("suppress_window_open_for_background_query(driver)"), 3)
+
     def test_update_package_excludes_sensitive_and_runtime_files(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
 

@@ -325,6 +325,17 @@ def js_set(driver: webdriver.Chrome, element_id: str, value: str) -> bool:
     )
 
 
+def suppress_window_open_for_background_query(driver: webdriver.Chrome) -> None:
+    try:
+        driver.execute_script(
+            """
+            window.open = function() { return null; };
+            """
+        )
+    except Exception:
+        pass
+
+
 def detect_login_error(driver: webdriver.Chrome) -> str:
     try:
         alert = driver.switch_to.alert
@@ -1458,6 +1469,7 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
 def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutySheet:
     open_ap(driver, DUTY_TABLE_AP)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     js_set(driver, "_txtTaskDate", target_roc_date)
     if not js_click(driver, "_btnQuery"):
         js_click(driver, "_btnSearch")
@@ -1601,6 +1613,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
 def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date: str) -> list[list[str]]:
     open_ap(driver, ap_name)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     for field_id in (
         "_txtSDATE",
         "_txtEDATE",
@@ -1655,6 +1668,7 @@ def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date:
 def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
     open_ap(driver, CASE_QUERY_AP)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     js_set(driver, "_hidDeptno", "033006")
     js_set(driver, "_txtSDATE", target_roc_date)
     js_set(driver, "_txtEDATE", target_roc_date)

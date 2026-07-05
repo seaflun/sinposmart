@@ -423,6 +423,14 @@ def configure_webdriver_timeouts(driver: webdriver.Chrome) -> None:
         pass
 
 
+def background_chrome_options() -> Options:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--window-position=-32000,-32000")
+    return options
+
+
 def sinposmart_tool_timeout_seconds() -> int:
     try:
         return max(60, int(os.environ.get("SINPOSMART_TOOL_TIMEOUT_SECONDS", str(DEFAULT_TOOL_TIMEOUT_SECONDS))))
@@ -2963,9 +2971,7 @@ class DutyGui(ctk.CTk):
     def _verify_login_worker(self, attempt_id: int, actor_no: str, user_id: str, password: str) -> None:
         driver = None
         try:
-            options = Options()
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-popup-blocking")
+            options = background_chrome_options()
             driver = self.register_webdriver(webdriver.Chrome(options=options))
             configure_webdriver_timeouts(driver)
             login(driver, user_id, password)
@@ -3071,9 +3077,7 @@ class DutyGui(ctk.CTk):
         def worker() -> None:
             driver = None
             try:
-                options = Options()
-                options.add_argument("--headless=new")
-                options.add_argument("--disable-popup-blocking")
+                options = background_chrome_options()
                 driver = self.register_webdriver(webdriver.Chrome(options=options))
                 configure_webdriver_timeouts(driver)
                 login(driver, session.user_id, session.password)
@@ -3211,9 +3215,7 @@ class DutyGui(ctk.CTk):
         def worker() -> None:
             driver = None
             try:
-                options = Options()
-                options.add_argument("--headless=new")
-                options.add_argument("--disable-popup-blocking")
+                options = background_chrome_options()
                 driver = self.register_webdriver(webdriver.Chrome(options=options))
                 configure_webdriver_timeouts(driver)
                 login(driver, session.user_id, session.password)
@@ -5057,9 +5059,9 @@ class DutyGui(ctk.CTk):
             options = Options()
             if visible:
                 options.add_argument("--start-maximized")
+                options.add_argument("--disable-popup-blocking")
             else:
-                options.add_argument("--headless=new")
-            options.add_argument("--disable-popup-blocking")
+                options = background_chrome_options()
             driver = self.register_webdriver(webdriver.Chrome(options=options))
             configure_webdriver_timeouts(driver)
             login(driver, session.user_id, session.password)
