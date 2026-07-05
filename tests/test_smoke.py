@@ -978,7 +978,78 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertNotIn("self.credential_export_button = ctk.CTkButton", source)
         self.assertIn("sync_credentials_after_login", {node.func.attr for node in ast.walk(login_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)})
 
-    def test_auto_credential_sync_uses_current_login_only(self) -> None:
+    def test_auto_credential_sync_sends_login_name_with_saved_accounts(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        captured: list[tuple[dict[str, object], int, bool]] = []
+
+        class ImmediateThread:
+            def __init__(self, target: object, args: tuple[object, ...] = (), daemon: bool | None = None) -> None:
+                self.target = target
+                self.args = args
+
+            def start(self) -> None:
+                self.target(*self.args)
+
+        gui.saved_accounts = [
+            {"actor_no": "8", "user_id": "tyfd01510", "password": "old-pass", "display_name": "8番 tyfd01510", "id_number": "B123017532"},
+            {"actor_no": "9", "user_id": "tyfd00009", "password": "pass9", "display_name": "9番 王小明", "name": "王小明"},
+        ]
+        gui.duty_staff = {}
+        gui.staff = {}
+        gui.duty_data = {}
+        gui.data = {}
+        gui.work_log_rows_for_person = lambda _actor_no, _name: []
+        gui._credential_sync_send_worker = lambda payload, count, notify_user=True: captured.append((payload, count, notify_user))
+        gui._credential_sync_send_failed = lambda *_args, **_kwargs: None
+        original_enabled = module.credential_sync_enabled
+        original_thread = module.threading.Thread
+        module.credential_sync_enabled = lambda: True
+        module.threading.Thread = ImmediateThread
+        try:
+            gui.sync_credentials_after_login("8", "tyfd01510", "new-pass", name="曾彥綸")
+        finally:
+            module.credential_sync_enabled = original_enabled
+            module.threading.Thread = original_thread
+
+        self.assertEqual(len(captured), 1)
+        payload, count, notify_user = captured[0]
+        accounts = payload["accounts"]
+        synced_8 = next(account for account in accounts if account["actor_no"] == "8")
+
+        self.assertEqual(count, 2)
+        self.assertFalse(notify_user)
+        self.assertEqual(synced_8["user_id"], "tyfd01510")
+        self.assertEqual(synced_8["password"], "new-pass")
+        self.assertEqual(synced_8["display_name"], "8番 曾彥綸")
+        self.assertEqual(synced_8["name"], "曾彥綸")
+        self.assertEqual(synced_8["id_number"], "B123017532")
+
+    def test_identify_logged_in_actor_keeps_greeting_name_without_staff_map(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.staff = {}
+        gui.actor_no_from_name = lambda _name: ""
+
+        class SwitchTo:
+            def default_content(self) -> None:
+                return None
+
+            def frame(self, _frame: object) -> None:
+                return None
+
+        class Driver:
+            switch_to = SwitchTo()
+
+            def execute_script(self, _script: str) -> str:
+                return "曾彥綸,您好"
+
+            def find_elements(self, _by: str, _value: str) -> list[object]:
+                return []
+
+        self.assertEqual(gui.identify_logged_in_actor(Driver()), ("", "曾彥綸"))
+
+    def test_auto_credential_sync_uses_saved_accounts_after_login(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         sync_fn = next(
@@ -989,7 +1060,7 @@ class PackageSmokeTests(unittest.TestCase):
         calls = {node.func.attr for node in ast.walk(sync_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
 
         self.assertIn("account_for_credential_sync", calls)
-        self.assertNotIn("saved_accounts_for_credential_sync", calls)
+        self.assertIn("saved_accounts_for_credential_sync", calls)
 
     def test_credential_sync_worker_supports_silent_background_mode(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")

@@ -2184,7 +2184,7 @@ class DutyGui(ctk.CTk):
         if self.saved_login_can_persist and (payload.get("accounts") != normalized or "accounts" not in payload):
             self.persist_saved_accounts(last_selected)
 
-    def save_login_locally(self, actor_no: str, user_id: str, password: str, display_name: str = "") -> None:
+    def save_login_locally(self, actor_no: str, user_id: str, password: str, display_name: str = "", name: str = "", id_number: str = "") -> None:
         identity = user_id or actor_no
         if not identity:
             return
@@ -2195,10 +2195,18 @@ class DutyGui(ctk.CTk):
             "user_id": user_id,
             "password": password,
             "display_name": display_name,
+            "name": str(name or "").strip(),
+            "id_number": str(id_number or "").strip(),
         }
         replaced = False
         for index, account in enumerate(self.saved_accounts):
             if self.account_identity(account) == identity:
+                if not updated["display_name"]:
+                    updated["display_name"] = str(account.get("display_name", "") or "")
+                if not updated["name"]:
+                    updated["name"] = str(account.get("name", "") or account.get("person_name", "") or "")
+                if not updated["id_number"]:
+                    updated["id_number"] = str(account.get("id_number", "") or account.get("national_id", "") or "")
                 self.saved_accounts[index] = updated
                 replaced = True
                 break
@@ -2659,16 +2667,22 @@ class DutyGui(ctk.CTk):
             "id_number": first_account["id_number"],
         }
 
-    def account_for_credential_sync(self, actor_no: str, user_id: str, password: str) -> dict[str, str]:
+    def account_for_credential_sync(self, actor_no: str, user_id: str, password: str, name: str = "") -> dict[str, str]:
         actor_no = str(actor_no or "").strip()
         user_id = str(user_id or "").strip()
         password = str(password or "")
-        display_name = self.current_account_display_name(actor_no, user_id)
+        saved_account = self.saved_account_by_user_id(user_id) or {}
+        name = str(name or "").strip()
+        display_name = str(saved_account.get("display_name", "") or self.current_account_display_name(actor_no, user_id)).strip()
+        if name:
+            display_name = f"{actor_no}番 {name}" if actor_no else name
         account = {
             "actor_no": actor_no,
             "user_id": user_id,
             "password": password,
             "display_name": display_name,
+            "name": name or str(saved_account.get("name", "") or saved_account.get("person_name", "") or ""),
+            "id_number": str(saved_account.get("id_number", "") or saved_account.get("national_id", "") or ""),
         }
         name, id_number = self.account_person_metadata(account, actor_no, user_id, display_name)
         return {
@@ -2677,18 +2691,36 @@ class DutyGui(ctk.CTk):
             "id_number": id_number,
         }
 
-    def sync_credentials_after_login(self, actor_no: str, user_id: str, password: str) -> None:
+    def upsert_credential_sync_account(self, accounts: list[dict[str, str]], account: dict[str, str]) -> None:
+        identity = self.account_identity(account)
+        if not identity:
+            return
+        for index, existing in enumerate(accounts):
+            if self.account_identity(existing) != identity:
+                continue
+            merged = dict(existing)
+            for key, value in account.items():
+                if key == "password" or str(value or "").strip():
+                    merged[key] = value
+            accounts[index] = merged
+            return
+        accounts.insert(0, account)
+
+    def sync_credentials_after_login(self, actor_no: str, user_id: str, password: str, name: str = "") -> None:
         try:
             if not credential_sync_enabled():
                 return
-            account = self.account_for_credential_sync(actor_no, user_id, password)
-            if not account["user_id"] or not account["password"]:
+            account = self.account_for_credential_sync(actor_no, user_id, password, name=name)
+            accounts = self.saved_accounts_for_credential_sync()
+            if account["user_id"] and account["password"]:
+                self.upsert_credential_sync_account(accounts, account)
+            if not accounts:
                 return
             payload = self.credential_sync_payload(
-                [account],
+                accounts,
                 sync_code=f"sinposmart-login-{datetime.now():%Y%m%d%H%M%S}-{uuid4().hex}",
             )
-            threading.Thread(target=self._credential_sync_send_worker, args=(payload, 1, False), daemon=True).start()
+            threading.Thread(target=self._credential_sync_send_worker, args=(payload, len(accounts), False), daemon=True).start()
         except Exception as exc:
             self._credential_sync_send_failed(str(exc), notify_user=False)
 
@@ -2985,7 +3017,7 @@ class DutyGui(ctk.CTk):
             return
         finally:
             self.quit_registered_webdriver(driver)
-        self.after(0, lambda value=attempt_id: self._login_succeeded(value, actor_no, user_id, password))
+        self.after(0, lambda value=attempt_id, resolved_name=actor_name: self._login_succeeded(value, actor_no, user_id, password, resolved_name))
 
     def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
         target_date = parse_roc_date(target_roc_date)
@@ -3331,6 +3363,7 @@ class DutyGui(ctk.CTk):
             actor_no = self.actor_no_from_name(actor_name)
             if actor_no:
                 return actor_no, actor_name
+            return "", actor_name
         candidates = []
         for no, info in self.staff.items():
             name = info.get("name", "")
@@ -3352,7 +3385,7 @@ class DutyGui(ctk.CTk):
             """
         ) or ""
 
-    def _login_succeeded(self, attempt_id: int, actor_no: str, user_id: str, password: str) -> None:
+    def _login_succeeded(self, attempt_id: int, actor_no: str, user_id: str, password: str, actor_name: str = "") -> None:
         if attempt_id != self.login_attempt_id:
             return
         self.login_running = False
@@ -3374,9 +3407,13 @@ class DutyGui(ctk.CTk):
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
         self.last_update_logout_identity = {"actor_no": actor_no, "user_id": user_id}
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
+        actor_name = str(actor_name or "").strip()
+        display_name = self.current_account_display_name(actor_no, user_id)
+        if actor_name:
+            display_name = f"{actor_no}番 {actor_name}" if actor_no else actor_name
         if self.should_save_successful_login(actor_no, user_id):
-            self.save_login_locally(actor_no, user_id, password, self.current_account_display_name(actor_no, user_id))
-        self.sync_credentials_after_login(actor_no, user_id, password)
+            self.save_login_locally(actor_no, user_id, password, display_name, name=actor_name)
+        self.sync_credentials_after_login(actor_no, user_id, password, name=actor_name)
         if self.data.get("target_date"):
             self.action_compare = self.build_comparison(self.data)
         if self.duty_data.get("target_date"):
