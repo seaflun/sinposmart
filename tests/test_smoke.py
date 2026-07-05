@@ -789,6 +789,126 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(submitted, [(0, "due")])
         self.assertTrue(any("繼續排程" in message for message in status_messages))
 
+    def test_manual_work_log_submit_uses_current_time(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        real_datetime = module.datetime
+
+        class FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 7, 2, 9, 37)
+                if tz is not None:
+                    return value.replace(tzinfo=tz)
+                return value
+
+        action = {
+            "kind": "work_log",
+            "time": "08:00",
+            "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+        }
+        try:
+            module.datetime = FixedDatetime
+            updated = gui.action_for_manual_submit(action)
+        finally:
+            module.datetime = real_datetime
+
+        self.assertIsNot(updated, action)
+        self.assertEqual(updated["time"], "09:37")
+        self.assertEqual(updated["submit_target_date"], "1150702")
+        self.assertEqual(updated["fields"]["工作時間"], "09:37")
+        self.assertEqual(action["fields"]["工作時間"], "08:00")
+
+    def test_manual_entry_log_without_reason_whitelist_uses_current_time(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        real_datetime = module.datetime
+
+        class FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 7, 2, 9, 41)
+                if tz is not None:
+                    return value.replace(tzinfo=tz)
+                return value
+
+        action = {
+            "kind": "entry_log",
+            "time": "08:05",
+            "source": "昨日在勤且今日未在勤",
+            "fields": {"出或入": "出", "領用事由及地點": "退勤", "登打時間": "08:05", "系統寫入時間": "08:05"},
+        }
+        try:
+            module.datetime = FixedDatetime
+            updated = gui.action_for_manual_submit(action)
+        finally:
+            module.datetime = real_datetime
+
+        self.assertIsNot(updated, action)
+        self.assertEqual(updated["time"], "09:41")
+        self.assertEqual(updated["submit_target_date"], "1150702")
+        self.assertEqual(updated["fields"]["登打時間"], "09:41")
+        self.assertEqual(updated["fields"]["系統寫入時間"], "09:41")
+        self.assertEqual(action["fields"]["系統寫入時間"], "08:05")
+
+    def test_manual_submit_confirmation_mentions_current_time(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("將使用按下「手動登打」時的當下時間登打。", source)
+        self.assertEqual(source.count("將使用按下「手動登打」時的當下時間登打。"), 2)
+
+    def test_resume_overdue_manual_pause_submits_resume_time(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        real_datetime = module.datetime
+
+        class FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 7, 2, 8, 2)
+                if tz is not None:
+                    return value.replace(tzinfo=tz)
+                return value
+
+        submitted: list[dict[str, object]] = []
+        gui.session = module.LoginSession(actor_no="10", user_id="tyfd01010", password="secret", verified=True)
+        gui.duty_selected_iids = {"duty-0"}
+        gui.duty_actions = [
+            {"kind": "work_log", "time": "08:00", "actor": "10", "fields": {"工作時間": "08:00", "勤務項目": "巡邏"}}
+        ]
+        gui.duty_action_compare = {0: {"compare": "未找到", "group": "todo", "matched": []}}
+        gui.manual_paused_due_indices = {0: "10"}
+        gui.paused_due_indices = {}
+        gui.executed_due = set()
+        gui.submitting_indices = set()
+        gui.failed_due_retry_after = {}
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.duty_task_indices = lambda: [0]
+        gui.action_datetime = lambda _action: datetime(2026, 7, 2, 8, 0)
+        gui.action_target_roc_date = lambda _action: "1150702"
+        gui.should_pause_due_action = lambda _action, _target_roc_date, now=None: ""
+        gui.is_auto_duty_action = lambda _action: True
+        gui.compare_needs_manual_review = lambda _compare: False
+        gui.log_trigger = lambda *_args, **_kwargs: None
+        gui.submit_duty_action = lambda _index, action, **_kwargs: submitted.append(action)
+        gui.set_duty_status = lambda *_args, **_kwargs: None
+        gui.refresh_duty_tasks = lambda: None
+        gui.schedule_pending_auto_logout_if_idle = lambda: None
+
+        try:
+            module.datetime = FixedDatetime
+            gui.resume_selected_schedule()
+            gui.trigger_due_tasks(datetime(2026, 7, 2, 8, 5))
+        finally:
+            module.datetime = real_datetime
+
+        self.assertEqual(gui.manual_paused_due_indices, {})
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]["time"], "08:02")
+        self.assertEqual(submitted[0]["submit_target_date"], "1150702")
+        self.assertEqual(submitted[0]["fields"]["工作時間"], "08:02")
+        self.assertEqual(gui.duty_actions[0]["fields"]["工作時間"], "08:00")
+
     def test_reset_duty_task_scroll_moves_hidden_canvas_to_top(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)

@@ -839,6 +839,7 @@ class DutyGui(ctk.CTk):
         self.manual_completed_keys: set[str] = set()
         self.paused_due_indices: dict[int, str] = {}
         self.manual_paused_due_indices: dict[int, str] = {}
+        self.manual_resume_due_times: dict[int, datetime] = {}
         self.failed_due_retry_after: dict[int, datetime] = {}
         self.submitting_indices: set[int] = set()
         self.submit_queues: dict[str, list[tuple[int, dict[str, Any], bool, bool, bool, str]]] = {"entry": [], "work": []}
@@ -3297,7 +3298,7 @@ class DutyGui(ctk.CTk):
         self.submit_queues = {"entry": [], "work": []}
         self.submit_worker_running = {"entry": False, "work": False}
         self.submitting_indices.clear()
-        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.clear_manual_pause_state()
         self.work_submit_parallel_enabled = True
         self.submit_needs_comparison_refresh = False
         self.submit_comparison_refresh_dates.clear()
@@ -3359,7 +3360,7 @@ class DutyGui(ctk.CTk):
         self.clear_duty_status_override()
         self.executed_due.clear()
         self.manual_completed_keys.clear()
-        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.clear_manual_pause_state()
         self.submitting_indices.clear()
         self.failed_due_retry_after.clear()
         self.submit_queues = {"entry": [], "work": []}
@@ -3408,7 +3409,7 @@ class DutyGui(ctk.CTk):
         self.login_running = False
         self.set_login_buttons_enabled(True)
         self.session = None
-        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.clear_manual_pause_state()
         self.login_status.set(error)
         snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
         self.send_sinposmart_backend_event("login_failed", status="failed", trigger_type="login", error=error, snapshot=snapshot)
@@ -3423,7 +3424,7 @@ class DutyGui(ctk.CTk):
         self.login_attempt_id += 1
         self.set_login_buttons_enabled(True)
         self.session = None
-        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.clear_manual_pause_state()
         self.login_status.set("登入逾時：請確認帳號密碼或勤務系統是否有回應。")
         messagebox.showerror("登入逾時", "登入超過 45 秒沒有完成，已恢復登入按鈕。")
         self.update_login_panel()
@@ -3604,7 +3605,7 @@ class DutyGui(ctk.CTk):
         self.session = None
         self.executed_due.clear()
         self.manual_completed_keys.clear()
-        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.clear_manual_pause_state()
         self.submitting_indices.clear()
         self.duty_selected_iids.clear()
         self.failed_due_retry_after.clear()
@@ -4012,7 +4013,7 @@ class DutyGui(ctk.CTk):
             return
         if self.session and self.session.verified and self.session.actor_no != actor_no:
             self.session = None
-            self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+            self.clear_manual_pause_state()
             self.login_status.set("番號已變更，請重新測試登入。")
         self.filter_actor.set(True)
         self.refresh_tasks()
@@ -4278,28 +4279,28 @@ class DutyGui(ctk.CTk):
             if compare:
                 self.duty_action_compare[index] = dict(compare)
 
-    def manual_entry_uses_current_time(self, action: dict[str, Any]) -> bool:
-        if action.get("kind") != "entry_log":
-            return False
-        fields = action.get("fields", {})
-        outin = fields.get("出或入", "")
-        reason = fields.get("領用事由及地點", "")
-        if outin in ("值班", "值退") or reason in ("值班", "值退", "到勤"):
-            return True
-        return str(action.get("source", "")).startswith("外勤") or reason in ("休息", "休息返隊", "休息後退勤")
+    def manual_submit_uses_current_time(self, action: dict[str, Any]) -> bool:
+        return action.get("kind") in ("work_log", "entry_log")
 
-    def action_for_manual_submit(self, action: dict[str, Any]) -> dict[str, Any]:
-        if not self.manual_entry_uses_current_time(action):
-            return action
-        current_now = datetime.now()
-        current_time = current_now.strftime("%H:%M")
+    def action_with_submit_time(self, action: dict[str, Any], submit_at: datetime) -> dict[str, Any]:
+        current_time = submit_at.strftime("%H:%M")
         updated = copy.deepcopy(action)
         fields = updated.setdefault("fields", {})
-        fields["登打時間"] = current_time
-        fields["系統寫入時間"] = current_time
+        if updated.get("kind") == "work_log":
+            fields["工作時間"] = current_time
+        elif updated.get("kind") == "entry_log":
+            fields["登打時間"] = current_time
+            fields["系統寫入時間"] = current_time
+        else:
+            return action
         updated["time"] = current_time
-        updated["submit_target_date"] = roc_date(current_now.date())
+        updated["submit_target_date"] = roc_date(submit_at.date())
         return updated
+
+    def action_for_manual_submit(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not self.manual_submit_uses_current_time(action):
+            return action
+        return self.action_with_submit_time(action, datetime.now())
 
     def pending_previous_duty_count(self, actor_no: str) -> int:
         if not actor_no:
@@ -4315,6 +4316,13 @@ class DutyGui(ctk.CTk):
         if not actor:
             return 0
         return sum(1 for paused_actor in self.__dict__.get("manual_paused_due_indices", {}).values() if str(paused_actor) == actor)
+
+    def manual_resume_times(self) -> dict[int, datetime]:
+        return self.__dict__.setdefault("manual_resume_due_times", {})
+
+    def clear_manual_pause_state(self) -> None:
+        self.__dict__.setdefault("manual_paused_due_indices", {}).clear()
+        self.manual_resume_times().clear()
 
     def is_manual_paused_action(self, index: int, actor_no: str | None = None) -> bool:
         actor = str(actor_no or (self.session.actor_no if self.session and self.session.verified else "")).strip()
@@ -4720,15 +4728,19 @@ class DutyGui(ctk.CTk):
             is_paused_retry = index in self.paused_due_indices and action_at <= now
             is_due_now = action_at <= now
             if is_due_now or is_paused_retry:
-                target_roc_date = self.action_target_roc_date(action)
-                pause_reason = self.should_pause_due_action(action, target_roc_date, now=now)
+                submit_action = action
+                resume_time = self.manual_resume_times().get(index)
+                if resume_time and action_at <= resume_time:
+                    submit_action = self.action_with_submit_time(action, resume_time)
+                target_roc_date = self.action_target_roc_date(submit_action)
+                pause_reason = self.should_pause_due_action(submit_action, target_roc_date, now=now)
                 if pause_reason:
                     self.paused_due_indices[index] = pause_reason
                     self.refresh_duty_tasks()
                     continue
                 self.paused_due_indices.pop(index, None)
-                self.log_trigger(index, action, "due")
-                self.submit_duty_action(index, action, save=True, visible=False, confirm=False, notify=False, trigger_type="due")
+                self.log_trigger(index, submit_action, "due")
+                self.submit_duty_action(index, submit_action, save=True, visible=False, confirm=False, notify=False, trigger_type="due")
 
     def selected_duty_indices(self) -> list[int]:
         indices = []
@@ -4774,6 +4786,7 @@ class DutyGui(ctk.CTk):
             if self.is_manual_paused_action(index, actor_no):
                 continue
             self.__dict__.setdefault("manual_paused_due_indices", {})[index] = actor_no
+            self.manual_resume_times().pop(index, None)
             paused += 1
         if not paused:
             messagebox.showinfo("手動暫停", "選取項目沒有可手動暫停的自動登打案件。")
@@ -4792,10 +4805,17 @@ class DutyGui(ctk.CTk):
             messagebox.showwarning("尚未登入", "請先登入後再繼續排程。")
             return
         actor_no = str(self.session.actor_no)
+        resume_time = datetime.now()
+        resume_times = self.manual_resume_times()
         resumed = 0
         for index in selected_indices:
             if self.is_manual_paused_action(index, actor_no):
                 self.__dict__.setdefault("manual_paused_due_indices", {}).pop(index, None)
+                action = self.duty_actions[index]
+                if self.action_datetime(action) <= resume_time:
+                    resume_times[index] = resume_time
+                else:
+                    resume_times.pop(index, None)
                 resumed += 1
         if not resumed:
             messagebox.showinfo("繼續排程", "選取項目沒有可恢復的手動暫停。")
@@ -4872,7 +4892,7 @@ class DutyGui(ctk.CTk):
             summaries += f"\n...另 {len(selected_actions) - 8} 筆"
         if skipped_completed or skipped_running:
             summaries += f"\n\n已略過：已登打 {skipped_completed} 筆，登打中 {skipped_running} 筆"
-        if save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統 {len(selected_actions)} 筆：\n{summaries}\n\n確定要繼續？"):
+        if save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統 {len(selected_actions)} 筆：\n{summaries}\n\n將使用按下「手動登打」時的當下時間登打。\n確定要繼續？"):
             return
         for index, action in sorted(selected_actions, key=lambda item: self.submit_order_key(item[0], item[1])):
             self.submit_duty_action(index, action, save=save, visible=visible, confirm=False, notify=False, trigger_type="manual")
@@ -4890,7 +4910,7 @@ class DutyGui(ctk.CTk):
             self.refresh_duty_tasks()
             return
         submit_kind = "出入" if action.get("kind") == "entry_log" else "工作"
-        if confirm and save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n確定要繼續？"):
+        if confirm and save and not messagebox.askyesno("確認手動登打", f"將登打勤務系統{submit_kind}：\n{self.duty_action_summary(action)}\n\n將使用按下「手動登打」時的當下時間登打。\n確定要繼續？"):
             return
         if trigger_type == "manual":
             self.log_trigger(index, action, trigger_type)
@@ -5149,6 +5169,7 @@ class DutyGui(ctk.CTk):
         elif trigger_type == "due":
             self.executed_due.add(index)
         self.__dict__.setdefault("manual_paused_due_indices", {}).pop(index, None)
+        self.manual_resume_times().pop(index, None)
         self.log_trigger(index, self.duty_actions[index], trigger_type, status="submitted", completion_key=completion_key)
         self.send_sinposmart_backend_event(
             "action_result",
@@ -5177,6 +5198,7 @@ class DutyGui(ctk.CTk):
         self.submitting_indices.discard(index)
         self.executed_due.add(index)
         self.__dict__.setdefault("manual_paused_due_indices", {}).pop(index, None)
+        self.manual_resume_times().pop(index, None)
         completion_key = self.action_completion_key(self.duty_actions[index])
         if trigger_type == "manual":
             self.manual_completed_keys.add(completion_key)
