@@ -446,6 +446,7 @@ FRONTEND_ERROR_MESSAGES = {
     "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
     "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
     "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "duty_sheet_preflight_failed": "勤務表檢查未通過，已停止登打。",
     "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
 }
 LOGIN_FAILURE_MARKERS = (
@@ -501,6 +502,8 @@ def automation_error_code(error: BaseException | str | None, context: str = "") 
         return "login_failed"
     if context == "login" and any(marker in lowered for marker in ("no such element", "unable to locate element")):
         return "login_failed"
+    if "勤務表檢查未通過" in text:
+        return "duty_sheet_preflight_failed"
     if "timeout" in lowered or "timed out" in lowered or "逾時" in text:
         return "timeout"
     if "no such element" in lowered or "unable to locate element" in lowered or "找不到網頁元素" in text:

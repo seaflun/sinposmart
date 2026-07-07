@@ -586,7 +586,13 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
                         car_options=opts,
                         hidden_car_options=hidden_opts,
                     )
-                    legacy.start_automation(uid, pwd, target_date, excel_path, cars_config)
+                    automation_result = legacy.start_automation(uid, pwd, target_date, excel_path, cars_config)
+                if automation_result is False:
+                    error = "勤務表檢查未通過，已停止登打。"
+                    if on_error is not None:
+                        on_error(error)
+                    run_on_dialog(lambda: set_status(f"失敗：{error}"))
+                    return
                 success = True
                 if on_finish is not None:
                     on_finish(f"勤務表登打完成：{target_date}")

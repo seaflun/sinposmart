@@ -186,6 +186,11 @@ class PackageSmokeTests(unittest.TestCase):
                 "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
             ),
             (
+                RuntimeError("勤務表檢查未通過，已停止登打。"),
+                "duty_sheet_preflight_failed",
+                "勤務表檢查未通過，已停止登打。",
+            ),
+            (
                 RuntimeError("unexpected failure\ntraceback\nsession token abc\ncookie xyz\npassword secret\nChromeDriver"),
                 "unknown_error",
                 "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
@@ -304,6 +309,98 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(excluded, {"29"})
         self.assertEqual(module.clean_to_list_excluding("18,29,23", excluded), ["18", "23"])
         self.assertEqual(module.clean_v_excluding("29,2", excluded), "2")
+        self.assertEqual(
+            module.clean_to_list("1,2 3，4.5．6、7·8。9"),
+            ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+        )
+
+    def test_daily_sheet_preflight_reports_duplicate_and_missing_assignments(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        roster = workbook.active
+        roster.title = "輪休基準表"
+        params = workbook.create_sheet("班別參數")
+        sheet = workbook.create_sheet("7號")
+
+        params.cell(row=4, column=1).value = None
+        params.cell(row=4, column=2).value = "上班"
+        roster.cell(row=4, column=5).value = 1
+        roster.cell(row=4, column=6).value = 2
+        roster.cell(row=4, column=7).value = 29
+        roster.cell(row=5, column=3).value = "日期"
+        roster.cell(row=5, column=5).value = "甲"
+        roster.cell(row=5, column=6).value = "乙"
+        roster.cell(row=5, column=7).value = "實習"
+        roster.cell(row=6, column=3).value = 7
+
+        sheet.cell(row=5, column=3).value = "值班"
+        sheet.cell(row=6, column=8).value = "指揮官"
+        for row in range(10, 34):
+            sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
+            sheet.cell(row=row, column=3).value = "1"
+            sheet.cell(row=row, column=4).value = "2"
+        sheet.cell(row=10, column=4).value = "1"
+        sheet.cell(row=10, column=5).value = "29"
+
+        issues = module.validate_daily_sheet_assignments(workbook, sheet, 7, {"29"})
+
+        self.assertTrue(any("08-09" in issue and "重複" in issue and "1" in issue for issue in issues))
+        self.assertTrue(any("08-09" in issue and "漏排" in issue and "2" in issue for issue in issues))
+        self.assertFalse(any("29" in issue for issue in issues))
+
+    def test_daily_sheet_preflight_accepts_complete_assignments(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        roster = workbook.active
+        roster.title = "輪休基準表"
+        params = workbook.create_sheet("班別參數")
+        sheet = workbook.create_sheet("7號")
+
+        params.cell(row=4, column=1).value = None
+        params.cell(row=4, column=2).value = "上班"
+        roster.cell(row=4, column=5).value = 1
+        roster.cell(row=4, column=6).value = 2
+        roster.cell(row=5, column=3).value = "日期"
+        roster.cell(row=5, column=5).value = "甲"
+        roster.cell(row=5, column=6).value = "乙"
+        roster.cell(row=6, column=3).value = 7
+
+        sheet.cell(row=5, column=3).value = "值班"
+        sheet.cell(row=6, column=8).value = "指揮官"
+        for row in range(10, 34):
+            sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
+            sheet.cell(row=row, column=3).value = "1"
+            sheet.cell(row=row, column=4).value = "2"
+
+        self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
+
+    def test_daily_sheet_preflight_counts_merged_assignments_for_each_time_slot(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        roster = workbook.active
+        roster.title = "輪休基準表"
+        params = workbook.create_sheet("班別參數")
+        sheet = workbook.create_sheet("7號")
+
+        params.cell(row=4, column=1).value = None
+        params.cell(row=4, column=2).value = "上班"
+        roster.cell(row=4, column=5).value = 1
+        roster.cell(row=4, column=6).value = 2
+        roster.cell(row=5, column=3).value = "日期"
+        roster.cell(row=5, column=5).value = "甲"
+        roster.cell(row=5, column=6).value = "乙"
+        roster.cell(row=6, column=3).value = 7
+
+        sheet.cell(row=5, column=3).value = "值班"
+        sheet.cell(row=6, column=8).value = "指揮官"
+        for row in range(10, 34):
+            sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
+            sheet.cell(row=row, column=3).value = "1"
+            sheet.cell(row=row, column=4).value = "2"
+        sheet.merge_cells(start_row=10, start_column=3, end_row=11, end_column=3)
+        sheet.merge_cells(start_row=10, start_column=4, end_row=11, end_column=4)
+
+        self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
 
     def test_base_month_text_can_detect_site_month_mismatch(self) -> None:
         module = rest_time_module()
@@ -997,6 +1094,15 @@ class PackageSmokeTests(unittest.TestCase):
             source.index("with SINPOSMART_BACKEND_EVENT_LOCK:"),
             source.index("pending = load_pending_sinposmart_backend_events()"),
         )
+
+    def test_duty_sheet_preflight_false_result_reports_tool_error(self) -> None:
+        source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("automation_result = legacy.start_automation", source)
+        self.assertIn("if automation_result is False:", source)
+        self.assertLess(source.index("if automation_result is False:"), source.index("success = True"))
+        self.assertLess(source.index("if automation_result is False:"), source.index("on_finish("))
+        self.assertIn("on_error(error)", source)
 
     def test_login_success_auto_syncs_credentials_without_export_gate(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")

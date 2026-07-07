@@ -186,7 +186,7 @@ def clean_v(v):
     """徹底清理番號：移除中文(全員)、0、標點符號，只留數字與逗號"""
     if v is None: return ""
     v_str = str(v).strip().replace(".0", "")
-    v_str = re.sub(r'[，、。\.\n\r\s]+', ',', v_str)
+    v_str = re.sub(r'[，、。．·‧\.\n\r\s]+', ',', v_str)
     v_str = re.sub(r'[^0-9,]', '', v_str) 
     v_str = re.sub(r',+', ',', v_str).strip(',')
     return v_str if v_str not in ["0", "0.0", "nan", ""] else ""
@@ -238,6 +238,129 @@ def trainee_numbers_from_workbook(workbook):
             continue
         trainee_numbers.update(clean_to_list(roster_sheet.cell(row=row, column=headers["no"]).value))
     return trainee_numbers
+
+def find_header_column(sheet, row, label):
+    """在指定列用標題文字找欄位。"""
+    target = normalize_header_text(label)
+    for col in range(1, sheet.max_column + 1):
+        if normalize_header_text(sheet.cell(row=row, column=col).value) == target:
+            return col
+    return 0
+
+def duty_status_labels_from_workbook(workbook):
+    """讀取班別參數的假別對照，空白假別通常代表上班。"""
+    params_sheet = next((sheet for sheet in workbook.worksheets if "班別參數" in str(sheet.title)), None)
+    labels = {"": "上班"}
+    if params_sheet is None:
+        return labels
+    for row in range(1, params_sheet.max_row + 1):
+        code = normalize_header_text(params_sheet.cell(row=row, column=1).value)
+        label = normalize_header_text(params_sheet.cell(row=row, column=2).value)
+        if label:
+            labels[code] = label
+    return labels
+
+def expected_on_duty_numbers_from_roster(workbook, day_int, excluded_numbers):
+    """依輪休基準表計算當日應排人員，取代 Excel FILTER/XLOOKUP 結果。"""
+    roster_sheet = next((sheet for sheet in workbook.worksheets if "輪休" in str(sheet.title)), None)
+    if roster_sheet is None:
+        return []
+
+    date_row, date_col = 0, 0
+    for row in range(1, roster_sheet.max_row + 1):
+        for col in range(1, roster_sheet.max_column + 1):
+            if normalize_header_text(roster_sheet.cell(row=row, column=col).value) == "日期":
+                date_row, date_col = row, col
+                break
+        if date_col:
+            break
+    if not date_col or date_row <= 1:
+        return []
+
+    target_row = 0
+    for row in range(date_row + 1, roster_sheet.max_row + 1):
+        day_values = clean_to_list(roster_sheet.cell(row=row, column=date_col).value)
+        if str(day_int) in day_values:
+            target_row = row
+            break
+    if not target_row:
+        return []
+
+    status_labels = duty_status_labels_from_workbook(workbook)
+    excluded = {str(no).strip() for no in excluded_numbers if str(no).strip()}
+    expected = []
+    for col in range(date_col + 2, roster_sheet.max_column + 1):
+        header = normalize_header_text(roster_sheet.cell(row=date_row, column=col).value)
+        if header == "最低人數":
+            break
+        numbers = clean_to_list(roster_sheet.cell(row=date_row - 1, column=col).value)
+        if not header or not numbers:
+            continue
+        duty_code = normalize_header_text(roster_sheet.cell(row=target_row, column=col).value)
+        status = status_labels.get(duty_code, "" if duty_code else status_labels.get("", "上班"))
+        if status == "上班" and numbers[0] not in excluded:
+            expected.append(numbers[0])
+    return expected
+
+def expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers):
+    """保留巨集原本讀第 22 列「備勤」右側應排名單的備援路徑。"""
+    standby_col = find_header_column(sheet, 22, "備勤")
+    if not standby_col:
+        return []
+    return clean_to_list_excluding(get_merged_val(sheet, 22, standby_col + 1), excluded_numbers)
+
+def expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers):
+    expected = expected_on_duty_numbers_from_roster(workbook, day_int, excluded_numbers)
+    if expected:
+        return expected
+    return expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
+
+def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers):
+    """檢查每日勤務表是否有同時段重複排班或漏排。"""
+    issues = []
+    start_col = find_header_column(sheet, 5, "值班")
+    end_col = find_header_column(sheet, 6, "指揮官")
+    if not start_col or not end_col:
+        return [f"{sheet.title}：找不到「值班」或「指揮官」欄位，無法執行勤務表檢查。"]
+
+    expected = expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers)
+    if not expected:
+        return [f"{sheet.title}：找不到當日應排名單，無法執行漏排檢查。"]
+
+    formula_error_values = {"#NAME?", "#VALUE!", "#REF!", "#DIV/0!", "#N/A"}
+    for row in range(10, 34):
+        row_title = str(sheet.cell(row=row, column=2).value or "").strip() or f"第 {row} 列"
+        seen = {}
+        duplicates = []
+        formula_errors = []
+        for col in range(start_col, end_col + 1):
+            value = get_merged_val(sheet, row, col)
+            text_value = str(value or "").strip()
+            if text_value.upper() in formula_error_values:
+                formula_errors.append(sheet.cell(row=row, column=col).coordinate)
+            for person in clean_to_list_excluding(value, excluded_numbers):
+                seen[person] = seen.get(person, 0) + 1
+                if seen[person] == 2:
+                    duplicates.append(person)
+
+        missing = [person for person in expected if person not in seen]
+        row_errors = []
+        if formula_errors:
+            row_errors.append(f"【公式錯誤】{','.join(formula_errors)}")
+        if duplicates:
+            row_errors.append(f"【重複】{','.join(duplicates)}")
+        if missing:
+            row_errors.append(f"【漏排】{','.join(missing)}")
+        if row_errors:
+            issues.append(f"{row_title}：" + " ".join(row_errors))
+    return issues
+
+def format_daily_sheet_preflight_message(issues):
+    shown = issues[:20]
+    message = "勤務表檢查未通過，已停止登打。\n\n" + "\n".join(shown)
+    if len(issues) > len(shown):
+        message += f"\n...另有 {len(issues) - len(shown)} 項未列出"
+    return message
 
 def get_merged_val(sheet, row, col):
     """處理 Excel 合併儲存格讀取"""
@@ -1050,6 +1173,14 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     }
 
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
+    preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
+    if preflight_issues:
+        preflight_message = format_daily_sheet_preflight_message(preflight_issues)
+        log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
+        root.after(0, lambda msg=preflight_message: messagebox.showerror("勤務表檢查未通過", msg))
+        wb.close()
+        return False
+    log_status("✅ 勤務表檢查通過，未發現重複或漏排")
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     driver = webdriver.Chrome()
