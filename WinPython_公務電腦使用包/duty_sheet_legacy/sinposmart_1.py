@@ -196,6 +196,49 @@ def clean_to_list(v):
     res = clean_v(v)
     return [x for x in res.split(',') if x] if res else []
 
+def clean_to_list_excluding(v, excluded_numbers):
+    """將番號字串轉為 List，並排除輪休基準表標示不需登打的人員。"""
+    excluded = {str(no).strip() for no in excluded_numbers if str(no).strip()}
+    return [x for x in clean_to_list(v) if x not in excluded]
+
+def clean_v_excluding(v, excluded_numbers):
+    """回傳已排除指定番號的逗號字串。"""
+    return ",".join(clean_to_list_excluding(v, excluded_numbers))
+
+def normalize_header_text(value):
+    return re.sub(r"\s+", "", str(value or "").strip())
+
+def roster_header_columns(sheet):
+    """以標題文字定位輪休基準表的人員清單欄位，避免欄位位移。"""
+    labels = {"no": "番號", "name": "姓名", "class": "班表欄位"}
+    for row in range(1, sheet.max_row + 1):
+        columns = {}
+        for col in range(1, sheet.max_column + 1):
+            text = normalize_header_text(sheet.cell(row=row, column=col).value)
+            for key, label in labels.items():
+                if text == label:
+                    columns[key] = col
+        if all(key in columns for key in labels):
+            columns["row"] = row
+            return columns
+    return {}
+
+def trainee_numbers_from_workbook(workbook):
+    """從輪休基準表的班表欄位讀取實習生番號。"""
+    roster_sheet = next((sheet for sheet in workbook.worksheets if "輪休" in str(sheet.title)), None)
+    if roster_sheet is None:
+        return set()
+    headers = roster_header_columns(roster_sheet)
+    if not headers:
+        return set()
+    trainee_numbers = set()
+    for row in range(headers["row"] + 1, roster_sheet.max_row + 1):
+        class_text = str(roster_sheet.cell(row=row, column=headers["class"]).value or "")
+        if "實習" not in class_text:
+            continue
+        trainee_numbers.update(clean_to_list(roster_sheet.cell(row=row, column=headers["no"]).value))
+    return trainee_numbers
+
 def get_merged_val(sheet, row, col):
     """處理 Excel 合併儲存格讀取"""
     cell = sheet.cell(row=row, column=col)
@@ -972,6 +1015,10 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     day_int = int(target_date[-2:])
     log_status(f"📂 讀取 Excel {day_int}號 分頁...")
     wb = openpyxl.load_workbook(excel_path, data_only=True, keep_vba=True)
+    excluded_numbers = trainee_numbers_from_workbook(wb)
+    if excluded_numbers:
+        ordered_excluded = sorted(excluded_numbers, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+        log_status(f"ℹ️ 已略過實習生番號：{', '.join(ordered_excluded)}")
     sheet = wb[f"{day_int}號"]
     
     ex_map = {"時間": 2, "值班": 3}
@@ -986,7 +1033,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     cmd_all = []
     for r in range(10, 34):
         val = get_merged_val(sheet, r, ex_map["指揮官"])
-        cmd_all.extend([int(x) for x in clean_to_list(val) if 1 <= int(x) <= 5])
+        cmd_all.extend([int(x) for x in clean_to_list_excluding(val, excluded_numbers) if 1 <= int(x) <= 5])
     daily_commander = min(cmd_all) if cmd_all else ""
 
     out_names, out_excel_cols = [], []
@@ -1055,19 +1102,19 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 if "-" not in time_cell: continue
                 hour = str(int(time_cell.split("-")[0].strip()))
                 
-                duty_map[f"_pln_{hour}_{web_idx['值班']}"] = clean_v(get_merged_val(sheet, r, ex_map["值班"]))
+                duty_map[f"_pln_{hour}_{web_idx['值班']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["值班"]), excluded_numbers)
                 for i, col_idx in enumerate(out_excel_cols):
-                    duty_map[f"_pln_{hour}_{web_idx['外勤開始'] + i}"] = clean_v(get_merged_val(sheet, r, col_idx))
+                    duty_map[f"_pln_{hour}_{web_idx['外勤開始'] + i}"] = clean_v_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers)
                 
-                med_v = clean_v(get_merged_val(sheet, r, ex_map["救護_Excel"])) + "," + clean_v(get_merged_val(sheet, r, ex_map["救護_Excel"]+1))
+                med_v = clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]), excluded_numbers) + "," + clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]+1), excluded_numbers)
                 duty_map[f"_pln_{hour}_{web_idx['救護']}"] = med_v.strip(',')
                 
                 dis_v = ""
                 for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
-                    val = clean_v(get_merged_val(sheet, r, c))
+                    val = clean_v_excluding(get_merged_val(sheet, r, c), excluded_numbers)
                     if val: dis_v += str(val) + ","
                 duty_map[f"_pln_{hour}_{web_idx['備勤']}"] = dis_v.strip(',')
-                duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v(get_merged_val(sheet, r, ex_map["休息_Excel"]))
+                duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["休息_Excel"]), excluded_numbers)
 
             team_tra_val = str(sheet["C35"].value or "").strip()
             remark_val = str(sheet["C34"].value or "").strip()
@@ -1136,18 +1183,18 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 
                 amb1_members = []
                 for c in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
-                    amb1_members.extend(clean_to_list(get_merged_val(sheet, r, c)))
+                    amb1_members.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
                 amb1_members = [m for m in amb1_members if m] 
                 
                 disaster_ids = []
                 for c in range(ex_map["備勤_Excel"], ex_map["指揮官"] + 1):
-                    disaster_ids.extend(clean_to_list(get_merged_val(sheet, r, c)))
+                    disaster_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
                 disaster_ids = [m for m in disaster_ids if m]
 
                 amb2_members = disaster_ids[:2]  
                 out_ids = []
                 for col_idx in out_excel_cols:
-                    out_ids.extend(clean_to_list(get_merged_val(sheet, r, col_idx)))
+                    out_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers))
 
                 mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, daily_commander)
                 if mission:

@@ -50,6 +50,18 @@ def package_module(name: str):
     return importlib.import_module(name)
 
 
+def legacy_duty_sheet_module():
+    legacy_dir = package_dir() / "duty_sheet_legacy"
+    if str(legacy_dir) not in sys.path:
+        sys.path.insert(0, str(legacy_dir))
+    spec = importlib.util.spec_from_file_location("legacy_sinposmart_1", legacy_dir / "sinposmart_1.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load legacy duty sheet module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PackageSmokeTests(unittest.TestCase):
     def test_package_entry_files_exist(self) -> None:
         root = package_dir()
@@ -271,6 +283,27 @@ class PackageSmokeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "勤務基準表.*115年07月"):
             module.validate_selected_year_month("勤務基準表", 115, 6, 115, 7)
+
+    def test_duty_sheet_filters_trainee_numbers_from_shift_workbook(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        roster = workbook.active
+        roster.title = "輪休基準表"
+        roster.cell(row=5, column=12).value = "番號"
+        roster.cell(row=5, column=13).value = "姓名"
+        roster.cell(row=5, column=14).value = "班表欄位"
+        roster.cell(row=6, column=12).value = 28
+        roster.cell(row=6, column=13).value = "正式人員"
+        roster.cell(row=6, column=14).value = "B班"
+        roster.cell(row=7, column=12).value = 29
+        roster.cell(row=7, column=13).value = "實習人員"
+        roster.cell(row=7, column=14).value = "實習生"
+
+        excluded = module.trainee_numbers_from_workbook(workbook)
+
+        self.assertEqual(excluded, {"29"})
+        self.assertEqual(module.clean_to_list_excluding("18,29,23", excluded), ["18", "23"])
+        self.assertEqual(module.clean_v_excluding("29,2", excluded), "2")
 
     def test_base_month_text_can_detect_site_month_mismatch(self) -> None:
         module = rest_time_module()
