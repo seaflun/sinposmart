@@ -469,9 +469,11 @@ class PackageSmokeTests(unittest.TestCase):
         scheduled: list[tuple[int, object]] = []
         gui.auto_logout_after_id = None
         gui.auto_logout_deadline = None
+        gui.auto_logout_handoff_at = None
         gui.auto_logout_actor_no = ""
         gui.pending_auto_logout_actor_no = ""
         gui.pending_auto_logout_deadline = None
+        gui.pending_auto_logout_handoff_at = None
         gui.submit_queues = {"entry": [("queued",)], "work": []}
         gui.submit_worker_running = {"entry": True, "work": False}
         gui.duty_status_text = StatusText()
@@ -508,9 +510,11 @@ class PackageSmokeTests(unittest.TestCase):
         scheduled: list[tuple[int, object]] = []
         gui.auto_logout_after_id = None
         gui.auto_logout_deadline = None
+        gui.auto_logout_handoff_at = None
         gui.auto_logout_actor_no = ""
         gui.pending_auto_logout_actor_no = ""
         gui.pending_auto_logout_deadline = None
+        gui.pending_auto_logout_handoff_at = None
         gui.submit_queues = {"entry": [], "work": []}
         gui.submit_worker_running = {"entry": False, "work": False}
         gui.manual_paused_due_indices = {0: "10"}
@@ -537,6 +541,154 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(gui.auto_logout_after_id, "after-id")
         self.assertEqual(gui.auto_logout_actor_no, "10")
         self.assertEqual(len(scheduled), 1)
+
+    def test_manual_handoff_checkout_schedules_auto_logout_from_planned_time(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class StatusText:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        scheduled: list[tuple[int, object]] = []
+        gui.auto_logout_after_id = None
+        gui.auto_logout_deadline = None
+        gui.auto_logout_handoff_at = None
+        gui.auto_logout_actor_no = ""
+        gui.pending_auto_logout_deadline = None
+        gui.pending_auto_logout_handoff_at = None
+        gui.pending_auto_logout_actor_no = ""
+        gui.submit_queues = {"entry": [], "work": []}
+        gui.submit_worker_running = {"entry": False, "work": False}
+        gui.manual_paused_due_indices = {}
+        gui.duty_status_text = StatusText()
+        gui.after = lambda delay, callback: scheduled.append((delay, callback)) or "after-id"
+        gui.after_cancel = lambda _after_id: None
+        gui.action_datetime = lambda _action: datetime(2026, 7, 10, 18, 0)
+        action = {
+            "kind": "entry_log",
+            "source": "值班交接",
+            "fields": {"出或入": "值退"},
+        }
+
+        self.assertTrue(gui.should_schedule_auto_logout(action, "manual"))
+        gui.schedule_auto_logout("28", action)
+
+        self.assertEqual(gui.auto_logout_handoff_at, datetime(2026, 7, 10, 18, 0))
+        self.assertEqual(gui.auto_logout_deadline, datetime(2026, 7, 10, 18, 10))
+        self.assertEqual(gui.auto_logout_actor_no, "28")
+        self.assertEqual(len(scheduled), 1)
+
+    def test_auto_logout_rechecks_until_handoff_group_is_complete(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        class StatusText:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        real_datetime = module.datetime
+
+        class FixedDatetime(real_datetime):
+            current = real_datetime(2026, 7, 10, 18, 10)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        handoff_at = datetime(2026, 7, 10, 18, 0)
+        first_check = datetime(2026, 7, 10, 18, 10)
+        scheduled: list[tuple[int, object]] = []
+        cleared: list[str] = []
+        gui.session = module.LoginSession(actor_no="28", user_id="user28", password="secret", verified=True)
+        gui.auto_logout_after_id = "after-id"
+        gui.auto_logout_deadline = first_check
+        gui.auto_logout_handoff_at = handoff_at
+        gui.auto_logout_actor_no = "28"
+        gui.pending_auto_logout_deadline = None
+        gui.pending_auto_logout_handoff_at = None
+        gui.pending_auto_logout_actor_no = ""
+        gui.submit_queues = {"entry": [], "work": []}
+        gui.submit_worker_running = {"entry": False, "work": False}
+        gui.manual_paused_due_indices = {}
+        gui.duty_status_text = StatusText()
+        gui.login_status = StatusText()
+        gui.after = lambda delay, callback: scheduled.append((delay, callback)) or f"after-{len(scheduled)}"
+        gui.after_cancel = lambda _after_id: None
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.clear_login = lambda trigger_type="manual": cleared.append(trigger_type)
+        gui.logged_in_identity_label = lambda _actor: "28番"
+        gui.set_duty_status = lambda message, **_kwargs: gui.duty_status_text.set(message)
+        gui.notify_user = lambda *_args, **_kwargs: None
+        gui.action_completion_key = lambda action: action["key"]
+        gui.action_datetime = lambda action: action["at"]
+        gui.duty_actions = [
+            {"key": "checkout", "at": handoff_at, "kind": "entry_log", "actor": "28", "source": "值班交接", "fields": {"出或入": "值退"}},
+            {"key": "checkin", "at": handoff_at, "kind": "entry_log", "actor": "28", "source": "值班交接", "fields": {"出或入": "值班"}},
+            {"key": "work", "at": handoff_at, "kind": "work_log", "actor": "28", "source": "值班交接", "fields": {}},
+            {"key": "next-shift", "at": datetime(2026, 7, 10, 20, 0), "kind": "work_log", "actor": "12", "source": "值班交接", "fields": {}},
+        ]
+        gui.duty_action_compare = {
+            0: {"group": "done"},
+            1: {"group": "done"},
+            2: {"group": "todo"},
+            3: {"group": "todo"},
+        }
+        gui.executed_due = {0, 1}
+        gui.manual_completed_keys = set()
+
+        try:
+            module.datetime = FixedDatetime
+            gui.run_auto_logout("28", first_check, handoff_at)
+
+            self.assertEqual(cleared, [])
+            self.assertEqual(gui.auto_logout_deadline, datetime(2026, 7, 10, 18, 20))
+            self.assertEqual(gui.auto_logout_handoff_at, handoff_at)
+            self.assertEqual(scheduled[0][0], 10 * 60 * 1000)
+            self.assertIn("1 筆未完成", gui.duty_status_text.value)
+
+            gui.duty_action_compare[2] = {"group": "done"}
+            FixedDatetime.current = real_datetime(2026, 7, 10, 18, 20)
+            scheduled[0][1]()
+        finally:
+            module.datetime = real_datetime
+
+        self.assertEqual(cleared, ["system"])
+
+    def test_completed_handoff_checkout_restores_auto_logout_timer(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        action = {
+            "kind": "entry_log",
+            "time": "18:00",
+            "actor": "28",
+            "source": "值班交接",
+            "fields": {"出或入": "值退"},
+        }
+        scheduled: list[tuple[str, dict[str, object]]] = []
+        submitted: list[int] = []
+        gui.session = module.LoginSession(actor_no="28", user_id="user28", password="secret", verified=True)
+        gui.duty_actions = [action]
+        gui.duty_action_compare = {0: {"group": "done"}}
+        gui.executed_due = {0}
+        gui.submitting_indices = set()
+        gui.failed_due_retry_after = {}
+        gui.paused_due_indices = {}
+        gui.manual_paused_due_indices = {}
+        gui.duty_task_indices = lambda: [0]
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.action_datetime = lambda _action: datetime(2026, 7, 10, 18, 0)
+        gui.ensure_auto_logout_scheduled = lambda actor, item: scheduled.append((actor, item))
+        gui.submit_duty_action = lambda index, *_args, **_kwargs: submitted.append(index)
+
+        gui.trigger_due_tasks(datetime(2026, 7, 10, 18, 0))
+
+        self.assertEqual(scheduled, [("28", action)])
+        self.assertEqual(submitted, [])
 
     def test_submit_login_failure_expires_session_and_stops_queues(self) -> None:
         module = duty_gui_module()

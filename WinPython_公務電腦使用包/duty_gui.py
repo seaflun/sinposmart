@@ -872,8 +872,10 @@ class DutyGui(ctk.CTk):
         self.logout_cleared = False
         self.auto_logout_after_id: str | None = None
         self.auto_logout_deadline: datetime | None = None
+        self.auto_logout_handoff_at: datetime | None = None
         self.auto_logout_actor_no = ""
         self.pending_auto_logout_deadline: datetime | None = None
+        self.pending_auto_logout_handoff_at: datetime | None = None
         self.pending_auto_logout_actor_no = ""
         self.saved_login_needs_backup = False
         self.saved_login_can_persist = True
@@ -3527,46 +3529,78 @@ class DutyGui(ctk.CTk):
                 pass
         self.auto_logout_after_id = None
         self.auto_logout_deadline = None
+        self.auto_logout_handoff_at = None
         self.auto_logout_actor_no = ""
         self.pending_auto_logout_deadline = None
+        self.pending_auto_logout_handoff_at = None
         self.pending_auto_logout_actor_no = ""
 
     def should_schedule_auto_logout(self, action: dict[str, Any], trigger_type: str) -> bool:
-        if trigger_type != "due" or action.get("kind") != "entry_log":
+        if trigger_type not in ("manual", "due") or action.get("kind") != "entry_log":
             return False
         fields = action.get("fields", {})
         outin = str(fields.get("出或入", "")).strip()
         source = str(action.get("source", "")).strip()
         return source == "值班交接" and outin == "值退"
 
+    def auto_logout_group_indices(self, actor_no: str, handoff_at: datetime) -> list[int]:
+        return [
+            index
+            for index, action in enumerate(self.duty_actions)
+            if action.get("kind") in ("entry_log", "work_log")
+            and str(action.get("actor", "")) == str(actor_no)
+            and self.action_datetime(action) == handoff_at
+        ]
+
+    def ensure_auto_logout_scheduled(self, actor_no: str, action: dict[str, Any]) -> None:
+        handoff_at = self.action_datetime(action)
+        actor = str(actor_no)
+        active_matches = self.auto_logout_actor_no == actor and self.auto_logout_handoff_at == handoff_at
+        pending_matches = self.pending_auto_logout_actor_no == actor and self.pending_auto_logout_handoff_at == handoff_at
+        if active_matches or pending_matches:
+            return
+        self.schedule_auto_logout(actor, action)
+
     def schedule_auto_logout(self, actor_no: str, action: dict[str, Any]) -> None:
         self.cancel_auto_logout()
-        action_at = self.action_datetime(action)
-        deadline = action_at + timedelta(minutes=10)
+        handoff_at = self.action_datetime(action)
+        deadline = handoff_at + timedelta(minutes=10)
         if self.manual_pause_count(actor_no):
             self.pending_auto_logout_deadline = deadline
+            self.pending_auto_logout_handoff_at = handoff_at
             self.pending_auto_logout_actor_no = str(actor_no)
             self.duty_status_text.set(self.manual_pause_status_text(actor_no))
             return
         if self.submit_queue_has_active_items():
             self.pending_auto_logout_deadline = deadline
+            self.pending_auto_logout_handoff_at = handoff_at
             self.pending_auto_logout_actor_no = str(actor_no)
             self.duty_status_text.set("已排定登打完成後自動登出。")
             return
-        self.set_auto_logout_timer(actor_no, deadline)
+        self.set_auto_logout_timer(actor_no, deadline, handoff_at)
 
-    def set_auto_logout_timer(self, actor_no: str, deadline: datetime) -> None:
+    def set_auto_logout_timer(self, actor_no: str, deadline: datetime, handoff_at: datetime) -> None:
         delay_ms = max(0, int((deadline - datetime.now()).total_seconds() * 1000))
         self.auto_logout_deadline = deadline
+        self.auto_logout_handoff_at = handoff_at
         self.auto_logout_actor_no = str(actor_no)
+        self.pending_auto_logout_deadline = None
+        self.pending_auto_logout_handoff_at = None
+        self.pending_auto_logout_actor_no = ""
         self.auto_logout_after_id = self.after(
             delay_ms,
-            lambda expected_actor=str(actor_no), expected_deadline=deadline: self.run_auto_logout(expected_actor, expected_deadline),
+            lambda expected_actor=str(actor_no), expected_deadline=deadline, expected_handoff=handoff_at: self.run_auto_logout(
+                expected_actor, expected_deadline, expected_handoff
+            ),
         )
         self.duty_status_text.set(f"已排定 {deadline:%H:%M} 自動登出。")
 
     def schedule_pending_auto_logout_if_idle(self) -> None:
-        if not self.pending_auto_logout_actor_no or self.pending_auto_logout_deadline is None:
+        if (
+            not self.pending_auto_logout_actor_no
+            or self.pending_auto_logout_deadline is None
+            or self.pending_auto_logout_handoff_at is None
+        ):
             return
         if self.submit_queue_has_active_items():
             return
@@ -3575,30 +3609,51 @@ class DutyGui(ctk.CTk):
             return
         actor_no = self.pending_auto_logout_actor_no
         deadline = self.pending_auto_logout_deadline
+        handoff_at = self.pending_auto_logout_handoff_at
         self.pending_auto_logout_actor_no = ""
         self.pending_auto_logout_deadline = None
-        self.set_auto_logout_timer(actor_no, deadline)
+        self.pending_auto_logout_handoff_at = None
+        if deadline <= datetime.now():
+            deadline = datetime.now() + timedelta(minutes=10)
+        self.set_auto_logout_timer(actor_no, deadline, handoff_at)
 
-    def run_auto_logout(self, expected_actor: str, expected_deadline: datetime) -> None:
+    def run_auto_logout(self, expected_actor: str, expected_deadline: datetime, expected_handoff_at: datetime) -> None:
         self.auto_logout_after_id = None
-        if self.auto_logout_deadline != expected_deadline or self.auto_logout_actor_no != str(expected_actor):
+        if (
+            self.auto_logout_deadline != expected_deadline
+            or self.auto_logout_handoff_at != expected_handoff_at
+            or self.auto_logout_actor_no != str(expected_actor)
+        ):
             return
         if not (self.session and self.session.verified) or str(self.session.actor_no) != str(expected_actor):
             self.cancel_auto_logout()
             return
         if self.submit_queue_has_active_items():
-            self.auto_logout_deadline = None
-            self.auto_logout_actor_no = ""
-            self.pending_auto_logout_deadline = expected_deadline
-            self.pending_auto_logout_actor_no = str(expected_actor)
-            self.duty_status_text.set("仍有登打項目執行中，延後自動登出。")
+            next_check = datetime.now() + timedelta(minutes=10)
+            self.set_auto_logout_timer(expected_actor, next_check, expected_handoff_at)
+            self.duty_status_text.set(f"仍有登打項目執行中，預計 {next_check:%H:%M} 再檢查自動登出。")
             return
         if self.manual_pause_count(expected_actor):
-            self.auto_logout_deadline = None
-            self.auto_logout_actor_no = ""
-            self.pending_auto_logout_deadline = expected_deadline
-            self.pending_auto_logout_actor_no = str(expected_actor)
-            self.duty_status_text.set(self.manual_pause_status_text(expected_actor))
+            next_check = datetime.now() + timedelta(minutes=10)
+            self.set_auto_logout_timer(expected_actor, next_check, expected_handoff_at)
+            self.duty_status_text.set(f"{self.manual_pause_status_text(expected_actor)} 預計 {next_check:%H:%M} 再檢查。")
+            return
+        self.sync_duty_compare_from_audit()
+        group_indices = self.auto_logout_group_indices(expected_actor, expected_handoff_at)
+        incomplete_indices = [
+            index
+            for index in group_indices
+            if not self.action_already_completed_for_submit(index, self.duty_actions[index])
+        ]
+        if not group_indices or incomplete_indices:
+            next_check = datetime.now() + timedelta(minutes=10)
+            self.set_auto_logout_timer(expected_actor, next_check, expected_handoff_at)
+            if incomplete_indices:
+                self.duty_status_text.set(
+                    f"當班交接仍有 {len(incomplete_indices)} 筆未完成，預計 {next_check:%H:%M} 再檢查。"
+                )
+            else:
+                self.duty_status_text.set(f"尚未取得當班交接紀錄，預計 {next_check:%H:%M} 再檢查。")
             return
         label = self.logged_in_identity_label(expected_actor)
         self.clear_login(trigger_type="system")
@@ -4375,9 +4430,11 @@ class DutyGui(ctk.CTk):
     def hold_auto_logout_for_manual_pause(self, actor_no: str) -> None:
         actor = str(actor_no)
         auto_logout_deadline = self.__dict__.get("auto_logout_deadline")
+        auto_logout_handoff_at = self.__dict__.get("auto_logout_handoff_at")
         auto_logout_actor_no = self.__dict__.get("auto_logout_actor_no", "")
-        if auto_logout_deadline and auto_logout_actor_no == actor:
+        if auto_logout_deadline and auto_logout_handoff_at and auto_logout_actor_no == actor:
             deadline = auto_logout_deadline
+            handoff_at = auto_logout_handoff_at
             auto_logout_after_id = self.__dict__.get("auto_logout_after_id")
             if auto_logout_after_id:
                 try:
@@ -4386,8 +4443,10 @@ class DutyGui(ctk.CTk):
                     pass
             self.auto_logout_after_id = None
             self.auto_logout_deadline = None
+            self.auto_logout_handoff_at = None
             self.auto_logout_actor_no = ""
             self.pending_auto_logout_deadline = deadline
+            self.pending_auto_logout_handoff_at = handoff_at
             self.pending_auto_logout_actor_no = actor
         duty_status_text = self.__dict__.get("duty_status_text")
         if duty_status_text is not None:
@@ -4744,6 +4803,14 @@ class DutyGui(ctk.CTk):
             return
         self.sync_duty_compare_from_audit()
         for index in self.duty_task_indices():
+            action = self.duty_actions[index]
+            if action.get("kind") not in ("work_log", "entry_log"):
+                continue
+            if str(action.get("actor", "")) != str(self.session.actor_no):
+                continue
+            action_at = self.action_datetime(action)
+            if self.should_schedule_auto_logout(action, "due") and action_at <= now:
+                self.ensure_auto_logout_scheduled(self.session.actor_no, action)
             if index in self.executed_due or index in self.submitting_indices:
                 continue
             retry_after = self.failed_due_retry_after.get(index)
@@ -4751,11 +4818,6 @@ class DutyGui(ctk.CTk):
                 continue
             if retry_after and now >= retry_after:
                 self.failed_due_retry_after.pop(index, None)
-            action = self.duty_actions[index]
-            if action.get("kind") not in ("work_log", "entry_log"):
-                continue
-            if str(action.get("actor", "")) != str(self.session.actor_no):
-                continue
             if self.is_manual_paused_action(index, self.session.actor_no):
                 continue
             compare = self.duty_action_compare.get(index, {})
@@ -4764,7 +4826,6 @@ class DutyGui(ctk.CTk):
                 continue
             if compare.get("group") == "manual" or self.compare_needs_manual_review(compare) or not self.is_auto_duty_action(action):
                 continue
-            action_at = self.action_datetime(action)
             is_paused_retry = index in self.paused_due_indices and action_at <= now
             is_due_now = action_at <= now
             if is_due_now or is_paused_retry:
