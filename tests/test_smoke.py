@@ -1417,6 +1417,96 @@ class PackageSmokeTests(unittest.TestCase):
             [("00:00", "8", "出", "休息", 1), ("02:00", "8", "入", "休息返隊", 1)],
         )
 
+    def test_overnight_2201_rest_is_one_block_not_two(self) -> None:
+        module = duty_rehearsal_module()
+        duty = "\u503c\u73ed"
+        rest = "\u4f11\u606f"
+        on_duty = "\u5728\u52e4"
+        direction = "\u51fa\u6216\u5165"
+        reason_key = "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede"
+        today = module.DutySheet(
+            roc_date="1150715",
+            rows=[
+                module.DutyRow("00-01", {duty: ["8"], rest: ["23"]}),
+                module.DutyRow("01-02", {duty: ["8"], rest: []}),
+                module.DutyRow("22-24", {duty: ["8"], rest: ["23"]}),
+            ],
+            summary={on_duty: ["8", "23"]},
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150715"), [], None)
+        rest_actions = [
+            action
+            for action in actions
+            if action.kind == "entry_log" and action.target == "23" and action.fields.get(reason_key) in (rest, "\u4f11\u606f\u8fd4\u968a")
+        ]
+
+        self.assertEqual(
+            [(action.time, action.fields[direction], action.fields[reason_key], action.date_offset, action.source) for action in rest_actions],
+            [
+                ("22:00", "\u51fa", rest, 0, "\u4f11\u606f\u7c3d\u51fa"),
+                ("01:00", "\u5165", "\u4f11\u606f\u8fd4\u968a", 1, "\u4f11\u606f\u7d50\u675f"),
+            ],
+        )
+
+    def test_schedule_load_replaces_stale_overnight_rest_actions(self) -> None:
+        module = duty_gui_module()
+        duty = "\u503c\u73ed"
+        rest = "\u4f11\u606f"
+        on_duty = "\u5728\u52e4"
+        direction = "\u51fa\u6216\u5165"
+        reason_key = "\u9818\u7528\u4e8b\u7531\u53ca\u5730\u9ede"
+        data = {
+            "target_date": "1150715",
+            "today": {
+                "rows": [
+                    {"slot": "00-01", "columns": {duty: ["8"], rest: ["23"]}},
+                    {"slot": "01-02", "columns": {duty: ["8"], rest: []}},
+                    {"slot": "22-24", "columns": {duty: ["8"], rest: ["23"]}},
+                ],
+                "summary": {on_duty: ["8", "23"]},
+            },
+            "yesterday": {},
+            "cases": [],
+            "yesterday_cases": [],
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "00:00",
+                    "actor": "8",
+                    "target": "23",
+                    "fields": {direction: "\u5165", reason_key: "\u4f11\u606f\u8fd4\u968a"},
+                    "source": "\u4f11\u606f\u7d50\u675f",
+                    "duplicate_key": "entry:1150715:0:in:23:\u4f11\u606f\u8fd4\u968a",
+                    "date_offset": 1,
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "00:00",
+                    "actor": "8",
+                    "target": "23",
+                    "fields": {direction: "\u51fa", reason_key: rest},
+                    "source": "\u4f11\u606f\u7c3d\u51fa",
+                    "duplicate_key": "entry:1150715:0:out:23:\u4f11\u606f",
+                    "date_offset": 1,
+                },
+            ],
+        }
+
+        module.DutyGui.ensure_schedule_actions(object(), data)
+        rest_actions = [
+            action
+            for action in data["actions"]
+            if action.get("kind") == "entry_log"
+            and action.get("target") == "23"
+            and action.get("fields", {}).get(reason_key) in (rest, "\u4f11\u606f\u8fd4\u968a")
+        ]
+
+        self.assertEqual(
+            [(action["time"], action["fields"][direction], action["fields"][reason_key], action["date_offset"]) for action in rest_actions],
+            [("22:00", "\u51fa", rest, 0), ("01:00", "\u5165", "\u4f11\u606f\u8fd4\u968a", 1)],
+        )
+
     def test_next_morning_0408_rest_for_off_duty_tomorrow_creates_rest_checkout(self) -> None:
         module = duty_rehearsal_module()
         duty = "\u503c\u73ed"

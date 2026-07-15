@@ -1885,7 +1885,13 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
     final_end = slot_end(ordered_rows[-1].slot) if ordered_rows else None
     for no, block_start in active.items():
         blocks.append((no, block_start, final_end))
-    return blocks
+    midnight_rest_ends = {no: end for no, start, end in blocks if start == 0 and end is not None}
+    overnight_rest_nos = {no for no, _start, end in blocks if end == 24 and no in midnight_rest_ends}
+    return [
+        (no, start, midnight_rest_ends[no] + 24) if no in overnight_rest_nos and end == 24 else (no, start, end)
+        for no, start, end in blocks
+        if not (no in overnight_rest_nos and start == 0)
+    ]
 
 
 def external_columns(row: DutyRow) -> dict[str, list[str]]:
@@ -1918,7 +1924,7 @@ def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | Non
     if start == 8:
         return False
     before = row_for_hour(sheet, start - 1) if start > 0 else None
-    after = row_for_hour(sheet, end) if end is not None and end < 24 else None
+    after = row_for_hour(sheet, clock_hour(end)) if end is not None and end != 24 else None
     return has_external_duty(before, no) or has_external_duty(after, no)
 
 
@@ -2293,7 +2299,7 @@ def planned_actions(
         if rest_is_external_route(today, no, start, end):
             continue
         start_offset = 1 if start < 8 else 0
-        end_offset = 1 if end is not None and (end <= 8 or end == 24) else 0
+        end_offset = 1 if end is not None and (end <= 8 or end >= 24) else 0
         rest_checkout = start_offset == 1 and tomorrow and no not in tomorrow_on and (end is None or end >= 8)
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         start_reason = "休息後退勤" if rest_checkout else "休息"
@@ -2320,9 +2326,9 @@ def planned_actions(
             continue
         if end is None:
             continue
-        end_hour = 0 if end == 24 else end
+        end_hour = clock_hour(end)
         end_time = f"{end_hour:02d}:00"
-        end_actor = next_morning_entry_actor(today, end) if end_offset else entry_actor_at(today, yesterday, end, 0)
+        end_actor = next_morning_entry_actor(today, end_hour) if end_offset else entry_actor_at(today, yesterday, end_hour, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",

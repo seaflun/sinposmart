@@ -1739,6 +1739,18 @@ class DutyGui(ctk.CTk):
                 str(fields.get("勤務項目", "") or ""),
             )
 
+        generated_rest_sources = {"休息簽出", "休息結束", "休息後退勤"}
+        planned_rest_keys = {
+            key
+            for action in planned_payloads
+            if action.get("source") in generated_rest_sources
+            if (key := action_merge_key(action)) is not None
+        }
+        existing_actions = [
+            action
+            for action in existing_actions
+            if not isinstance(action, dict) or action.get("source") not in generated_rest_sources or action_merge_key(action) in planned_rest_keys
+        ]
         existing_keys = set()
         for action in existing_actions:
             key = action_merge_key(action)
