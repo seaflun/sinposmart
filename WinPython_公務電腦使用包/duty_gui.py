@@ -856,6 +856,9 @@ class DutyGui(ctk.CTk):
         self.duty_visible_iids: list[str] = []
         self.duty_card_rows: dict[str, ctk.CTkFrame] = {}
         self.duty_card_borders: dict[str, str] = {}
+        self.duty_card_widgets: dict[str, dict[str, object]] = {}
+        self.duty_task_refresh_after_id: str | None = None
+        self.duty_task_refresh_full_requested = False
         self.last_duty_refresh_minute = ""
         self.saved_accounts: list[dict[str, str]] = []
         self.work_log_defaults = load_work_log_defaults()
@@ -867,6 +870,8 @@ class DutyGui(ctk.CTk):
         self.snapshot_running = False
         self.snapshot_completed_slots: set[str] = set()
         self.comparison_running = False
+        self.comparison_waiting_due_indices: dict[int, datetime] = {}
+        self.comparison_wait_requested_indices: set[int] = set()
         self.comparison_completed_hours: set[str] = set()
         self.pending_hourly_comparison: tuple[str, str, list[str], str, str] | None = None
         self.logout_cleared = False
@@ -3309,7 +3314,7 @@ class DutyGui(ctk.CTk):
             self.refresh_tasks()
         if any(path.exists() for path in paths) and self.duty_data.get("target_date") == target_roc_date:
             self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data, self.duty_actions), self.duty_actions)
-            self.refresh_duty_tasks()
+            self.request_duty_task_refresh()
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         self.run_pending_hourly_comparison()
@@ -4137,7 +4142,7 @@ class DutyGui(ctk.CTk):
             minute_key = now.strftime("%Y%m%d%H%M")
             if minute_key != self.last_duty_refresh_minute:
                 self.last_duty_refresh_minute = minute_key
-                self.refresh_duty_tasks()
+                self.request_duty_task_refresh()
         self.check_scheduled_screenshot_folders(now)
         self.after(1000, self.tick_clock)
 
@@ -4472,6 +4477,39 @@ class DutyGui(ctk.CTk):
                 entry_source = self.duty_data.get("visible_entry_rows", [])
         return flatten_rows(entry_source or [], target_roc_date)
 
+    def comparison_data_available(self, target_roc_date: str) -> bool:
+        return comparison_path(target_roc_date).exists()
+
+    def comparison_wait_status(self, index: int, now: datetime) -> str:
+        started_at = self.comparison_waiting_due_indices.get(index)
+        if started_at and now - started_at >= timedelta(minutes=2):
+            return "跨日比對逾時，請手動確認"
+        return "等待跨日比對"
+
+    def wait_for_crossday_comparison(self, index: int, target_roc_date: str, now: datetime) -> bool:
+        if self.comparison_data_available(target_roc_date):
+            self.comparison_waiting_due_indices.pop(index, None)
+            self.comparison_wait_requested_indices.discard(index)
+            return True
+
+        waiting = self.__dict__.setdefault("comparison_waiting_due_indices", {})
+        requested = self.__dict__.setdefault("comparison_wait_requested_indices", set())
+        started_at = waiting.setdefault(index, now)
+        if now - started_at >= timedelta(minutes=2):
+            self.request_duty_task_refresh()
+            return False
+
+        if not self.comparison_running and index not in requested:
+            requested.add(index)
+            base_target_date = str(self.duty_data.get("target_date", "") or target_roc_date)
+            self.refresh_comparison_background(
+                base_target_date,
+                "到期跨日比對",
+                comparison_dates=duty_window_dates(base_target_date),
+            )
+        self.request_duty_task_refresh()
+        return False
+
     def handoff_group_actions(self, action: dict[str, Any], target_roc_date: str) -> list[dict[str, Any]]:
         fields = action.get("fields", {})
         outin = fields.get("出或入", "")
@@ -4580,6 +4618,8 @@ class DutyGui(ctk.CTk):
             return self.display_status_text(compare.get("compare") or "已存在"), "triggered", False
         if self.is_manual_paused_action(index, actor_no):
             return "人員手動暫停", "manual", False
+        if index in self.__dict__.get("comparison_waiting_due_indices", {}):
+            return self.comparison_wait_status(index, now), "manual", False
         if index in self.paused_due_indices:
             return "未返隊暫停", "manual", False
         if index in self.executed_due:
@@ -4594,7 +4634,19 @@ class DutyGui(ctk.CTk):
             return "手動", "waiting", False
         return ("到點待執行", "ready", True) if action_at <= now else ("等待", "waiting", is_auto_candidate)
 
-    def refresh_duty_tasks(self) -> None:
+    def request_duty_task_refresh(self, full: bool = False) -> None:
+        self.duty_task_refresh_full_requested = self.duty_task_refresh_full_requested or full
+        if self.duty_task_refresh_after_id is not None:
+            return
+        self.duty_task_refresh_after_id = self.after(180, self.run_requested_duty_task_refresh)
+
+    def run_requested_duty_task_refresh(self) -> None:
+        self.duty_task_refresh_after_id = None
+        full = self.duty_task_refresh_full_requested
+        self.duty_task_refresh_full_requested = False
+        self.refresh_duty_tasks(full=full)
+
+    def refresh_duty_tasks(self, full: bool = False) -> None:
         if not hasattr(self, "duty_task_list"):
             return
         self.last_duty_refresh_minute = datetime.now().strftime("%Y%m%d%H%M")
@@ -4605,6 +4657,7 @@ class DutyGui(ctk.CTk):
                 child.destroy()
             self.duty_card_rows.clear()
             self.duty_card_borders.clear()
+            self.duty_card_widgets.clear()
             self.duty_visible_iids = []
             self.next_task_text.set("下一項任務：-")
             self.duty_status_text.set(self.active_duty_status_override() or "")
@@ -4631,27 +4684,47 @@ class DutyGui(ctk.CTk):
             self.duty_status_text.set(f"任務列表更新失敗：{exc}")
             return
 
-        for child in self.duty_task_list.winfo_children():
-            child.destroy()
-        self.duty_card_rows.clear()
-        self.duty_card_borders.clear()
-        self.duty_visible_iids = visible_iids
         try:
-            for iid, task_time, system_text, type_text, task_text, people_text, status, tag in card_rows:
-                self.create_duty_task_card(
-                    iid=iid,
-                    task_time=task_time,
-                    system_text=system_text,
-                    type_text=type_text,
-                    task_text=task_text,
-                    people_text=people_text,
-                    status=status,
-                    tag=tag,
-                )
-            self.reset_duty_task_scroll()
+            can_update_cards = (
+                not full
+                and visible_iids == self.duty_visible_iids
+                and all(iid in self.duty_card_rows for iid in visible_iids)
+                and all(iid in self.duty_card_widgets for iid in visible_iids)
+            )
+            if can_update_cards:
+                for iid, task_time, system_text, type_text, task_text, people_text, status, tag in card_rows:
+                    self.update_duty_task_card(
+                        iid=iid,
+                        task_time=task_time,
+                        system_text=system_text,
+                        task_text=task_text,
+                        people_text=people_text,
+                        status=status,
+                        tag=tag,
+                    )
+            else:
+                for child in self.duty_task_list.winfo_children():
+                    child.destroy()
+                self.duty_card_rows.clear()
+                self.duty_card_borders.clear()
+                self.duty_card_widgets.clear()
+                self.duty_visible_iids = visible_iids
+                for iid, task_time, system_text, type_text, task_text, people_text, status, tag in card_rows:
+                    self.create_duty_task_card(
+                        iid=iid,
+                        task_time=task_time,
+                        system_text=system_text,
+                        type_text=type_text,
+                        task_text=task_text,
+                        people_text=people_text,
+                        status=status,
+                        tag=tag,
+                    )
+                self.reset_duty_task_scroll()
         except Exception as exc:
             self.duty_card_rows.clear()
             self.duty_card_borders.clear()
+            self.duty_card_widgets.clear()
             self.duty_visible_iids = []
             ctk.CTkLabel(
                 self.duty_task_list,
@@ -4680,6 +4753,8 @@ class DutyGui(ctk.CTk):
                 self.duty_status_text.set("正在登打")
             elif self.manual_pause_count(self.session.actor_no):
                 self.duty_status_text.set(self.manual_pause_status_text(self.session.actor_no))
+            elif self.__dict__.get("comparison_waiting_due_indices", {}):
+                self.duty_status_text.set(f"有 {len(self.__dict__.get('comparison_waiting_due_indices', {}))} 筆等待跨日比對；完成後才會判斷是否自動登打。")
             elif self.paused_due_indices:
                 self.duty_status_text.set(f"未返隊，暫停登打 {len(self.paused_due_indices)} 筆；返隊後請手動簽入/登打。")
             elif self.auto_logout_deadline and self.auto_logout_actor_no == str(self.session.actor_no):
@@ -4715,14 +4790,48 @@ class DutyGui(ctk.CTk):
         self.duty_card_rows[iid] = card
         self.duty_card_borders[iid] = border
 
-        ctk.CTkLabel(row, text=task_time, text_color="#0f172a", font=(UI_FONT, 13, "bold"), width=DUTY_TASK_COLUMN_WIDTHS[0], anchor=tk.CENTER, justify=tk.CENTER).grid(row=0, column=0, sticky=tk.EW, padx=0, pady=5)
-        ctk.CTkLabel(row, text=system_text, text_color="#1d4ed8" if system_text == "出入" else "#047857", font=FONT_BUTTON, width=DUTY_TASK_COLUMN_WIDTHS[1], anchor=tk.CENTER).grid(row=0, column=1, sticky=tk.EW, padx=0, pady=5)
-        ctk.CTkLabel(row, text=task_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.W, justify=tk.LEFT, width=DUTY_TASK_COLUMN_WIDTHS[2], wraplength=DUTY_TASK_COLUMN_WIDTHS[2] - 4).grid(row=0, column=2, sticky=tk.EW, padx=0, pady=5)
-        ctk.CTkLabel(row, text=people_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.CENTER, width=DUTY_TASK_COLUMN_WIDTHS[3]).grid(row=0, column=3, sticky=tk.EW, padx=0, pady=5)
+        time_label = ctk.CTkLabel(row, text=task_time, text_color="#0f172a", font=(UI_FONT, 13, "bold"), width=DUTY_TASK_COLUMN_WIDTHS[0], anchor=tk.CENTER, justify=tk.CENTER)
+        time_label.grid(row=0, column=0, sticky=tk.EW, padx=0, pady=5)
+        system_label = ctk.CTkLabel(row, text=system_text, text_color="#1d4ed8" if system_text == "出入" else "#047857", font=FONT_BUTTON, width=DUTY_TASK_COLUMN_WIDTHS[1], anchor=tk.CENTER)
+        system_label.grid(row=0, column=1, sticky=tk.EW, padx=0, pady=5)
+        task_label = ctk.CTkLabel(row, text=task_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.W, justify=tk.LEFT, width=DUTY_TASK_COLUMN_WIDTHS[2], wraplength=DUTY_TASK_COLUMN_WIDTHS[2] - 4)
+        task_label.grid(row=0, column=2, sticky=tk.EW, padx=0, pady=5)
+        people_label = ctk.CTkLabel(row, text=people_text, text_color=UI_TEXT, font=FONT_BODY, anchor=tk.CENTER, width=DUTY_TASK_COLUMN_WIDTHS[3])
+        people_label.grid(row=0, column=3, sticky=tk.EW, padx=0, pady=5)
         status_pill = self.create_status_pill(row, status, status_bg, status_fg, status_border, bg)
         status_pill.grid(row=0, column=4, sticky=tk.EW, padx=0, pady=5)
+        self.duty_card_widgets[iid] = {
+            "time": time_label,
+            "system": system_label,
+            "task": task_label,
+            "people": people_label,
+            "status": status_pill,
+        }
 
         self.bind_duty_card_click(card, iid)
+
+    def update_duty_task_card(
+        self,
+        iid: str,
+        task_time: str,
+        system_text: str,
+        task_text: str,
+        people_text: str,
+        status: str,
+        tag: str,
+    ) -> None:
+        widgets = self.duty_card_widgets.get(iid)
+        card = self.duty_card_rows.get(iid)
+        if not widgets or card is None:
+            return
+        bg, border, status_bg, status_fg, status_border = self.duty_card_colors(tag)
+        card.configure(fg_color=bg)
+        self.duty_card_borders[iid] = border
+        widgets["time"].configure(text=task_time)
+        widgets["system"].configure(text=system_text, text_color="#1d4ed8" if system_text == "出入" else "#047857")
+        widgets["task"].configure(text=task_text)
+        widgets["people"].configure(text=people_text)
+        widgets["status"].configure(text=status, bg_color=bg, fg_color=status_bg, text_color=status_fg)
 
     def create_status_pill(self, parent: tk.Widget, text: str, fill: str, text_color: str, _outline: str, background: str) -> ctk.CTkLabel:
         return ctk.CTkLabel(
@@ -4846,10 +4955,13 @@ class DutyGui(ctk.CTk):
                 if resume_time and action_at <= resume_time:
                     submit_action = self.action_with_submit_time(action, resume_time)
                 target_roc_date = self.action_target_roc_date(submit_action)
+                base_target_date = str(self.__dict__.get("duty_data", {}).get("target_date", ""))
+                if base_target_date and target_roc_date != base_target_date and not self.wait_for_crossday_comparison(index, target_roc_date, now):
+                    continue
                 pause_reason = self.should_pause_due_action(submit_action, target_roc_date, now=now)
                 if pause_reason:
                     self.paused_due_indices[index] = pause_reason
-                    self.refresh_duty_tasks()
+                    self.request_duty_task_refresh()
                     continue
                 self.paused_due_indices.pop(index, None)
                 self.log_trigger(index, submit_action, "due")

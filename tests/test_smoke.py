@@ -1071,6 +1071,119 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(submitted, [(0, "due")])
         self.assertTrue(any("繼續排程" in message for message in status_messages))
 
+    def test_crossday_due_waits_for_comparison_before_submit(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        comparison_requests: list[tuple[str, list[str]]] = []
+        submitted: list[int] = []
+        action = {
+            "kind": "entry_log",
+            "time": "06:00",
+            "actor": "10",
+            "target": "25",
+            "date_offset": 1,
+            "fields": {"登打時間": "06:00", "系統寫入時間": "06:00", "出或入": "出", "領用事由及地點": "退勤"},
+        }
+
+        gui.session = module.LoginSession(actor_no="10", user_id="user10", password="secret", verified=True)
+        gui.duty_data = {"target_date": "1150715"}
+        gui.duty_actions = [action]
+        gui.duty_action_compare = {0: {"compare": "未找到", "group": "todo", "matched": []}}
+        gui.executed_due = set()
+        gui.submitting_indices = set()
+        gui.failed_due_retry_after = {}
+        gui.paused_due_indices = {}
+        gui.manual_paused_due_indices = {}
+        gui.manual_resume_due_times = {}
+        gui.comparison_waiting_due_indices = {}
+        gui.comparison_running = False
+        gui.duty_task_indices = lambda: [0]
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.action_datetime = lambda _action: datetime(2026, 7, 16, 6, 0)
+        gui.action_target_roc_date = lambda _action: "1150716"
+        gui.is_auto_duty_action = lambda _action: True
+        gui.compare_needs_manual_review = lambda _compare: False
+        gui.should_pause_due_action = lambda _action, _target_date, now=None: ""
+        gui.comparison_data_available = lambda target_date: False
+        gui.refresh_comparison_background = lambda target_date, _slot, comparison_dates=None, **_kwargs: comparison_requests.append((target_date, comparison_dates or []))
+        gui.request_duty_task_refresh = lambda **_kwargs: None
+        gui.submit_duty_action = lambda index, *_args, **_kwargs: submitted.append(index)
+
+        gui.trigger_due_tasks(datetime(2026, 7, 16, 6, 0))
+
+        self.assertEqual(submitted, [])
+        self.assertIn(0, gui.comparison_waiting_due_indices)
+        self.assertEqual(comparison_requests, [("1150715", ["1150714", "1150715", "1150716"])])
+
+    def test_request_duty_task_refresh_coalesces_and_upgrades_to_full(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        scheduled: list[tuple[int, object]] = []
+        refreshed: list[bool] = []
+
+        gui.duty_task_refresh_after_id = None
+        gui.duty_task_refresh_full_requested = False
+        gui.after = lambda delay, callback: scheduled.append((delay, callback)) or "refresh-id"
+        gui.refresh_duty_tasks = lambda full=False: refreshed.append(full)
+
+        gui.request_duty_task_refresh()
+        gui.request_duty_task_refresh(full=True)
+
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0][1]()
+        self.assertEqual(refreshed, [True])
+        self.assertIsNone(gui.duty_task_refresh_after_id)
+
+    def test_status_only_refresh_reuses_matching_task_cards(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        updates: list[tuple[object, ...]] = []
+        rebuilds: list[str] = []
+
+        class ActorNo:
+            def get(self) -> str:
+                return "10"
+
+        class TextValue:
+            def set(self, _value: str) -> None:
+                pass
+
+        class TaskList:
+            def winfo_children(self) -> list[object]:
+                return []
+
+        action = {"kind": "work_log", "time": "08:00", "actor": "10", "target": "10", "fields": {"工作時間": "08:00", "勤務項目": "巡邏"}}
+        gui.duty_task_list = TaskList()
+        gui.session = None
+        gui.actor_no = ActorNo()
+        gui.logout_cleared = False
+        gui.duty_selected_iids = set()
+        gui.duty_actions = [action]
+        gui.duty_action_compare = {0: {"compare": "未找到", "group": "todo", "matched": []}}
+        gui.duty_visible_iids = ["duty-0"]
+        gui.duty_card_rows = {"duty-0": object()}
+        gui.duty_card_borders = {"duty-0": "#cbd5e1"}
+        gui.duty_card_widgets = {"duty-0": {}}
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.duty_task_indices = lambda: [0]
+        gui.resolve_duty_task_display = lambda *_args: ("正在登打", "running", False)
+        gui.action_display_time = lambda _action: "08:00"
+        gui.duty_task_card_time = lambda value: value
+        gui.duty_task_columns = lambda _action: ("工作", "", "巡邏", "10番")
+        gui.pending_previous_duty_count = lambda _actor: 0
+        gui.update_duty_task_card = lambda *args, **kwargs: updates.append((args, kwargs))
+        gui.create_duty_task_card = lambda **_kwargs: rebuilds.append("create")
+        gui.reset_duty_task_scroll = lambda: rebuilds.append("scroll")
+        gui.update_duty_card_selection = lambda: None
+        gui.next_task_text = TextValue()
+        gui.duty_status_text = TextValue()
+        gui.active_duty_status_override = lambda: ""
+
+        gui.refresh_duty_tasks(full=False)
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(rebuilds, [])
+
     def test_manual_work_log_submit_uses_current_time(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)
