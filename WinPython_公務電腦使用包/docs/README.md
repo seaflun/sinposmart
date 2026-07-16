@@ -47,6 +47,10 @@ SETUP_WINPYTHON.bat
 - `RUN_DUTY_GUI_WINPYTHON.bat`：用 WinPython 啟動 GUI，除錯時可直接執行。
 - `RUN_DUTY_GUI_WINPYTHON.vbs`：正式啟動，隱藏小黑窗。
 
+## Google Site 值班看板
+
+值班 GUI 讀取當日勤務表後，可將完整班表同步到 Google Site 的「自動化」頁面；看板會顯示目前時段、下一時段與最後更新時間。詳細部署、設定與輪替同步金鑰方式請見 [GOOGLE_SITE_DUTY_BOARD_SETUP.md](GOOGLE_SITE_DUTY_BOARD_SETUP.md)。
+
 ## 注意事項
 
 - 帳號清單存在各電腦本機，不會跟著 Google Drive 共用。

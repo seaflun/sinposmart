@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import re
@@ -178,6 +179,8 @@ APP_USER_MODEL_ID = "TYFD.DutyAutomation"
 APP_DISPLAY_NAME = "SinpoSmart"
 CREDENTIAL_SYNC_URL = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_URL", "http://100.114.126.58:8080/api/credential-sync").strip()
 CREDENTIAL_SYNC_TOKEN = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
+DUTY_BOARD_SYNC_URL = os.environ.get("SINPOSMART_DUTY_BOARD_SYNC_URL", "").strip()
+DUTY_BOARD_SYNC_KEY = os.environ.get("SINPOSMART_DUTY_BOARD_SYNC_KEY", "").strip()
 SINPOSMART_BACKEND_EVENT_URL = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "http://10.30.65.30:8080/api/sinposmart/events").strip()
 SINPOSMART_BACKEND_EVENT_PENDING_PATH = RUNTIME_OUTPUT_DIR / "sinposmart_backend_events_pending.jsonl"
 SINPOSMART_BACKEND_EVENT_LOCK = threading.Lock()
@@ -384,6 +387,90 @@ def post_credential_sync_payload(payload: dict[str, Any]) -> dict[str, Any]:
         result = {}
     if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError("NAS 帳密同步未回報成功。")
+    return result
+
+
+def duty_board_sync_timeout_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("SINPOSMART_DUTY_BOARD_SYNC_TIMEOUT_SECONDS", "8")))
+    except ValueError:
+        return 8
+
+
+def duty_board_sync_enabled() -> bool:
+    return bool(DUTY_BOARD_SYNC_URL and DUTY_BOARD_SYNC_KEY)
+
+
+def normalize_duty_board_day(raw_day: dict[str, Any]) -> dict[str, Any] | None:
+    roc_day = str(raw_day.get("roc_date", "")).strip()
+    rows = raw_day.get("rows")
+    staff = raw_day.get("staff")
+    if len(roc_day) != 7 or not isinstance(rows, list) or not isinstance(staff, dict):
+        return None
+    slots: list[dict[str, Any]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        slot = str(raw_row.get("slot", "")).strip()
+        start = slot_start(slot)
+        end = slot_end(slot)
+        columns = raw_row.get("columns")
+        duty_nos = columns.get("值班", []) if isinstance(columns, dict) else []
+        if start is None or end is None or not isinstance(duty_nos, list):
+            continue
+        numbers = [str(no).strip() for no in duty_nos if str(no).strip()]
+        names = [str(staff.get(no, {}).get("name", "")).strip() for no in numbers]
+        slots.append({
+            "slot": slot,
+            "start_hour": start,
+            "end_hour": end,
+            "duty_nos": numbers,
+            "names": [name for name in names if name],
+        })
+    return {"roc_date": roc_day, "slots": slots}
+
+
+def build_duty_board_payload(schedule_data: dict[str, Any]) -> dict[str, Any]:
+    days = [
+        normalized
+        for raw_day in (schedule_data.get("today"), schedule_data.get("tomorrow"))
+        if isinstance(raw_day, dict)
+        for normalized in [normalize_duty_board_day(raw_day)]
+        if normalized is not None
+    ]
+    if not days:
+        raise RuntimeError("找不到可同步的今日或下一勤務日看板資料。")
+    canonical = json.dumps({"schema_version": 1, "days": days}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "schema_version": 1,
+        "days": days,
+        "content_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def post_duty_board_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not duty_board_sync_enabled():
+        raise RuntimeError("尚未設定 Google Site 看板同步 URL 或同步密鑰。")
+    body = json.dumps({"sync_key": DUTY_BOARD_SYNC_KEY, "payload": payload}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        DUTY_BOARD_SYNC_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=duty_board_sync_timeout_seconds()) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Google Site 看板同步失敗：HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Google Site 看板同步連線失敗。") from exc
+    try:
+        result = json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("Google Site 看板同步未回報成功。")
     return result
 
 
@@ -869,6 +956,9 @@ class DutyGui(ctk.CTk):
         self.audit_bottom_frame: ttk.Frame | None = None
         self.snapshot_running = False
         self.snapshot_completed_slots: set[str] = set()
+        self.duty_board_completed_hours: set[str] = set()
+        self.duty_board_sync_running = False
+        self.duty_board_last_hash = ""
         self.comparison_running = False
         self.comparison_waiting_due_indices: dict[int, datetime] = {}
         self.comparison_wait_requested_indices: set[int] = set()
@@ -904,6 +994,7 @@ class DutyGui(ctk.CTk):
         self.after(1000, self.tick_clock)
         self.after(15000, self.check_scheduled_snapshot)
         self.after(60000, self.check_hourly_comparison)
+        self.after(65000, self.check_hourly_duty_board_sync)
 
     # Layout construction
 
@@ -3120,9 +3211,9 @@ class DutyGui(ctk.CTk):
         if target_dates:
             self.refresh_schedule_background(base_roc_date, slot_label, target_dates=target_dates)
 
-    def refresh_schedule_background(self, target_roc_date: str, slot_label: str, target_dates: list[str] | None = None) -> None:
+    def refresh_schedule_background(self, target_roc_date: str, slot_label: str, target_dates: list[str] | None = None) -> bool:
         if self.snapshot_running or not (self.session and self.session.verified):
-            return
+            return False
         session = self.session
         key = f"schedule-{target_roc_date}-{slot_label}"
         target_dates = target_dates or [target_roc_date]
@@ -3147,6 +3238,7 @@ class DutyGui(ctk.CTk):
             self.after(0, lambda: self._schedule_succeeded(session.actor_no, session.user_id, key, target_roc_date, paths))
 
         threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def _schedule_succeeded(self, actor_no: str, user_id: str, key: str, target_roc_date: str, paths: list[Path]) -> None:
         self.snapshot_running = False
@@ -3162,13 +3254,19 @@ class DutyGui(ctk.CTk):
             return
         self.snapshot_completed_slots.add(key)
         today_path = next((path for path in paths if path.exists() and path.name == schedule_path(duty_business_roc_date()).name), None)
+        today_data: dict[str, Any] | None = None
         if today_path:
+            try:
+                loaded_today_data = json.loads(today_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_today_data, dict):
+                    today_data = loaded_today_data
+            except Exception:
+                pass
             if not self.data.get("target_date"):
                 self.preview_path.set(str(today_path))
                 self.load_preview(today_path, update_duty=True)
-            else:
+            elif today_data is not None:
                 try:
-                    today_data = json.loads(today_path.read_text(encoding="utf-8"))
                     self.sanitize_schedule_data(today_data)
                     if self.data.get("target_date") == today_data.get("target_date"):
                         self.data = today_data
@@ -3188,6 +3286,8 @@ class DutyGui(ctk.CTk):
                         self.refresh_duty_tasks()
                 except Exception:
                     pass
+        if today_data is not None and self.current_session_matches(user_id):
+            self.queue_duty_board_sync(today_data)
         if self.current_session_matches(user_id):
             self.set_logged_in_status(self.session.actor_no)
         selected_date = "".join(ch for ch in self.audit_date.get() if ch.isdigit())
@@ -3227,6 +3327,47 @@ class DutyGui(ctk.CTk):
                         self.refresh_comparison_background(target_roc_date, f"{now:%H}00", comparison_dates=comparison_dates, completion_key=key)
         finally:
             self.after(60000, self.check_hourly_comparison)
+
+    def queue_duty_board_sync(self, schedule_data: dict[str, Any]) -> None:
+        if self.duty_board_sync_running or not duty_board_sync_enabled():
+            return
+        try:
+            payload = build_duty_board_payload(schedule_data)
+        except Exception as exc:
+            log_automation_exception("duty_board_payload", exc)
+            return
+        if payload["content_hash"] == self.duty_board_last_hash:
+            return
+        self.duty_board_sync_running = True
+
+        def worker() -> None:
+            try:
+                post_duty_board_payload(payload)
+            except Exception as exc:
+                log_automation_exception("duty_board_sync", exc)
+                self.after(0, self._duty_board_sync_finished)
+                return
+            self.after(0, lambda: self._duty_board_sync_finished(payload["content_hash"]))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _duty_board_sync_finished(self, content_hash: str = "") -> None:
+        self.duty_board_sync_running = False
+        if content_hash:
+            self.duty_board_last_hash = content_hash
+
+    def check_hourly_duty_board_sync(self) -> None:
+        try:
+            now = datetime.now()
+            if not (self.simple_mode.get() and self.session and self.session.verified) or now.minute >= 5:
+                return
+            hour_key = f"duty-board-{duty_business_roc_date(now)}-{now:%Y%m%d%H}"
+            if hour_key in self.duty_board_completed_hours or self.snapshot_running:
+                return
+            if self.refresh_schedule_background(duty_business_roc_date(now), hour_key, target_dates=[duty_business_roc_date(now)]):
+                self.duty_board_completed_hours.add(hour_key)
+        finally:
+            self.after(60000, self.check_hourly_duty_board_sync)
 
     def refresh_current_comparison(self) -> None:
         target_roc_date = "".join(ch for ch in self.audit_date.get() if ch.isdigit())

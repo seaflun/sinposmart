@@ -10,6 +10,7 @@ import unittest
 import os
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +64,32 @@ def legacy_duty_sheet_module():
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def duty_board_schedule_payload(self) -> dict[str, object]:
+        return {
+            "target_date": "1150716",
+            "today": {
+                "roc_date": "1150716",
+                "rows": [
+                    {"slot": "8-9", "columns": {"值班": ["1", "2"]}},
+                    {"slot": "9-10", "columns": {"值班": ["3"]}},
+                    {"slot": "23-0", "columns": {"值班": ["4"]}},
+                    {"slot": "0-1", "columns": {"值班": ["5"]}},
+                ],
+                "staff": {
+                    "1": {"name": "王小明", "role": "隊員"},
+                    "2": {"name": "李小華", "role": "隊員"},
+                    "3": {"name": "陳小美", "role": "隊員"},
+                    "4": {"name": "林小強", "role": "隊員"},
+                    "5": {"name": "周小安", "role": "隊員"},
+                },
+            },
+            "tomorrow": {
+                "roc_date": "1150717",
+                "rows": [{"slot": "8-9", "columns": {"值班": ["6"]}}],
+                "staff": {"6": {"name": "張小雲", "role": "隊員"}},
+            },
+        }
+
     def test_package_entry_files_exist(self) -> None:
         root = package_dir()
 
@@ -2008,6 +2035,80 @@ class PackageSmokeTests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_duty_board_payload_keeps_full_days_and_stable_hash(self) -> None:
+        module = duty_gui_module()
+        schedule = self.duty_board_schedule_payload()
+
+        first = module.build_duty_board_payload(schedule)
+        second = module.build_duty_board_payload(schedule)
+
+        self.assertEqual(first["schema_version"], 1)
+        self.assertEqual([day["roc_date"] for day in first["days"]], ["1150716", "1150717"])
+        self.assertEqual(len(first["days"][0]["slots"]), 4)
+        self.assertEqual(first["days"][0]["slots"][0]["duty_nos"], ["1", "2"])
+        self.assertEqual(first["days"][0]["slots"][0]["names"], ["王小明", "李小華"])
+        self.assertEqual(first["days"][0]["slots"][3]["start_hour"], 0)
+        self.assertEqual(first["days"][0]["slots"][3]["end_hour"], 1)
+        self.assertEqual(first["content_hash"], second["content_hash"])
+
+    def test_post_duty_board_payload_requires_configuration_and_ok_response(self) -> None:
+        module = duty_gui_module()
+        payload = module.build_duty_board_payload(self.duty_board_schedule_payload())
+        previous_url = module.DUTY_BOARD_SYNC_URL
+        previous_key = module.DUTY_BOARD_SYNC_KEY
+        module.DUTY_BOARD_SYNC_URL = ""
+        module.DUTY_BOARD_SYNC_KEY = ""
+        try:
+            with self.assertRaisesRegex(RuntimeError, "看板同步"):
+                module.post_duty_board_payload(payload)
+        finally:
+            module.DUTY_BOARD_SYNC_URL = previous_url
+            module.DUTY_BOARD_SYNC_KEY = previous_key
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok": true, "changed": false}'
+
+        module.DUTY_BOARD_SYNC_URL = "https://example.invalid/exec"
+        module.DUTY_BOARD_SYNC_KEY = "test-key"
+        try:
+            with mock.patch.object(module.urllib.request, "urlopen", return_value=Response()) as urlopen:
+                result = module.post_duty_board_payload(payload)
+            request = urlopen.call_args.args[0]
+            sent = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(result, {"ok": True, "changed": False})
+            self.assertEqual(sent["payload"]["content_hash"], payload["content_hash"])
+            self.assertNotIn("test-key", request.full_url)
+        finally:
+            module.DUTY_BOARD_SYNC_URL = previous_url
+            module.DUTY_BOARD_SYNC_KEY = previous_key
+
+    def test_hourly_duty_board_sync_reuses_schedule_refresh_once(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.simple_mode = type("Mode", (), {"get": lambda self: True})()
+        gui.session = module.LoginSession(actor_no="1", user_id="user", password="secret", verified=True)
+        gui.duty_board_completed_hours = set()
+        gui.snapshot_running = False
+        scheduled = []
+        refreshes = []
+        gui.after = lambda delay, callback: scheduled.append((delay, callback)) or "after-id"
+        gui.refresh_schedule_background = lambda target, label, target_dates=None: refreshes.append((target, label, target_dates)) or True
+        with mock.patch.object(module, "datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 7, 16, 9, 2)
+            mocked_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+            gui.check_hourly_duty_board_sync()
+            gui.check_hourly_duty_board_sync()
+        self.assertEqual(len(refreshes), 1)
+        self.assertEqual(refreshes[0][0], "1150716")
+        self.assertEqual(len(scheduled), 2)
 
 
 if __name__ == "__main__":

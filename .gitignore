@@ -33,6 +33,7 @@ cache/
 .cache/
 .agents/
 skills-lock.json
+google_site_duty_board/**/.clasp.json
 
 # outputs
 outputs/
