@@ -3706,6 +3706,7 @@ class DutyGui(ctk.CTk):
             index
             for index, action in enumerate(self.duty_actions)
             if action.get("kind") in ("entry_log", "work_log")
+            and self.is_auto_duty_action(action)
             and str(action.get("actor", "")) == str(actor_no)
             and self.action_datetime(action) == handoff_at
         ]

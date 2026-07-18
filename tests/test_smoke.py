@@ -657,6 +657,7 @@ class PackageSmokeTests(unittest.TestCase):
             {"key": "checkout", "at": handoff_at, "kind": "entry_log", "actor": "28", "source": "值班交接", "fields": {"出或入": "值退"}},
             {"key": "checkin", "at": handoff_at, "kind": "entry_log", "actor": "28", "source": "值班交接", "fields": {"出或入": "值班"}},
             {"key": "work", "at": handoff_at, "kind": "work_log", "actor": "28", "source": "值班交接", "fields": {}},
+            {"key": "rest-return", "at": handoff_at, "kind": "entry_log", "actor": "28", "source": "休息結束", "fields": {"出或入": "入", "領用事由及地點": "休息返隊"}},
             {"key": "next-shift", "at": datetime(2026, 7, 10, 20, 0), "kind": "work_log", "actor": "12", "source": "值班交接", "fields": {}},
         ]
         gui.duty_action_compare = {
@@ -664,6 +665,7 @@ class PackageSmokeTests(unittest.TestCase):
             1: {"group": "done"},
             2: {"group": "todo"},
             3: {"group": "todo"},
+            4: {"group": "todo"},
         }
         gui.executed_due = {0, 1}
         gui.manual_completed_keys = set()
