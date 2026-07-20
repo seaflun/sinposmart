@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -2111,6 +2111,54 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(len(refreshes), 1)
         self.assertEqual(refreshes[0][0], "1150716")
         self.assertEqual(len(scheduled), 2)
+
+    def test_cleanup_old_files_removes_only_expired_matching_files(self) -> None:
+        module = duty_gui_module()
+        now = datetime(2026, 7, 21, 12, 0)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            expired_png = root / "expired.png"
+            recent_png = root / "recent.png"
+            expired_txt = root / "expired.txt"
+            for path in (expired_png, recent_png, expired_txt):
+                path.write_text(path.name, encoding="utf-8")
+            os.utime(expired_png, (now.timestamp(), (now - timedelta(days=31)).timestamp()))
+            os.utime(recent_png, (now.timestamp(), (now - timedelta(days=29)).timestamp()))
+            os.utime(expired_txt, (now.timestamp(), (now - timedelta(days=31)).timestamp()))
+
+            module.cleanup_old_files(((root, "*.png", 30),), now)
+
+            self.assertFalse(expired_png.exists())
+            self.assertTrue(recent_png.exists())
+            self.assertTrue(expired_txt.exists())
+
+    def test_daily_cleanup_delay_targets_next_0300(self) -> None:
+        module = duty_gui_module()
+
+        self.assertEqual(
+            module.milliseconds_until_next_cleanup(datetime(2026, 7, 21, 2, 30)),
+            30 * 60 * 1000,
+        )
+        self.assertEqual(
+            module.milliseconds_until_next_cleanup(datetime(2026, 7, 21, 3, 30)),
+            (23 * 60 + 30) * 60 * 1000,
+        )
+
+    def test_daily_cleanup_runs_both_rules_and_reschedules(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        rescheduled = []
+        gui.schedule_daily_cleanup = lambda: rescheduled.append(True)
+
+        with (
+            mock.patch.object(module, "cleanup_old_json_files") as cleanup_json,
+            mock.patch.object(module, "cleanup_old_screenshot_files") as cleanup_screenshots,
+        ):
+            gui.run_daily_cleanup()
+
+        cleanup_json.assert_called_once_with()
+        cleanup_screenshots.assert_called_once_with()
+        self.assertEqual(rescheduled, [True])
 
 
 if __name__ == "__main__":

@@ -61,6 +61,10 @@ AUTO_CLEAN_RULES = (
     (FORM_TEST_OUTPUT_DIR, "*.json", 7),
     (SNAPSHOT_OUTPUT_DIR, "*.json", 14),
 )
+SCREENSHOT_CLEAN_RULES = (
+    (Path(__file__).resolve().parent / DAILY_SCREENSHOT_DIR, "*.png", 30),
+    (Path(__file__).resolve().parent / NIGHT_SCREENSHOT_DIR, "*.png", 30),
+)
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -806,9 +810,12 @@ def legacy_rehearsal_path(target_roc_date: str) -> Path:
     return REHEARSAL_OUTPUT_DIR / f"rehearsal_output_{target_roc_date}.json"
 
 
-def cleanup_old_json_files() -> None:
-    now = datetime.now()
-    for folder, pattern, keep_days in AUTO_CLEAN_RULES:
+def cleanup_old_files(
+    rules: tuple[tuple[Path, str, int], ...],
+    now: datetime | None = None,
+) -> None:
+    now = now or datetime.now()
+    for folder, pattern, keep_days in rules:
         if not folder.exists():
             continue
         for old_path in folder.glob(pattern):
@@ -818,6 +825,22 @@ def cleanup_old_json_files() -> None:
                     old_path.unlink()
             except Exception:
                 continue
+
+
+def cleanup_old_json_files() -> None:
+    cleanup_old_files(AUTO_CLEAN_RULES)
+
+
+def cleanup_old_screenshot_files() -> None:
+    cleanup_old_files(SCREENSHOT_CLEAN_RULES)
+
+
+def milliseconds_until_next_cleanup(now: datetime | None = None) -> int:
+    now = now or datetime.now()
+    next_cleanup = now.replace(hour=3, minute=0, second=0, microsecond=0)
+    if next_cleanup <= now:
+        next_cleanup += timedelta(days=1)
+    return max(1, int((next_cleanup - now).total_seconds() * 1000))
 
 
 DEFAULT_PREVIEW = latest_preview_file()
@@ -986,6 +1009,7 @@ class DutyGui(ctk.CTk):
         self.opened_screenshot_folder_slots: set[str] = set()
 
         cleanup_old_json_files()
+        cleanup_old_screenshot_files()
         self.load_saved_login()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -995,6 +1019,7 @@ class DutyGui(ctk.CTk):
         self.after(15000, self.check_scheduled_snapshot)
         self.after(60000, self.check_hourly_comparison)
         self.after(65000, self.check_hourly_duty_board_sync)
+        self.schedule_daily_cleanup()
 
     # Layout construction
 
@@ -4287,6 +4312,16 @@ class DutyGui(ctk.CTk):
                 self.request_duty_task_refresh()
         self.check_scheduled_screenshot_folders(now)
         self.after(1000, self.tick_clock)
+
+    def schedule_daily_cleanup(self) -> None:
+        self.after(milliseconds_until_next_cleanup(), self.run_daily_cleanup)
+
+    def run_daily_cleanup(self) -> None:
+        try:
+            cleanup_old_json_files()
+            cleanup_old_screenshot_files()
+        finally:
+            self.schedule_daily_cleanup()
 
     def screenshot_folder_path(self, folder_name: str) -> Path:
         folder = Path(__file__).resolve().parent / folder_name
