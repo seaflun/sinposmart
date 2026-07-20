@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import ctypes
 import msvcrt
 import socket
@@ -64,6 +65,20 @@ AUTO_CLEAN_RULES = (
 SCREENSHOT_CLEAN_RULES = (
     (Path(__file__).resolve().parent / DAILY_SCREENSHOT_DIR, "*.png", 30),
     (Path(__file__).resolve().parent / NIGHT_SCREENSHOT_DIR, "*.png", 30),
+)
+SUPPORT_CLEAN_RULES = (
+    (Path("issue_reports"), "*.zip", 7),
+    (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SinpoSmart" / "update_backups", "*.zip", 7),
+)
+CLOUD_FORM_TEST_KEEP_DAYS = 7
+DUTY_TRIGGER_LOG_KEEP_DAYS = 30
+DUTY_TRIGGER_LOG_MAX_BYTES = 10 * 1024 * 1024
+BACKEND_PENDING_KEEP_DAYS = 7
+BACKEND_PENDING_MAX_ENTRIES = 1000
+SELENIUM_DRIVER_KEEP_DAYS = 30
+SELENIUM_DRIVER_KEEP_LATEST = 2
+SELENIUM_DRIVER_CACHE_ROOT = (
+    Path(os.environ.get("SE_CACHE_PATH", str(Path.home() / ".cache" / "selenium"))) / "chromedriver"
 )
 
 from selenium import webdriver
@@ -708,6 +723,33 @@ def load_pending_sinposmart_backend_events() -> list[dict[str, Any]]:
     return entries
 
 
+def parse_event_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def prune_pending_sinposmart_backend_events(
+    entries: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=BACKEND_PENDING_KEEP_DAYS)
+    retained = []
+    for entry in entries:
+        occurred_at = parse_event_datetime(entry.get("occurred_at"))
+        if occurred_at is not None and occurred_at >= cutoff:
+            retained.append(entry)
+    return retained[-BACKEND_PENDING_MAX_ENTRIES:]
+
+
 def write_pending_sinposmart_backend_events(entries: list[dict[str, Any]]) -> None:
     if not entries:
         try:
@@ -728,8 +770,9 @@ def enqueue_sinposmart_backend_event(payload: dict[str, Any]) -> None:
 
 def send_sinposmart_backend_event_worker(payload: dict[str, Any]) -> None:
     with SINPOSMART_BACKEND_EVENT_LOCK:
-        pending = load_pending_sinposmart_backend_events()
+        pending = prune_pending_sinposmart_backend_events(load_pending_sinposmart_backend_events())
         pending.append(payload)
+        pending = prune_pending_sinposmart_backend_events(pending)
         write_pending_sinposmart_backend_events(pending)
         sent_count = 0
         try:
@@ -833,6 +876,167 @@ def cleanup_old_json_files() -> None:
 
 def cleanup_old_screenshot_files() -> None:
     cleanup_old_files(SCREENSHOT_CLEAN_RULES)
+
+
+def prune_jsonl_file(
+    path: Path,
+    keep_days: int,
+    max_bytes: int,
+    now: datetime | None = None,
+    timestamp_field: str = "created_at",
+) -> None:
+    if not path.exists():
+        return
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=keep_days)
+    try:
+        original_body = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    retained_lines = []
+    for raw_line in original_body.splitlines():
+        text = raw_line.strip()
+        if not text:
+            continue
+        try:
+            record = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        created_at = parse_event_datetime(record.get(timestamp_field))
+        if created_at is not None and created_at >= cutoff:
+            retained_lines.append(text + "\n")
+
+    newest_lines = []
+    retained_bytes = 0
+    for line in reversed(retained_lines):
+        line_bytes = len(line.encode("utf-8"))
+        if line_bytes > max_bytes:
+            continue
+        if retained_bytes + line_bytes > max_bytes:
+            break
+        newest_lines.append(line)
+        retained_bytes += line_bytes
+    pruned_body = "".join(reversed(newest_lines))
+    if pruned_body == original_body:
+        return
+    try:
+        if pruned_body:
+            path.write_text(pruned_body, encoding="utf-8")
+        else:
+            path.unlink()
+    except OSError:
+        pass
+
+
+def cleanup_selenium_driver_cache(
+    cache_root: Path = SELENIUM_DRIVER_CACHE_ROOT,
+    now: datetime | None = None,
+) -> None:
+    if not cache_root.exists():
+        return
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=SELENIUM_DRIVER_KEEP_DAYS)
+    try:
+        resolved_root = cache_root.resolve()
+    except OSError:
+        return
+    version_dirs: dict[Path, tuple[str, tuple[int, ...], datetime]] = {}
+    try:
+        executables = list(cache_root.rglob("chromedriver.exe"))
+    except OSError:
+        return
+    for executable in executables:
+        try:
+            relative = executable.resolve().relative_to(resolved_root)
+            if len(relative.parts) != 3:
+                continue
+            platform_name, version_text, executable_name = relative.parts
+            if executable_name.lower() != "chromedriver.exe" or not re.fullmatch(r"\d+(?:\.\d+)+", version_text):
+                continue
+            version_key = tuple(int(part) for part in version_text.split("."))
+            modified_at = datetime.fromtimestamp(executable.stat().st_mtime)
+        except (OSError, ValueError):
+            continue
+        version_dir = executable.parent
+        previous = version_dirs.get(version_dir)
+        if previous is None or modified_at > previous[2]:
+            version_dirs[version_dir] = (platform_name, version_key, modified_at)
+    newest: set[Path] = set()
+    platforms = {metadata[0] for metadata in version_dirs.values()}
+    for platform_name in platforms:
+        platform_versions = [
+            (path, metadata)
+            for path, metadata in version_dirs.items()
+            if metadata[0] == platform_name
+        ]
+        newest.update(
+            path
+            for path, _metadata in sorted(
+                platform_versions,
+                key=lambda item: item[1][1],
+                reverse=True,
+            )[:SELENIUM_DRIVER_KEEP_LATEST]
+        )
+    for version_dir, (_platform_name, _version_key, modified_at) in version_dirs.items():
+        if version_dir in newest or modified_at >= cutoff:
+            continue
+        try:
+            relative_dir = version_dir.resolve().relative_to(resolved_root)
+            if len(relative_dir.parts) != 2 or version_dir.is_symlink():
+                continue
+            shutil.rmtree(version_dir)
+        except (OSError, ValueError):
+            continue
+
+
+def cleanup_accumulated_runtime_files(now: datetime | None = None) -> None:
+    now = now or datetime.now()
+    cleanup_old_files(SUPPORT_CLEAN_RULES, now)
+    prune_jsonl_file(
+        Path("duty_trigger_log.jsonl"),
+        keep_days=DUTY_TRIGGER_LOG_KEEP_DAYS,
+        max_bytes=DUTY_TRIGGER_LOG_MAX_BYTES,
+        now=now,
+    )
+    cloud_root = cloud_runtime_log_root()
+    if cloud_root:
+        cleanup_old_files(((cloud_root / "form_tests", "*.json", CLOUD_FORM_TEST_KEEP_DAYS),), now)
+        prune_jsonl_file(
+            cloud_root / "duty_trigger_log.jsonl",
+            keep_days=DUTY_TRIGGER_LOG_KEEP_DAYS,
+            max_bytes=DUTY_TRIGGER_LOG_MAX_BYTES,
+            now=now,
+        )
+    cleanup_selenium_driver_cache(now=now)
+    if SINPOSMART_BACKEND_EVENT_LOCK.acquire(blocking=False):
+        try:
+            pending = load_pending_sinposmart_backend_events()
+            retained = prune_pending_sinposmart_backend_events(pending, now=now)
+            if retained != pending:
+                write_pending_sinposmart_backend_events(retained)
+        finally:
+            SINPOSMART_BACKEND_EVENT_LOCK.release()
+
+
+def prune_runtime_completion_keys(values: set[str], now: datetime | None = None) -> None:
+    now = now or datetime.now()
+    valid_dates = [now.date() + timedelta(days=offset) for offset in (-1, 0, 1)]
+    valid_tokens = {
+        token
+        for value in valid_dates
+        for token in (
+            value.strftime("%Y%m%d"),
+            f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+        )
+    }
+    values.intersection_update(
+        key
+        for key in values
+        if any(token in key for token in valid_tokens)
+    )
 
 
 def milliseconds_until_next_cleanup(now: datetime | None = None) -> int:
@@ -1010,6 +1214,7 @@ class DutyGui(ctk.CTk):
 
         cleanup_old_json_files()
         cleanup_old_screenshot_files()
+        cleanup_accumulated_runtime_files()
         self.load_saved_login()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -4320,6 +4525,12 @@ class DutyGui(ctk.CTk):
         try:
             cleanup_old_json_files()
             cleanup_old_screenshot_files()
+            cleanup_accumulated_runtime_files()
+            now = datetime.now()
+            prune_runtime_completion_keys(self.snapshot_completed_slots, now=now)
+            prune_runtime_completion_keys(self.duty_board_completed_hours, now=now)
+            prune_runtime_completion_keys(self.comparison_completed_hours, now=now)
+            prune_runtime_completion_keys(self.opened_screenshot_folder_slots, now=now)
         finally:
             self.schedule_daily_cleanup()
 

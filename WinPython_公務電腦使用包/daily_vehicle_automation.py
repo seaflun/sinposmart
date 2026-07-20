@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from tkinter import messagebox
@@ -23,6 +24,8 @@ RUNNING_PID_FILE = ".daily_vehicle_runner.pid"
 WINDOW_TITLE = "SinpoSmart - 車輛保養清點"
 OUTPUT_TAIL_LIMIT = 3000
 DEFAULT_AUTOMATION_TIMEOUT_SECONDS = 15 * 60
+BROWSER_CLOSE_DELAY_SECONDS = 10 * 60
+AUTOMATION_COMPLETED_MARKER = "[automation] work-complete"
 FRONTEND_ERROR_MESSAGES = {
     "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
     "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
@@ -242,7 +245,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
         "PPE_ACCOUNT": account,
         "PPE_PASSWORD": pwd,
         "HEADLESS": "false",
-        "KEEP_BROWSER_OPEN": "true",
+        "KEEP_BROWSER_OPEN": "false",
+        "BROWSER_CLOSE_DELAY_SECONDS": str(BROWSER_CLOSE_DELAY_SECONDS),
         "SELENIUM_REMOTE_URL": "",
     }
 
@@ -270,17 +274,42 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                 errors="replace",
             )
             set_running(project_dir, True, process.pid)
-            try:
-                output, _ = process.communicate(timeout=automation_timeout_seconds())
-            except subprocess.TimeoutExpired:
-                process.kill()
-                output, _ = process.communicate()
-                raise RuntimeError(f"車輛保養清點逾時未完成，已超過 {automation_timeout_seconds()} 秒。")
+            output_lines: list[str] = []
+            completion_seen = threading.Event()
+
+            def read_output() -> None:
+                if process is None or process.stdout is None:
+                    return
+                for line in process.stdout:
+                    output_lines.append(line)
+                    if AUTOMATION_COMPLETED_MARKER in line:
+                        completion_seen.set()
+
+            output_reader = threading.Thread(target=read_output, daemon=True)
+            output_reader.start()
+            completed_notified = False
+            deadline = time.monotonic() + automation_timeout_seconds()
+            while process.poll() is None:
+                if completion_seen.is_set() and not completed_notified:
+                    completed_notified = True
+                    deadline = time.monotonic() + BROWSER_CLOSE_DELAY_SECONDS + 60
+                    if on_finish is not None:
+                        on_finish("車輛保養清點已完成。")
+                    run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成，瀏覽器將於 10 分鐘後自動關閉。", parent=parent))
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait(timeout=10)
+                    output_reader.join(timeout=5)
+                    raise RuntimeError(f"車輛保養清點逾時未完成，已超過 {automation_timeout_seconds()} 秒。")
+                time.sleep(0.1)
+            output_reader.join(timeout=5)
+            output = "".join(output_lines)
             return_code = process.returncode
             if return_code == 0:
-                if on_finish is not None:
-                    on_finish("車輛保養清點已完成。")
-                run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
+                if not completed_notified:
+                    if on_finish is not None:
+                        on_finish("車輛保養清點已完成。")
+                    run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
                 detail = output_tail(output)
                 raw_error = f"車輛保養清點執行失敗，代碼：{return_code}；{detail}"

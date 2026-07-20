@@ -37,6 +37,7 @@ TEXT_SEARCH = "\u67e5\u8a62"
 TEXT_EQUIP_CHECK = "\u6e05\u9ede"
 TEXT_REVIEW = "\u6aa2\u8996"
 TEXT_FINISH_EQUIP_CHECK = "\u5b8c\u6210\u6e05\u9ede"
+AUTOMATION_COMPLETED_MARKER = "[automation] work-complete"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -65,6 +66,7 @@ def load_config() -> dict[str, object]:
         "password": password,
         "headless": read_bool("HEADLESS", True),
         "keep_browser_open": read_bool("KEEP_BROWSER_OPEN", False),
+        "browser_close_delay_seconds": max(0, int(os.getenv("BROWSER_CLOSE_DELAY_SECONDS", "0"))),
         "send_line_result": read_bool("SEND_LINE_RESULT", True),
         "timeout_seconds": int(os.getenv("SELENIUM_TIMEOUT_SECONDS", "60")),
         "selenium_remote_url": os.getenv("SELENIUM_REMOTE_URL", "").strip(),
@@ -409,6 +411,7 @@ def main(argv: list[str] | None = None) -> None:
     parse_args(argv)
     config = load_config()
     driver = None
+    completed = False
 
     options = webdriver.ChromeOptions()
     if config["headless"]:
@@ -451,6 +454,8 @@ def main(argv: list[str] | None = None) -> None:
         print("[done] automation finished")
         if config["send_line_result"]:
             send_line_push(config, f"PPE 自動化完成\n時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n結果: 成功")
+        completed = True
+        print(AUTOMATION_COMPLETED_MARKER, flush=True)
     except Exception as error:
         if driver is not None:
             save_artifacts(driver, "error")
@@ -468,6 +473,10 @@ def main(argv: list[str] | None = None) -> None:
         raise
     finally:
         if driver is not None and not config["keep_browser_open"]:
+            close_delay_seconds = int(config["browser_close_delay_seconds"]) if completed else 0
+            if close_delay_seconds > 0:
+                print(f"[browser] closing in {close_delay_seconds} seconds", flush=True)
+                time.sleep(close_delay_seconds)
             try:
                 driver.quit()
             except WebDriverException as error:

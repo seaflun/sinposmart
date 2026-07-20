@@ -2149,16 +2149,181 @@ class PackageSmokeTests(unittest.TestCase):
         gui = object.__new__(module.DutyGui)
         rescheduled = []
         gui.schedule_daily_cleanup = lambda: rescheduled.append(True)
+        gui.snapshot_completed_slots = set()
+        gui.duty_board_completed_hours = set()
+        gui.comparison_completed_hours = set()
+        gui.opened_screenshot_folder_slots = set()
 
         with (
             mock.patch.object(module, "cleanup_old_json_files") as cleanup_json,
             mock.patch.object(module, "cleanup_old_screenshot_files") as cleanup_screenshots,
+            mock.patch.object(module, "cleanup_accumulated_runtime_files") as cleanup_accumulated,
+            mock.patch.object(module, "prune_runtime_completion_keys") as prune_keys,
         ):
             gui.run_daily_cleanup()
 
         cleanup_json.assert_called_once_with()
         cleanup_screenshots.assert_called_once_with()
+        cleanup_accumulated.assert_called_once_with()
+        self.assertEqual(prune_keys.call_count, 4)
         self.assertEqual(rescheduled, [True])
+
+    def test_pending_backend_events_drop_expired_entries_and_cap_latest_thousand(self) -> None:
+        module = duty_gui_module()
+        now = datetime(2026, 7, 21, 3, 0)
+        entries = [
+            {"event_id": "expired", "occurred_at": "2026-07-13T02:59:59"},
+            *[
+                {"event_id": f"recent-{index}", "occurred_at": "2026-07-21T02:00:00"}
+                for index in range(1002)
+            ],
+        ]
+
+        retained = module.prune_pending_sinposmart_backend_events(entries, now=now)
+
+        self.assertEqual(len(retained), 1000)
+        self.assertEqual(retained[0]["event_id"], "recent-2")
+        self.assertEqual(retained[-1]["event_id"], "recent-1001")
+
+    def test_pending_backend_events_drop_missing_or_invalid_timestamps(self) -> None:
+        module = duty_gui_module()
+        entries = [
+            {"event_id": "missing"},
+            {"event_id": "invalid", "occurred_at": "not-a-date"},
+            {"event_id": "valid", "occurred_at": "2026-07-21T02:00:00"},
+        ]
+
+        retained = module.prune_pending_sinposmart_backend_events(
+            entries,
+            now=datetime(2026, 7, 21, 3, 0),
+        )
+
+        self.assertEqual([entry["event_id"] for entry in retained], ["valid"])
+
+    def test_jsonl_retention_applies_age_and_byte_limit(self) -> None:
+        module = duty_gui_module()
+        now = datetime(2026, 7, 21, 3, 0)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "events.jsonl"
+            records = [
+                {"id": "expired", "created_at": "2026-06-20T12:00:00", "payload": "x" * 40},
+                {"id": "recent-1", "created_at": "2026-07-20T12:00:00", "payload": "y" * 40},
+                {"id": "recent-2", "created_at": "2026-07-20T13:00:00", "payload": "z" * 40},
+                {"id": "recent-3", "created_at": "2026-07-20T14:00:00", "payload": "w" * 40},
+            ]
+            lines = [json.dumps(record, ensure_ascii=False) + "\n" for record in records]
+            path.write_text("".join(lines), encoding="utf-8")
+            max_bytes = len((lines[-2] + lines[-1]).encode("utf-8"))
+
+            module.prune_jsonl_file(path, keep_days=30, max_bytes=max_bytes, now=now)
+
+            retained = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["id"] for record in retained], ["recent-2", "recent-3"])
+
+    def test_jsonl_retention_drops_invalid_lines_and_oversized_single_record(self) -> None:
+        module = duty_gui_module()
+        now = datetime(2026, 7, 21, 3, 0)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "events.jsonl"
+            oversized = {
+                "id": "oversized",
+                "created_at": "2026-07-21T02:00:00",
+                "payload": "x" * 200,
+            }
+            path.write_text(
+                "not-json\n"
+                + json.dumps({"id": "missing-time"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps(oversized, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            module.prune_jsonl_file(path, keep_days=30, max_bytes=100, now=now)
+
+            self.assertFalse(path.exists())
+
+    def test_selenium_cache_cleanup_keeps_latest_two_versions(self) -> None:
+        module = duty_gui_module()
+        now = datetime(2026, 7, 21, 3, 0)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "chromedriver" / "win64"
+            versions = {
+                "147.0.1": 60,
+                "148.0.1": 50,
+                "149.0.1": 100,
+                "150.0.1": 90,
+            }
+            for version, age_days in versions.items():
+                version_dir = root / version
+                version_dir.mkdir(parents=True)
+                executable = version_dir / "chromedriver.exe"
+                executable.write_bytes(b"driver")
+                timestamp = (now - timedelta(days=age_days)).timestamp()
+                os.utime(executable, (timestamp, timestamp))
+                os.utime(version_dir, (timestamp, timestamp))
+            unsafe_dir = root.parent / "unsafe"
+            unsafe_dir.mkdir()
+            unsafe_executable = unsafe_dir / "chromedriver.exe"
+            unsafe_executable.write_bytes(b"driver")
+            unsafe_timestamp = (now - timedelta(days=120)).timestamp()
+            os.utime(unsafe_executable, (unsafe_timestamp, unsafe_timestamp))
+            os.utime(unsafe_dir, (unsafe_timestamp, unsafe_timestamp))
+
+            module.cleanup_selenium_driver_cache(root.parent, now=now)
+
+            self.assertFalse((root / "147.0.1").exists())
+            self.assertFalse((root / "148.0.1").exists())
+            self.assertTrue((root / "149.0.1").exists())
+            self.assertTrue((root / "150.0.1").exists())
+            self.assertTrue(unsafe_dir.exists())
+
+    def test_runtime_completion_keys_keep_only_nearby_dates(self) -> None:
+        module = duty_gui_module()
+        keys = {
+            "schedule-1150719-2359",
+            "schedule-1150721-1800",
+            "comparison-1150720-2026072003",
+            "comparison-1150719-2026071903",
+            "duty-board-1150722-2026072203",
+        }
+
+        module.prune_runtime_completion_keys(keys, now=datetime(2026, 7, 21, 3, 0))
+
+        self.assertEqual(
+            keys,
+            {
+                "schedule-1150721-1800",
+                "comparison-1150720-2026072003",
+                "duty-board-1150722-2026072203",
+            },
+        )
+
+    def test_accumulation_retention_constants_match_public_computer_policy(self) -> None:
+        module = duty_gui_module()
+
+        self.assertEqual(module.CLOUD_FORM_TEST_KEEP_DAYS, 7)
+        self.assertEqual(module.DUTY_TRIGGER_LOG_KEEP_DAYS, 30)
+        self.assertEqual(module.DUTY_TRIGGER_LOG_MAX_BYTES, 10 * 1024 * 1024)
+        self.assertEqual(module.BACKEND_PENDING_KEEP_DAYS, 7)
+        self.assertEqual(module.BACKEND_PENDING_MAX_ENTRIES, 1000)
+        self.assertEqual(module.SELENIUM_DRIVER_KEEP_DAYS, 30)
+        self.assertEqual(module.SELENIUM_DRIVER_KEEP_LATEST, 2)
+        support_rules = {(path.name, pattern): days for path, pattern, days in module.SUPPORT_CLEAN_RULES}
+        self.assertEqual(support_rules[("issue_reports", "*.zip")], 7)
+        self.assertEqual(support_rules[("update_backups", "*.zip")], 7)
+
+    def test_daily_vehicle_keeps_browser_for_ten_minutes_then_closes(self) -> None:
+        launcher = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
+        worker = (package_dir() / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("BROWSER_CLOSE_DELAY_SECONDS = 10 * 60", launcher)
+        self.assertIn('"KEEP_BROWSER_OPEN": "false"', launcher)
+        self.assertIn('"BROWSER_CLOSE_DELAY_SECONDS": str(BROWSER_CLOSE_DELAY_SECONDS)', launcher)
+        self.assertIn("AUTOMATION_COMPLETED_MARKER", launcher)
+        self.assertIn("AUTOMATION_COMPLETED_MARKER", worker)
+        self.assertIn("time.sleep(close_delay_seconds)", worker)
+        self.assertLess(worker.index("print(AUTOMATION_COMPLETED_MARKER"), worker.index("time.sleep(close_delay_seconds)"))
 
 
 if __name__ == "__main__":
