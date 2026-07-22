@@ -341,6 +341,28 @@ class PackageSmokeTests(unittest.TestCase):
             ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
         )
 
+    def test_rescue_ambulance2_uses_out_duty_when_no_disaster_standby(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        members = module.select_ambulance2_members([], ["11", "12", "13"])
+
+        self.assertEqual(members, ["11", "12"])
+
+    def test_rescue_ambulance2_keeps_disaster_standby_before_out_duty(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        members = module.select_ambulance2_members(["21"], ["11", "12"])
+
+        self.assertEqual(members, ["21", "11"])
+
+    def test_fire_mission_allows_cross_vehicle_reuse_for_minimum_staffing(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(["10", "11"], [], ["12"], "")
+
+        self.assertEqual(mission["attack"].split(","), ["11", "10"])
+        self.assertEqual(mission["relay"].split(","), ["10", "11", "12"])
+
     def test_daily_sheet_preflight_reports_duplicate_and_missing_assignments(self) -> None:
         module = legacy_duty_sheet_module()
         workbook = module.openpyxl.Workbook()

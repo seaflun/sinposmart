@@ -740,6 +740,17 @@ def preview_excel_capture(excel_path, target_date):
 # 專注於救災任務編組的分配邏輯
 # ==========================================
 
+def select_ambulance2_members(disaster_ids, out_ids):
+    members = []
+    for source in (disaster_ids, out_ids):
+        for person in source:
+            if person and person not in members:
+                members.append(person)
+            if len(members) >= 2:
+                return members
+    return members
+
+
 def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
     """
     救災任務編組 v7.0:
@@ -772,7 +783,8 @@ def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
     if sub_leader and sub_leader != r_driver: relay_team.insert(1, sub_leader)
     if leader and leader != a_driver: attack_team.insert(1, leader)
     
-    occupied = set(relay_team + attack_team)
+    # Allow staff to be listed on more than one rescue vehicle.
+    occupied = set()
     others = [p for p in pool if p not in occupied]
 
     # 防呆：確保攻擊車與中繼車至少 2 人
@@ -1322,10 +1334,10 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                     disaster_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
                 disaster_ids = [m for m in disaster_ids if m]
 
-                amb2_members = disaster_ids[:2]  
                 out_ids = []
                 for col_idx in out_excel_cols:
                     out_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers))
+                amb2_members = select_ambulance2_members(disaster_ids, out_ids)
 
                 mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, daily_commander)
                 if mission:
