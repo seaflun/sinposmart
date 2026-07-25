@@ -341,6 +341,102 @@ class PackageSmokeTests(unittest.TestCase):
             ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
         )
 
+    def test_fire_mission_does_not_reuse_people_across_disaster_vehicles(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission([], ["8", "8", "9", "10"], [], "")
+
+        self.assertIsNotNone(mission)
+        assigned = {
+            vehicle: set(members.split(",")) - {""}
+            for vehicle, members in mission.items()
+        }
+        self.assertFalse(assigned["attack"] & assigned["relay"])
+        self.assertEqual(assigned["attack"] | assigned["relay"], {"8", "9", "10"})
+
+    def test_fire_mission_fills_the_unique_pool_after_duplicate_removal(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(["12"], ["8", "8", "9", "10", "11"], [], "")
+
+        self.assertIsNotNone(mission)
+        assigned = {
+            vehicle: set(members.split(",")) - {""}
+            for vehicle, members in mission.items()
+        }
+        self.assertFalse(assigned["attack"] & assigned["relay"])
+        self.assertEqual(assigned["attack"] | assigned["relay"], {"8", "9", "10", "11", "12"})
+
+    def test_fire_mission_does_not_reuse_officer_drivers_across_disaster_vehicles(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission([], ["1", "2"], [], "")
+
+        self.assertIsNotNone(mission)
+        assigned = {
+            vehicle: set(members.split(",")) - {""}
+            for vehicle, members in mission.items()
+        }
+        self.assertFalse(assigned["attack"] & assigned["relay"])
+        self.assertEqual(assigned["attack"] | assigned["relay"], {"1", "2"})
+
+    def test_ambulance2_uses_standby_then_on_duty_external_staff_without_ambulance1_overlap(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        self.assertEqual(module.select_ambulance2_members(["8", "9"], ["10"], ["6", "7"]), ["8", "9"])
+        self.assertEqual(module.select_ambulance2_members(["8"], ["6", "9"], ["6", "7"]), ["8", "9"])
+        self.assertEqual(module.select_ambulance2_members([], ["6", "7", "8", "9"], ["6", "7"]), ["8", "9"])
+        self.assertEqual(module.select_ambulance2_members(["6", "7"], ["8", "9"], ["6", "7"]), ["8", "9"])
+
+    def test_fire_mission_uses_one_ambulance1_member_when_standby_has_four_people(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(["6", "7"], ["8", "9", "10", "11"], [], "10")
+
+        self.assertEqual(mission, {"attack": "9,10", "relay": "8,11,6"})
+
+    def test_fire_mission_uses_both_ambulance1_members_when_standby_has_three_people(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(["6", "7"], ["8", "9", "10"], [], "10")
+
+        self.assertEqual(mission, {"attack": "9,10", "relay": "8,6,7"})
+
+    def test_fire_mission_prefers_an_officer_for_attack_second_when_commander_is_blank(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission([], ["8", "9", "4", "10", "5"], [], "")
+
+        self.assertEqual(mission, {"attack": "9,4", "relay": "8,10,5"})
+
+    def test_fire_mission_uses_ambulance1_and_one_on_duty_external_member_when_standby_has_two_people(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(["6", "7"], ["8", "9"], ["10"], "10")
+
+        self.assertEqual(mission, {"attack": "9,10", "relay": "8,6,7"})
+
+    def test_fire_mission_uses_the_specified_external_staffing_when_standby_has_one_or_zero_people(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        self.assertEqual(
+            module.calculate_fire_mission(["6", "7"], ["8"], ["9", "10", "11", "12"], "10"),
+            {"attack": "9,10", "relay": "8,11,12"},
+        )
+        self.assertEqual(
+            module.calculate_fire_mission(["6", "7"], [], ["8", "9", "10", "11", "12"], "9"),
+            {"attack": "8,9", "relay": "10,11,12"},
+        )
+
+    def test_fire_mission_caps_standby_candidates_at_ten_and_replaces_a_conflicting_driver_for_the_commander(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        mission = module.calculate_fire_mission(
+            [], ["1", "2", "8", "9", "10", "11", "12", "13", "14", "15", "16"], [], "1"
+        )
+
+        self.assertEqual(mission, {"attack": "2,1,13,14,15", "relay": "8,9,10,11,12"})
+
     def test_daily_sheet_preflight_reports_duplicate_and_missing_assignments(self) -> None:
         module = legacy_duty_sheet_module()
         workbook = module.openpyxl.Workbook()

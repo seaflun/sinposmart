@@ -740,52 +740,94 @@ def preview_excel_capture(excel_path, target_date):
 # 專注於救災任務編組的分配邏輯
 # ==========================================
 
+def unique_member_ids(member_ids):
+    """依勤務表原順序保留有效且不重複的番號。"""
+    return list(dict.fromkeys(str(member).strip() for member in member_ids if str(member).strip()))
+
+
+def select_ambulance2_members(standby_ids, out_ids, ambulance1_ids):
+    """救護車 2 優先取備勤，不足時取同時段外勤，且不得與救護車 1 重複。"""
+    ambulance1 = set(unique_member_ids(ambulance1_ids))
+    standby = unique_member_ids(standby_ids)
+    out_duty = unique_member_ids(out_ids)
+    candidates = standby + out_duty
+    selected = []
+    for member in candidates:
+        if member not in ambulance1 and member not in selected:
+            selected.append(member)
+        if len(selected) == 2:
+            break
+    return selected
+
+
+def fire_candidate_pool(med_ids, disaster_ids, out_ids):
+    """依備勤人數建立攻擊車與中繼車的五人起始候選池。"""
+    standby = unique_member_ids(disaster_ids)
+    ambulance1 = unique_member_ids(med_ids)[:2]
+    out_duty = unique_member_ids(out_ids)
+    standby_count = len(standby)
+
+    if standby_count >= 5:
+        return standby[:10]
+    if standby_count == 4:
+        return unique_member_ids(standby + ambulance1[:1])
+    if standby_count == 3:
+        return unique_member_ids(standby + ambulance1)
+    if standby_count == 2:
+        return unique_member_ids(standby + ambulance1 + out_duty[:1])
+    if standby_count == 1:
+        return unique_member_ids(standby + out_duty[:4])
+    return out_duty[:5]
+
+
+def first_available_member(preferred_ids, candidate_ids, excluded_ids):
+    """優先取指定人員；衝突時依候選順序遞補。"""
+    excluded = set(excluded_ids)
+    for member in unique_member_ids(preferred_ids) + unique_member_ids(candidate_ids):
+        if member not in excluded:
+            return member
+    return ""
+
+
 def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
-    """
-    救災任務編組 v7.0:
-    1. 司機第 1 位、幹部固定第 2 位。
-    2. 備勤不足 5 人才抓補位。
-    3. 確保每台車(攻擊、中繼)至少 2 人。
-    """
-    pool = list(disaster_ids)
-    if len(disaster_ids) < 5:
-        for p in med_ids:
-            if p not in pool: pool.append(p)
-            if len(pool) >= 5: break
-    if len(pool) < 5:
-        for p in out_ids:
-            if p not in pool: pool.append(p)
-            if len(pool) >= 5: break
-            
-    if str(daily_commander) in (med_ids + out_ids) and str(daily_commander) not in pool:
-        pool.append(str(daily_commander))
-    if len(pool) < 2: return None
+    """依勤務表規則編組互斥的攻擊車與中繼車，每車最多五人。"""
+    standby = unique_member_ids(disaster_ids)
+    out_duty = unique_member_ids(out_ids)
+    pool = fire_candidate_pool(med_ids, standby, out_duty)
+    commander = str(daily_commander).strip()
 
-    r_driver = disaster_ids[0] if disaster_ids else (pool[0] if pool else "")
-    a_driver = disaster_ids[1] if len(disaster_ids) > 1 else (pool[1] if len(pool) > 1 else (pool[0] if pool else ""))
+    if commander and commander not in pool:
+        if len(pool) >= 10:
+            pool[-1] = commander
+        else:
+            pool.append(commander)
+        pool = unique_member_ids(pool)
+    if len(pool) < 2:
+        return None
 
-    all_officers = sorted([p for p in pool if 1 <= int(p) <= 5], key=lambda x: int(x))
-    leader = str(daily_commander) if str(daily_commander) in pool else (all_officers[0] if all_officers else None)
-    sub_leader = next((p for p in all_officers if p != leader), None)
+    attack_preferred = standby[1:2] if len(standby) >= 2 else out_duty
+    attack_driver = first_available_member(attack_preferred, pool, {commander})
+    attack_team = [attack_driver] if attack_driver else []
+    if commander and commander not in attack_team:
+        attack_team.append(commander)
+    if len(attack_team) < 2:
+        officer_ids = [member for member in pool if member in {"1", "2", "3", "4", "5"}]
+        attack_team.append(first_available_member(officer_ids, pool, set(attack_team)))
 
-    relay_team, attack_team = [r_driver], [a_driver]
-    if sub_leader and sub_leader != r_driver: relay_team.insert(1, sub_leader)
-    if leader and leader != a_driver: attack_team.insert(1, leader)
-    
-    occupied = set(relay_team + attack_team)
-    others = [p for p in pool if p not in occupied]
+    relay_preferred = standby[:1] if standby else out_duty
+    relay_driver = first_available_member(relay_preferred, pool, set(attack_team))
+    relay_team = [relay_driver] if relay_driver else []
 
-    # 防呆：確保攻擊車與中繼車至少 2 人
-    if len(attack_team) < 2 and others:
-        attack_team.append(others.pop(0))
-    if len(relay_team) < 2 and others:
-        relay_team.append(others.pop(0))
-        
-    while len(relay_team) < 5 and others: 
-        relay_team.append(others.pop(0))
-        
-    attack_team.extend(others)
-    
+    occupied = set(attack_team + relay_team)
+    for member in pool:
+        if member in occupied:
+            continue
+        if len(relay_team) < 5:
+            relay_team.append(member)
+        elif len(attack_team) < 5:
+            attack_team.append(member)
+        occupied.add(member)
+
     return {"relay": ",".join(relay_team), "attack": ",".join(attack_team)}
 
 
@@ -1315,19 +1357,23 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 amb1_members = []
                 for c in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
                     amb1_members.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
-                amb1_members = [m for m in amb1_members if m] 
+                amb1_members = unique_member_ids(amb1_members)[:2]
                 
                 disaster_ids = []
-                for c in range(ex_map["備勤_Excel"], ex_map["指揮官"] + 1):
+                for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
                     disaster_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
-                disaster_ids = [m for m in disaster_ids if m]
-
-                amb2_members = disaster_ids[:2]  
+                disaster_ids = unique_member_ids(disaster_ids)
+                commander_ids = clean_to_list_excluding(
+                    get_merged_val(sheet, r, ex_map["指揮官"]), excluded_numbers
+                )
+                row_commander = commander_ids[0] if commander_ids else ""
                 out_ids = []
                 for col_idx in out_excel_cols:
                     out_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers))
+                out_ids = unique_member_ids(out_ids)
+                amb2_members = select_ambulance2_members(disaster_ids, out_ids, amb1_members)
 
-                mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, daily_commander)
+                mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, row_commander)
                 if mission:
                     mission_map[f"_pln_{hour}_1"] = mission['attack']
                     mission_map[f"_pln_{hour}_2"] = mission['relay']
