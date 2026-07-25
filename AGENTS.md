@@ -1,16 +1,19 @@
 # AGENTS.md
 
-## Superpowers Skills
+## 工程 Skills
 
-- 本專案已在 `project_skills/superpowers/` 保存 Superpowers skills。
-- 每次開始本專案工作時，優先使用 `using-superpowers` skill 判斷是否需要啟用其他 Superpowers skills。
-- 若任務涉及規劃、除錯、測試、分支收尾、code review 或驗證完成狀態，依情境使用對應 Superpowers skill。
-- 使用 Superpowers 時仍必須遵守本 `AGENTS.md` 與使用者直接指示；本檔案與使用者指示優先於 skill 內容。
+- 本專案使用 Matt Pocock 工程 skills，不再使用 Superpowers 工作流程。
+- 優先順序固定為：使用者直接要求、`AGENTS.md` 與安全／部署／資料治理規則、專案特有 skill（NAS、Worker、Release、帳密與正式環境驗證）、Matt Pocock 工程 skill、一般開發習慣。後者不得覆蓋前者。
+- 不確定流程時使用 `ask-matt`；明確小型工作使用 `implement`，可測行為依 `tdd` 的 Red-Green 垂直切片處理。
+- 模糊需求先使用 `grill-with-docs`；大型或跨 session 工作依序使用 `grill-with-docs`、`to-spec`、`to-tickets`，再逐張 ticket 使用 `implement`；需要交接時使用 `handoff`。
+- 難解 bug、間歇性失敗或效能退化使用 `diagnosing-bugs`；外部未整理的 bug、需求或 PR 使用 `triage`；實作路徑不明的大型工作使用 `wayfinder`；需要外部可信資料使用 `research`；模組邊界改善使用 `codebase-design`。
+- 完成前執行相關完整驗證，並以明確 commit、branch、tag 或 merge-base 為比較基準使用 `code-review` 進行 Standards 與 Spec 雙軸審查；沒有規格時須明記 Spec 無可比對規格。
+- `implement` 不會授權 commit、release、部署、刪除檔案或修改正式環境；這些操作仍須遵守本檔案與使用者授權，並維持 Source、Build、Release、NAS、Worker 的既有驗證階梯。
 
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
-4. 每次在本專案開始工作前，先從目前 repo 往上搜尋 `專案\SKILL\install-skills-from-cloud.ps1` 或 `專案\skill\install-skills-from-cloud.ps1`，找到後執行 `powershell -NoProfile -ExecutionPolicy Bypass -File "<找到的腳本路徑>"`，由腳本同步雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills 到本機 `%USERPROFILE%\.codex\skills`，並驗證雲端/本機 `SKILL.md` hash 一致；若找不到腳本或腳本失敗，先停止工作。
+4. 每次在本專案開始工作前，先從目前 repo 往上搜尋 `專案\SKILL\install-skills-from-cloud.ps1` 或 `專案\skill\install-skills-from-cloud.ps1`，找到後執行 `powershell -NoProfile -ExecutionPolicy Bypass -File "<找到的腳本路徑>"`，由腳本同步雲端 skill 資料夾內所有已啟用且含 `SKILL.md` 的 skills 到本機 `%USERPROFILE%\.codex\skills`，並驗證完整資料夾 fingerprint 一致；若找不到腳本或腳本失敗，先停止工作。
 
 ## Language
 
@@ -31,28 +34,39 @@
 
 ## Repository boundaries
 
-- 本 repo `G:\我的雲端硬碟\專案\值班勤務系統自動化` 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
-- SinpoSmart 後台網頁 APP 目前在 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `G:\我的雲端硬碟\專案\IOS\ambulance_return_bot` 僅作為歷史路徑，不要新增命令或文件指向舊路徑。
+- 本 repo 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
+- SinpoSmart 後台網頁 APP 位於共享 `專案` 目錄下的 sibling repo `救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `IOS\ambulance_return_bot` 僅作為歷史位置，不要新增命令或文件指向舊路徑。
 - 提到「值班 GUI、勤務表登打、休息時間登打、勤務基準表登打、車輛保養清點、WinPython 公務電腦使用包、UPDATE、GITHUB RELEASE」時，優先在本 repo 工作。
 - 提到「後台事件、後台 UI、admin_sinposmart、狀態 pill、快照內容、NAS 後台網頁」時，優先切到 `救護返隊小幫手\ambulance_return_bot` repo 工作。
 - 若一次任務同時跨 SinpoSmart WinPython 包與救護返隊小幫手後台網頁，必須分開檢查、測試、commit、push；不要把兩個 repo 的工作混成同一個提交或 release。
-- SinpoSmart 專案不再直接部署或覆蓋 NAS runtime；NAS runtime 唯一來源是 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot`。
+- SinpoSmart 專案不再直接部署或覆蓋 NAS runtime；NAS runtime 唯一來源是 sibling repo `救護返隊小幫手\ambulance_return_bot`。
 - 不得從本 repo 直接覆蓋 `\\100.114.126.58\docker\ambulance_return_bot`，也不得把值班後台使用的 NAS 檔案手動複製到本 repo 後再部署。
 - 本 repo 只負責：公務電腦 GUI、值班 GUI / 值班模式流程、值班登入/登打流程、送到 NAS 的事件資料 payload、SinpoSmart 公務電腦更新包。
-- 只要是值班後台會用到的 NAS 檔案，都必須切到 `G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot` 修改、測試、打 NAS 包、同步 NAS、重啟容器。
+- 只要是值班後台會用到的 NAS 檔案，都必須切到 sibling repo `救護返隊小幫手\ambulance_return_bot` 修改、測試、打 NAS 包、同步 NAS、重啟容器。
 - 值班後台 NAS 檔案包含但不限於：NAS 後台 Flask app、`/admin/sinposmart`、`/api/sinposmart/events`、值班後台模板、`admin_sinposmart.html`、值班後台 CSS / JS / template include、`sinposmart_backend.py`、值班資料整理、分組、顯示、保留邏輯，以及任何會被複製到 `\\100.114.126.58\docker\ambulance_return_bot` 的檔案。
 - 如果一次需求同時需要改 GUI 送出資料與值班後台使用的 NAS 檔案：本 repo 只修改 GUI payload 或公務電腦更新包；值班後台 NAS 檔案必須在救護返隊小幫手 repo 修改、測試、打 NAS 包、同步 NAS、重啟容器。
-- 本 repo 若出現 NAS deploy/copy script、`NAS包`、或任何準備覆蓋 `\\100.114.126.58\docker\ambulance_return_bot` 的命令，必須停止執行並提示：`值班後台使用的 NAS 檔案請到 G:\我的雲端硬碟\專案\救護返隊小幫手\ambulance_return_bot 修改與部署。`
+- 本 repo 若出現 NAS deploy/copy script、`NAS包`、或任何準備覆蓋 `\\100.114.126.58\docker\ambulance_return_bot` 的命令，必須停止執行並提示：`值班後台使用的 NAS 檔案請到共享專案目錄下的救護返隊小幫手\ambulance_return_bot 修改與部署。`
 
-## Current work
+## Cross-project login safety
 
-- 目前工作重點是讓另一個公務自動化專案可登入與登打四個公務網站。
+- 另一個公務自動化專案若需登入與登打四個公務網站，必須遵守以下安全邊界。
 - 四個公務網站使用同一組已授權的公務帳號密碼，但每個網站仍需明確列入允許清單後才能使用。
 - 優先採用專用 Chrome Profile 保存登入狀態，不直接依賴日常 Chrome Profile。
 - Chrome Profile 的用途是保留 session、cookie 與登入狀態；不要把它視為可被 Selenium 穩定操作的帳號密碼下拉選單。
 - 若網站未保持登入，優先分析該網站的實際登入流程，再決定是由程式填入網頁 input，或提示使用者手動完成一次登入。
 - 不要在新專案重複寫死帳號密碼；應使用既有受控設定來源或共用 credential loader。
 - log、截圖、錯誤訊息與回覆內容不得顯示密碼、token、cookie 或其他憑證內容。
+
+## SinpoSmart Google Site 值班看板
+
+- Google Site 既有頁面為 `https://sites.google.com/view/sinpo666/%E5%80%BC%E7%8F%AD%E4%BA%BA%E5%93%A1`；在同一頁加入或更新「目前值班人員」動態區塊，不建立新的 Google Site 頁面。
+- 保留既有的人員清單與各人介紹頁；動態區塊只顯示目前時段的值班人員、下一時段人員與資料更新時間。
+- SinpoSmart 的當日勤務表是唯一資料來源。程式須從既有班表讀取時段、值班番號及姓名，不得以 Google Site 的靜態清單作為班表來源。
+- 值班模式在執行期間每小時同步一次班表；資料內容沒有變更時不重複寫入遠端資料來源。
+- Google Site 的靜態文字或姓名連結不作為同步目標。以 Google Apps Script 網頁程式提供動態內容，再嵌入現有 Google Site 頁面。
+- Apps Script 專案與值班看板資料檔應建立在 `sinpo666@gmail.com` 的 Google Drive 資料夾 `https://drive.google.com/drive/folders/1SAGSTlDr8qZoZvFw8R_DqK1atjqWwGrN?usp=sharing`。
+- Google 端同步須使用獨立設定的同步密鑰；不得在程式碼、Google Site、log、截圖或 Git 中寫入帳號密碼、token、cookie、Apps Script 部署網址的祕密參數或其他憑證。
+- 此功能屬於本 repo 的值班 GUI / 公務電腦更新包範圍。不得為此直接覆蓋 NAS runtime；若需改值班後台 NAS 檔案，必須改在 sibling repo `救護返隊小幫手\ambulance_return_bot` 並依該 repo 流程部署。
 
 ## Operation modes
 

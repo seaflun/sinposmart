@@ -815,6 +815,33 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(scheduled, [("28", action)])
         self.assertEqual(submitted, [])
 
+    def test_relogin_after_automatic_logout_does_not_reschedule_completed_handoff(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        handoff_at = datetime(2026, 7, 10, 18, 0)
+        action = {
+            "kind": "entry_log",
+            "time": "18:00",
+            "actor": "28",
+            "source": "值班交接",
+            "fields": {"出或入": "值退"},
+        }
+        scheduled: list[tuple[str, dict[str, object]]] = []
+        gui.session = module.LoginSession(actor_no="28", user_id="user28", password="secret", verified=True)
+        gui.auto_logout_login_started_at = datetime(2026, 7, 10, 18, 20)
+        gui.duty_actions = [action]
+        gui.duty_action_compare = {0: {"group": "done"}}
+        gui.executed_due = {0}
+        gui.submitting_indices = set()
+        gui.duty_task_indices = lambda: [0]
+        gui.sync_duty_compare_from_audit = lambda: None
+        gui.action_datetime = lambda _action: handoff_at
+        gui.ensure_auto_logout_scheduled = lambda actor, item: scheduled.append((actor, item))
+
+        gui.trigger_due_tasks(datetime(2026, 7, 10, 18, 20))
+
+        self.assertEqual(scheduled, [])
+
     def test_submit_login_failure_expires_session_and_stops_queues(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)

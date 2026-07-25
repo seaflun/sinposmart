@@ -51,8 +51,8 @@ CLOUD_PROJECT_CANDIDATES = (
     Path(os.environ["SINPOSMART_CLOUD_PROJECT_DIR"])
     if os.environ.get("SINPOSMART_CLOUD_PROJECT_DIR")
     else None,
-    Path("G:/我的雲端硬碟/專案/值班勤務系統自動化"),
-    Path("I:/我的雲端硬碟/專案/值班勤務系統自動化"),
+    Path("G:/我的雲端硬碟/專案/SinpoSmart_值班台"),
+    Path("I:/我的雲端硬碟/專案/SinpoSmart_值班台"),
 )
 AUTO_CLEAN_RULES = (
     (SCHEDULE_OUTPUT_DIR, "*.json", 45),
@@ -972,6 +972,7 @@ class DutyGui(ctk.CTk):
         self.pending_auto_logout_deadline: datetime | None = None
         self.pending_auto_logout_handoff_at: datetime | None = None
         self.pending_auto_logout_actor_no = ""
+        self.auto_logout_login_started_at: datetime | None = None
         self.saved_login_needs_backup = False
         self.saved_login_can_persist = True
         self.login_running = False
@@ -3567,6 +3568,7 @@ class DutyGui(ctk.CTk):
         self.submit_comparison_refresh_dates.clear()
         self.submit_comparison_refresh_scheduled = False
         self.cancel_auto_logout()
+        self.auto_logout_login_started_at = datetime.now()
         self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
         self.last_update_logout_identity = {"actor_no": actor_no, "user_id": user_id}
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
@@ -5072,7 +5074,12 @@ class DutyGui(ctk.CTk):
             if str(action.get("actor", "")) != str(self.session.actor_no):
                 continue
             action_at = self.action_datetime(action)
-            if self.should_schedule_auto_logout(action, "due") and action_at <= now:
+            login_started_at = self.__dict__.get("auto_logout_login_started_at")
+            if (
+                self.should_schedule_auto_logout(action, "due")
+                and action_at <= now
+                and (login_started_at is None or action_at >= login_started_at)
+            ):
                 self.ensure_auto_logout_scheduled(self.session.actor_no, action)
             if index in self.executed_due or index in self.submitting_indices:
                 continue
