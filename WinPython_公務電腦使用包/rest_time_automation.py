@@ -23,7 +23,7 @@ from urllib.request import urlopen
 from urllib.error import HTTPError, URLError
 
 import openpyxl
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -75,6 +75,8 @@ FRONTEND_ERROR_MESSAGES = {
     "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
     "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
     "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "browser_error": "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
+    "monthly_base_source_failed": "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
     "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
 }
 LOGIN_FAILURE_MARKERS = (
@@ -153,6 +155,10 @@ def format_automation_error(exc: Exception) -> str:
         return FRONTEND_ERROR_MESSAGES["timeout"]
     if "nosuchelementexception" in lowered or "no such element" in lowered or "unable to locate element" in lowered:
         return FRONTEND_ERROR_MESSAGES["no_such_element"]
+    if isinstance(exc, WebDriverException):
+        return FRONTEND_ERROR_MESSAGES["browser_error"]
+    if "讀取固定 google 試算表失敗" in lowered or "固定 google 試算表目前不允許程式直接讀取" in text:
+        return FRONTEND_ERROR_MESSAGES["monthly_base_source_failed"]
     if any(marker in lowered for marker in UNSAFE_ERROR_MARKERS):
         return FRONTEND_ERROR_MESSAGES["unknown_error"]
     if text:
@@ -359,8 +365,10 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if not uid or not pwd:
             messagebox.showwarning("缺少帳號密碼", "請先在主視窗登入，再啟動休息時間登打。", parent=dialog)
             return
-        if not workbook_path.exists():
-            messagebox.showwarning("找不到 Excel", "請選擇勤務表 Excel 檔案。", parent=dialog)
+        try:
+            validate_rest_workbook_path(workbook_path)
+        except RuntimeError as exc:
+            messagebox.showwarning("找不到 Excel", str(exc), parent=dialog)
             return
         try:
             expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
@@ -579,6 +587,12 @@ def default_workbook_path() -> Path:
     base_dir = Path(__file__).resolve().parent
     workbooks = sorted(base_dir.glob("*.xlsm"), key=lambda item: item.stat().st_mtime, reverse=True)
     return workbooks[0] if workbooks else Path()
+
+
+def validate_rest_workbook_path(workbook_path: Path) -> None:
+    if workbook_path.is_file() and workbook_path.suffix.lower() in {".xlsx", ".xlsm"}:
+        return
+    raise RuntimeError("休息時間登打失敗：請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
 
 
 def load_last_workbook_path() -> Path | None:

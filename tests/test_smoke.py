@@ -310,6 +310,44 @@ class PackageSmokeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Excel.*115年07月"):
                 module.validate_workbook_year_month(path, 115, 6)
 
+    def test_rest_time_rejects_directory_and_non_excel_workbook_paths(self) -> None:
+        module = rest_time_module()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            directory = Path(tmp_dir)
+            non_excel = directory / "duty.csv"
+            non_excel.write_text("not an Excel workbook", encoding="utf-8")
+
+            for path in (directory, non_excel):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(RuntimeError, "有效的勤務表 Excel 檔案"):
+                        module.validate_rest_workbook_path(path)
+
+    def test_rest_and_monthly_base_failures_use_safe_diagnostic_messages(self) -> None:
+        module = rest_time_module()
+        from selenium.common.exceptions import WebDriverException
+
+        self.assertEqual(
+            module.format_automation_error(WebDriverException("driver startup failed")),
+            "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
+        )
+        self.assertEqual(
+            module.format_automation_error(RuntimeError("讀取固定 Google 試算表失敗：HTTP 503")),
+            "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
+        )
+
+    def test_tool_failure_payload_classifies_rest_and_monthly_base_diagnostics(self) -> None:
+        module = duty_gui_module()
+
+        cases = (
+            ("休息時間登打失敗：請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。", "rest_workbook_invalid"),
+            ("瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。", "browser_error"),
+            ("勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。", "monthly_base_source_failed"),
+        )
+        for message, error_code in cases:
+            with self.subTest(error_code=error_code):
+                self.assertEqual(module.frontend_error_payload(message)["error_code"], error_code)
+
     def test_monthly_base_rejects_selected_month_mismatch(self) -> None:
         module = rest_time_module()
 

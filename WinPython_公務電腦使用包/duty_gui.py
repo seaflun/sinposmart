@@ -534,6 +534,9 @@ FRONTEND_ERROR_MESSAGES = {
     "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
     "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
     "duty_sheet_preflight_failed": "勤務表檢查未通過，已停止登打。",
+    "rest_workbook_invalid": "休息時間登打失敗：請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。",
+    "browser_error": "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
+    "monthly_base_source_failed": "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
     "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
 }
 LOGIN_FAILURE_MARKERS = (
@@ -591,6 +594,12 @@ def automation_error_code(error: BaseException | str | None, context: str = "") 
         return "login_failed"
     if "勤務表檢查未通過" in text:
         return "duty_sheet_preflight_failed"
+    if "請選擇有效的勤務表 Excel 檔案" in text:
+        return "rest_workbook_invalid"
+    if "瀏覽器啟動或連線失敗" in text:
+        return "browser_error"
+    if "輪休基準表無法讀取" in text:
+        return "monthly_base_source_failed"
     if "timeout" in lowered or "timed out" in lowered or "逾時" in text:
         return "timeout"
     if "no such element" in lowered or "unable to locate element" in lowered or "找不到網頁元素" in text:
