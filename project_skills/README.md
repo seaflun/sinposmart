@@ -2,15 +2,15 @@
 
 本目錄只保留專案特有的 skill 指引；工程流程採用已安裝的 Matt Pocock engineering skills，不再保存或啟用 Superpowers 的專案內副本。NAS、Worker、Release、帳密、資料安全與正式環境驗證等專案規範仍以 `AGENTS.md` 與其對應專案特有 skill 為準。
 
-## Canonical source and synchronization
+## Canonical source and optional synchronization
 
-Matt Pocock engineering skills 的唯一來源是共享雲端資料夾 `G:\我的雲端硬碟\專案\SKILL`。每次在本專案開始工作前，從目前 repo 向上找到並執行：
+Matt Pocock engineering skills 的唯一來源是共享雲端資料夾 `G:\我的雲端硬碟\專案\SKILL`。同步屬於需要更新或修復本機 skills 時的手動維護作業，不是本專案開始工作的前置條件；需要時可執行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "G:\我的雲端硬碟\專案\SKILL\install-skills-from-cloud.ps1"
 ```
 
-此腳本會把所有已啟用、含 `SKILL.md` 的雲端 skills 平面同步到 `%USERPROFILE%\.codex\skills`，並驗證完整資料夾 fingerprint。若找不到腳本、同步失敗或 fingerprint 不一致，應停止工作。不要把工程 skill 複製回本目錄；以雲端來源加同步腳本作為單一真實來源，避免全域 skill 與專案副本版本漂移。
+此腳本會把所有已啟用、含 `SKILL.md` 的雲端 skills 平面同步到 `%USERPROFILE%\.codex\skills`，並驗證完整資料夾 fingerprint。同步失敗或 fingerprint 不一致時，只影響這項手動維護作業；應回報狀況，但不阻擋本專案其他工作。不要把工程 skill 複製回本目錄；以雲端來源加同步腳本作為單一真實來源，避免全域 skill 與專案副本版本漂移。
 
 目前工程 skill 包含：`ask-matt`、`implement`、`tdd`、`code-review`、`diagnosing-bugs`、`grill-me`、`grill-with-docs`、`to-spec`、`to-tickets`、`triage`、`wayfinder`、`handoff`、`research`、`codebase-design`。
 

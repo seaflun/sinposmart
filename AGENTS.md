@@ -13,7 +13,6 @@
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
-4. 每次在本專案開始工作前，先從目前 repo 往上搜尋 `專案\SKILL\install-skills-from-cloud.ps1` 或 `專案\skill\install-skills-from-cloud.ps1`，找到後執行 `powershell -NoProfile -ExecutionPolicy Bypass -File "<找到的腳本路徑>"`，由腳本同步雲端 skill 資料夾內所有已啟用且含 `SKILL.md` 的 skills 到本機 `%USERPROFILE%\.codex\skills`，並驗證完整資料夾 fingerprint 一致；若找不到腳本或腳本失敗，先停止工作。
 
 ## Language
 
