@@ -103,6 +103,31 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertTrue((root / relative).is_file())
 
+    def test_rescue_video_beta_tool_is_packaged_and_launches_without_delete_flags(self) -> None:
+        root = package_dir()
+        gui_source = (root / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertTrue((root / "rescue_video" / "救護影片分類GUI.py").is_file())
+        self.assertTrue((root / "rescue_video" / "classify_rescue_video.py").is_file())
+        self.assertIn('text="行車紀錄器（BETA）"', gui_source)
+        update_source = (root / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"rescue_video\\救護影片分類GUI.py"', update_source)
+        self.assertIn('"rescue_video\\classify_rescue_video.py"', update_source)
+
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        messages: list[tuple[str, str]] = []
+        gui.notify_user = lambda title, message, **_kwargs: messages.append((title, message))
+
+        with mock.patch.object(module.subprocess, "Popen") as popen:
+            gui.open_rescue_video_tool()
+
+        command = popen.call_args.args[0]
+        self.assertTrue(command[-1].endswith("救護影片分類GUI.py"))
+        self.assertNotIn("--delete-source", command)
+        self.assertNotIn("--apply", command)
+        self.assertEqual(messages, [(module.APP_DISPLAY_NAME, "已開啟行車紀錄器（BETA）。")])
+
     def test_python_sources_compile(self) -> None:
         root = package_dir()
         sources = sorted(list(root.rglob("*.py")) + list(root.rglob("*.pyw")))

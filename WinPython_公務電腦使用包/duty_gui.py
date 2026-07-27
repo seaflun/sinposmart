@@ -1349,11 +1349,14 @@ class DutyGui(ctk.CTk):
         tools_panel.columnconfigure(0, minsize=58)
         tools_panel.columnconfigure(1, weight=1, uniform="duty_tools")
         tools_panel.columnconfigure(2, weight=1, uniform="duty_tools")
+        tools_panel.columnconfigure(3, weight=1, uniform="duty_tools")
         ctk.CTkLabel(tools_panel, text="每日作業", text_color="#1D4ED8", font=(UI_FONT, 13, "bold")).grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=(0, 8))
         self.duty_sheet_button = ctk.CTkButton(tools_panel, text="勤務表登打", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_duty_sheet_automation)
         self.duty_sheet_button.grid(row=0, column=1, sticky=tk.EW, pady=(0, 8), padx=(0, 4))
         self.daily_vehicle_button = ctk.CTkButton(tools_panel, text="車輛保養清點", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_daily_vehicle_automation)
-        self.daily_vehicle_button.grid(row=0, column=2, sticky=tk.EW, pady=(0, 8), padx=(4, 0))
+        self.daily_vehicle_button.grid(row=0, column=2, sticky=tk.EW, pady=(0, 8), padx=4)
+        self.rescue_video_button = ctk.CTkButton(tools_panel, text="行車紀錄器（BETA）", height=40, font=FONT_BUTTON, fg_color="#FEF3C7", text_color="#92400E", hover_color="#FDE68A", border_color="#FCD34D", border_width=1, command=self.open_rescue_video_tool)
+        self.rescue_video_button.grid(row=0, column=3, sticky=tk.EW, pady=(0, 8), padx=(4, 0))
         ctk.CTkLabel(tools_panel, text="每月作業", text_color="#3730A3", font=(UI_FONT, 13, "bold")).grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
         self.rest_time_button = ctk.CTkButton(tools_panel, text="休息時間登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=self.open_rest_time_automation)
         self.rest_time_button.grid(row=1, column=1, sticky=tk.EW, padx=(0, 4))
@@ -4240,6 +4243,25 @@ class DutyGui(ctk.CTk):
             on_finish=on_finish,
             on_error=on_error,
         )
+
+    def open_rescue_video_tool(self) -> None:
+        tool_path = Path(__file__).resolve().parent / "rescue_video" / "救護影片分類GUI.py"
+        if not tool_path.is_file():
+            messagebox.showerror("找不到行車紀錄器", f"找不到工具檔案：{tool_path}", parent=self)
+            return
+
+        pythonw_path = Path(sys.executable).with_name("pythonw.exe")
+        executable = str(pythonw_path if pythonw_path.is_file() else Path(sys.executable))
+        try:
+            subprocess.Popen(
+                [executable, str(tool_path)],
+                cwd=str(tool_path.parent),
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+            )
+        except OSError as exc:
+            messagebox.showerror("無法開啟行車紀錄器", str(exc), parent=self)
+            return
+        self.notify_user(APP_DISPLAY_NAME, "已開啟行車紀錄器（BETA）。")
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED

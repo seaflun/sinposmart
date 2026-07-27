@@ -283,6 +283,8 @@ function New-PackageBackup {
         "duty_sheet_automation.py",
         "daily_vehicle_automation.py",
         "rest_time_automation.py",
+        "rescue_video\救護影片分類GUI.py",
+        "rescue_video\classify_rescue_video.py",
         "duty_rehearsal.py",
         "compare_rehearsal_records.py",
         "check_environment.py",
