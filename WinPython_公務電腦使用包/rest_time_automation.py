@@ -7,26 +7,51 @@ import json
 import csv
 import io
 import re
+import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
+import customtkinter as ctk
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from urllib.error import HTTPError, URLError
 
 import openpyxl
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from duty_rehearsal import build_driver, js_click, login, open_ap
 
+UI_FONT = "Microsoft JhengHei UI"
+UI_BG = "#f5f7fb"
+UI_PANEL = "#ffffff"
+UI_PANEL_TINT = "#eef6ff"
+UI_BORDER = "#d7e2f0"
+UI_TEXT = "#172033"
+UI_MUTED = "#64748b"
+UI_BLUE = "#2563eb"
+UI_BLUE_HOVER = "#1d4ed8"
+FONT_BODY = (UI_FONT, 12)
+FONT_TITLE = (UI_FONT, 14, "bold")
+FONT_BUTTON = (UI_FONT, 12, "bold")
+CTK_COMBO_STYLE = {
+    "fg_color": UI_PANEL,
+    "border_color": UI_BORDER,
+    "button_color": "#dbeafe",
+    "button_hover_color": "#bfdbfe",
+    "dropdown_fg_color": "#ffffff",
+    "dropdown_hover_color": "#eff6ff",
+    "dropdown_text_color": UI_TEXT,
+    "text_color": UI_TEXT,
+}
 
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
@@ -46,6 +71,38 @@ MONTHLY_BASE_SYMBOLS = {
     "喪": "喪",
     "心": "❤",
 }
+FRONTEND_ERROR_MESSAGES = {
+    "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+    "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+    "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "browser_error": "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
+    "monthly_base_source_failed": "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
+    "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+}
+LOGIN_FAILURE_MARKERS = (
+    "登入失敗",
+    "登入狀態失效",
+    "密碼可能已變更",
+    "帳號密碼有誤",
+    "尚未申請帳號權限",
+    "帳號或密碼",
+    "重新登入",
+    "login119",
+    "_txtusername",
+    "_txtpassword",
+    "登入後元素",
+    "仍停留在登入頁",
+)
+UNSAFE_ERROR_MARKERS = (
+    "stacktrace",
+    "stack trace",
+    "traceback",
+    "chromedriver",
+    "selenium.common.exceptions",
+    "session token",
+    "cookie",
+    "password",
+)
 
 
 @dataclass(frozen=True)
@@ -91,15 +148,100 @@ class MonthlyBasePlan:
 
 def format_automation_error(exc: Exception) -> str:
     text = str(exc).strip()
+    lowered = text.lower()
+    if any(marker in lowered or marker in text for marker in LOGIN_FAILURE_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["login_failed"]
+    if "timeoutexception" in lowered or "timeout" in lowered or "timed out" in lowered or "逾時" in text:
+        return FRONTEND_ERROR_MESSAGES["timeout"]
+    if "nosuchelementexception" in lowered or "no such element" in lowered or "unable to locate element" in lowered:
+        return FRONTEND_ERROR_MESSAGES["no_such_element"]
+    if isinstance(exc, WebDriverException):
+        return FRONTEND_ERROR_MESSAGES["browser_error"]
+    if "讀取固定 google 試算表失敗" in lowered or "固定 google 試算表目前不允許程式直接讀取" in text:
+        return FRONTEND_ERROR_MESSAGES["monthly_base_source_failed"]
+    if any(marker in lowered for marker in UNSAFE_ERROR_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["unknown_error"]
     if text:
         return text
     details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    lowered_details = details.lower()
+    if any(marker in lowered_details for marker in UNSAFE_ERROR_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["unknown_error"]
     if details:
         return details
-    return exc.__class__.__name__
+    return FRONTEND_ERROR_MESSAGES["unknown_error"]
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> tk.Toplevel | None:
+def log_automation_exception(context: str, exc: BaseException) -> None:
+    print(f"[automation-error] {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    traceback.print_exc()
+
+
+def current_roc_year_month() -> tuple[int, int]:
+    today = date.today()
+    return today.year - 1911, today.month
+
+
+def nearby_month_options(center_month: int | None = None) -> list[str]:
+    center = center_month or current_roc_year_month()[1]
+    return [f"{((center + offset - 1) % 12) + 1:02d}" for offset in (-1, 0, 1)]
+
+
+def selected_year_month(year_text: str, month_text: str) -> tuple[int, int]:
+    try:
+        roc_year = int(str(year_text).strip())
+        month = int(str(month_text).strip())
+    except ValueError as exc:
+        raise RuntimeError("請選擇正確的年月。") from exc
+    if roc_year < 1 or not 1 <= month <= 12:
+        raise RuntimeError("請選擇正確的年月。")
+    return roc_year, month
+
+
+def format_roc_year_month(roc_year: int, month: int) -> str:
+    return f"{int(roc_year)}年{int(month):02d}月"
+
+
+def validate_selected_year_month(source_label: str, selected_year: int, selected_month: int, actual_year: int, actual_month: int) -> None:
+    if int(selected_year) == int(actual_year) and int(selected_month) == int(actual_month):
+        return
+    raise RuntimeError(
+        f"選擇年月為 {format_roc_year_month(selected_year, selected_month)}，"
+        f"但{source_label}為 {format_roc_year_month(actual_year, actual_month)}，請確認後再執行。"
+    )
+
+
+def workbook_year_month(workbook_path: Path) -> tuple[int, int]:
+    wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
+    try:
+        roc_year, month, _days = workbook_date_info(wb)
+        return roc_year, month
+    finally:
+        wb.close()
+
+
+def workbook_default_year_month(workbook_path: Path) -> tuple[int, int]:
+    try:
+        if workbook_path.exists():
+            return workbook_year_month(workbook_path)
+    except Exception:
+        pass
+    return current_roc_year_month()
+
+
+def validate_workbook_year_month(workbook_path: Path, selected_year: int, selected_month: int) -> None:
+    actual_year, actual_month = workbook_year_month(workbook_path)
+    validate_selected_year_month("Excel", selected_year, selected_month, actual_year, actual_month)
+
+
+def extract_base_month_from_text(text: str) -> tuple[int, int] | None:
+    match = re.search(r"目前編輯月份為[:：]?\s*(\d{2,3})年\s*(\d{1,2})月", str(text or ""))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
@@ -112,12 +254,12 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             pass
         setattr(parent, "_rest_time_dialog", None)
 
-    dialog = tk.Toplevel(parent)
+    dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_rest_time_dialog", dialog)
     dialog.title("SinpoSmart - 休息時間登打")
-    dialog.geometry("430x300")
-    dialog.minsize(430, 300)
-    dialog.configure(bg="#f8fafc")
+    dialog.geometry("430x350")
+    dialog.minsize(430, 350)
+    dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
     def close_dialog() -> None:
@@ -126,26 +268,32 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
 
     dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = tk.Frame(dialog, bg="#f8fafc")
+    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
     root.pack(fill=tk.BOTH, expand=True)
 
-    header = tk.Frame(root, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
     header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    tk.Label(header, text="休息時間登打", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    ctk.CTkLabel(header, text="休息時間登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = tk.Frame(root, bg="#f8fafc")
+    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
     body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
 
-    form = ttk.LabelFrame(body, text="勤務表檔案", padding=8)
+    form = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
     form.pack(fill=tk.X, pady=(10, 8))
+    ctk.CTkLabel(form, text="勤務表檔案", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(10, 4))
     form.columnconfigure(1, weight=1)
 
     file_var = tk.StringVar(value=str(default_workbook_path()))
+    fixed_roc_year, current_month = current_roc_year_month()
+    _default_year, default_month = workbook_default_year_month(Path(file_var.get().strip()))
+    allowed_months = nearby_month_options(current_month)
+    default_month_text = f"{default_month:02d}"
+    month_var = tk.StringVar(value=default_month_text if default_month_text in allowed_months else f"{current_month:02d}")
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
 
-    ttk.Label(form, text="Excel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-    file_entry = ttk.Entry(form, textvariable=file_var)
-    file_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
+    ctk.CTkLabel(form, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=(4, 12))
+    file_entry = ctk.CTkEntry(form, textvariable=file_var, height=34, font=FONT_BODY, fg_color=UI_PANEL, border_color=UI_BORDER)
+    file_entry.grid(row=1, column=1, sticky=tk.EW, pady=(4, 12))
 
     def browse_file() -> None:
         current_file = Path(file_var.get().strip())
@@ -154,31 +302,47 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if path:
             file_var.set(path)
             save_last_workbook_path(Path(path))
+            _file_year, file_month = workbook_default_year_month(Path(path))
+            file_month_text = f"{file_month:02d}"
+            if file_month_text in allowed_months:
+                month_var.set(file_month_text)
             status_var.set("已選擇勤務表 Excel。")
 
-    def bind_button_hover(button: tk.Button, normal_bg: str, hover_bg: str) -> None:
-        button.bind("<Enter>", lambda _event: button.configure(bg=hover_bg))
-        button.bind("<Leave>", lambda _event: button.configure(bg=normal_bg))
-
-    browse_button = tk.Button(
+    browse_button = ctk.CTkButton(
         form,
         text="選擇",
         command=browse_file,
-        bg="#2563eb",
-        fg="#ffffff",
-        activebackground="#1d4ed8",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        width=5,
+        width=64,
+        height=30,
+        font=FONT_BUTTON,
+        fg_color=UI_BLUE,
+        hover_color=UI_BLUE_HOVER,
     )
-    bind_button_hover(browse_button, "#2563eb", "#1d4ed8")
-    browse_button.grid(row=0, column=2, sticky=tk.E, padx=(8, 0), pady=4)
+    browse_button.grid(row=1, column=2, sticky=tk.E, padx=(8, 12), pady=(4, 12))
 
-    action_row = tk.Frame(body, bg="#f8fafc")
+    ctk.CTkLabel(form, text="年月", text_color=UI_MUTED, font=FONT_BODY).grid(row=2, column=0, sticky=tk.W, padx=(12, 8), pady=(0, 12))
+    month_row = ctk.CTkFrame(form, fg_color="transparent")
+    month_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(0, 12))
+    ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
+    ctk.CTkComboBox(
+        month_row,
+        variable=month_var,
+        values=allowed_months,
+        state="readonly",
+        width=78,
+        height=32,
+        font=FONT_BODY,
+        dropdown_font=FONT_BODY,
+        **CTK_COMBO_STYLE,
+    ).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
+
+    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
-    status_bar = ttk.Label(body, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
+    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
     status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def set_running(running: bool) -> None:
@@ -201,19 +365,33 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         if not uid or not pwd:
             messagebox.showwarning("缺少帳號密碼", "請先在主視窗登入，再啟動休息時間登打。", parent=dialog)
             return
-        if not workbook_path.exists():
-            messagebox.showwarning("找不到 Excel", "請選擇勤務表 Excel 檔案。", parent=dialog)
+        try:
+            validate_rest_workbook_path(workbook_path)
+        except RuntimeError as exc:
+            messagebox.showwarning("找不到 Excel", str(exc), parent=dialog)
+            return
+        try:
+            expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
+        except RuntimeError as exc:
+            messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
             return
         save_last_workbook_path(workbook_path)
+        if on_start is not None:
+            on_start()
         set_running(True)
         set_status("開啟瀏覽器登打休息時間...")
 
         def worker() -> None:
             try:
-                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no)
+                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month)
+                if on_finish is not None:
+                    on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
-                error = str(exc)
+                log_automation_exception("rest_time", exc)
+                error = format_automation_error(exc)
+                if on_error is not None:
+                    on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
@@ -225,39 +403,32 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         messagebox.showinfo("完成", result, parent=dialog)
         close_dialog()
 
-    start_button = tk.Button(
+    start_button = ctk.CTkButton(
         action_row,
         text="啟動登打",
         command=run_automation,
-        bg="#16a34a",
-        fg="#ffffff",
-        activebackground="#15803d",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        height=2,
+        fg_color="#16a34a",
+        hover_color="#15803d",
+        font=FONT_BUTTON,
+        height=38,
     )
-    bind_button_hover(start_button, "#16a34a", "#15803d")
     start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = tk.Button(
+    close_button = ctk.CTkButton(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#e2e8f0",
-        fg="#0f172a",
-        activebackground="#cbd5e1",
-        activeforeground="#0f172a",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        width=8,
-        height=2,
+        fg_color="#e2e8f0",
+        text_color=UI_TEXT,
+        hover_color="#cbd5e1",
+        font=FONT_BUTTON,
+        width=90,
+        height=38,
     )
-    bind_button_hover(close_button, "#e2e8f0", "#cbd5e1")
     close_button.grid(row=0, column=1, sticky=tk.E)
     return dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "") -> tk.Toplevel | None:
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
@@ -270,12 +441,12 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             pass
         setattr(parent, "_monthly_base_dialog", None)
 
-    dialog = tk.Toplevel(parent)
+    dialog = ctk.CTkToplevel(parent)
     setattr(parent, "_monthly_base_dialog", dialog)
     dialog.title("SinpoSmart - 勤務基準表登打")
-    dialog.geometry("430x280")
-    dialog.minsize(430, 280)
-    dialog.configure(bg="#f8fafc")
+    dialog.geometry("430x330")
+    dialog.minsize(430, 330)
+    dialog.configure(fg_color=UI_BG)
     dialog.transient(parent)
 
     def close_dialog() -> None:
@@ -284,32 +455,50 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
 
     dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = tk.Frame(dialog, bg="#f8fafc")
+    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
     root.pack(fill=tk.BOTH, expand=True)
 
-    header = tk.Frame(root, bg="#eff6ff", highlightbackground="#bfdbfe", highlightthickness=1)
+    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
     header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    tk.Label(header, text="勤務基準表登打", bg="#eff6ff", fg="#1e3a8a", font=("Microsoft JhengHei", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    ctk.CTkLabel(header, text="勤務基準表登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = tk.Frame(root, bg="#f8fafc")
+    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
     body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
 
-    info = ttk.LabelFrame(body, text="固定來源", padding=8)
+    info = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
     info.pack(fill=tk.X, pady=(10, 8))
+    ctk.CTkLabel(info, text="固定來源", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
     info.columnconfigure(0, weight=1)
-    ttk.Label(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W)
+    ctk.CTkLabel(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
 
-    action_row = tk.Frame(body, bg="#f8fafc")
+    fixed_roc_year, current_month = current_roc_year_month()
+    allowed_months = nearby_month_options(current_month)
+    month_var = tk.StringVar(value=f"{current_month:02d}")
+    month_row = ctk.CTkFrame(info, fg_color="transparent")
+    month_row.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 12))
+    ctk.CTkLabel(month_row, text="年月", text_color=UI_MUTED, font=FONT_BODY).pack(side=tk.LEFT, padx=(0, 8))
+    ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
+    ctk.CTkComboBox(
+        month_row,
+        variable=month_var,
+        values=allowed_months,
+        state="readonly",
+        width=78,
+        height=32,
+        font=FONT_BODY,
+        dropdown_font=FONT_BODY,
+        **CTK_COMBO_STYLE,
+    ).pack(side=tk.LEFT)
+    ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
+
+    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
     status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
-    status_bar = ttk.Label(body, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
+    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
     status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def bind_button_hover(button: tk.Button, normal_bg: str, hover_bg: str) -> None:
-        button.bind("<Enter>", lambda _event: button.configure(bg=hover_bg))
-        button.bind("<Leave>", lambda _event: button.configure(bg=normal_bg))
 
     def set_running(running: bool) -> None:
         start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
@@ -338,15 +527,27 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         if not actor:
             messagebox.showwarning("缺少番號", "請先在主視窗確認番號，再啟動每月基準表登打。", parent=dialog)
             return
+        try:
+            expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
+        except RuntimeError as exc:
+            messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
+            return
         set_running(True)
         set_status("讀取輪休基準表並開啟勤務基準表...")
 
         def worker() -> None:
             try:
-                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True)
+                if on_start is not None:
+                    on_start()
+                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month)
+                if on_finish is not None:
+                    on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
+                log_automation_exception("monthly_base", exc)
                 error = format_automation_error(exc)
+                if on_error is not None:
+                    on_error(error)
                 run_on_dialog(lambda: messagebox.showerror("每月基準表登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
@@ -354,34 +555,27 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
 
         threading.Thread(target=worker, daemon=True).start()
 
-    start_button = tk.Button(
+    start_button = ctk.CTkButton(
         action_row,
         text="啟動登打",
         command=run_automation,
-        bg="#16a34a",
-        fg="#ffffff",
-        activebackground="#15803d",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        height=2,
+        fg_color="#16a34a",
+        hover_color="#15803d",
+        font=FONT_BUTTON,
+        height=38,
     )
-    bind_button_hover(start_button, "#16a34a", "#15803d")
     start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = tk.Button(
+    close_button = ctk.CTkButton(
         action_row,
         text="關閉",
         command=close_dialog,
-        bg="#e2e8f0",
-        fg="#0f172a",
-        activebackground="#cbd5e1",
-        activeforeground="#0f172a",
-        relief=tk.FLAT,
-        font=("Microsoft JhengHei", 11, "bold"),
-        width=8,
-        height=2,
+        fg_color="#e2e8f0",
+        text_color=UI_TEXT,
+        hover_color="#cbd5e1",
+        font=FONT_BUTTON,
+        width=90,
+        height=38,
     )
-    bind_button_hover(close_button, "#e2e8f0", "#cbd5e1")
     close_button.grid(row=0, column=1, sticky=tk.E)
     return dialog
 
@@ -393,6 +587,12 @@ def default_workbook_path() -> Path:
     base_dir = Path(__file__).resolve().parent
     workbooks = sorted(base_dir.glob("*.xlsm"), key=lambda item: item.stat().st_mtime, reverse=True)
     return workbooks[0] if workbooks else Path()
+
+
+def validate_rest_workbook_path(workbook_path: Path) -> None:
+    if workbook_path.is_file() and workbook_path.suffix.lower() in {".xlsx", ".xlsm"}:
+        return
+    raise RuntimeError("休息時間登打失敗：請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
 
 
 def load_last_workbook_path() -> Path | None:
@@ -431,8 +631,12 @@ def submit_rest_entries(
     status: Callable[[str], None] | None = None,
     keep_browser_open: bool = False,
     actor_no: str = "",
+    expected_roc_year: int | None = None,
+    expected_month: int | None = None,
 ) -> str:
     status = status or (lambda _message: None)
+    if expected_roc_year is not None and expected_month is not None:
+        validate_workbook_year_month(workbook_path, expected_roc_year, expected_month)
     target_name = workbook_person_name(workbook_path, actor_no)
     driver = build_driver(headless=headless)
     inserted = 0
@@ -444,6 +648,9 @@ def submit_rest_entries(
         status("登入完成，開啟勤務基準表...")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
+        if expected_roc_year is not None and expected_month is not None:
+            status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
+            select_base_month(driver, expected_roc_year, expected_month)
         person = find_person_link(driver, user_id, target_no=actor_no, target_name=target_name)
         status(f"找到個人連結：{person.name}（系統儲存列 {person.staff_no}）")
         entries = parse_rest_entries(workbook_path, target_name=person.name, target_no=person.staff_no)
@@ -478,10 +685,14 @@ def submit_monthly_base_entries(
     headless: bool,
     status: Callable[[str], None] | None = None,
     keep_browser_open: bool = False,
+    expected_roc_year: int | None = None,
+    expected_month: int | None = None,
 ) -> str:
     status = status or (lambda _message: None)
     actor_no = str(actor_no or "").strip()
     plan = fetch_monthly_base_plan(actor_no)
+    if expected_roc_year is not None and expected_month is not None:
+        validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
     driver = build_driver(headless=headless)
     success = False
     try:
@@ -751,8 +962,14 @@ def select_base_month(driver, roc_year: int, month: int) -> None:
         raise RuntimeError("勤務基準表找不到年月與查詢欄位。")
     if not result.get("okYear") or not result.get("okMonth"):
         raise RuntimeError(f"勤務基準表無法切換到 {roc_year}年{month:02d}月。")
-    expected_pattern = re.compile(rf"目前編輯月份為:\s*{roc_year}年{month:02d}月")
-    WebDriverWait(driver, 20).until(lambda d: expected_pattern.search(current_page_text(d)))
+    try:
+        WebDriverWait(driver, 20).until(lambda d: extract_base_month_from_text(current_page_text(d)) is not None)
+    except TimeoutException as exc:
+        raise RuntimeError("網站沒有顯示目前編輯月份，無法確認年月。") from exc
+    actual = extract_base_month_from_text(current_page_text(driver))
+    if not actual:
+        raise RuntimeError("網站沒有顯示目前編輯月份，無法確認年月。")
+    validate_selected_year_month("網站", roc_year, month, actual[0], actual[1])
     time.sleep(0.8)
 
 
@@ -776,28 +993,61 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
           rows.sort((a, b) => a.querySelectorAll('input, textarea, select, button').length - b.querySelectorAll('input, textarea, select, button').length);
           return rows;
         }
-        function findDayControl(row, day) {
+        function findDayControl(row, day, days) {
+          const controls = editableControls(row);
+          for (const el of controls) {
+            const key = el.id || el.name || '';
+            const match = key.match(/^_pln_(\\d+)_(\\d+)$/);
+            if (match && Number(match[2]) === Number(day)) return el;
+          }
           const candidates = [
-            `[name$="_${day}"]`,
-            `[name$="_${String(day).padStart(2, '0')}"]`,
             `#_pln_${day}`,
             `#_pln_${String(day).padStart(2, '0')}`,
-            `[id$="_${day}"]`,
-            `[id$="_${String(day).padStart(2, '0')}"]`,
           ];
           for (const selector of candidates) {
-            const el = row.querySelector(selector);
+            const el = controls.find((control) => control.matches(selector));
             if (el) return el;
           }
-          const controls = editableControls(row);
-          if (controls.length >= Number(day)) return controls[Number(day) - 1];
+          const planControls = dayPlanControls(row, days);
+          if (planControls.length >= Number(day)) return planControls[Number(day) - 1];
           return null;
+        }
+        function dayPlanControls(row, days) {
+          return editableControls(row).filter((el) => {
+            const match = (el.id || el.name || '').match(/^_pln_(\\d+)_(\\d+)$/);
+            if (!match) return false;
+            const day = Number(match[2]);
+            return Number(match[2]) >= 1 && day <= Number(days);
+          });
+        }
+        function missingDayControls(row, data) {
+          const missing = [];
+          for (const day in data) {
+            if (!findDayControl(row, day, Object.keys(data).length)) missing.push(day);
+          }
+          return missing;
+        }
+        function dispatchPlanInput(el) {
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          el.dispatchEvent(new Event('blur', {bubbles: true}));
+          try { if (typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch (_error) {}
+        }
+        function clearRowValues(row, days) {
+          const controls = dayPlanControls(row, days);
+          for (const el of controls) {
+            try {
+              el.focus();
+              el.value = '';
+              dispatchPlanInput(el);
+            } catch (_error) {}
+          }
         }
         function setRowValues(row, data) {
           let count = 0;
           const missing = [];
           for (const day in data) {
-            const el = findDayControl(row, day);
+            const el = findDayControl(row, day, Object.keys(data).length);
             if (!el) {
               missing.push(day);
               continue;
@@ -805,10 +1055,7 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
             try {
               el.focus();
               el.value = data[day];
-              el.dispatchEvent(new Event('input', {bubbles: true}));
-              el.dispatchEvent(new Event('change', {bubbles: true}));
-              el.dispatchEvent(new Event('blur', {bubbles: true}));
-              try { if (typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch (_error) {}
+              dispatchPlanInput(el);
               count += 1;
             } catch (_error) {
               missing.push(day);
@@ -819,6 +1066,9 @@ def fill_monthly_base_row(driver, person_name: str, day_symbols: dict[int, str],
         function deepFillByName(win, personName, data) {
           try {
             for (const row of personRows(win, personName)) {
+              const missingBeforeClear = missingDayControls(row, data);
+              if (missingBeforeClear.length) return {count: 0, missing: missingBeforeClear};
+              clearRowValues(row, Object.keys(data).length);
               return setRowValues(row, data);
             }
           } catch (_error) {}

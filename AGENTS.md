@@ -1,9 +1,18 @@
 # AGENTS.md
 
+## 工程 Skills
+
+- 本專案使用 Matt Pocock 工程 skills，不再使用 Superpowers 工作流程。
+- 優先順序固定為：使用者直接要求、`AGENTS.md` 與安全／部署／資料治理規則、專案特有 skill（NAS、Worker、Release、帳密與正式環境驗證）、Matt Pocock 工程 skill、一般開發習慣。後者不得覆蓋前者。
+- 不確定流程時使用 `ask-matt`；明確小型工作使用 `implement`，可測行為依 `tdd` 的 Red-Green 垂直切片處理。
+- 模糊需求先使用 `grill-with-docs`；大型或跨 session 工作依序使用 `grill-with-docs`、`to-spec`、`to-tickets`，再逐張 ticket 使用 `implement`；需要交接時使用 `handoff`。
+- 難解 bug、間歇性失敗或效能退化使用 `diagnosing-bugs`；外部未整理的 bug、需求或 PR 使用 `triage`；實作路徑不明的大型工作使用 `wayfinder`；需要外部可信資料使用 `research`；模組邊界改善使用 `codebase-design`。
+- 完成前執行相關完整驗證，並以明確 commit、branch、tag 或 merge-base 為比較基準使用 `code-review` 進行 Standards 與 Spec 雙軸審查；沒有規格時須明記 Spec 無可比對規格。
+- `implement` 不會授權 commit、release、部署、刪除檔案或修改正式環境；這些操作仍須遵守本檔案與使用者授權，並維持 Source、Build、Release、NAS、Worker 的既有驗證階梯。
+
 1. 貼上程式碼時，講述總共有幾行。
 2. 修改其中一段程式碼時，講述是第幾行到第幾行，且要對齊原本格式。
 3. 不能隨意刪除檔案，需通過使用者確認。
-4. 每次在本專案開始工作前，先確認雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills，並全部同步到本機 `%USERPROFILE%\.codex\skills` 後再使用。
 
 ## Language
 
@@ -22,6 +31,52 @@
 - `daily_vehicle_legacy/`: 每日車輛舊版 Selenium 流程。
 - `WinPython_公務電腦使用包/`: 公務電腦可攜執行包。
 
+## Repository boundaries
+
+- 本 repo 負責 SinpoSmart 公務電腦 WinPython 包、值班 GUI、工具按鈕、工具流程、更新包與 GitHub public package release。
+- SinpoSmart 後台網頁 APP 位於共享 `專案` 目錄下的 sibling repo `救護返隊小幫手\ambulance_return_bot`，包含 `app.py`、`ambulance_bot/sinposmart_backend.py`、`templates/admin_sinposmart.html`、`NAS包/` 與該 repo 的 `WinPython_公務電腦使用包/` 同步檔；舊 `IOS\ambulance_return_bot` 僅作為歷史位置，不要新增命令或文件指向舊路徑。
+- 提到「值班 GUI、勤務表登打、休息時間登打、勤務基準表登打、車輛保養清點、WinPython 公務電腦使用包、UPDATE、GITHUB RELEASE」時，優先在本 repo 工作。
+- 提到「後台事件、後台 UI、admin_sinposmart、狀態 pill、快照內容、NAS 後台網頁」時，優先切到 `救護返隊小幫手\ambulance_return_bot` repo 工作。
+- 若一次任務同時跨 SinpoSmart WinPython 包與救護返隊小幫手後台網頁，必須分開檢查、測試、commit、push；不要把兩個 repo 的工作混成同一個提交或 release。
+- SinpoSmart 專案不再直接部署或覆蓋 NAS runtime；NAS runtime 唯一來源是 sibling repo `救護返隊小幫手\ambulance_return_bot`。
+- 不得從本 repo 直接覆蓋 `\\100.114.126.58\docker\ambulance_return_bot`，也不得把值班後台使用的 NAS 檔案手動複製到本 repo 後再部署。
+- 本 repo 只負責：公務電腦 GUI、值班 GUI / 值班模式流程、值班登入/登打流程、送到 NAS 的事件資料 payload、SinpoSmart 公務電腦更新包。
+- 只要是值班後台會用到的 NAS 檔案，都必須切到 sibling repo `救護返隊小幫手\ambulance_return_bot` 修改、測試、打 NAS 包、同步 NAS、重啟容器。
+- 值班後台 NAS 檔案包含但不限於：NAS 後台 Flask app、`/admin/sinposmart`、`/api/sinposmart/events`、值班後台模板、`admin_sinposmart.html`、值班後台 CSS / JS / template include、`sinposmart_backend.py`、值班資料整理、分組、顯示、保留邏輯，以及任何會被複製到 `\\100.114.126.58\docker\ambulance_return_bot` 的檔案。
+- 如果一次需求同時需要改 GUI 送出資料與值班後台使用的 NAS 檔案：本 repo 只修改 GUI payload 或公務電腦更新包；值班後台 NAS 檔案必須在救護返隊小幫手 repo 修改、測試、打 NAS 包、同步 NAS、重啟容器。
+- 本 repo 若出現 NAS deploy/copy script、`NAS包`、或任何準備覆蓋 `\\100.114.126.58\docker\ambulance_return_bot` 的命令，必須停止執行並提示：`值班後台使用的 NAS 檔案請到共享專案目錄下的救護返隊小幫手\ambulance_return_bot 修改與部署。`
+
+## Cross-project login safety
+
+- 另一個公務自動化專案若需登入與登打四個公務網站，必須遵守以下安全邊界。
+- 四個公務網站使用同一組已授權的公務帳號密碼，但每個網站仍需明確列入允許清單後才能使用。
+- 優先採用專用 Chrome Profile 保存登入狀態，不直接依賴日常 Chrome Profile。
+- Chrome Profile 的用途是保留 session、cookie 與登入狀態；不要把它視為可被 Selenium 穩定操作的帳號密碼下拉選單。
+- 若網站未保持登入，優先分析該網站的實際登入流程，再決定是由程式填入網頁 input，或提示使用者手動完成一次登入。
+- 不要在新專案重複寫死帳號密碼；應使用既有受控設定來源或共用 credential loader。
+- log、截圖、錯誤訊息與回覆內容不得顯示密碼、token、cookie 或其他憑證內容。
+
+## SinpoSmart Google Site 值班看板
+
+- Google Site 既有頁面為 `https://sites.google.com/view/sinpo666/%E5%80%BC%E7%8F%AD%E4%BA%BA%E5%93%A1`；在同一頁加入或更新「目前值班人員」動態區塊，不建立新的 Google Site 頁面。
+- 保留既有的人員清單與各人介紹頁；動態區塊只顯示目前時段的值班人員、下一時段人員與資料更新時間。
+- SinpoSmart 的當日勤務表是唯一資料來源。程式須從既有班表讀取時段、值班番號及姓名，不得以 Google Site 的靜態清單作為班表來源。
+- 值班模式在執行期間每小時同步一次班表；資料內容沒有變更時不重複寫入遠端資料來源。
+- Google Site 的靜態文字或姓名連結不作為同步目標。以 Google Apps Script 網頁程式提供動態內容，再嵌入現有 Google Site 頁面。
+- Apps Script 專案與值班看板資料檔應建立在 `sinpo666@gmail.com` 的 Google Drive 資料夾 `https://drive.google.com/drive/folders/1SAGSTlDr8qZoZvFw8R_DqK1atjqWwGrN?usp=sharing`。
+- Google 端同步須使用獨立設定的同步密鑰；不得在程式碼、Google Site、log、截圖或 Git 中寫入帳號密碼、token、cookie、Apps Script 部署網址的祕密參數或其他憑證。
+- 此功能屬於本 repo 的值班 GUI / 公務電腦更新包範圍。不得為此直接覆蓋 NAS runtime；若需改值班後台 NAS 檔案，必須改在 sibling repo `救護返隊小幫手\ambulance_return_bot` 並依該 repo 流程部署。
+
+## Operation modes
+
+- 值班模式：用於正式執行日常勤務登打、車輛或其他公務網站資料填報；重點是依既有流程穩定完成輸入、送出前確認、保存結果與回報異常。
+- 審核模式：用於送出前或送出後檢查資料是否正確，包含比對來源資料、檢查缺漏、確認欄位值、標示異常項目；此模式原則上不主動送出或修改正式資料，除非使用者明確要求。
+- 設定模式：用於維護網站清單、帳號設定來源、Chrome Profile 路徑、欄位對應、預設值與執行參數；不得顯示或回報密碼、token、cookie。
+- 登入維護模式：用於處理 Chrome Profile、session、cookie、Google 帳號狀態與公務網站登入狀態；優先讓使用者手動完成必要的一次性登入，再由程式沿用狀態。
+- 除錯模式：用於定位流程卡住的位置、元素選取失敗、網站改版、驗證碼、權限或 session 過期問題；除錯輸出不得包含憑證或敏感個資。
+- 手動協助模式：當網站阻擋自動化、需要人工確認、驗證碼或二階段驗證時，程式應停在可操作畫面，提示使用者手動處理後再繼續。
+- 測試模式：用於驗證流程、欄位定位、資料轉換與登入狀態；不得對正式網站送出不可回復的資料，除非使用者明確確認。
+
 ## Working rules
 
 - 開始修改前，先找出最小相關檔案集合。
@@ -32,6 +87,8 @@
 - 不要改動 `.env`、密鑰、憑證、production config。
 - 不要新增 dependency，除非使用者明確同意。
 - 不要修改程式邏輯，除非任務明確要求。
+- 啟動 SinpoSmart GUI 時，預設使用無黑窗模式：優先用 `WinPython_公務電腦使用包\RUN_DUTY_GUI_WINPYTHON.bat`、`duty_gui.pyw` 或 `pythonw.exe`；不要直接用 `py duty_gui.py`、`python duty_gui.py` 或會留下黑色 console 視窗的方式啟動，除非正在做明確的 console 除錯。
+- 若 tracked config 因本機執行變成 dirty，例如 `WinPython_公務電腦使用包\duty_sheet_legacy\config.json`，預設不要 stage、不要讀內容；除非使用者明確要求，否則不把 runtime config 納入 commit 或 release。這類已知 runtime config 若與本次任務無關，不必在一般完成回報重複列為風險；只有在使用者詢問 git 狀態、dirty 檔、設定檔，或它影響 staging、測試、打包、release 時才提。
 
 ## Python file policy
 
@@ -73,6 +130,17 @@
 - 不要提交 cache、logs、build output、temporary files、outputs。
 - 不要提交 `.env`、key、pem、token、secret、credentials。
 - 發現敏感檔案時，只回報風險，不要讀取內容。
+
+## Git commit rules
+
+- commit 前先執行 `git status --short`，確認只包含本次任務相關檔案。
+- 不要把 `tmp/`、`outputs/`、`logs/`、cache、build output 或敏感檔案加入 commit。
+- commit 前回報預計提交的檔案清單；若有不確定是否屬於本次任務的變更，先詢問使用者。
+- commit message 使用繁體中文或清楚的英文，內容需描述實際變更，不使用 `update`、`fix` 這類過度籠統訊息。
+- 未經使用者要求，不要自動建立 commit。
+- 若使用者要求 commit，先測試或說明無法測試的原因，再提交。
+- commit 後回報 commit hash 與提交檔案摘要。
+- 若遇到 `.git/*.lock`，可自動搜尋本 repo `.git` 內的 lock 檔；先檢查是否仍有 `git` 寫入程序（例如 commit、push、fetch、merge、rebase、gc、pack-refs），若沒有且 lock 檔看起來是 stale，可直接刪除 stale lock，不需再次詢問使用者。若仍有寫入程序，保留 lock 檔並回報風險。
 
 ## Completion report
 

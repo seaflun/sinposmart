@@ -50,6 +50,43 @@ function Get-Sha256FromText {
     return $firstToken.ToLowerInvariant()
 }
 
+$skipDirs = @("logs", "runtime_outputs", "tmp", "snapshots", "__pycache__", "artifacts")
+$alwaysSkipFiles = @(
+    "duty_sheet_legacy\config.json",
+    "duty_sheet_legacy/effortless-leaf-353501-63492cc3ece4.json",
+    "duty_sheet_legacy\effortless-leaf-353501-63492cc3ece4.json",
+    "daily_vehicle_legacy\.env",
+    "daily_vehicle_legacy/.env"
+)
+$preserveIfExistsFiles = @(
+    "rest_time_automation_config.json"
+)
+$skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token", ".jsonl")
+
+function Test-SkipPackagePath {
+    param([string]$RelativePath)
+
+    $relativeSlash = $RelativePath -replace "\\", "/"
+    $parts = $relativeSlash -split "/"
+    if ($parts | Where-Object { $skipDirs -contains $_ }) {
+        return $true
+    }
+    if (($alwaysSkipFiles -contains $RelativePath) -or ($alwaysSkipFiles -contains $relativeSlash)) {
+        return $true
+    }
+
+    $fileName = [System.IO.Path]::GetFileName($RelativePath)
+    if ($fileName -eq "desktop.ini") {
+        return $true
+    }
+    if ($fileName -eq ".env" -or ($fileName.StartsWith(".env.") -and $fileName -ne ".env.example")) {
+        return $true
+    }
+
+    $extension = [System.IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    return $skipExtensions -contains $extension
+}
+
 function Get-RunningDutyGuiProcesses {
     $packagePath = $packageDir.TrimEnd([char]92)
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -58,6 +95,48 @@ function Get-RunningDutyGuiProcesses {
             $_.CommandLine -match "duty_gui\.pyw?" -and
             $_.CommandLine.Contains($packagePath)
         }
+}
+
+function Send-UpdateLogoutEvent {
+    $client = $null
+    $stream = $null
+    $asyncResult = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $asyncResult = $client.BeginConnect("127.0.0.1", 47631, $null, $null)
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne(1500)) {
+            Write-Warning "Could not report update logout: command server timeout."
+            return $false
+        }
+
+        $client.EndConnect($asyncResult)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 5000
+        $stream.WriteTimeout = 5000
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("update_logout`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+
+        $buffer = New-Object byte[] 64
+        $count = $stream.Read($buffer, 0, $buffer.Length)
+        if ($count -gt 0) {
+            $response = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count).Trim()
+            Write-Host "Update logout event: $response"
+        }
+        return $true
+    } catch {
+        Write-Warning "Could not report update logout: $_"
+        return $false
+    } finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+        if ($client) {
+            $client.Close()
+        }
+        if ($asyncResult -and $asyncResult.AsyncWaitHandle) {
+            $asyncResult.AsyncWaitHandle.Dispose()
+        }
+    }
 }
 
 function Stop-RunningDutyGui {
@@ -95,13 +174,7 @@ function Start-DutyGui {
         $pythonw = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder -Windowed | Select-Object -First 1)
     }
     if (-not $pythonw) {
-        $command = Get-Command "pythonw.exe" -ErrorAction SilentlyContinue
-        if ($command) {
-            $pythonw = $command.Source
-        }
-    }
-    if (-not $pythonw) {
-        Write-Warning "Could not restart app because pythonw.exe was not found."
+        Write-Warning "Could not restart app because WinPython pythonw.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
         return
     }
 
@@ -117,32 +190,59 @@ function Restart-DutyGuiIfRunning {
     return $false
 }
 
+function Get-WinPythonExe {
+    $finder = Join-Path $packageDir "find_winpython.ps1"
+    $python = ""
+    if (Test-Path -LiteralPath $finder -PathType Leaf) {
+        $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
+    }
+    if (-not $python) {
+        throw "Could not run setup because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
+    }
+    return [string]$python
+}
+
+function Invoke-SetupAfterUpdate {
+    $requirementsPath = Join-Path $packageDir "requirements.txt"
+    if (-not (Test-Path -LiteralPath $requirementsPath -PathType Leaf)) {
+        Write-Warning "Skipped setup because requirements.txt was not found."
+        return
+    }
+
+    $python = Get-WinPythonExe
+    Push-Location $packageDir
+    try {
+        Write-Host "Installing or refreshing Python requirements..."
+        & $python -m pip install -r $requirementsPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip install failed with exit code $LASTEXITCODE."
+        }
+
+        $environmentCheck = Join-Path $packageDir "check_environment.py"
+        if (Test-Path -LiteralPath $environmentCheck -PathType Leaf) {
+            Write-Host "Running environment check..."
+            & $python $environmentCheck
+            if ($LASTEXITCODE -ne 0) {
+                throw "Environment check failed with exit code $LASTEXITCODE."
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Copy-UpdateTree {
     param(
         [string]$SourceDir,
         [string]$DestDir
     )
 
-    $skipDirs = @("logs", "runtime_outputs", "tmp", "snapshots", "__pycache__", "artifacts")
-    $alwaysSkipFiles = @(
-        "duty_sheet_legacy\config.json",
-        "duty_sheet_legacy\effortless-leaf-353501-63492cc3ece4.json",
-        "daily_vehicle_legacy\.env"
-    )
-    $preserveIfExistsFiles = @(
-        "rest_time_automation_config.json"
-    )
-
     $slash = [string][char]92
     $sourceRoot = $SourceDir.TrimEnd([char]92) + $slash
     Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force | ForEach-Object {
         $relative = $_.FullName.Substring($sourceRoot.Length)
-        $parts = $relative -split "[\\/]"
-        if ($parts | Where-Object { $skipDirs -contains $_ }) {
-            return
-        }
         $target = Join-Path $DestDir $relative
-        if ($alwaysSkipFiles -contains $relative) {
+        if (Test-SkipPackagePath -RelativePath $relative) {
             Write-Host "Skipped local-only file: $relative"
             return
         }
@@ -158,6 +258,70 @@ function Copy-UpdateTree {
         Copy-Item -LiteralPath $_.FullName -Destination $target -Force
         Write-Host "Updated: $relative"
     }
+}
+
+function New-PackageBackup {
+    param(
+        [string]$SourceDir,
+        [string]$BackupZip,
+        [string]$StageDir
+    )
+
+    if (Test-Path -LiteralPath $StageDir) {
+        Remove-Item -LiteralPath $StageDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
+
+    $backupFiles = @(
+        "VERSION.txt",
+        "update_package.ps1",
+        "UPDATE_PACKAGE.bat",
+        "RUN_DUTY_GUI_WINPYTHON.bat",
+        "RUN_DUTY_GUI_WINPYTHON.vbs",
+        "duty_gui.py",
+        "duty_gui.pyw",
+        "duty_sheet_automation.py",
+        "daily_vehicle_automation.py",
+        "rest_time_automation.py",
+        "rescue_video\救護影片分類GUI.py",
+        "rescue_video\classify_rescue_video.py",
+        "duty_rehearsal.py",
+        "compare_rehearsal_records.py",
+        "check_environment.py",
+        "requirements.txt",
+        "work_log_defaults.json"
+    )
+
+    $copied = 0
+    foreach ($relative in $backupFiles) {
+        if (Test-SkipPackagePath -RelativePath $relative) {
+            continue
+        }
+        $source = Join-Path $SourceDir $relative
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            continue
+        }
+
+        $target = Join-Path $StageDir $relative
+        $targetDir = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        $copied += 1
+    }
+
+    $manifestPath = Join-Path $StageDir "backup-manifest.txt"
+    @(
+        "Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "Source: $SourceDir",
+        "Files: $copied",
+        "",
+        ($backupFiles -join [Environment]::NewLine)
+    ) | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+    Compress-Archive -LiteralPath (Join-Path $StageDir "*") -DestinationPath $BackupZip -Force
+    Write-Host "Backup completed: $copied files"
 }
 
 if (-not (Test-Path -LiteralPath $localVersionPath)) {
@@ -209,7 +373,7 @@ try {
 
     $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
     Write-Host "Creating backup: $backupZip"
-    Compress-Archive -LiteralPath (Join-Path $packageDir "*") -DestinationPath $backupZip -Force
+    New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir (Join-Path $tempDir "backup-stage")
 
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
@@ -236,8 +400,10 @@ try {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
 
+    Send-UpdateLogoutEvent | Out-Null
     $wasRunning = Stop-RunningDutyGui
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
+    Invoke-SetupAfterUpdate
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
     if ($wasRunning) {
         Start-DutyGui

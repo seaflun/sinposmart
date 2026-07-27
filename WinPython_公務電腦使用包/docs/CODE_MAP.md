@@ -1,4 +1,4 @@
-﻿# 值班勤務系統自動化程式地圖
+﻿# SinpoSmart_值班台程式地圖
 
 本文件先記錄目前大檔案的責任分區。這次整理只新增註解與文件，不搬動函式、不改執行邏輯。
 
@@ -57,7 +57,7 @@ Tkinter 控制台主程式，負責登入畫面、值班模式、審核模式、
 
 ## duty_sheet_automation.py
 
-勤務表登打內嵌視窗，負責從 SinpoSmart 值班模式開啟勤務表登打表單，並呼叫舊的 `勤務表自動化\sinposmart_1.py` 核心流程。
+勤務表登打內嵌視窗，負責從 SinpoSmart 值班模式開啟勤務表登打表單，並呼叫包內 `duty_sheet_legacy\sinposmart_1.py` 核心流程。
 
 目前定位：
 
@@ -78,5 +78,5 @@ Tkinter 控制台主程式，負責登入畫面、值班模式、審核模式、
 每次拆檔後都應先跑：
 
 ```powershell
-py -m py_compile .\duty_gui.py .\duty_rehearsal.py .\compare_rehearsal_records.py
+py -m py_compile .\duty_gui.py .\duty_gui.pyw .\duty_rehearsal.py .\compare_rehearsal_records.py .\duty_sheet_automation.py .\daily_vehicle_automation.py .\rest_time_automation.py .\check_environment.py
 ```

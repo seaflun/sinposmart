@@ -1,8 +1,8 @@
 # 換電腦執行說明
 
-## 需要安裝
+## 需要準備
 
-1. Python 3.11 以上
+1. WinPython 或 Python 3.11 以上
 2. Google Chrome
 3. Python 套件：
 
@@ -18,14 +18,14 @@ python -m pip install -r requirements.txt
 python check_environment.py
 ```
 
-看到最後一行 `環境檢查完成，可以執行 duty_gui.pyw` 就表示基本環境可用。
+看到最後一行 `[OK] Environment check passed. Start SinpoSmart with duty_gui.pyw.` 就表示基本環境可用。
 
 ## 啟動 GUI
 
-雙擊：
+公務電腦正式啟動建議雙擊：
 
 ```text
-start_duty_gui.bat
+RUN_DUTY_GUI_WINPYTHON.vbs
 ```
 
 或直接執行：
@@ -42,10 +42,15 @@ pythonw duty_gui.pyw
 - `duty_gui.pyw`
 - `duty_rehearsal.py`
 - `compare_rehearsal_records.py`
-- `export_preview_texts.py`
+- `duty_sheet_automation.py`
+- `daily_vehicle_automation.py`
+- `rest_time_automation.py`
 - `requirements.txt`
 - `check_environment.py`
-- `start_duty_gui.bat`
+- `find_winpython.ps1`
+- `SETUP_WINPYTHON.bat`
+- `RUN_DUTY_GUI_WINPYTHON.bat`
+- `RUN_DUTY_GUI_WINPYTHON.vbs`
 
 資料檔可選：
 

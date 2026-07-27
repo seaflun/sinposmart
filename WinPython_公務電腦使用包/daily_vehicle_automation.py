@@ -7,9 +7,11 @@ import os
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from tkinter import messagebox
 import tkinter as tk
+from typing import Callable
 
 
 PACKAGED_PROJECT_DIR = "daily_vehicle_legacy"
@@ -20,6 +22,37 @@ ENV_EXAMPLE = ".env.example"
 RUNNING_PID_FILE = ".daily_vehicle_runner.pid"
 WINDOW_TITLE = "SinpoSmart - 車輛保養清點"
 OUTPUT_TAIL_LIMIT = 3000
+DEFAULT_AUTOMATION_TIMEOUT_SECONDS = 15 * 60
+FRONTEND_ERROR_MESSAGES = {
+    "login_failed": "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。",
+    "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
+    "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
+    "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
+}
+LOGIN_FAILURE_MARKERS = (
+    "登入失敗",
+    "登入狀態失效",
+    "密碼可能已變更",
+    "帳號密碼有誤",
+    "尚未申請帳號權限",
+    "帳號或密碼",
+    "重新登入",
+    "login119",
+    "_txtusername",
+    "_txtpassword",
+    "登入後元素",
+    "仍停留在登入頁",
+)
+UNSAFE_ERROR_MARKERS = (
+    "stacktrace",
+    "stack trace",
+    "traceback",
+    "chromedriver",
+    "selenium.common.exceptions",
+    "session token",
+    "cookie",
+    "password",
+)
 
 _RUNNING_PROJECTS: set[str] = set()
 _RUNNING_LOCK = threading.Lock()
@@ -71,6 +104,35 @@ def output_tail(output: str, limit: int = OUTPUT_TAIL_LIMIT) -> str:
     if len(output) <= limit:
         return output
     return "...\n" + output[-limit:]
+
+
+def format_automation_error(exc: BaseException | str) -> str:
+    text = str(exc or "").strip()
+    lowered = text.lower()
+    if any(marker in lowered or marker in text for marker in LOGIN_FAILURE_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["login_failed"]
+    if "timeoutexception" in lowered or "timeout" in lowered or "timed out" in lowered or "逾時" in text:
+        return FRONTEND_ERROR_MESSAGES["timeout"]
+    if "nosuchelementexception" in lowered or "no such element" in lowered or "unable to locate element" in lowered:
+        return FRONTEND_ERROR_MESSAGES["no_such_element"]
+    if any(marker in lowered for marker in UNSAFE_ERROR_MARKERS):
+        return FRONTEND_ERROR_MESSAGES["unknown_error"]
+    if text:
+        return text
+    return FRONTEND_ERROR_MESSAGES["unknown_error"]
+
+
+def log_automation_exception(context: str, exc: BaseException) -> None:
+    print(f"[automation-error] {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    traceback.print_exc()
+
+
+def automation_timeout_seconds() -> int:
+    raw_value = os.environ.get("SINPOSMART_DAILY_VEHICLE_TIMEOUT_SECONDS") or os.environ.get("SINPOSMART_TOOL_TIMEOUT_SECONDS", "")
+    try:
+        return max(60, int(raw_value or DEFAULT_AUTOMATION_TIMEOUT_SECONDS))
+    except ValueError:
+        return DEFAULT_AUTOMATION_TIMEOUT_SECONDS
 
 
 def running_pid_path(project_dir: Path) -> Path:
@@ -145,7 +207,7 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
         clear_running_pid(project_dir, pid)
 
 
-def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "") -> None:
+def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> None:
     base_dir = Path(__file__).resolve().parent
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
@@ -171,6 +233,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
     if not messagebox.askyesno(WINDOW_TITLE, "將開啟瀏覽器執行車輛保養清點，是否繼續？", parent=parent):
         return
 
+    if on_start is not None:
+        on_start()
     default_env = load_dotenv_like(project_dir / ENV_EXAMPLE)
     current_env = {**default_env, **load_dotenv_like(project_dir / ".env")}
     env_values = {
@@ -206,16 +270,31 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                 errors="replace",
             )
             set_running(project_dir, True, process.pid)
-            output, _ = process.communicate()
+            try:
+                output, _ = process.communicate(timeout=automation_timeout_seconds())
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                raise RuntimeError(f"車輛保養清點逾時未完成，已超過 {automation_timeout_seconds()} 秒。")
             return_code = process.returncode
             if return_code == 0:
+                if on_finish is not None:
+                    on_finish("車輛保養清點已完成。")
                 run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
                 detail = output_tail(output)
-                run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點執行失敗，代碼：{return_code}\n\n輸出尾端：\n{detail}", parent=parent))
+                raw_error = f"車輛保養清點執行失敗，代碼：{return_code}；{detail}"
+                print(f"[automation-error] daily_vehicle: {raw_error}", file=sys.stderr)
+                error = format_automation_error(raw_error)
+                if on_error is not None:
+                    on_error(error)
+                run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, error, parent=parent))
         except Exception as exc:
-            error = str(exc)
-            run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, f"車輛保養清點啟動失敗：{error}", parent=parent))
+            log_automation_exception("daily_vehicle", exc)
+            error = format_automation_error(exc)
+            if on_error is not None:
+                on_error(error)
+            run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, error, parent=parent))
         finally:
             set_running(project_dir, False, process.pid if process else None)
 

@@ -43,12 +43,17 @@ SETUP_WINPYTHON.bat
 ## 檔案用途
 
 - `find_winpython.ps1`：尋找 WinPython 的 `python.exe` 或 `pythonw.exe`。
-- `SETUP_WINPYTHON.bat`：安裝 `requirements.txt` 內所有套件並檢查環境。
+- `SETUP_WINPYTHON.bat`：用 WinPython 安裝 `requirements.txt` 內所有套件並檢查環境。
 - `RUN_DUTY_GUI_WINPYTHON.bat`：用 WinPython 啟動 GUI，除錯時可直接執行。
 - `RUN_DUTY_GUI_WINPYTHON.vbs`：正式啟動，隱藏小黑窗。
+
+## Google Site 值班看板
+
+值班 GUI 讀取當日勤務表後，可將完整班表同步到 Google Site 的「自動化」頁面；看板會顯示目前時段、下一時段與最後更新時間。詳細部署、設定與輪替同步金鑰方式請見 [GOOGLE_SITE_DUTY_BOARD_SETUP.md](GOOGLE_SITE_DUTY_BOARD_SETUP.md)。
 
 ## 注意事項
 
 - 帳號清單存在各電腦本機，不會跟著 Google Drive 共用。
+- 需要啟用帳密同步時，請在該電腦設定 `SINPOSMART_CREDENTIAL_SYNC_TOKEN` 與 `SINPOSMART_CREDENTIAL_SYNC_URL`；登入成功後會自動同步當次值班台帳密。
 - 勤務表與比對資料仍會留在專案資料夾內，兩台電腦可透過 Google Drive 同步。
-- 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 Selenium、pystray、Pillow、pywin32、win11toast；這時需要先在可連網電腦準備離線 wheel。
+- 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 `requirements.txt` 內的套件；這時需要先在可連網電腦準備離線 wheel。

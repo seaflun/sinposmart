@@ -31,6 +31,10 @@ tmp/
 temp/
 cache/
 .cache/
+.worktrees/
+.agents/
+skills-lock.json
+google_site_duty_board/**/.clasp.json
 
 # outputs
 outputs/
@@ -57,11 +61,15 @@ logs/
 
 # secrets
 .env.*
+!.env.example
+!**/.env.example
 *.key
 *.pem
 *.token
 secrets.json
 credentials.json
+duty_sheet_legacy/config.json
+WinPython_公務電腦使用包/duty_sheet_legacy/config.json
 
 # OS / editor
 .vscode/

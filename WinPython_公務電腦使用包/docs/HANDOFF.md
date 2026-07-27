@@ -1,4 +1,4 @@
-# 值班勤務系統自動化交接紀錄
+# SinpoSmart_值班台交接紀錄
 
 更新時間：2026-05-19 09:41
 
@@ -9,7 +9,10 @@
 3. 執行：
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\sync_project_skills_before_use.ps1
+$cloudSkillRoot = "I:\我的雲端硬碟\專案\skill"
+$localSkillRoot = Join-Path $env:USERPROFILE ".codex\skills"
+New-Item -ItemType Directory -Force -Path $localSkillRoot
+Copy-Item -LiteralPath (Join-Path $cloudSkillRoot "*") -Destination $localSkillRoot -Recurse -Force
 ```
 
 4. 再執行環境檢查：
@@ -21,7 +24,7 @@ py check_environment.py
 5. 若要開 GUI：
 
 ```powershell
-.\start_duty_gui.bat
+.\RUN_DUTY_GUI_WINPYTHON.vbs
 ```
 
 ## 2026-05-19 本機變更
@@ -29,10 +32,10 @@ py check_environment.py
 ### skill 同步規則
 
 - 新增 `AGENTS.md`
-- 新增 `sync_project_skills_before_use.ps1`
+- 新增 `AGENTS.md` 內的 skill 同步規則
 - 規則：每次在本專案開始工作前，先掃描雲端 `專案\skill` 內所有含 `SKILL.md` 的 skills，全部同步到本機 `%USERPROFILE%\.codex\skills` 後再使用。
-- 雲端安裝腳本位置：`G:\我的雲端硬碟\專案\skill\install-skills-from-cloud.ps1`
-- 目前會同步 10 個 skills。
+- 雲端 skill 來源位置：`I:\我的雲端硬碟\專案\skill`
+- 目前實測會同步 14 個 skills。
 
 ### GUI 觸發狀態修正
 
@@ -50,7 +53,9 @@ py check_environment.py
 - `duty_gui.py`：Tkinter 控制台，載入預演 JSON、顯示任務、登入值班人員、到點記錄待接線任務。
 - `duty_gui.pyw`：GUI 入口。
 - `compare_rehearsal_records.py`：比對預演 actions 與系統既有紀錄。
-- `export_preview_texts.py`：把預演 JSON 輸出成人可讀文字稿。
+- `duty_sheet_automation.py`：勤務表登打輔助流程。
+- `daily_vehicle_automation.py`：車輛保養清點啟動器。
+- `rest_time_automation.py`：休息時間與勤務基準表登打輔助流程。
 - `check_environment.py`：檢查 Python、Tkinter、Selenium、Chrome / ChromeDriver。
 - `rehearsal_output_1150518.json`：目前主要測試資料。
 - `snapshots\verify_compare_1150518.txt`：2026-05-19 產生的比對驗證檔。
@@ -58,7 +63,7 @@ py check_environment.py
 ## 已驗證
 
 ```powershell
-py -m py_compile duty_gui.py duty_gui.pyw duty_rehearsal.py compare_rehearsal_records.py export_preview_texts.py check_environment.py
+py -m py_compile duty_gui.py duty_gui.pyw duty_rehearsal.py compare_rehearsal_records.py duty_sheet_automation.py daily_vehicle_automation.py rest_time_automation.py check_environment.py
 py compare_rehearsal_records.py rehearsal_output_1150518.json --out snapshots\verify_compare_1150518.txt
 ```
 

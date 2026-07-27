@@ -15,7 +15,7 @@ import tempfile
 import shutil
 from datetime import datetime, timedelta
 from urllib.parse import quote
-from selenium.common.exceptions import UnexpectedAlertPresentException
+from selenium.common.exceptions import NoAlertPresentException, NoSuchFrameException, TimeoutException, UnexpectedAlertPresentException
 import threading
 from pathlib import Path
 from openpyxl.utils import get_column_letter
@@ -51,7 +51,8 @@ def sync_status_to_gui(msg):
 # [區塊二] 設定、日期、Excel 截圖與通知工具 (Config, Excel, Notification)
 # 放置不直接操作勤務網站的共用工具；網站 Selenium 動作集中在區塊四、五。
 # ==========================================
-CONFIG_FILE = "config.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = SCRIPT_DIR / "config.json"
 DEFAULT_CAPTURE_TOP_ROW = 3
 DEFAULT_CAPTURE_BOTTOM_ROW = 36
 DAILY_SCREENSHOT_DIR = "每日勤務表"
@@ -61,8 +62,8 @@ NIGHT_SCREENSHOT_DIR = "夜間勤務"
 def get_default_config():
     return {
         "login": {
-            "user_id": "tyfd01510",
-            "user_pwd": "alan810730@Aggggg"
+            "user_id": "",
+            "user_pwd": ""
         },
         "last_selection": {
             "attack": "新坡15/KES-5922",
@@ -73,14 +74,18 @@ def get_default_config():
         "car_options": {
             "attack": ["新坡15/KES-5922", "新坡16/981-S5"],
             "stop": ["新坡11/KEC-2608"],
-            "amb": ["新坡91/BGV-2310", "新坡92/BXB-7593", "新坡93/BSL-9230"]
+            "amb": ["新坡91/BGV-2310", "新坡92/BXB-7593", "新坡93/BSL-9230", "新坡95/BPE-5951"]
+        },
+        "hidden_car_options": {
+            "attack": [],
+            "amb": []
         },
         "notification": {
-            "enabled": True,
+            "enabled": False,
             "provider": "line",
-            "line_channel_access_token": "5nA7PYBlQ+qzF+gPXXRqhn7bRaSuaqOFBakk2/ODCgw3p7K6JIf2jHSfuYqFvhC8LAXWQQeHM1SM4O774xdTPi0ibcT6gSYDbmyzmppHAvt0TP4fdmJTq/ZS1fO3iIcYQ1O0TunlRV+8l7Xrz4DSBwdB04t89/1O/w1cDnyilFU=",
-            "line_to_id": "Uf2573574f8594fea56067df935a2542d",
-            "line_group_id": "Uf2573574f8594fea56067df935a2542d",
+            "line_channel_access_token": "",
+            "line_to_id": "",
+            "line_group_id": "",
             "gcs_bucket_name": "sinpo-duty-schedule-images",
             "gcs_service_account_json": "effortless-leaf-353501-63492cc3ece4.json"
         }
@@ -94,6 +99,32 @@ def merge_config(defaults, loaded):
             loaded[key] = merge_config(value, loaded[key])
     return loaded
 
+def normalize_car_options(config):
+    default_config = get_default_config()
+    car_options = config.setdefault("car_options", {})
+    hidden_options = config.setdefault("hidden_car_options", {})
+    if not isinstance(hidden_options, dict):
+        hidden_options = {}
+        config["hidden_car_options"] = hidden_options
+
+    for group, default_values in default_config.get("car_options", {}).items():
+        values = car_options.get(group, [])
+        if not isinstance(values, list):
+            values = []
+        hidden_values = hidden_options.get(group, [])
+        if not isinstance(hidden_values, list):
+            hidden_values = []
+
+        hidden_set = set(hidden_values)
+        merged_values = []
+        for item in values + default_values:
+            if item and item not in hidden_set and item not in merged_values:
+                merged_values.append(item)
+        car_options[group] = merged_values
+        hidden_options[group] = [item for item in hidden_values if item]
+
+    return config
+
 def resolve_config_path(path_value):
     if not path_value:
         return ""
@@ -101,7 +132,7 @@ def resolve_config_path(path_value):
     path_obj = Path(path_text)
     if path_obj.is_absolute():
         return str(path_obj)
-    return str((Path.cwd() / path_obj).resolve())
+    return str((CONFIG_FILE.parent / path_obj).resolve())
 
 def screenshot_archive_root():
     script_dir = Path(__file__).resolve().parent
@@ -125,16 +156,20 @@ def load_config():
     default_config = get_default_config()
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return merge_config(default_config, json.load(f))
-    return default_config
+            return normalize_car_options(merge_config(default_config, json.load(f)))
+    return normalize_car_options(default_config)
 
-def save_config(selection, login_settings=None, notification_settings=None):
+def save_config(selection, login_settings=None, notification_settings=None, car_options=None, hidden_car_options=None):
     """儲存本次選擇、登入資訊與通知設定到設定檔"""
     config = load_config()
     if login_settings is None:
         login_settings = config.get("login", get_default_config()["login"])
     config["login"] = login_settings
     config["last_selection"] = selection
+    if car_options is not None:
+        config["car_options"] = car_options
+    if hidden_car_options is not None:
+        config["hidden_car_options"] = hidden_car_options
     if notification_settings is None:
         notification_settings = config.get("notification", get_default_config()["notification"])
     config["notification"] = notification_settings
@@ -151,7 +186,7 @@ def clean_v(v):
     """徹底清理番號：移除中文(全員)、0、標點符號，只留數字與逗號"""
     if v is None: return ""
     v_str = str(v).strip().replace(".0", "")
-    v_str = re.sub(r'[，、。\.\n\r\s]+', ',', v_str)
+    v_str = re.sub(r'[，、。．·‧\.\n\r\s]+', ',', v_str)
     v_str = re.sub(r'[^0-9,]', '', v_str) 
     v_str = re.sub(r',+', ',', v_str).strip(',')
     return v_str if v_str not in ["0", "0.0", "nan", ""] else ""
@@ -160,6 +195,172 @@ def clean_to_list(v):
     """將清理後的番號字串轉為 List"""
     res = clean_v(v)
     return [x for x in res.split(',') if x] if res else []
+
+def clean_to_list_excluding(v, excluded_numbers):
+    """將番號字串轉為 List，並排除輪休基準表標示不需登打的人員。"""
+    excluded = {str(no).strip() for no in excluded_numbers if str(no).strip()}
+    return [x for x in clean_to_list(v) if x not in excluded]
+
+def clean_v_excluding(v, excluded_numbers):
+    """回傳已排除指定番號的逗號字串。"""
+    return ",".join(clean_to_list_excluding(v, excluded_numbers))
+
+def normalize_header_text(value):
+    return re.sub(r"\s+", "", str(value or "").strip())
+
+def roster_header_columns(sheet):
+    """以標題文字定位輪休基準表的人員清單欄位，避免欄位位移。"""
+    labels = {"no": "番號", "name": "姓名", "class": "班表欄位"}
+    for row in range(1, sheet.max_row + 1):
+        columns = {}
+        for col in range(1, sheet.max_column + 1):
+            text = normalize_header_text(sheet.cell(row=row, column=col).value)
+            for key, label in labels.items():
+                if text == label:
+                    columns[key] = col
+        if all(key in columns for key in labels):
+            columns["row"] = row
+            return columns
+    return {}
+
+def trainee_numbers_from_workbook(workbook):
+    """從輪休基準表的班表欄位讀取實習生番號。"""
+    roster_sheet = next((sheet for sheet in workbook.worksheets if "輪休" in str(sheet.title)), None)
+    if roster_sheet is None:
+        return set()
+    headers = roster_header_columns(roster_sheet)
+    if not headers:
+        return set()
+    trainee_numbers = set()
+    for row in range(headers["row"] + 1, roster_sheet.max_row + 1):
+        class_text = str(roster_sheet.cell(row=row, column=headers["class"]).value or "")
+        if "實習" not in class_text:
+            continue
+        trainee_numbers.update(clean_to_list(roster_sheet.cell(row=row, column=headers["no"]).value))
+    return trainee_numbers
+
+def find_header_column(sheet, row, label):
+    """在指定列用標題文字找欄位。"""
+    target = normalize_header_text(label)
+    for col in range(1, sheet.max_column + 1):
+        if normalize_header_text(sheet.cell(row=row, column=col).value) == target:
+            return col
+    return 0
+
+def duty_status_labels_from_workbook(workbook):
+    """讀取班別參數的假別對照，空白假別通常代表上班。"""
+    params_sheet = next((sheet for sheet in workbook.worksheets if "班別參數" in str(sheet.title)), None)
+    labels = {"": "上班"}
+    if params_sheet is None:
+        return labels
+    for row in range(1, params_sheet.max_row + 1):
+        code = normalize_header_text(params_sheet.cell(row=row, column=1).value)
+        label = normalize_header_text(params_sheet.cell(row=row, column=2).value)
+        if label:
+            labels[code] = label
+    return labels
+
+def expected_on_duty_numbers_from_roster(workbook, day_int, excluded_numbers):
+    """依輪休基準表計算當日應排人員，取代 Excel FILTER/XLOOKUP 結果。"""
+    roster_sheet = next((sheet for sheet in workbook.worksheets if "輪休" in str(sheet.title)), None)
+    if roster_sheet is None:
+        return []
+
+    date_row, date_col = 0, 0
+    for row in range(1, roster_sheet.max_row + 1):
+        for col in range(1, roster_sheet.max_column + 1):
+            if normalize_header_text(roster_sheet.cell(row=row, column=col).value) == "日期":
+                date_row, date_col = row, col
+                break
+        if date_col:
+            break
+    if not date_col or date_row <= 1:
+        return []
+
+    target_row = 0
+    for row in range(date_row + 1, roster_sheet.max_row + 1):
+        day_values = clean_to_list(roster_sheet.cell(row=row, column=date_col).value)
+        if str(day_int) in day_values:
+            target_row = row
+            break
+    if not target_row:
+        return []
+
+    status_labels = duty_status_labels_from_workbook(workbook)
+    excluded = {str(no).strip() for no in excluded_numbers if str(no).strip()}
+    expected = []
+    for col in range(date_col + 2, roster_sheet.max_column + 1):
+        header = normalize_header_text(roster_sheet.cell(row=date_row, column=col).value)
+        if header == "最低人數":
+            break
+        numbers = clean_to_list(roster_sheet.cell(row=date_row - 1, column=col).value)
+        if not header or not numbers:
+            continue
+        duty_code = normalize_header_text(roster_sheet.cell(row=target_row, column=col).value)
+        status = status_labels.get(duty_code, "" if duty_code else status_labels.get("", "上班"))
+        if status == "上班" and numbers[0] not in excluded:
+            expected.append(numbers[0])
+    return expected
+
+def expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers):
+    """保留巨集原本讀第 22 列「備勤」右側應排名單的備援路徑。"""
+    standby_col = find_header_column(sheet, 22, "備勤")
+    if not standby_col:
+        return []
+    return clean_to_list_excluding(get_merged_val(sheet, 22, standby_col + 1), excluded_numbers)
+
+def expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers):
+    expected = expected_on_duty_numbers_from_roster(workbook, day_int, excluded_numbers)
+    if expected:
+        return expected
+    return expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
+
+def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers):
+    """檢查每日勤務表是否有同時段重複排班或漏排。"""
+    issues = []
+    start_col = find_header_column(sheet, 5, "值班")
+    end_col = find_header_column(sheet, 6, "指揮官")
+    if not start_col or not end_col:
+        return [f"{sheet.title}：找不到「值班」或「指揮官」欄位，無法執行勤務表檢查。"]
+
+    expected = expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers)
+    if not expected:
+        return [f"{sheet.title}：找不到當日應排名單，無法執行漏排檢查。"]
+
+    formula_error_values = {"#NAME?", "#VALUE!", "#REF!", "#DIV/0!", "#N/A"}
+    for row in range(10, 34):
+        row_title = str(sheet.cell(row=row, column=2).value or "").strip() or f"第 {row} 列"
+        seen = {}
+        duplicates = []
+        formula_errors = []
+        for col in range(start_col, end_col + 1):
+            value = get_merged_val(sheet, row, col)
+            text_value = str(value or "").strip()
+            if text_value.upper() in formula_error_values:
+                formula_errors.append(sheet.cell(row=row, column=col).coordinate)
+            for person in clean_to_list_excluding(value, excluded_numbers):
+                seen[person] = seen.get(person, 0) + 1
+                if seen[person] == 2:
+                    duplicates.append(person)
+
+        missing = [person for person in expected if person not in seen]
+        row_errors = []
+        if formula_errors:
+            row_errors.append(f"【公式錯誤】{','.join(formula_errors)}")
+        if duplicates:
+            row_errors.append(f"【重複】{','.join(duplicates)}")
+        if missing:
+            row_errors.append(f"【漏排】{','.join(missing)}")
+        if row_errors:
+            issues.append(f"{row_title}：" + " ".join(row_errors))
+    return issues
+
+def format_daily_sheet_preflight_message(issues):
+    shown = issues[:20]
+    message = "勤務表檢查未通過，已停止登打。\n\n" + "\n".join(shown)
+    if len(issues) > len(shown):
+        message += f"\n...另有 {len(issues) - len(shown)} 項未列出"
+    return message
 
 def get_merged_val(sheet, row, col):
     """處理 Excel 合併儲存格讀取"""
@@ -223,16 +424,19 @@ def resolve_night_capture_range(sheet):
 def fit_summary_cells_for_screenshot(worksheet, sheet_values, min_col, min_row, max_col, max_row):
     """截圖前微調右下角假別統計，避免窄欄把 10 顯示成 1。"""
     summary_labels = {"輪休", "月補", "補休", "請休", "公假", "婚假", "喪假", "身心假", "陪產假"}
-    for row in range(min_row, max_row + 1):
-        for col in range(min_col, max_col + 1):
+    summary_start_row = max(min_row, max_row - 7)
+    summary_start_col = max(min_col, max_col - 12)
+    for row in range(summary_start_row, max_row + 1):
+        for col in range(summary_start_col, max_col + 1):
             value = worksheet.Cells(row, col).Value
             if value is None or str(value).strip() not in summary_labels:
                 continue
             end_col = min(max_col, col + 6)
+            if end_col <= col:
+                continue
             summary_range = worksheet.Range(worksheet.Cells(row, col + 1), worksheet.Cells(row, end_col))
-            summary_range.ShrinkToFit = True
+            summary_range.ShrinkToFit = False
             summary_range.WrapText = False
-            summary_range.Font.Size = 10
             for value_col in range(col + 1, end_col + 1):
                 original_value = sheet_values.cell(row=row, column=value_col).value
                 if original_value is None or str(original_value).strip() == "":
@@ -536,52 +740,94 @@ def preview_excel_capture(excel_path, target_date):
 # 專注於救災任務編組的分配邏輯
 # ==========================================
 
+def unique_member_ids(member_ids):
+    """依勤務表原順序保留有效且不重複的番號。"""
+    return list(dict.fromkeys(str(member).strip() for member in member_ids if str(member).strip()))
+
+
+def select_ambulance2_members(standby_ids, out_ids, ambulance1_ids):
+    """救護車 2 優先取備勤，不足時取同時段外勤，且不得與救護車 1 重複。"""
+    ambulance1 = set(unique_member_ids(ambulance1_ids))
+    standby = unique_member_ids(standby_ids)
+    out_duty = unique_member_ids(out_ids)
+    candidates = standby + out_duty
+    selected = []
+    for member in candidates:
+        if member not in ambulance1 and member not in selected:
+            selected.append(member)
+        if len(selected) == 2:
+            break
+    return selected
+
+
+def fire_candidate_pool(med_ids, disaster_ids, out_ids):
+    """依備勤人數建立攻擊車與中繼車的五人起始候選池。"""
+    standby = unique_member_ids(disaster_ids)
+    ambulance1 = unique_member_ids(med_ids)[:2]
+    out_duty = unique_member_ids(out_ids)
+    standby_count = len(standby)
+
+    if standby_count >= 5:
+        return standby[:10]
+    if standby_count == 4:
+        return unique_member_ids(standby + ambulance1[:1])
+    if standby_count == 3:
+        return unique_member_ids(standby + ambulance1)
+    if standby_count == 2:
+        return unique_member_ids(standby + ambulance1 + out_duty[:1])
+    if standby_count == 1:
+        return unique_member_ids(standby + out_duty[:4])
+    return out_duty[:5]
+
+
+def first_available_member(preferred_ids, candidate_ids, excluded_ids):
+    """優先取指定人員；衝突時依候選順序遞補。"""
+    excluded = set(excluded_ids)
+    for member in unique_member_ids(preferred_ids) + unique_member_ids(candidate_ids):
+        if member not in excluded:
+            return member
+    return ""
+
+
 def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
-    """
-    救災任務編組 v7.0:
-    1. 司機第 1 位、幹部固定第 2 位。
-    2. 備勤不足 5 人才抓補位。
-    3. 確保每台車(攻擊、中繼)至少 2 人。
-    """
-    pool = list(disaster_ids)
-    if len(disaster_ids) < 5:
-        for p in med_ids:
-            if p not in pool: pool.append(p)
-            if len(pool) >= 5: break
-    if len(pool) < 5:
-        for p in out_ids:
-            if p not in pool: pool.append(p)
-            if len(pool) >= 5: break
-            
-    if str(daily_commander) in (med_ids + out_ids) and str(daily_commander) not in pool:
-        pool.append(str(daily_commander))
-    if len(pool) < 2: return None
+    """依勤務表規則編組互斥的攻擊車與中繼車，每車最多五人。"""
+    standby = unique_member_ids(disaster_ids)
+    out_duty = unique_member_ids(out_ids)
+    pool = fire_candidate_pool(med_ids, standby, out_duty)
+    commander = str(daily_commander).strip()
 
-    r_driver = disaster_ids[0] if disaster_ids else (pool[0] if pool else "")
-    a_driver = disaster_ids[1] if len(disaster_ids) > 1 else (pool[1] if len(pool) > 1 else (pool[0] if pool else ""))
+    if commander and commander not in pool:
+        if len(pool) >= 10:
+            pool[-1] = commander
+        else:
+            pool.append(commander)
+        pool = unique_member_ids(pool)
+    if len(pool) < 2:
+        return None
 
-    all_officers = sorted([p for p in pool if 1 <= int(p) <= 5], key=lambda x: int(x))
-    leader = str(daily_commander) if str(daily_commander) in pool else (all_officers[0] if all_officers else None)
-    sub_leader = next((p for p in all_officers if p != leader), None)
+    attack_preferred = standby[1:2] if len(standby) >= 2 else out_duty
+    attack_driver = first_available_member(attack_preferred, pool, {commander})
+    attack_team = [attack_driver] if attack_driver else []
+    if commander and commander not in attack_team:
+        attack_team.append(commander)
+    if len(attack_team) < 2:
+        officer_ids = [member for member in pool if member in {"1", "2", "3", "4", "5"}]
+        attack_team.append(first_available_member(officer_ids, pool, set(attack_team)))
 
-    relay_team, attack_team = [r_driver], [a_driver]
-    if sub_leader and sub_leader != r_driver: relay_team.insert(1, sub_leader)
-    if leader and leader != a_driver: attack_team.insert(1, leader)
-    
-    occupied = set(relay_team + attack_team)
-    others = [p for p in pool if p not in occupied]
+    relay_preferred = standby[:1] if standby else out_duty
+    relay_driver = first_available_member(relay_preferred, pool, set(attack_team))
+    relay_team = [relay_driver] if relay_driver else []
 
-    # 防呆：確保攻擊車與中繼車至少 2 人
-    if len(attack_team) < 2 and others:
-        attack_team.append(others.pop(0))
-    if len(relay_team) < 2 and others:
-        relay_team.append(others.pop(0))
-        
-    while len(relay_team) < 5 and others: 
-        relay_team.append(others.pop(0))
-        
-    attack_team.extend(others)
-    
+    occupied = set(attack_team + relay_team)
+    for member in pool:
+        if member in occupied:
+            continue
+        if len(relay_team) < 5:
+            relay_team.append(member)
+        elif len(attack_team) < 5:
+            attack_team.append(member)
+        occupied.add(member)
+
     return {"relay": ",".join(relay_team), "attack": ",".join(attack_team)}
 
 
@@ -592,23 +838,32 @@ def calculate_fire_mission(med_ids, disaster_ids, out_ids, daily_commander):
 
 def super_js_execute(driver, element_id, action="click", value=""):
     """地毯式搜尋全網頁 ID 並執行動作 (支援存在檢查)"""
-    js_code = f"""
-    function deepScan(win) {{
-        var el = win.document.getElementById('{element_id}');
-        if (el) {{
-            if ('{action}' == 'click') {{ el.click(); if (el.onclick) el.onclick(); return true; }}
-            else if ('{action}' == 'set') {{ el.value = '{value}'; el.dispatchEvent(new Event('change')); return true; }}
-            else if ('{action}' == 'exists') {{ return (el.offsetWidth > 0 || el.offsetHeight > 0); }}
+    js_code = """
+    const targetId = arguments[0];
+    const action = arguments[1];
+    const value = arguments[2];
+    function deepScan(win) {
+        var el = win.document.getElementById(targetId);
+        if (el) {
+            if (action == 'click') { el.click(); if (el.onclick) el.onclick(); return true; }
+            else if (action == 'set') {
+                el.value = value;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                return true;
+            }
+            else if (action == 'exists') { return (el.offsetWidth > 0 || el.offsetHeight > 0); }
             return true;
-        }}
-        for (var i = 0; i < win.frames.length; i++) {{
-            try {{ if (deepScan(win.frames[i])) return true; }} catch(e) {{}}
-        }}
+        }
+        for (var i = 0; i < win.frames.length; i++) {
+            try { if (deepScan(win.frames[i])) return true; } catch(e) {}
+        }
         return false;
-    }}
+    }
     return deepScan(window.top);
     """
-    return driver.execute_script(js_code)
+    return driver.execute_script(js_code, element_id, action, value)
 
 
 # ==========================================
@@ -677,7 +932,8 @@ def step_prepare_content(driver, wait):
         try:
             wait.until(EC.frame_to_be_available_and_switch_to_it("contentFrame"))
             return True
-        except: time.sleep(2)
+        except TimeoutException:
+            time.sleep(2)
     return False
 
 def step_config_popups(driver, wait, out_duty_names, daily_commander):
@@ -689,8 +945,10 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
     # 🌟 恢復使用最強 JS 點擊，避免 Selenium 找不到框架崩潰
     super_js_execute(driver, "_btnOpenWinTaskCode", "click")
     
-    try: wait.until(lambda d: len(d.window_handles) > 1)
-    except: pass
+    try:
+        wait.until(lambda d: len(d.window_handles) > 1)
+    except TimeoutException:
+        log_status("   ⚠️ 外勤設定視窗未在時間內開啟")
     
     for h in driver.window_handles:
         if h != main_window:
@@ -712,11 +970,14 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                 try:
                     WebDriverWait(driver, 3).until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
-                except: pass
+                except TimeoutException:
+                    pass
                 
                 # 確保存檔後視窗真的關閉
-                try: wait.until(lambda d: len(d.window_handles) == 1)
-                except: pass
+                try:
+                    wait.until(lambda d: len(d.window_handles) == 1)
+                except TimeoutException:
+                    log_status("   ⚠️ 外勤設定視窗未自動關閉")
             except Exception as e:
                 log_status(f"   ❌ 外勤設定發生錯誤: {e}")
             break
@@ -737,8 +998,10 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
     # 🌟 恢復使用最強 JS 點擊
     super_js_execute(driver, "_btnOpenWinUserNo", "click")
     
-    try: wait.until(lambda d: len(d.window_handles) > 1)
-    except: pass
+    try:
+        wait.until(lambda d: len(d.window_handles) > 1)
+    except TimeoutException:
+        log_status("   ⚠️ 勤務番號設定視窗未在時間內開啟")
     
     for h in driver.window_handles:
         if h != main_window:
@@ -776,10 +1039,13 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                 try:
                     WebDriverWait(driver, 3).until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
-                except: pass
+                except TimeoutException:
+                    pass
                 
-                try: wait.until(lambda d: len(d.window_handles) == 1)
-                except: pass
+                try:
+                    wait.until(lambda d: len(d.window_handles) == 1)
+                except TimeoutException:
+                    log_status("   ⚠️ 勤務番號設定視窗未自動關閉")
             except Exception as e: 
                 log_status(f"   ❌ 指揮官小視窗操作失敗: {e}")
             break
@@ -840,64 +1106,64 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
 def step_batch_fill_duty(driver, duty_map):
     """批次填寫勤務基準表"""
     if not duty_map: return
-    js_data = str(duty_map).replace("'", '"')
-    js_fill = f"""
-    function deepBatchFill(win, data) {{
+    js_fill = """
+    const data = arguments[0] || {};
+    function deepBatchFill(win, data) {
         var oldAlert = win.alert; var oldConfirm = win.confirm;
-        win.alert = function(msg) {{ console.log("攔截: " + msg); }};
-        win.confirm = function(msg) {{ return true; }};
+        win.alert = function(msg) { console.log("攔截: " + msg); };
+        win.confirm = function(msg) { return true; };
         var count = 0;
-        for (var id in data) {{
+        for (var id in data) {
             var el = win.document.getElementById(id);
-            if (el && data[id] !== "") {{
+            if (el && data[id] !== "") {
                 el.focus(); el.value = data[id];
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                el.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                try {{ if(typeof el.onchange === 'function') el.onchange({{target: el, type: 'change'}}); }} catch(e){{}}
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                try { if(typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch(e){}
                 count++;
-            }}
-        }}
-        for(var i=0; i<win.frames.length; i++) {{
-            try {{ count += deepBatchFill(win.frames[i], data); }} catch(e){{}}
-        }}
+            }
+        }
+        for(var i=0; i<win.frames.length; i++) {
+            try { count += deepBatchFill(win.frames[i], data); } catch(e){}
+        }
         win.alert = oldAlert; win.confirm = oldConfirm;
         return count;
-    }}
-    return deepBatchFill(window.top, {js_data});
+    }
+    return deepBatchFill(window.top, data);
     """
     try:
-        count = driver.execute_script(js_fill)
+        count = driver.execute_script(js_fill, duty_map)
     except Exception as e: log_status(f"   ❌ 批次填寫異常: {e}")
 
 def step_fill_mission_cells(driver, mission_map):
     """批次填寫救災任務編組表"""
-    js_data = str(mission_map).replace("'", '"')
-    js_fill_and_save = f"""
-    function deepProcess(win, data) {{
+    js_fill_and_save = """
+    const data = arguments[0] || {};
+    function deepProcess(win, data) {
         var foundAny = false;
-        for (var id in data) {{
+        for (var id in data) {
             var el = win.document.getElementById(id);
-            if (el) {{
+            if (el) {
                 el.value = data[id];
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                el.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
                 if(typeof el.onchange === 'function') el.onchange();
                 foundAny = true;
-            }}
-        }}
+            }
+        }
         var btn = win.document.getElementById('_btnSave');
-        if (btn) {{ btn.click(); return "SUCCESS_WITH_SAVE"; }}
-        for(var i=0; i<win.frames.length; i++) {{
-            try {{ var res = deepProcess(win.frames[i], data); if (res) return res; }} catch(e){{}}
-        }}
+        if (btn) { btn.click(); return "SUCCESS_WITH_SAVE"; }
+        for(var i=0; i<win.frames.length; i++) {
+            try { var res = deepProcess(win.frames[i], data); if (res) return res; } catch(e){}
+        }
         return foundAny ? "SUCCESS_NO_SAVE" : null;
-    }}
-    return deepProcess(window.top, {js_data});
+    }
+    return deepProcess(window.top, data);
     """
     try:
-        result = driver.execute_script(js_fill_and_save)
+        result = driver.execute_script(js_fill_and_save, mission_map)
     except Exception as e: log_status(f"   ❌ 任務填寫報錯: {e}")
 
 
@@ -914,6 +1180,10 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     day_int = int(target_date[-2:])
     log_status(f"📂 讀取 Excel {day_int}號 分頁...")
     wb = openpyxl.load_workbook(excel_path, data_only=True, keep_vba=True)
+    excluded_numbers = trainee_numbers_from_workbook(wb)
+    if excluded_numbers:
+        ordered_excluded = sorted(excluded_numbers, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+        log_status(f"ℹ️ 已略過實習生番號：{', '.join(ordered_excluded)}")
     sheet = wb[f"{day_int}號"]
     
     ex_map = {"時間": 2, "值班": 3}
@@ -928,7 +1198,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     cmd_all = []
     for r in range(10, 34):
         val = get_merged_val(sheet, r, ex_map["指揮官"])
-        cmd_all.extend([int(x) for x in clean_to_list(val) if 1 <= int(x) <= 5])
+        cmd_all.extend([int(x) for x in clean_to_list_excluding(val, excluded_numbers) if 1 <= int(x) <= 5])
     daily_commander = min(cmd_all) if cmd_all else ""
 
     out_names, out_excel_cols = [], []
@@ -945,9 +1215,25 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     }
 
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
+    preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
+    if preflight_issues:
+        preflight_message = format_daily_sheet_preflight_message(preflight_issues)
+        log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
+        root.after(0, lambda msg=preflight_message: messagebox.showerror("勤務表檢查未通過", msg))
+        wb.close()
+        return False
+    log_status("✅ 勤務表檢查通過，未發現重複或漏排")
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     driver = webdriver.Chrome()
+    try:
+        driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
     wait = WebDriverWait(driver, 20)
 
     try:
@@ -989,19 +1275,19 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 if "-" not in time_cell: continue
                 hour = str(int(time_cell.split("-")[0].strip()))
                 
-                duty_map[f"_pln_{hour}_{web_idx['值班']}"] = clean_v(get_merged_val(sheet, r, ex_map["值班"]))
+                duty_map[f"_pln_{hour}_{web_idx['值班']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["值班"]), excluded_numbers)
                 for i, col_idx in enumerate(out_excel_cols):
-                    duty_map[f"_pln_{hour}_{web_idx['外勤開始'] + i}"] = clean_v(get_merged_val(sheet, r, col_idx))
+                    duty_map[f"_pln_{hour}_{web_idx['外勤開始'] + i}"] = clean_v_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers)
                 
-                med_v = clean_v(get_merged_val(sheet, r, ex_map["救護_Excel"])) + "," + clean_v(get_merged_val(sheet, r, ex_map["救護_Excel"]+1))
+                med_v = clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]), excluded_numbers) + "," + clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]+1), excluded_numbers)
                 duty_map[f"_pln_{hour}_{web_idx['救護']}"] = med_v.strip(',')
                 
                 dis_v = ""
                 for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
-                    val = clean_v(get_merged_val(sheet, r, c))
+                    val = clean_v_excluding(get_merged_val(sheet, r, c), excluded_numbers)
                     if val: dis_v += str(val) + ","
                 duty_map[f"_pln_{hour}_{web_idx['備勤']}"] = dis_v.strip(',')
-                duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v(get_merged_val(sheet, r, ex_map["休息_Excel"]))
+                duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["休息_Excel"]), excluded_numbers)
 
             team_tra_val = str(sheet["C35"].value or "").strip()
             remark_val = str(sheet["C34"].value or "").strip()
@@ -1029,7 +1315,8 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                     wait_alert.until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
                     time.sleep(1)
-                except: break
+                except (NoAlertPresentException, TimeoutException):
+                    break
             time.sleep(2)
             
             # --- 進入救災任務編組表 ---
@@ -1069,20 +1356,24 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 
                 amb1_members = []
                 for c in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
-                    amb1_members.extend(clean_to_list(get_merged_val(sheet, r, c)))
-                amb1_members = [m for m in amb1_members if m] 
+                    amb1_members.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
+                amb1_members = unique_member_ids(amb1_members)[:2]
                 
                 disaster_ids = []
-                for c in range(ex_map["備勤_Excel"], ex_map["指揮官"] + 1):
-                    disaster_ids.extend(clean_to_list(get_merged_val(sheet, r, c)))
-                disaster_ids = [m for m in disaster_ids if m]
-
-                amb2_members = disaster_ids[:2]  
+                for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
+                    disaster_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
+                disaster_ids = unique_member_ids(disaster_ids)
+                commander_ids = clean_to_list_excluding(
+                    get_merged_val(sheet, r, ex_map["指揮官"]), excluded_numbers
+                )
+                row_commander = commander_ids[0] if commander_ids else ""
                 out_ids = []
                 for col_idx in out_excel_cols:
-                    out_ids.extend(clean_to_list(get_merged_val(sheet, r, col_idx)))
+                    out_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers))
+                out_ids = unique_member_ids(out_ids)
+                amb2_members = select_ambulance2_members(disaster_ids, out_ids, amb1_members)
 
-                mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, daily_commander)
+                mission = calculate_fire_mission(amb1_members, disaster_ids, out_ids, row_commander)
                 if mission:
                     mission_map[f"_pln_{hour}_1"] = mission['attack']
                     mission_map[f"_pln_{hour}_2"] = mission['relay']
@@ -1094,13 +1385,17 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 time.sleep(5) 
                 driver.switch_to.default_content()
                 for frame_name in ['main', 'Content', 'contents', 'ehrFrame', 'contentFrame']:
-                    try: driver.switch_to.frame(frame_name)
-                    except: continue
+                    try:
+                        driver.switch_to.frame(frame_name)
+                    except NoSuchFrameException:
+                        continue
 
                 step_fill_mission_cells(driver, mission_map)
                 time.sleep(1)
-                try: driver.switch_to.alert.accept()
-                except: pass
+                try:
+                    driver.switch_to.alert.accept()
+                except NoAlertPresentException:
+                    pass
             
             notification_status = ""
             notification_config = load_config().get("notification", {})
@@ -1140,6 +1435,8 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
 
     except Exception as e:
         log_status(f"❌ 流程中斷：{e}")
+    finally:
+        wb.close()
 
 
 # ==========================================
@@ -1168,7 +1465,13 @@ def on_submit():
         'amb2': amb2_car_var.get()
     }
     # 按下啟動時，自動記憶這次選了什麼
-    save_config(cars_config, login_settings=login_config, notification_settings=notification_config)
+    save_config(
+        cars_config,
+        login_settings=login_config,
+        notification_settings=notification_config,
+        car_options=opts,
+        hidden_car_options=hidden_opts
+    )
     
     if not f_path: 
         messagebox.showwarning("提示", "請選擇 Excel 檔案！")
@@ -1195,6 +1498,7 @@ if __name__ == "__main__":
     login = current_config["login"]
     last = current_config["last_selection"]
     opts = current_config["car_options"]
+    hidden_opts = current_config["hidden_car_options"]
 
     root = tk.Tk()
     root.title("🚒 新坡全自動勤務分配表及救災任務編組表V2.0")
@@ -1296,6 +1600,167 @@ if __name__ == "__main__":
     amb2_car_var = tk.StringVar(value=last['amb2'])
     amb2_combo = ttk.Combobox(frame_car, textvariable=amb2_car_var, values=opts['amb'], width=combo_width)
     amb2_combo.grid(row=3, column=1, sticky="w", padx=5, pady=6)
+
+    def persist_car_options():
+        login_config = {
+            "user_id": entry_user.get().strip(),
+            "user_pwd": entry_pwd.get()
+        }
+        notification_config = load_config().get("notification", get_default_config()["notification"]).copy()
+        notification_config["enabled"] = bool(send_group_var.get())
+        cars_config = {
+            'attack': attack_car_var.get(),
+            'stop': stop_car_var.get(),
+            'amb1': amb1_car_var.get(),
+            'amb2': amb2_car_var.get()
+        }
+        save_config(
+            cars_config,
+            login_settings=login_config,
+            notification_settings=notification_config,
+            car_options=opts,
+            hidden_car_options=hidden_opts
+        )
+
+    vehicle_groups = {
+        "消防車": "attack",
+        "救護車": "amb"
+    }
+
+    def refresh_vehicle_options():
+        attack_combo["values"] = opts.get("attack", [])
+        amb_values = opts.get("amb", [])
+        amb1_combo["values"] = amb_values
+        amb2_combo["values"] = amb_values
+
+    def open_add_vehicle_dialog():
+        result = {}
+        dialog = tk.Toplevel(root)
+        dialog.title("新增車輛")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        vehicle_type_var = tk.StringVar(value="救護車")
+        code_var = tk.StringVar()
+        plate_var = tk.StringVar()
+
+        ttk.Label(dialog, text="車輛類型").grid(row=0, column=0, sticky="e", padx=10, pady=(12, 6))
+        type_combo = ttk.Combobox(dialog, textvariable=vehicle_type_var, values=list(vehicle_groups.keys()), state="readonly", width=18)
+        type_combo.grid(row=0, column=1, sticky="w", padx=10, pady=(12, 6))
+
+        ttk.Label(dialog, text="車輛代號").grid(row=1, column=0, sticky="e", padx=10, pady=6)
+        code_entry = ttk.Entry(dialog, textvariable=code_var, width=22)
+        code_entry.grid(row=1, column=1, sticky="w", padx=10, pady=6)
+
+        ttk.Label(dialog, text="車牌號碼").grid(row=2, column=0, sticky="e", padx=10, pady=6)
+        plate_entry = ttk.Entry(dialog, textvariable=plate_var, width=22)
+        plate_entry.grid(row=2, column=1, sticky="w", padx=10, pady=6)
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=3, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 12))
+
+        def confirm():
+            vehicle_type = vehicle_type_var.get().strip()
+            code = code_var.get().strip()
+            plate = plate_var.get().strip()
+            if not code or not plate:
+                messagebox.showwarning("資料不足", "請輸入車輛代號與車牌號碼。", parent=dialog)
+                return
+            result["type"] = vehicle_type
+            result["value"] = f"{code}/{plate}"
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="確定", command=confirm).pack(side="left", padx=(0, 6))
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="left")
+        code_entry.focus_set()
+        root.wait_window(dialog)
+        return result
+
+    def add_vehicle_option():
+        result = open_add_vehicle_dialog()
+        if not result:
+            return
+        group = vehicle_groups[result["type"]]
+        value = result["value"]
+        options = opts.setdefault(group, [])
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value in hidden_values:
+            hidden_values.remove(value)
+        if value not in options:
+            options.append(value)
+        refresh_vehicle_options()
+        persist_car_options()
+        messagebox.showinfo("已新增", f"已加入{result['type']}選項：{value}", parent=root)
+
+    def open_remove_vehicle_dialog():
+        choices = []
+        choice_map = {}
+        for vehicle_type, group in vehicle_groups.items():
+            for value in opts.get(group, []):
+                label = f"{vehicle_type} {value}"
+                choices.append(label)
+                choice_map[label] = (vehicle_type, group, value)
+        if not choices:
+            messagebox.showwarning("沒有車輛", "目前沒有可移除的車輛。", parent=root)
+            return None
+
+        result = {}
+        dialog = tk.Toplevel(root)
+        dialog.title("移除車輛")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        selected_var = tk.StringVar(value=choices[0])
+        ttk.Label(dialog, text="車輛代號/車牌號碼").grid(row=0, column=0, sticky="e", padx=10, pady=(12, 6))
+        select_combo = ttk.Combobox(dialog, textvariable=selected_var, values=choices, state="readonly", width=34)
+        select_combo.grid(row=0, column=1, sticky="w", padx=10, pady=(12, 6))
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=1, column=0, columnspan=2, sticky="e", padx=10, pady=(8, 12))
+
+        def confirm():
+            selected = selected_var.get()
+            if selected in choice_map:
+                result["vehicle"] = choice_map[selected]
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="確定", command=confirm).pack(side="left", padx=(0, 6))
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="left")
+        select_combo.focus_set()
+        root.wait_window(dialog)
+        return result.get("vehicle")
+
+    def remove_vehicle_option():
+        selected = open_remove_vehicle_dialog()
+        if not selected:
+            return
+        vehicle_type, group, value = selected
+        options = opts.setdefault(group, [])
+        if value not in options:
+            messagebox.showwarning("找不到車輛", f"車輛清單中沒有：{value}", parent=root)
+            return
+        options.remove(value)
+        hidden_values = hidden_opts.setdefault(group, [])
+        if value not in hidden_values:
+            hidden_values.append(value)
+        fallback = options[0] if options else ""
+        if group == "attack" and attack_car_var.get().strip() == value:
+            attack_car_var.set(fallback)
+        if group == "amb":
+            if amb1_car_var.get().strip() == value:
+                amb1_car_var.set(fallback)
+            if amb2_car_var.get().strip() == value:
+                amb2_car_var.set(fallback)
+        refresh_vehicle_options()
+        persist_car_options()
+        messagebox.showinfo("已移除", f"已從{vehicle_type}選項移除：{value}", parent=root)
+
+    vehicle_button_frame = ttk.Frame(frame_car)
+    vehicle_button_frame.grid(row=4, column=1, sticky="w", padx=5, pady=(0, 6))
+    ttk.Button(vehicle_button_frame, text="新增車輛", command=add_vehicle_option).pack(side="left", padx=(0, 6))
+    ttk.Button(vehicle_button_frame, text="移除車輛", command=remove_vehicle_option).pack(side="left")
 
     # ==========================================
     # 區塊 4：執行

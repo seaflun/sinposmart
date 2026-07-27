@@ -43,7 +43,6 @@ WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 WORK_LOG_DEFAULTS_PATH = Path(__file__).with_name("work_log_defaults.json")
 
-HANDOFF_HOURS = [8, 10, 12, 14, 16, 18, 20, 22]
 OFF_DUTY_SUMMARY_KEYS = {
     "公假",
     "請休",
@@ -324,6 +323,17 @@ def js_set(driver: webdriver.Chrome, element_id: str, value: str) -> bool:
             value,
         )
     )
+
+
+def suppress_window_open_for_background_query(driver: webdriver.Chrome) -> None:
+    try:
+        driver.execute_script(
+            """
+            window.open = function() { return null; };
+            """
+        )
+    except Exception:
+        pass
 
 
 def detect_login_error(driver: webdriver.Chrome) -> str:
@@ -685,140 +695,36 @@ def click_entry_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
 
 # Work log automation
 
-def fill_work_log_form_for_test(
-    driver: webdriver.Chrome,
-    action: dict[str, Any],
-    staff: dict[str, dict[str, str]],
-    target_roc_date: str,
-    save: bool = False,
-) -> dict[str, Any]:
-    """Fill the work-log form. Save only when explicitly requested."""
+def accept_pending_alerts(driver: webdriver.Chrome, max_alerts: int = 2) -> list[str]:
+    accepted: list[str] = []
+    for _ in range(max_alerts):
+        try:
+            alert = driver.switch_to.alert
+            text = alert.text.strip()
+            alert.accept()
+            accepted.append(text)
+            time.sleep(0.5)
+        except Exception:
+            break
+    return accepted
 
-    fields = action.get("fields", {})
-    time_value = fields.get("工作時間", action.get("time", "00:00"))
-    hour, minute = time_value.split(":", 1)
-    people = [
-        {
-            "id": staff.get(str(no), {}).get("user_id", ""),
-            "name": staff.get(str(no), {}).get("name", str(no)),
-        }
-        for no in fields.get("服勤人員", [])
-    ]
 
-    navigated = ensure_ap(driver, WORK_LOG_AP)
-    if navigated:
-        time.sleep(1)
-    before_controls = control_snapshot(driver)
-    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH') && document.getElementById('_areDescription'));")
-    insert_result = {"ok": True, "skipped": True, "reason": "work form already open"} if form_ready else click_insert_control(driver)
-    time.sleep(2)
+def quit_driver(driver: webdriver.Chrome | None) -> None:
+    if not driver:
+        return
+    service = getattr(driver, "service", None)
+    try:
+        driver.quit()
+    finally:
+        if service:
+            try:
+                service.stop()
+            except Exception:
+                pass
 
-    fill_result = driver.execute_script(
-        """
-        const values = arguments[0];
-        const result = {set: [], missing: []};
-        const used = new Set();
 
-        function visibleControls() {
-          return Array.from(document.querySelectorAll('input, select, textarea'));
-        }
-        function setControl(el, value) {
-          if (!el) return false;
-          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
-          if (used.has(key)) return false;
-          if (el.tagName.toLowerCase() === 'select') {
-            const options = Array.from(el.options || []);
-            const exactOption = options.find(opt =>
-              String(opt.text || '').trim() === String(value).trim() ||
-              String(opt.value || '').trim() === String(value).trim()
-            );
-            const option = exactOption || options.find(opt =>
-              String(opt.text || '').includes(String(value).trim())
-            );
-            if (!option) return false;
-            el.value = option.value;
-          } else {
-            el.value = value;
-          }
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          used.add(key);
-          result.set.push({id: el.id || '', name: el.name || '', value});
-          return true;
-        }
-        function byIds(ids, value) {
-          for (const id of ids) {
-            const el = document.getElementById(id);
-            if (setControl(el, value)) return true;
-          }
-          return false;
-        }
-        function optionMatches(opt, value, exactOnly = false) {
-          const target = String(value || '').trim();
-          const text = String(opt.text || '').trim();
-          const optValue = String(opt.value || '').trim();
-          if (text === target || optValue === target) return true;
-          if (exactOnly) return false;
-          return text.includes(target);
-        }
-        function byOptionText(value) {
-          const exactOnly = String(value || '').trim() === '其他';
-          const el = visibleControls().find(control =>
-            control.tagName.toLowerCase() === 'select' &&
-            Array.from(control.options || []).some(opt => optionMatches(opt, value, exactOnly))
-          );
-          return setControl(el, value);
-        }
-        function byNearbyText(label, value, preferTextarea = false) {
-          const normalize = text => String(text || '').replace(/\\s+/g, '');
-          const controlsOf = root => Array.from(root.querySelectorAll('input, select, textarea'));
-          const rows = Array.from(document.querySelectorAll('tr'));
-          for (const row of rows) {
-            const cells = Array.from(row.children);
-            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
-            if (labelIndex < 0) continue;
-            const targetCells = cells.slice(labelIndex + 1);
-            const controls = targetCells.flatMap(controlsOf);
-            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
-            for (const control of candidates) {
-              if (setControl(control, value)) return true;
-            }
-          }
-          const labels = Array.from(document.querySelectorAll('td, th, label, span'));
-          const node = labels.find(el => normalize(el.innerText).includes(label));
-          if (!node) return false;
-          let cursor = node.parentElement;
-          for (let depth = 0; depth < 3 && cursor; depth += 1, cursor = cursor.parentElement) {
-            const controls = controlsOf(cursor);
-            const candidates = preferTextarea ? controls.filter(el => el.tagName.toLowerCase() === 'textarea') : controls;
-            for (const control of candidates) {
-              if (setControl(control, value)) return true;
-            }
-          }
-          return false;
-        }
-
-        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
-        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
-        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
-        byIds(['_selETIMEH', '_selETimeH'], values.hour);
-        byIds(['_selETIMEM', '_selETimeM'], values.minute);
-        if (!byOptionText(values.item)) result.missing.push('item');
-        if (values.reason && !byNearbyText('事由', values.reason)) result.missing.push('reason');
-        return result;
-        """,
-        {
-            "date": target_roc_date,
-            "hour": hour,
-            "minute": minute,
-            "item": fields.get("勤務項目", ""),
-            "reason": fields.get("事由", ""),
-            "description": fields.get("工作概述", ""),
-            "status": fields.get("處理情形", ""),
-        },
-    )
-    time.sleep(1)
-    content_result = driver.execute_script(
+def set_work_log_content_fields(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
+    return driver.execute_script(
         """
         const values = arguments[0];
         const result = {set: [], missing: []};
@@ -838,6 +744,57 @@ def fill_work_log_form_for_test(
           }
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function setDirect(id, value) {
+          const el = document.getElementById(id);
+          return setControl(el, value);
+        }
+        if (!setDirect('_areDescription', values.description)) result.missing.push('description');
+        if (!setDirect('_areStatus', values.status)) result.missing.push('status');
+        return result;
+        """,
+        {
+            "description": fields.get("工作概述", ""),
+            "status": fields.get("處理情形", ""),
+        },
+    )
+
+
+def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
+    reason = fields.get("事由", "")
+    if not reason:
+        return {"set": [], "missing": [], "skipped": True}
+    return driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: [], confirms: []};
+        function setControl(el, value) {
+          if (!el) return false;
+          if (el.tagName.toLowerCase() === 'select') {
+            const target = String(value || '').trim();
+            const options = Array.from(el.options || []);
+            const option = options.find(opt =>
+              String(opt.text || '').trim() === target ||
+              String(opt.value || '').trim() === target
+            ) || options.find(opt => String(opt.text || '').includes(target));
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          const originalConfirm = window.confirm;
+          window.confirm = message => {
+            result.confirms.push(String(message || ''));
+            return true;
+          };
+          try {
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          } finally {
+            window.confirm = originalConfirm;
+          }
           result.set.push({id: el.id || '', name: el.name || '', value});
           return true;
         }
@@ -877,17 +834,131 @@ def fill_work_log_form_for_test(
           }
           return false;
         }
-        if (values.reason && !byIds(['_selReason', '_selList4', '_selList2', '_txtReason'], values.reason) && !byNearbyText('事由', values.reason) && !byOptionText(values.reason)) result.missing.push('reason');
-        if (!setDirect('_areDescription', values.description)) result.missing.push('description');
-        if (!setDirect('_areStatus', values.status)) result.missing.push('status');
+        if (!byIds(['_selReason', '_selList4', '_selList2', '_txtReason'], values.reason) && !byNearbyText('事由', values.reason) && !byOptionText(values.reason)) result.missing.push('reason');
+        return result;
+        """,
+        {"reason": reason},
+    )
+
+
+def fill_work_log_form_for_test(
+    driver: webdriver.Chrome,
+    action: dict[str, Any],
+    staff: dict[str, dict[str, str]],
+    target_roc_date: str,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Fill the work-log form. Save only when explicitly requested."""
+
+    fields = action.get("fields", {})
+    time_value = fields.get("工作時間", action.get("time", "00:00"))
+    hour, minute = time_value.split(":", 1)
+    people = [
+        {
+            "id": staff.get(str(no), {}).get("user_id", ""),
+            "name": staff.get(str(no), {}).get("name", str(no)),
+        }
+        for no in fields.get("服勤人員", [])
+    ]
+
+    navigated = ensure_ap(driver, WORK_LOG_AP)
+    if navigated:
+        time.sleep(1)
+    before_controls = control_snapshot(driver)
+    form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH') && document.getElementById('_areDescription'));")
+    insert_result = {"ok": True, "skipped": True, "reason": "work form already open"} if form_ready else click_insert_control(driver)
+    time.sleep(2)
+
+    fill_result = driver.execute_script(
+        """
+        const values = arguments[0];
+        const result = {set: [], missing: [], confirms: []};
+        const used = new Set();
+
+        function visibleControls() {
+          return Array.from(document.querySelectorAll('input, select, textarea'));
+        }
+        function setControl(el, value, confirmOnReplace = false) {
+          if (!el) return false;
+          const key = el.id || el.name || `${el.tagName}:${result.set.length}`;
+          if (used.has(key)) return false;
+          const oldValue = String(el.value || '');
+          const willReplace = oldValue.trim() !== '' && oldValue !== String(value);
+          if (el.tagName.toLowerCase() === 'select') {
+            const options = Array.from(el.options || []);
+            const exactOption = options.find(opt =>
+              String(opt.text || '').trim() === String(value).trim() ||
+              String(opt.value || '').trim() === String(value).trim()
+            );
+            const option = exactOption || options.find(opt =>
+              String(opt.text || '').includes(String(value).trim())
+            );
+            if (!option) return false;
+            el.value = option.value;
+          } else {
+            el.value = value;
+          }
+          const originalConfirm = window.confirm;
+          if (confirmOnReplace && willReplace) {
+            window.confirm = message => {
+              result.confirms.push(String(message || ''));
+              return true;
+            };
+          }
+          try {
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          } finally {
+            window.confirm = originalConfirm;
+          }
+          used.add(key);
+          result.set.push({id: el.id || '', name: el.name || '', value});
+          return true;
+        }
+        function byIds(ids, value) {
+          for (const id of ids) {
+            const el = document.getElementById(id);
+            if (setControl(el, value)) return true;
+          }
+          return false;
+        }
+        function optionMatches(opt, value, exactOnly = false) {
+          const target = String(value || '').trim();
+          const text = String(opt.text || '').trim();
+          const optValue = String(opt.value || '').trim();
+          if (text === target || optValue === target) return true;
+          if (exactOnly) return false;
+          return text.includes(target);
+        }
+        function byOptionText(value) {
+          const exactOnly = String(value || '').trim() === '其他';
+          const el = visibleControls().find(control =>
+            control.tagName.toLowerCase() === 'select' &&
+            Array.from(control.options || []).some(opt => optionMatches(opt, value, exactOnly))
+          );
+          return setControl(el, value, true);
+        }
+        if (!byIds(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.date)) result.missing.push('date');
+        if (!byIds(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.hour)) result.missing.push('hour');
+        if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
+        byIds(['_selETIMEH', '_selETimeH'], values.hour);
+        byIds(['_selETIMEM', '_selETimeM'], values.minute);
+        if (!byOptionText(values.item)) result.missing.push('item');
         return result;
         """,
         {
-            "reason": fields.get("事由", ""),
-            "description": fields.get("工作概述", ""),
-            "status": fields.get("處理情形", ""),
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "item": fields.get("勤務項目", ""),
         },
     )
+    fill_result["item_alerts"] = accept_pending_alerts(driver)
+    reason_result = set_work_log_reason_field(driver, fields)
+    fill_result["reason"] = reason_result
+    fill_result["reason_alerts"] = accept_pending_alerts(driver)
+    time.sleep(1)
+    content_result = set_work_log_content_fields(driver, fields)
     fill_result["content"] = content_result
 
     people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
@@ -1078,15 +1149,87 @@ def fill_entry_log_form_for_test(
           }
           return false;
         }
+        function selectedOptionText(el) {
+          return String(el?.options?.[el.selectedIndex]?.text || '').trim();
+        }
+        function setOutinControl(el) {
+          if (!el || el.tagName.toLowerCase() !== 'select') return false;
+          const key = el.id || el.name || `${el.tagName}:outin`;
+          if (used.has(key)) return false;
+          const wantedValue = String(values.outin_value || '').trim();
+          const wantedText = String(values.outin_text || values.outin || '').trim();
+          const options = Array.from(el.options || []);
+          const option = options.find(opt => wantedValue && String(opt.value || '').trim() === wantedValue) ||
+            options.find(opt => wantedText && String(opt.text || '').trim() === wantedText) ||
+            options.find(opt => wantedText && String(opt.text || '').replace(/\\s+/g, '') === wantedText);
+          if (!option) return false;
+          el.value = option.value;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          used.add(key);
+          const actualText = selectedOptionText(el);
+          const confirmed = (
+            (wantedValue && String(el.value || '').trim() === wantedValue) ||
+            (wantedText && actualText === wantedText)
+          );
+          result.outin = {
+            id: el.id || '',
+            name: el.name || '',
+            value: el.value || '',
+            text: actualText,
+            confirmed,
+          };
+          result.set.push({id: el.id || '', name: el.name || '', value: el.value || '', text: actualText, field: 'outin'});
+          return confirmed;
+        }
+        function byOutinIds(ids) {
+          for (const id of ids) {
+            if (setOutinControl(document.getElementById(id))) return true;
+          }
+          return false;
+        }
+        function byNearbyOutin(label) {
+          const normalize = text => String(text || '').replace(/\\s+/g, '');
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.children);
+            const labelIndex = cells.findIndex(cell => normalize(cell.innerText).includes(label));
+            if (labelIndex < 0) continue;
+            const candidates = cells.slice(labelIndex + 1).flatMap(cell =>
+              Array.from(cell.querySelectorAll('select'))
+            );
+            for (const control of candidates) {
+              if (setOutinControl(control)) return true;
+            }
+          }
+          return false;
+        }
+        function byOutinSignature() {
+          const candidates = controls().filter(control => {
+            if (control.tagName.toLowerCase() !== 'select') return false;
+            const signature = String(`${control.id || ''} ${control.name || ''}`).toLowerCase();
+            return signature.includes('isout') || signature.includes('outin') ||
+              signature.includes('out_in') || signature.includes('inout') || signature === 'io';
+          });
+          for (const control of candidates) {
+            if (setOutinControl(control)) return true;
+          }
+          return false;
+        }
 
         if (!byIds(['_selMan'], values.man)) result.missing.push('man');
         byIds(['_txtMan'], values.man_name);
         if (values.title) byIds(['_selTitle'], values.title);
         if (values.title_text) byIds(['_txtTitle'], values.title_text);
-        if (!byIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT'], values.outin_value || values.outin) && !byOptionText(values.outin) && !byNearbyText('出或入', values.outin)) result.missing.push('outin');
-        const outinEl = document.getElementById('_selIsout');
-        const outinText = outinEl?.options?.[outinEl.selectedIndex]?.text || '';
-        if (values.outin_text && outinEl && outinEl.value !== values.outin_value && outinText.trim() !== values.outin_text) result.missing.push('outin_confirm');
+        if (values.outin || values.outin_value) {
+          const outinSet = byOutinIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT']) ||
+            byNearbyOutin('出或入') || byOutinSignature();
+          if (!outinSet) {
+            result.missing.push('outin');
+          } else if (!result.outin?.confirmed) {
+            result.missing.push('outin_confirm');
+          }
+        }
         if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
         if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
@@ -1326,6 +1469,7 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
 def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutySheet:
     open_ap(driver, DUTY_TABLE_AP)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     js_set(driver, "_txtTaskDate", target_roc_date)
     if not js_click(driver, "_btnQuery"):
         js_click(driver, "_btnSearch")
@@ -1424,6 +1568,19 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         return result;
         """
     )
+    if not data.get("rows"):
+        page_text = driver.execute_script(
+            """
+            const body = document.body ? document.body.innerText : '';
+            const controls = Array.from(document.querySelectorAll('input,select,textarea'))
+              .map(el => [el.id || '', el.name || '', el.value || ''].join(' '))
+              .join('\\n');
+            return [location.href || '', document.title || '', body, controls].join('\\n');
+            """
+        ) or ""
+        if "login119" in page_text or "_txtUsername" in page_text or "_txtPassword" in page_text:
+            raise RuntimeError("勤務表讀取失敗：登入狀態失效或密碼可能已變更，請登出/清除後重新輸入新密碼登入。")
+        raise RuntimeError("勤務表讀取失敗：未讀到勤務表資料，已停止產生空白勤務資料。請確認勤務系統頁面是否正常。")
     sheet = DutySheet(
         roc_date=target_roc_date,
         unit=data.get("unit", ""),
@@ -1456,6 +1613,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
 def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date: str) -> list[list[str]]:
     open_ap(driver, ap_name)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     for field_id in (
         "_txtSDATE",
         "_txtEDATE",
@@ -1510,6 +1668,7 @@ def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date:
 def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
     open_ap(driver, CASE_QUERY_AP)
     time.sleep(1)
+    suppress_window_open_for_background_query(driver)
     js_set(driver, "_hidDeptno", "033006")
     js_set(driver, "_txtSDATE", target_roc_date)
     js_set(driver, "_txtEDATE", target_roc_date)
@@ -1597,6 +1756,55 @@ def people_at(sheet: DutySheet, hour: int, column: str) -> list[str]:
     return row.columns.get(column, []) if row else []
 
 
+def fire_day_hour(hour: int) -> int:
+    return hour if hour >= 8 else hour + 24
+
+
+def fire_day_slot_bounds(slot: str) -> tuple[int, int] | None:
+    start = slot_start(slot)
+    end = slot_end(slot)
+    if start is None or end is None:
+        return None
+    fire_start = fire_day_hour(start)
+    fire_end = fire_day_hour(end)
+    if end == 24:
+        fire_end = 24
+    if fire_end <= fire_start:
+        fire_end += 24
+    return fire_start, fire_end
+
+
+def duty_segments(sheet: DutySheet) -> list[tuple[int, int, tuple[str, ...]]]:
+    rows: list[tuple[int, int, tuple[str, ...]]] = []
+    for row in sheet.rows:
+        bounds = fire_day_slot_bounds(row.slot)
+        people = tuple(row.columns.get("值班", []))
+        if not bounds or not people:
+            continue
+        rows.append((bounds[0], bounds[1], people))
+    rows.sort(key=lambda item: item[0])
+
+    segments: list[tuple[int, int, tuple[str, ...]]] = []
+    for start, end, people in rows:
+        if segments and segments[-1][1] == start and segments[-1][2] == people:
+            prev_start, _, _ = segments[-1]
+            segments[-1] = (prev_start, end, people)
+        else:
+            segments.append((start, end, people))
+    return segments
+
+
+def duty_segment_before_fire_hour(sheet: DutySheet, fire_hour: int) -> tuple[int, int, tuple[str, ...]] | None:
+    for start, end, people in duty_segments(sheet):
+        if start < fire_hour <= end:
+            return start, end, people
+    return None
+
+
+def clock_hour(fire_hour: int) -> int:
+    return fire_hour % 24
+
+
 def is_active_checkout_column(column: str) -> bool:
     return column not in OFF_DUTY_SUMMARY_KEYS and column != "檢核欄"
 
@@ -1615,7 +1823,10 @@ def rest_starting_at(sheet: DutySheet, hour: int, next_sheet: DutySheet | None =
         start = slot_start(row.slot)
         end = slot_end(row.slot)
         if start == hour and end is not None:
+            previous = row_for_hour(sheet, start - 1) if start > 0 else None
             for no in row.columns.get("休息", []):
+                if previous and no in previous.columns.get("休息", []):
+                    continue
                 block_end = end
                 probe = end
                 while True:
@@ -1674,7 +1885,13 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
     final_end = slot_end(ordered_rows[-1].slot) if ordered_rows else None
     for no, block_start in active.items():
         blocks.append((no, block_start, final_end))
-    return blocks
+    midnight_rest_ends = {no: end for no, start, end in blocks if start == 0 and end is not None}
+    overnight_rest_nos = {no for no, _start, end in blocks if end == 24 and no in midnight_rest_ends}
+    return [
+        (no, start, midnight_rest_ends[no] + 24) if no in overnight_rest_nos and end == 24 else (no, start, end)
+        for no, start, end in blocks
+        if not (no in overnight_rest_nos and start == 0)
+    ]
 
 
 def external_columns(row: DutyRow) -> dict[str, list[str]]:
@@ -1707,8 +1924,19 @@ def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | Non
     if start == 8:
         return False
     before = row_for_hour(sheet, start - 1) if start > 0 else None
-    after = row_for_hour(sheet, end) if end is not None and end < 24 else None
+    after = row_for_hour(sheet, clock_hour(end)) if end is not None and end != 24 else None
     return has_external_duty(before, no) or has_external_duty(after, no)
+
+
+def rest_checkout_targets(sheet: DutySheet | None, next_sheet: DutySheet | None) -> set[str]:
+    if not sheet or not next_sheet:
+        return set()
+    next_on = set(next_sheet.summary.get("在勤", []))
+    targets: set[str] = set()
+    for no, start, end in rest_blocks(sheet, next_sheet):
+        if start < 8 and no not in next_on and (end is None or end >= 8) and not rest_is_external_route(sheet, no, start, end):
+            targets.add(no)
+    return targets
 
 
 def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[tuple[str, str, int, int | None, int]]:
@@ -1725,6 +1953,8 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
             for no in values:
                 current.add((column, no))
                 route_start = adjacent_rest_start(sheet, no, start)
+                if route_start < 8 <= start:
+                    route_start = start
                 active.setdefault((column, no), start if route_start == 8 else route_start)
         for key in list(active.keys()):
             if key not in current:
@@ -1771,9 +2001,51 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
 
 
 def prev_slot_duty(today: DutySheet, yesterday: DutySheet | None, handoff_hour: int) -> list[str]:
+    source = yesterday if handoff_hour == 8 and yesterday else today
+    fire_hour = 32 if source is yesterday and handoff_hour == 8 else fire_day_hour(handoff_hour)
+    segment = duty_segment_before_fire_hour(source, fire_hour)
+    if segment:
+        return list(segment[2])
     if handoff_hour == 8:
-        return people_at(yesterday, 6, "值班") if yesterday else []
-    return people_at(today, handoff_hour - 2, "值班")
+        previous_fire_day = (
+            people_at(yesterday, 7, "值班")
+            or people_at(yesterday, 6, "值班")
+            or people_at(yesterday, 22, "值班")
+            if yesterday
+            else []
+        )
+        if previous_fire_day:
+            return previous_fire_day
+        return people_at(today, handoff_hour - 1, "值班")
+    if handoff_hour == 0:
+        return people_at(today, 23, "值班") or (people_at(yesterday, 23, "值班") if yesterday else [])
+    return people_at(today, handoff_hour - 1, "值班")
+
+
+def handoff_hours_for_sheet(sheet: DutySheet) -> list[int]:
+    dynamic_hours: set[int] = set()
+    for row in sheet.rows:
+        start = slot_start(row.slot)
+        if start is None:
+            continue
+        if row.columns.get("值班"):
+            dynamic_hours.add(start)
+    return sorted(dynamic_hours)
+
+
+def handoff_period(today: DutySheet, yesterday: DutySheet | None, hour: int) -> tuple[int, int]:
+    source = yesterday if hour == 8 and yesterday else today
+    fire_hour = 32 if source is yesterday and hour == 8 else fire_day_hour(hour)
+    segment = duty_segment_before_fire_hour(source, fire_hour)
+    if segment:
+        return clock_hour(segment[0]), clock_hour(segment[1])
+    if hour == 0:
+        return 22, 0
+    if hour == 8:
+        return 22, 8
+    previous_row = row_for_hour(today, hour - 1)
+    previous_start = slot_start(previous_row.slot) if previous_row else None
+    return previous_start if previous_start is not None else hour - 2, hour
 
 
 def case_counts(cases: list[CaseRecord], start_hour: int, end_hour: int) -> dict[str, int]:
@@ -1924,6 +2196,20 @@ def next_morning_entry_actor(today: DutySheet, hour: int) -> str:
     return (people_at(today, 22, "值班") or people_at(today, hour, "值班") or [""])[0]
 
 
+def physical_entry_key(base_date: date, action: PlannedAction) -> tuple[str, date, str, str, str, str] | None:
+    if action.kind != "entry_log":
+        return None
+    fields = action.fields
+    return (
+        action.kind,
+        base_date + timedelta(days=action.date_offset),
+        action.time,
+        action.target,
+        str(fields.get("出或入", "")),
+        str(fields.get("領用事由及地點", "")),
+    )
+
+
 def planned_actions(
     today: DutySheet,
     yesterday: DutySheet | None,
@@ -1939,8 +2225,11 @@ def planned_actions(
     # 08 boundary, including rest-start exceptions.
     today_on = set(today.summary.get("在勤", []))
     yesterday_on = set(yesterday.summary.get("在勤", [])) if yesterday else set()
+    tomorrow_on = set(tomorrow.summary.get("在勤", [])) if tomorrow else set()
     today_rest_start_08 = rest_starting_at(today, 8, tomorrow)
     yesterday_rest_start_06 = rest_starting_at(yesterday, 6, today) if yesterday else {}
+    today_rest_checkouts = rest_checkout_targets(today, tomorrow)
+    yesterday_rest_checkouts = rest_checkout_targets(yesterday, today)
 
     for no in sorted(today_on - yesterday_on, key=int):
         if no in today_rest_start_08:
@@ -1978,6 +2267,8 @@ def planned_actions(
             minute = 0
             reason = "休息後退勤"
             actor = entry_actor_at(today, yesterday, at, minute)
+        elif no in yesterday_rest_checkouts:
+            continue
         else:
             at = 8
             minute = 0
@@ -2008,10 +2299,10 @@ def planned_actions(
         if rest_is_external_route(today, no, start, end):
             continue
         start_offset = 1 if start < 8 else 0
-        end_offset = 1 if end is not None and (end <= 8 or end == 24) else 0
-        if start == 6 and start_offset == 1 and tomorrow and no not in set(tomorrow.summary.get("在勤", [])):
-            continue
+        end_offset = 1 if end is not None and (end <= 8 or end >= 24) else 0
+        rest_checkout = start_offset == 1 and tomorrow and no not in tomorrow_on and (end is None or end >= 8)
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
+        start_reason = "休息後退勤" if rest_checkout else "休息"
         actions.append(
             PlannedAction(
                 kind="entry_log",
@@ -2022,22 +2313,22 @@ def planned_actions(
                     "登打時間": f"{start:02d}:00",
                     "系統寫入時間": f"{start:02d}:00",
                     "出或入": "出",
-                    "領用事由及地點": "休息",
-                    "手提無線電編號": "",
-                    "是否歸還": "",
+                    "領用事由及地點": start_reason,
+                    "手提無線電編號": handheld_radio(no) if rest_checkout else "",
+                    "是否歸還": "是" if rest_checkout else "",
                 },
-                source="休息簽出",
-                duplicate_key=f"entry:{target}:{start}:out:{no}:休息",
+                source="休息後退勤" if rest_checkout else "休息簽出",
+                duplicate_key=f"entry:{target}:{start}:out:{no}:{start_reason}",
                 date_offset=start_offset,
             )
         )
+        if rest_checkout:
+            continue
         if end is None:
             continue
-        if end_offset and start == 6:
-            continue
-        end_hour = 0 if end == 24 else end
+        end_hour = clock_hour(end)
         end_time = f"{end_hour:02d}:00"
-        end_actor = next_morning_entry_actor(today, end) if end_offset else entry_actor_at(today, yesterday, end, 0)
+        end_actor = next_morning_entry_actor(today, end_hour) if end_offset else entry_actor_at(today, yesterday, end_hour, 0)
         actions.append(
             PlannedAction(
                 kind="entry_log",
@@ -2108,22 +2399,26 @@ def planned_actions(
         )
 
     # Duty handoff entry log and work log.
-    for hour in HANDOFF_HOURS:
+    for hour in handoff_hours_for_sheet(today):
         outgoing = prev_slot_duty(today, yesterday, hour)
         incoming = people_at(today, hour, "值班")
+        suppressed_outgoing = yesterday_rest_checkouts if hour == 8 else set()
+        outgoing_entries = [no for no in outgoing if no not in set(incoming) and no not in suppressed_outgoing]
+        incoming_entries = [no for no in incoming if no not in set(outgoing)]
+        if not outgoing_entries and not incoming_entries:
+            continue
         actor = outgoing[0] if outgoing else duty_actor_at(today, yesterday, hour)
-        if hour == 8:
-            time_range = "22-08"
+        start_hour, end_hour = handoff_period(today, yesterday, hour)
+        time_range = f"{start_hour:02d}-{end_hour:02d}"
+        if hour == 8 and start_hour > end_hour:
             counts = case_counts_overnight(yesterday_cases, today_cases)
             vehicle_items = unreturned_case_vehicle_items(yesterday_cases, work_log_defaults, roc_date(target - timedelta(days=1)))
             vehicle_items.extend(unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=8))
         else:
-            start_hour = hour - 2
-            time_range = f"{start_hour:02d}-{hour:02d}"
-            counts = case_counts(today_cases, start_hour, hour)
+            counts = case_counts(today_cases, start_hour, end_hour) if start_hour < end_hour else {"救護": 0, "火警": 0}
             vehicle_items = unreturned_case_vehicle_items(today_cases, work_log_defaults, roc_date(target), before_hour=hour)
         vehicle_out_count = sum(int(item.get("count", 0)) for item in vehicle_items)
-        for no in outgoing:
+        for no in outgoing_entries:
             actions.append(
                 PlannedAction(
                     kind="entry_log",
@@ -2143,7 +2438,7 @@ def planned_actions(
                     duplicate_key=f"entry:{target}:{hour}:值退:{no}",
                 )
             )
-        for no in incoming:
+        for no in incoming_entries:
             actions.append(
                 PlannedAction(
                     kind="entry_log",
@@ -2185,12 +2480,26 @@ def planned_actions(
     if sheet_has_duty_data(tomorrow):
         next_target = target + timedelta(days=1)
         next_morning_sources = {"今日在勤且昨日未在勤", "昨日在勤且今日未在勤", "值班交接"}
+        existing_entry_keys = {key for action in actions if (key := physical_entry_key(target, action)) is not None}
+        existing_work_keys = {action.duplicate_key for action in actions if action.kind == "work_log" and action.duplicate_key}
         for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
             if action.source not in next_morning_sources:
                 continue
-            if action.time not in ("06:00", "07:55", "08:00", "08:05"):
+            if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
+                continue
+            if action.kind == "entry_log" and action.target in today_rest_checkouts and action.fields.get("出或入") in ("出", "值退"):
                 continue
             action.date_offset = 1
+            if action.kind == "entry_log":
+                entry_key = physical_entry_key(target, action)
+                if entry_key is not None and entry_key in existing_entry_keys:
+                    continue
+                if entry_key is not None:
+                    existing_entry_keys.add(entry_key)
+            elif action.kind == "work_log" and action.duplicate_key:
+                if action.duplicate_key in existing_work_keys:
+                    continue
+                existing_work_keys.add(action.duplicate_key)
             actions.append(action)
 
     # Radio test at 11:10, entered by 10-12 duty.
@@ -2326,7 +2635,16 @@ def build_driver(headless: bool) -> webdriver.Chrome:
         options.add_argument("--headless=new")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--window-size=1280,900")
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    try:
+        driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
+    except Exception:
+        pass
+    return driver
 
 
 def main() -> int:
@@ -2378,7 +2696,7 @@ def main() -> int:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             print(f"JSON 輸出: {args.json_out}")
     finally:
-        driver.quit()
+        quit_driver(driver)
     return 0
 
 

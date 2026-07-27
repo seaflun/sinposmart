@@ -7,13 +7,13 @@ Use this file when moving to the duty computer tomorrow.
 Main project:
 
 ```text
-I:\我的雲端硬碟\專案\值班勤務系統自動化
+I:\我的雲端硬碟\專案\SinpoSmart_值班台
 ```
 
 Duty computer package:
 
 ```text
-I:\我的雲端硬碟\專案\值班勤務系統自動化\WinPython_公務電腦使用包
+I:\我的雲端硬碟\專案\SinpoSmart_值班台\WinPython_公務電腦使用包
 ```
 
 ## What Was Updated Today
@@ -134,7 +134,10 @@ When continuing work, first read:
 Then run:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\sync_project_skills_before_use.ps1
+$cloudSkillRoot = "I:\我的雲端硬碟\專案\skill"
+$localSkillRoot = Join-Path $env:USERPROFILE ".codex\skills"
+New-Item -ItemType Directory -Force -Path $localSkillRoot
+Copy-Item -LiteralPath (Join-Path $cloudSkillRoot "*") -Destination $localSkillRoot -Recurse -Force
 ```
 
 Use `karpathy-guidelines` before code changes.
