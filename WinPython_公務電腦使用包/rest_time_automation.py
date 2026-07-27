@@ -385,7 +385,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             try:
                 result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
-                    on_finish(result)
+                    on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 log_automation_exception("rest_time", exc)
@@ -541,7 +541,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
                     on_start()
                 result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
-                    on_finish(result)
+                    on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 log_automation_exception("monthly_base", exc)

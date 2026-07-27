@@ -2524,20 +2524,31 @@ class DutyGui(ctk.CTk):
         )
 
     def sinposmart_tool_event_callbacks(self, tool_name: str, tool_label: str):
-        state = {"started": False, "finished": False, "timer": None}
+        state = {"started": False, "finished": False, "timer": None, "business_roc_date": ""}
         lock = threading.Lock()
 
-        def finish_once(status: str, result: str = "", error: str = "") -> None:
+        def finish_once(status: str, result: str = "", error: str = "") -> bool:
             timer = None
             with lock:
                 if state["finished"]:
-                    return
+                    return False
                 state["finished"] = True
                 timer = state.get("timer")
                 state["timer"] = None
             if timer is not None:
                 timer.cancel()
             self.send_tool_finish_event(tool_name, tool_label, status, result=result, error=error)
+            return True
+
+        def completion_notification(result: str) -> str:
+            date_match = re.search(r"(?<!\d)(\d{7})(?!\d)", result)
+            if date_match is not None:
+                return f"已完成：{date_match.group(1)} {tool_label}"
+            month_match = re.search(r"(?<!\d)(\d{3})年0?(\d{1,2})月", result)
+            if month_match is not None:
+                return f"已完成：{month_match.group(1)}年{int(month_match.group(2))}月 {tool_label}"
+            business_roc_date = state["business_roc_date"] or duty_business_roc_date()
+            return f"已完成：{business_roc_date} {tool_label}"
 
         def timeout() -> None:
             seconds = sinposmart_tool_timeout_seconds()
@@ -2548,6 +2559,7 @@ class DutyGui(ctk.CTk):
                 if state["started"]:
                     return
                 state["started"] = True
+                state["business_roc_date"] = duty_business_roc_date()
             self.send_tool_start_event(tool_name, tool_label)
             timer = threading.Timer(sinposmart_tool_timeout_seconds(), timeout)
             timer.daemon = True
@@ -2558,7 +2570,9 @@ class DutyGui(ctk.CTk):
             timer.start()
 
         def finish(result: str) -> None:
-            finish_once("completed", result=result)
+            if finish_once("completed", result=result):
+                message = completion_notification(result)
+                self.after(0, lambda: self.notify_user(APP_DISPLAY_NAME, message))
 
         def fail(error: str) -> None:
             finish_once("failed", error=error)

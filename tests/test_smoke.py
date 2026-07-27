@@ -303,6 +303,38 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(callback_name=callback_name):
                 self.assertGreaterEqual(source.count(callback_name), 4)
 
+    def test_tool_finish_callbacks_show_date_or_month_in_completion_notification(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        notifications: list[tuple[str, str]] = []
+        gui.send_tool_start_event = lambda *_args, **_kwargs: None
+        gui.send_tool_finish_event = lambda *_args, **_kwargs: None
+        gui.notify_user = lambda title, message, **_kwargs: notifications.append((title, message))
+        gui.after = lambda _delay, callback: callback()
+
+        cases = (
+            ("duty_sheet", "勤務表登打", "勤務表登打完成：1150728", "已完成：1150728 勤務表登打"),
+            ("daily_vehicle", "車輛保養清點", "車輛保養清點已完成。", "已完成：1150728 車輛保養清點"),
+            ("rest_time", "休息時間登打", "115年7月 休息時間登打完成：完成。", "已完成：115年7月 休息時間登打"),
+            ("monthly_base", "勤務基準表登打", "115年7月 勤務基準表登打完成：完成。", "已完成：115年7月 勤務基準表登打"),
+        )
+
+        with mock.patch.object(module, "duty_business_roc_date", return_value="1150728"), mock.patch.object(
+            module.threading, "Timer"
+        ):
+            for tool_name, tool_label, result, expected in cases:
+                with self.subTest(tool_name=tool_name):
+                    start, finish, _fail = gui.sinposmart_tool_event_callbacks(tool_name, tool_label)
+                    start()
+                    finish(result)
+                    finish(result)
+                    self.assertEqual(notifications[-1], (module.APP_DISPLAY_NAME, expected))
+
+        self.assertEqual(len(notifications), len(cases))
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+        self.assertIn('on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")', rest_source)
+        self.assertIn('on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")', rest_source)
+
     def test_rest_and_monthly_base_dialogs_use_fixed_year_and_three_month_combo(self) -> None:
         source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
 
