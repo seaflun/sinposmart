@@ -118,15 +118,23 @@ class PackageSmokeTests(unittest.TestCase):
         gui = object.__new__(module.DutyGui)
         messages: list[tuple[str, str]] = []
         gui.notify_user = lambda title, message, **_kwargs: messages.append((title, message))
+        gui.focus_rescue_video_window = lambda: False
+        gui.after = lambda _delay, callback: callback()
+        gui.save_tool_usage_history = lambda: None
+        gui.refresh_last_tool_usage_card = lambda: None
 
         with mock.patch.object(module.subprocess, "Popen") as popen:
+            popen.return_value.poll.return_value = None
+            gui.open_rescue_video_tool()
             gui.open_rescue_video_tool()
 
         command = popen.call_args.args[0]
+        popen.assert_called_once()
         self.assertTrue(command[-1].endswith("救護影片分類GUI.py"))
         self.assertNotIn("--delete-source", command)
         self.assertNotIn("--apply", command)
-        self.assertEqual(messages, [(module.APP_DISPLAY_NAME, "已開啟行車紀錄器（BETA）。")])
+        self.assertIs(gui.rescue_video_process, popen.return_value)
+        self.assertEqual(messages, [])
 
     def test_python_sources_compile(self) -> None:
         root = package_dir()
@@ -303,6 +311,102 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(callback_name=callback_name):
                 self.assertGreaterEqual(source.count(callback_name), 4)
 
+    def test_tool_usage_records_the_logged_in_operator_not_the_staff_roster(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.__dict__["session"] = mock.Mock(verified=True, actor_no="03", user_id="operator")
+        gui.__dict__["duty_staff"] = {str(number): {"name": f"人員{number}"} for number in range(1, 29)}
+        gui.current_account_display_name = lambda actor_no, user_id: f"{actor_no}番 操作人員"
+        gui.save_tool_usage_history = lambda: None
+        gui.refresh_last_tool_usage_card = lambda: None
+
+        for tool_name in ("duty_sheet", "daily_vehicle", "rest_time", "monthly_base"):
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(gui.tool_usage_people_label(tool_name), "03番 操作人員")
+
+        gui.record_tool_usage_started("daily_vehicle", "車輛保養清點")
+        latest = gui.__dict__["tool_usage_history"][-1]
+        self.assertEqual(latest["operator"], "03番 操作人員")
+        self.assertEqual(latest["people"], "03番 操作人員")
+        self.assertEqual(gui.recorded_tool_operator_label({"people": "舊全員名單"}), "舊紀錄未保存操作人員")
+
+    def test_daily_vehicle_usage_result_includes_business_date(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+
+        self.assertEqual(
+            gui.recorded_tool_report_label(
+                "daily_vehicle",
+                {"time": "2026-07-28 10:00", "business_roc_date": "1150728", "report": "已完成"},
+            ),
+            "1150728 車輛保養清點已完成",
+        )
+        self.assertEqual(
+            gui.recorded_tool_report_label(
+                "duty_sheet",
+                {"time": "2026-07-28 10:00", "business_roc_date": "1150728", "report": "已完成"},
+            ),
+            "1150728 勤務表已完成",
+        )
+        self.assertEqual(
+            gui.recorded_tool_report_label(
+                "rest_time",
+                {"time": "2026-07-28 10:00", "usage_period": "11507", "report": "失敗"},
+            ),
+            "11507 休息時間失敗",
+        )
+        self.assertEqual(
+            gui.recorded_tool_report_label(
+                "monthly_base",
+                {"time": "2026-07-28 10:00", "usage_period": "11507", "report": "已完成"},
+            ),
+            "11507 勤務基準表已完成",
+        )
+        self.assertEqual(
+            gui.recorded_tool_report_label(
+                "duty_sheet",
+                {"time": "2026-07-28 10:00", "business_roc_date": "1150728", "report": ""},
+            ),
+            "尚無執行紀錄",
+        )
+
+    def test_finished_tool_usage_refreshes_side_card_immediately_with_semantic_color(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.__dict__["tool_usage_history"] = []
+        gui.__dict__["active_tool_usage_ids"] = {}
+        gui.__dict__["session"] = mock.Mock(verified=True, actor_no="03", user_id="operator")
+        gui.current_account_display_name = lambda actor_no, user_id: f"{actor_no}番 操作人員"
+        gui.save_tool_usage_history = lambda: None
+        gui.after = lambda _delay, callback: callback()
+
+        class ValueVar:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        result_label = mock.Mock()
+        view = {
+            "time_var": ValueVar(),
+            "people_var": ValueVar(),
+            "result_var": ValueVar(),
+            "result_label": result_label,
+        }
+        gui.__dict__["tool_usage_side_views"] = {"duty_sheet": view}
+
+        gui.record_tool_usage_started("duty_sheet", "勤務表登打", usage_period="1150728")
+        self.assertEqual(view["result_var"].value, "尚無執行紀錄")
+        gui.record_tool_usage_finished("duty_sheet", "completed", result="勤務表登打完成：1150728")
+        self.assertEqual(view["result_var"].value, "1150728 勤務表已完成")
+        result_label.configure.assert_called_with(text_color="#248A3D")
+
+        gui.record_tool_usage_started("duty_sheet", "勤務表登打", usage_period="1150729")
+        gui.record_tool_usage_finished("duty_sheet", "failed")
+        self.assertEqual(view["result_var"].value, "1150729 勤務表失敗")
+        result_label.configure.assert_called_with(text_color="#C62828")
+
     def test_tool_finish_callbacks_show_date_or_month_in_completion_notification(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)
@@ -311,6 +415,8 @@ class PackageSmokeTests(unittest.TestCase):
         gui.send_tool_finish_event = lambda *_args, **_kwargs: None
         gui.notify_user = lambda title, message, **_kwargs: notifications.append((title, message))
         gui.after = lambda _delay, callback: callback()
+        gui.save_tool_usage_history = lambda: None
+        gui.refresh_last_tool_usage_card = lambda: None
 
         cases = (
             ("duty_sheet", "勤務表登打", "勤務表登打完成：1150728", "已完成：1150728 勤務表登打"),
@@ -673,6 +779,223 @@ class PackageSmokeTests(unittest.TestCase):
             "self.minsize(530, 300)" in source,
             "未登入值班模式最小高度應維持精簡。",
         )
+
+    def test_duty_side_panel_uses_fixed_dimensions(self) -> None:
+        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("self.resizable(False, False)", source)
+        self.assertIn("self.duty_main_width = 522", source)
+        self.assertIn("self.tool_side_width = 400", source)
+        self.assertIn("minsize=self.duty_main_width_px, weight=0", source)
+        self.assertNotIn("capture_tool_side_main_width", source)
+
+    def test_tool_button_widths_and_daily_vehicle_copy_are_consistent(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        vehicle_source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
+
+        for button_name in (
+            "duty_sheet_button",
+            "daily_vehicle_button",
+            "rescue_video_button",
+            "rest_time_button",
+            "monthly_base_button",
+        ):
+            with self.subTest(button_name=button_name):
+                self.assertRegex(gui_source, rf"self\.{button_name}\.grid\([^\n]+padx=4\)")
+        self.assertIn('text="準備就緒。"', gui_source)
+        self.assertNotIn('text="目前狀態  準備就緒，可開始執行"', gui_source)
+        self.assertIn('text="啟動登打"', gui_source)
+        self.assertIn('on_finish("車輛保養清點已完成。")', vehicle_source)
+        self.assertNotIn('messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。"', vehicle_source)
+
+    def test_all_four_tool_forms_lock_settings_while_running(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("def set_settings_running(running: bool) -> None:", duty_source)
+        self.assertEqual(rest_source.count("def set_settings_running(running: bool) -> None:"), 2)
+        self.assertGreaterEqual(duty_source.count('text="啟動中..."'), 1)
+        self.assertGreaterEqual(rest_source.count('text="啟動中..."'), 2)
+        self.assertIn("self.daily_vehicle_start_button", gui_source)
+        self.assertIn('text="啟動中..." if running else "啟動登打"', gui_source)
+
+    def test_all_four_side_tool_status_cards_match_duty_sheet_format(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        status_label = 'font=FONT_BODY, anchor=tk.W, height=38'
+        self.assertIn('status_var = tk.StringVar(value="準備就緒。")', duty_source)
+        self.assertIn('status_card.pack(fill=tk.X, pady=(2, 6), before=action_row)', duty_source)
+        self.assertIn(status_label, duty_source)
+        self.assertIn('status_card.pack(fill=tk.X, pady=(2, 6))', gui_source)
+        self.assertIn(status_label, gui_source)
+        self.assertEqual(rest_source.count('status_var = tk.StringVar(value="準備就緒。")'), 2)
+        self.assertEqual(rest_source.count('status_card.pack(fill=tk.X, pady=(2, 6), before=action_row)'), 2)
+        self.assertEqual(rest_source.count(status_label), 2)
+
+    def test_side_tool_status_messages_use_semantic_apple_colors(self) -> None:
+        modules = (package_module("duty_sheet_automation"), rest_time_module())
+        cases = (
+            ("準備就緒。", {"fg_color": "#F2F2F7", "border_color": "#D1D1D6", "text_color": "#636366"}),
+            ("尚未選擇 Excel 檔案。", {"fg_color": "#F2F2F7", "border_color": "#D1D1D6", "text_color": "#636366"}),
+            ("開啟瀏覽器登打休息時間...", {"fg_color": "#F0F7FF", "border_color": "#B8D8FF", "text_color": "#007AFF"}),
+            ("全部完成！耗時 10 秒", {"fg_color": "#F0FAF2", "border_color": "#BFE8C8", "text_color": "#248A3D"}),
+            ("已移除車輛：A1", {"fg_color": "#FFF8E5", "border_color": "#F2D27A", "text_color": "#8A5A00"}),
+            ("失敗：登入失敗", {"fg_color": "#FFF2F1", "border_color": "#FFC9C5", "text_color": "#C62828"}),
+            ("找不到刪除按鈕", {"fg_color": "#FFF2F1", "border_color": "#FFC9C5", "text_color": "#C62828"}),
+        )
+
+        for module in modules:
+            with self.subTest(module=module.__name__, prefix="full-width"):
+                self.assertEqual(module.normalize_side_status_message("狀態： 讀取資料..."), "讀取資料...")
+            with self.subTest(module=module.__name__, prefix="half-width"):
+                self.assertEqual(module.normalize_side_status_message("狀態: 讀取資料..."), "讀取資料...")
+            for message, expected in cases:
+                with self.subTest(module=module.__name__, message=message):
+                    self.assertEqual(module.side_status_style(message), expected)
+
+        legacy_source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
+        self.assertNotRegex(legacy_source, r'狀態\s*[：:]')
+
+        gui_module = duty_gui_module()
+        gui = object.__new__(gui_module.DutyGui)
+        gui.daily_vehicle_status_card = mock.Mock()
+        gui.daily_vehicle_status_bar = mock.Mock()
+        gui.daily_vehicle_status_card.winfo_exists.return_value = True
+        gui.daily_vehicle_status_bar.winfo_exists.return_value = True
+        gui.set_daily_vehicle_side_status("失敗：測試錯誤")
+        gui.daily_vehicle_status_card.configure.assert_called_once_with(
+            fg_color="#FFF2F1",
+            border_color="#FFC9C5",
+        )
+        gui.daily_vehicle_status_bar.configure.assert_called_once_with(
+            text="失敗：測試錯誤",
+            text_color="#C62828",
+        )
+        vehicle_source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
+        self.assertIn('on_status("開始車輛保養清點...")', vehicle_source)
+        self.assertIn('on_status("車輛保養清點已完成。")', vehicle_source)
+        self.assertIn('on_status(f"失敗：{error}")', vehicle_source)
+
+    def test_tool_forms_are_mounted_inside_the_fixed_side_panel(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("launch_tool(\n                container=form_host,", gui_source)
+        self.assertNotIn('text=f"開啟{tool_label}"', gui_source)
+        self.assertIn('"work_log_defaults", "工作紀錄預設內容"', gui_source)
+        self.assertIn('self.add_tool_side_section_header(action, "上次使用", "#22C55E")', gui_source)
+        self.assertIn('action = ctk.CTkFrame(side_content, fg_color="#FCFDFF", corner_radius=0)', gui_source)
+        self.assertIn('self.tool_side_panel = ctk.CTkFrame(root, width=self.tool_side_width, fg_color="#FCFDFF", border_color="#D9E1EC", border_width=1, corner_radius=16)', gui_source)
+        self.assertNotIn("CTkScrollableFrame(self.tool_side_panel", gui_source)
+        self.assertIn('fg_color="#2563EB"', gui_source)
+        self.assertIn('fg_color="#FCFDFF"', gui_source)
+        self.assertIn('fg_color="#F1F7FF"', gui_source)
+        launch_index = gui_source.index("            launch_tool(\n                container=form_host,")
+        show_index = gui_source.index("        self.tool_side_panel.grid(row=0, column=1", launch_index)
+        self.assertLess(launch_index, show_index)
+        self.assertIn("self.tool_side_panel.update_idletasks()", gui_source)
+        self.assertIn('fg_color="transparent" if embedded else UI_PANEL', gui_source)
+        self.assertNotIn("group = ctk.CTkFrame(item_row", gui_source)
+        self.assertNotIn("start_work_log_center_reveal", gui_source)
+        self.assertNotIn("animate_work_log_center_reveal", gui_source)
+        self.assertNotIn("work_log_reveal_masks", gui_source)
+        self.assertNotIn("expansion_backdrop", gui_source)
+        self.assertIn('ANIMATED_SIDE_TOOL_NAMES = {"duty_sheet", "daily_vehicle", "rest_time", "monthly_base"}', gui_source)
+        self.assertIn("def animate_tool_side_panel(self, opening: bool) -> None:", gui_source)
+        self.assertIn("base_duration_ms = 140 if opening else 110", gui_source)
+        self.assertIn("if tool_name in ANIMATED_SIDE_TOOL_NAMES:\n            self.animate_tool_side_panel(opening=True)", gui_source)
+        self.assertIn('animation_is_closing = self.__dict__.get("tool_side_animation_target") == -self.tool_side_width', gui_source)
+        self.assertIn("target_offset = 0 if opening else -self.tool_side_width", gui_source)
+        self.assertIn("side_content.place(x=-self.tool_side_width", gui_source)
+        self.assertNotIn("side_content.place(x=-self.tool_side_width, y=0, width=", gui_source)
+        self.assertIn("container: tk.Widget | None = None", duty_source)
+        self.assertIn("def create_embedded_vehicle_page", duty_source)
+        self.assertIn("open_embedded_add_vehicle_page()", duty_source)
+        self.assertIn("open_embedded_remove_vehicle_page(choices, choice_map)", duty_source)
+        self.assertIn("root.pack_forget()", duty_source)
+        self.assertGreaterEqual(rest_source.count("container: tk.Widget | None = None"), 2)
+
+    def test_side_tool_titles_instructions_and_primary_buttons_share_apple_roles(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+
+        for text in (
+            '"duty_sheet": "來源檔案及日期設定"',
+            '"daily_vehicle": "車輛保養設定"',
+            '"rest_time": "來源檔案及月份設定"',
+            '"monthly_base": "來源及月份設定"',
+            '"work_log_defaults": "工作紀錄預設"',
+            "依序至車輛平日保養檢查清點",
+            "登打以勤務表為主；若個人有補欠時數歸還，請自行修正。",
+            "登打以 Google 試算表為主；若後續有更改假別，請自行修正。",
+        ):
+            self.assertIn(text, gui_source)
+        self.assertIn('self.add_tool_side_section_header(action, section_titles.get(tool_name, "工具設定"), "#2563EB")', gui_source)
+        self.assertIn('height=2, fg_color="#D1D1D6"', gui_source)
+        self.assertIn('font=FONT_SMALL, justify=tk.LEFT, anchor=tk.W, wraplength=360', gui_source)
+        self.assertIn('ctk.CTkLabel(source_row, text="來源"', rest_source)
+        self.assertNotIn('text="來源", text_color=UI_MUTED, font=FONT_BODY, width=38', rest_source)
+        self.assertIn('text=f"Google 試算表 / 輪休基準表', rest_source)
+        self.assertIn('ctk.CTkLabel(form, text=item_label', gui_source)
+        self.assertNotIn('item_row = ctk.CTkFrame(form', gui_source)
+        self.assertIn('status_var.set("尚未選擇 Excel 檔案。")', duty_source)
+        self.assertIn('status_var.set("尚未選擇 Excel 檔案。")', rest_source)
+
+        self.assertIn("FONT_CONTROL_EMPHASIS = (UI_FONT, 14, \"bold\")", duty_source)
+        self.assertIn("font=FONT_CONTROL_EMPHASIS if embedded else FONT_BUTTON", duty_source)
+        self.assertIn("height=50 if embedded else 38", duty_source)
+        self.assertIn("FONT_CONTROL_EMPHASIS = (UI_FONT, 14, \"bold\")", rest_source)
+        self.assertEqual(rest_source.count("font=FONT_CONTROL_EMPHASIS if embedded else FONT_BUTTON"), 2)
+        self.assertEqual(rest_source.count("height=50 if embedded else 38"), 2)
+        self.assertIn('text="啟動登打", height=50, corner_radius=9, font=FONT_CONTROL_EMPHASIS, fg_color="#2563EB", hover_color="#1D4ED8"', gui_source)
+
+    def test_four_visible_tool_browsers_are_positioned_on_screen_right(self) -> None:
+        rehearsal = package_module("duty_rehearsal")
+        driver = mock.Mock()
+        driver.execute_script.return_value = {"left": 0, "top": 0, "width": 1920, "height": 1040}
+
+        rehearsal.position_browser_on_right(driver)
+
+        driver.set_window_rect.assert_called_once_with(x=960, y=0, width=960, height=1040)
+        rehearsal_source = (package_dir() / "duty_rehearsal.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
+        vehicle_source = (package_dir() / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
+        for source in (rehearsal_source, duty_source, vehicle_source):
+            self.assertIn("def position_browser_on_right(driver) -> None:", source)
+            self.assertIn("position_browser_on_right(driver)", source)
+        self.assertIn('if not config["headless"]:\n        position_browser_on_right(driver)', vehicle_source)
+
+    def test_gui_typography_uses_one_apple_role_scale(self) -> None:
+        gui_source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        duty_source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+        rescue_source = next((package_dir() / "rescue_video").glob("*GUI.py")).read_text(encoding="utf-8-sig")
+
+        for source in (gui_source, duty_source, rest_source, rescue_source):
+            self.assertIn('UI_FONT = "Microsoft JhengHei UI"', source)
+            self.assertNotIn('"Microsoft JhengHei",', source)
+        expected_scale = {
+            "TYPE_SIZE_CAPTION": 11,
+            "TYPE_SIZE_BODY": 12,
+            "TYPE_SIZE_LABEL": 13,
+            "TYPE_SIZE_CONTROL": 14,
+            "TYPE_SIZE_SECTION_TITLE": 15,
+            "TYPE_SIZE_WINDOW_TITLE": 16,
+            "TYPE_SIZE_PANEL_TITLE": 18,
+            "TYPE_SIZE_NAV_ICON": 24,
+            "TYPE_SIZE_DISPLAY": 30,
+        }
+        for token, size in expected_scale.items():
+            self.assertIn(f"{token} = {size}", gui_source)
+        self.assertIn('ctk.ThemeManager.theme["CTkFont"].update', gui_source)
+        self.assertIn("def _configure_apple_typography", rescue_source)
+        self.assertIn('style.configure("Treeview.Heading", font=FONT_TABLE_HEAD)', rescue_source)
+        self.assertNotIn("ctk.CTkFont(", rescue_source)
 
     def test_auto_logout_waits_until_submit_queues_are_idle(self) -> None:
         module = duty_gui_module()
@@ -1628,6 +1951,11 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertNotIn("CREDENTIAL_EXPORT_USER_ID", source)
         self.assertNotIn("self.credential_export_button = ctk.CTkButton", source)
         self.assertIn("sync_credentials_after_login", {node.func.attr for node in ast.walk(login_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)})
+        self.assertIn("position_window_on_left_work_area", {node.func.attr for node in ast.walk(login_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)})
+        self.assertIn("def position_window_on_left_work_area(self) -> None:", source)
+        self.assertNotIn("user32.SetWindowPos", source)
+        self.assertIn('self.geometry(f"{x_offset}{y_offset}")', source)
+        self.assertNotIn('self.geometry(f"{width}x{height}{x_offset}{y_offset}")', source)
 
     def test_auto_credential_sync_sends_login_name_with_saved_accounts(self) -> None:
         module = duty_gui_module()

@@ -40,8 +40,10 @@ UI_MUTED = "#64748b"
 UI_BLUE = "#2563eb"
 UI_BLUE_HOVER = "#1d4ed8"
 FONT_BODY = (UI_FONT, 12)
+FONT_SMALL = (UI_FONT, 11)
 FONT_TITLE = (UI_FONT, 14, "bold")
 FONT_BUTTON = (UI_FONT, 12, "bold")
+FONT_CONTROL_EMPHASIS = (UI_FONT, 14, "bold")
 CTK_COMBO_STYLE = {
     "fg_color": UI_PANEL,
     "border_color": UI_BORDER,
@@ -52,6 +54,49 @@ CTK_COMBO_STYLE = {
     "dropdown_text_color": UI_TEXT,
     "text_color": UI_TEXT,
 }
+SIDE_STATUS_STYLES = {
+    "ready": {"fg_color": "#F2F2F7", "border_color": "#D1D1D6", "text_color": "#636366"},
+    "progress": {"fg_color": "#F0F7FF", "border_color": "#B8D8FF", "text_color": "#007AFF"},
+    "success": {"fg_color": "#F0FAF2", "border_color": "#BFE8C8", "text_color": "#248A3D"},
+    "warning": {"fg_color": "#FFF8E5", "border_color": "#F2D27A", "text_color": "#8A5A00"},
+    "error": {"fg_color": "#FFF2F1", "border_color": "#FFC9C5", "text_color": "#C62828"},
+}
+SIDE_STATUS_ERROR_MARKERS = ("失敗", "錯誤", "中斷", "找不到", "未通過", "異常", "逾時")
+SIDE_STATUS_REMOVAL_MARKERS = ("移除", "刪除")
+SIDE_STATUS_SUCCESS_MARKERS = ("完成", "完畢", "已填入", "檢查通過", "已送出", "已新增")
+
+
+def normalize_side_status_message(message: str) -> str:
+    return re.sub(r"^\s*狀態\s*[：:]\s*", "", str(message or "")).strip()
+
+
+def side_status_style(message: str) -> dict[str, str]:
+    text = normalize_side_status_message(message)
+    if any(marker in text for marker in SIDE_STATUS_ERROR_MARKERS):
+        category = "error"
+    elif any(marker in text for marker in SIDE_STATUS_REMOVAL_MARKERS):
+        category = "warning"
+    elif text.startswith(("準備就緒", "尚未選擇")):
+        category = "ready"
+    elif any(marker in text for marker in SIDE_STATUS_SUCCESS_MARKERS):
+        category = "success"
+    else:
+        category = "progress"
+    return SIDE_STATUS_STYLES[category].copy()
+
+
+def bind_side_status_style(status_var: tk.StringVar, status_card: ctk.CTkFrame, status_bar: ctk.CTkLabel) -> None:
+    def refresh_style(*_args) -> None:
+        message = normalize_side_status_message(status_var.get())
+        if message != status_var.get():
+            status_var.set(message)
+            return
+        style = side_status_style(message)
+        status_card.configure(fg_color=style["fg_color"], border_color=style["border_color"])
+        status_bar.configure(text_color=style["text_color"])
+
+    status_var.trace_add("write", refresh_style)
+    refresh_style()
 
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
@@ -241,8 +286,9 @@ def extract_base_month_from_text(text: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
-    existing = getattr(parent, "_rest_time_dialog", None)
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[..., None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, container: tk.Widget | None = None, on_close: Callable[[], None] | None = None) -> ctk.CTkToplevel | ctk.CTkFrame | None:
+    embedded = container is not None
+    existing = None if embedded else getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
             if existing.winfo_exists():
@@ -254,33 +300,45 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
             pass
         setattr(parent, "_rest_time_dialog", None)
 
-    dialog = ctk.CTkToplevel(parent)
-    setattr(parent, "_rest_time_dialog", dialog)
-    dialog.title("SinpoSmart - 休息時間登打")
-    dialog.geometry("430x350")
-    dialog.minsize(430, 350)
-    dialog.configure(fg_color=UI_BG)
-    dialog.transient(parent)
+    if embedded:
+        dialog = parent
+    else:
+        dialog = ctk.CTkToplevel(parent)
+        setattr(parent, "_rest_time_dialog", dialog)
+        dialog.title("SinpoSmart - 休息時間登打")
+        dialog.geometry("430x350")
+        dialog.minsize(430, 350)
+        dialog.configure(fg_color=UI_BG)
+        dialog.transient(parent)
 
     def close_dialog() -> None:
+        if embedded:
+            if on_close is not None:
+                on_close()
+            elif root.winfo_exists():
+                root.destroy()
+            return
         setattr(parent, "_rest_time_dialog", None)
         dialog.destroy()
 
-    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+    if not embedded:
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
-    root.pack(fill=tk.BOTH, expand=True)
+    root = ctk.CTkFrame(container if embedded else dialog, fg_color="transparent" if embedded else UI_BG, corner_radius=0)
+    root.pack(fill=tk.BOTH if not embedded else tk.X, expand=not embedded)
 
-    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
-    header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    ctk.CTkLabel(header, text="休息時間登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    if not embedded:
+        header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
+        header.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ctk.CTkLabel(header, text="休息時間登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
-    body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
+    body = ctk.CTkFrame(root, fg_color="transparent" if embedded else UI_BG, corner_radius=0)
+    body.pack(fill=tk.BOTH, expand=True, padx=0 if embedded else 10, pady=(0, 10) if embedded else (8, 10))
 
-    form = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+    form = ctk.CTkFrame(body, fg_color="transparent" if embedded else UI_PANEL, border_color=UI_BORDER, border_width=0 if embedded else 1, corner_radius=0 if embedded else 8)
     form.pack(fill=tk.X, pady=(10, 8))
-    ctk.CTkLabel(form, text="勤務表檔案", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(10, 4))
+    if not embedded:
+        ctk.CTkLabel(form, text="勤務表檔案", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=12, pady=(10, 4))
     form.columnconfigure(1, weight=1)
 
     file_var = tk.StringVar(value=str(default_workbook_path()))
@@ -289,7 +347,10 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     allowed_months = nearby_month_options(current_month)
     default_month_text = f"{default_month:02d}"
     month_var = tk.StringVar(value=default_month_text if default_month_text in allowed_months else f"{current_month:02d}")
-    status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
+    status_var = tk.StringVar(value="準備就緒。")
+    if not Path(file_var.get().strip()).is_file():
+        status_var.set("尚未選擇 Excel 檔案。")
+    settings_widget_states: dict[tk.Widget, str] = {}
 
     ctk.CTkLabel(form, text="Excel", text_color=UI_MUTED, font=FONT_BODY).grid(row=1, column=0, sticky=tk.W, padx=(12, 8), pady=(4, 12))
     file_entry = ctk.CTkEntry(form, textvariable=file_var, height=34, font=FONT_BODY, fg_color=UI_PANEL, border_color=UI_BORDER)
@@ -325,7 +386,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     month_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(0, 12))
     ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
-    ctk.CTkComboBox(
+    month_combo = ctk.CTkComboBox(
         month_row,
         variable=month_var,
         values=allowed_months,
@@ -335,50 +396,71 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         font=FONT_BODY,
         dropdown_font=FONT_BODY,
         **CTK_COMBO_STYLE,
-    ).pack(side=tk.LEFT)
+    )
+    month_combo.pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
-    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
+    action_row = ctk.CTkFrame(body, fg_color="transparent" if embedded else UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
-    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
-    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    if embedded:
+        status_card = ctk.CTkFrame(body, fg_color="#F0FDF4", border_color="#BBF7D0", border_width=1, corner_radius=10)
+        status_card.pack(fill=tk.X, pady=(2, 6), before=action_row)
+        status_bar = ctk.CTkLabel(status_card, textvariable=status_var, fg_color="transparent", text_color="#166534", font=FONT_BODY, anchor=tk.W, height=38)
+        status_bar.pack(fill=tk.X, padx=12, pady=1)
+        bind_side_status_style(status_var, status_card, status_bar)
+    else:
+        status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def set_running(running: bool) -> None:
-        start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
+    def set_settings_running(running: bool) -> None:
+        for widget in (file_entry, browse_button, month_combo):
+            try:
+                if running:
+                    settings_widget_states.setdefault(widget, str(widget.cget("state")))
+                    widget.configure(state=tk.DISABLED)
+                else:
+                    widget.configure(state=settings_widget_states.pop(widget, tk.NORMAL))
+            except (tk.TclError, ValueError):
+                continue
+        start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="啟動中..." if running else "啟動登打")
 
     def run_on_dialog(callback: Callable[[], None]) -> None:
+        event_widget = root if embedded else dialog
         try:
-            if dialog.winfo_exists():
-                dialog.after(0, lambda: callback() if dialog.winfo_exists() else None)
+            if event_widget.winfo_exists():
+                event_widget.after(0, lambda: callback() if event_widget.winfo_exists() else None)
         except tk.TclError:
             pass
 
     def set_status(message: str) -> None:
-        run_on_dialog(lambda: status_var.set(message))
+        run_on_dialog(lambda: status_var.set(normalize_side_status_message(message)))
 
     def run_automation() -> None:
         uid = user_id.strip()
         pwd = password
         workbook_path = Path(file_var.get().strip())
         if not uid or not pwd:
+            set_status("失敗：請先在主視窗登入。")
             messagebox.showwarning("缺少帳號密碼", "請先在主視窗登入，再啟動休息時間登打。", parent=dialog)
             return
         try:
             validate_rest_workbook_path(workbook_path)
         except RuntimeError as exc:
+            set_status(f"失敗：{exc}")
             messagebox.showwarning("找不到 Excel", str(exc), parent=dialog)
             return
         try:
             expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
         except RuntimeError as exc:
+            set_status(f"失敗：{exc}")
             messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
             return
         save_last_workbook_path(workbook_path)
+        set_settings_running(True)
         if on_start is not None:
-            on_start()
-        set_running(True)
+            on_start(f"{expected_roc_year:03d}{expected_month:02d}")
         set_status("開啟瀏覽器登打休息時間...")
 
         def worker() -> None:
@@ -386,6 +468,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
                 result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
                     on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")
+                set_status(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 log_automation_exception("rest_time", exc)
@@ -395,7 +478,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
                 run_on_dialog(lambda: messagebox.showerror("休息時間登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
-                run_on_dialog(lambda: set_running(False))
+                run_on_dialog(lambda: set_settings_running(False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -407,29 +490,32 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
         action_row,
         text="啟動登打",
         command=run_automation,
-        fg_color="#16a34a",
-        hover_color="#15803d",
-        font=FONT_BUTTON,
-        height=38,
+        fg_color="#2563EB" if embedded else "#16a34a",
+        hover_color="#1D4ED8" if embedded else "#15803d",
+        font=FONT_CONTROL_EMPHASIS if embedded else FONT_BUTTON,
+        height=50 if embedded else 38,
+        corner_radius=9 if embedded else 6,
     )
-    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = ctk.CTkButton(
-        action_row,
-        text="關閉",
-        command=close_dialog,
-        fg_color="#e2e8f0",
-        text_color=UI_TEXT,
-        hover_color="#cbd5e1",
-        font=FONT_BUTTON,
-        width=90,
-        height=38,
-    )
-    close_button.grid(row=0, column=1, sticky=tk.E)
-    return dialog
+    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 0 if embedded else 8))
+    if not embedded:
+        close_button = ctk.CTkButton(
+            action_row,
+            text="關閉",
+            command=close_dialog,
+            fg_color="#e2e8f0",
+            text_color=UI_TEXT,
+            hover_color="#cbd5e1",
+            font=FONT_BUTTON,
+            width=90,
+            height=38,
+        )
+        close_button.grid(row=0, column=1, sticky=tk.E)
+    return root if embedded else dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
-    existing = getattr(parent, "_monthly_base_dialog", None)
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[..., None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, container: tk.Widget | None = None, on_close: Callable[[], None] | None = None) -> ctk.CTkToplevel | ctk.CTkFrame | None:
+    embedded = container is not None
+    existing = None if embedded else getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
             if existing.winfo_exists():
@@ -441,45 +527,61 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             pass
         setattr(parent, "_monthly_base_dialog", None)
 
-    dialog = ctk.CTkToplevel(parent)
-    setattr(parent, "_monthly_base_dialog", dialog)
-    dialog.title("SinpoSmart - 勤務基準表登打")
-    dialog.geometry("430x330")
-    dialog.minsize(430, 330)
-    dialog.configure(fg_color=UI_BG)
-    dialog.transient(parent)
+    if embedded:
+        dialog = parent
+    else:
+        dialog = ctk.CTkToplevel(parent)
+        setattr(parent, "_monthly_base_dialog", dialog)
+        dialog.title("SinpoSmart - 勤務基準表登打")
+        dialog.geometry("430x330")
+        dialog.minsize(430, 330)
+        dialog.configure(fg_color=UI_BG)
+        dialog.transient(parent)
 
     def close_dialog() -> None:
+        if embedded:
+            if on_close is not None:
+                on_close()
+            elif root.winfo_exists():
+                root.destroy()
+            return
         setattr(parent, "_monthly_base_dialog", None)
         dialog.destroy()
 
-    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+    if not embedded:
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
-    root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
-    root.pack(fill=tk.BOTH, expand=True)
+    root = ctk.CTkFrame(container if embedded else dialog, fg_color="transparent" if embedded else UI_BG, corner_radius=0)
+    root.pack(fill=tk.BOTH if not embedded else tk.X, expand=not embedded)
 
-    header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
-    header.pack(fill=tk.X, padx=10, pady=(10, 0))
-    ctk.CTkLabel(header, text="勤務基準表登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
+    if not embedded:
+        header = ctk.CTkFrame(root, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
+        header.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ctk.CTkLabel(header, text="勤務基準表登打", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 10))
 
-    body = ctk.CTkFrame(root, fg_color=UI_BG, corner_radius=0)
-    body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 10))
+    body = ctk.CTkFrame(root, fg_color="transparent" if embedded else UI_BG, corner_radius=0)
+    body.pack(fill=tk.BOTH, expand=True, padx=0 if embedded else 10, pady=(0, 10) if embedded else (8, 10))
 
-    info = ctk.CTkFrame(body, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
+    info = ctk.CTkFrame(body, fg_color="transparent" if embedded else UI_PANEL, border_color=UI_BORDER, border_width=0 if embedded else 1, corner_radius=0 if embedded else 8)
     info.pack(fill=tk.X, pady=(10, 8))
-    ctk.CTkLabel(info, text="固定來源", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
+    if not embedded:
+        ctk.CTkLabel(info, text="固定來源", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
     info.columnconfigure(0, weight=1)
-    ctk.CTkLabel(info, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
+    source_row = ctk.CTkFrame(info, fg_color="transparent")
+    source_row.grid(row=1, column=0, sticky=tk.EW, padx=12, pady=(0, 12))
+    ctk.CTkLabel(source_row, text="來源", text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 6))
+    ctk.CTkLabel(source_row, text=f"Google 試算表 / 輪休基準表  {display_name or actor_no or user_id}", text_color=UI_TEXT, font=FONT_BODY, justify=tk.LEFT, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     fixed_roc_year, current_month = current_roc_year_month()
     allowed_months = nearby_month_options(current_month)
     month_var = tk.StringVar(value=f"{current_month:02d}")
+    settings_widget_states: dict[tk.Widget, str] = {}
     month_row = ctk.CTkFrame(info, fg_color="transparent")
     month_row.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 12))
     ctk.CTkLabel(month_row, text="年月", text_color=UI_MUTED, font=FONT_BODY).pack(side=tk.LEFT, padx=(0, 8))
     ctk.CTkLabel(month_row, text=str(fixed_roc_year), text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="年", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 10))
-    ctk.CTkComboBox(
+    month_combo = ctk.CTkComboBox(
         month_row,
         variable=month_var,
         values=allowed_months,
@@ -489,29 +591,46 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         font=FONT_BODY,
         dropdown_font=FONT_BODY,
         **CTK_COMBO_STYLE,
-    ).pack(side=tk.LEFT)
+    )
+    month_combo.pack(side=tk.LEFT)
     ctk.CTkLabel(month_row, text="月", text_color=UI_TEXT, font=FONT_BODY).pack(side=tk.LEFT, padx=(6, 0))
 
-    action_row = ctk.CTkFrame(body, fg_color=UI_BG)
+    action_row = ctk.CTkFrame(body, fg_color="transparent" if embedded else UI_BG)
     action_row.pack(fill=tk.X, pady=(8, 8))
     action_row.columnconfigure(0, weight=1)
 
-    status_var = tk.StringVar(value=f"準備就緒。{display_name or actor_no or user_id}")
-    status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
-    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    status_var = tk.StringVar(value="準備就緒。")
+    if embedded:
+        status_card = ctk.CTkFrame(body, fg_color="#F0FDF4", border_color="#BBF7D0", border_width=1, corner_radius=10)
+        status_card.pack(fill=tk.X, pady=(2, 6), before=action_row)
+        status_bar = ctk.CTkLabel(status_card, textvariable=status_var, fg_color="transparent", text_color="#166534", font=FONT_BODY, anchor=tk.W, height=38)
+        status_bar.pack(fill=tk.X, padx=12, pady=1)
+        bind_side_status_style(status_var, status_card, status_bar)
+    else:
+        status_bar = ctk.CTkLabel(body, textvariable=status_var, fg_color=UI_PANEL, text_color=UI_MUTED, font=FONT_BODY, anchor=tk.W, height=32)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def set_running(running: bool) -> None:
-        start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="登打中..." if running else "啟動登打")
+    def set_settings_running(running: bool) -> None:
+        try:
+            if running:
+                settings_widget_states.setdefault(month_combo, str(month_combo.cget("state")))
+                month_combo.configure(state=tk.DISABLED)
+            else:
+                month_combo.configure(state=settings_widget_states.pop(month_combo, "readonly"))
+        except (tk.TclError, ValueError):
+            pass
+        start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="啟動中..." if running else "啟動登打")
 
     def run_on_dialog(callback: Callable[[], None]) -> None:
+        event_widget = root if embedded else dialog
         try:
-            if dialog.winfo_exists():
-                dialog.after(0, lambda: callback() if dialog.winfo_exists() else None)
+            if event_widget.winfo_exists():
+                event_widget.after(0, lambda: callback() if event_widget.winfo_exists() else None)
         except tk.TclError:
             pass
 
     def set_status(message: str) -> None:
-        run_on_dialog(lambda: status_var.set(message))
+        run_on_dialog(lambda: status_var.set(normalize_side_status_message(message)))
 
     def show_complete_and_close(result: str) -> None:
         messagebox.showinfo("完成", result, parent=dialog)
@@ -522,26 +641,30 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         pwd = password
         actor = actor_no.strip()
         if not uid or not pwd:
+            set_status("失敗：請先在主視窗登入。")
             messagebox.showwarning("缺少帳號密碼", "請先在主視窗登入，再啟動每月基準表登打。", parent=dialog)
             return
         if not actor:
+            set_status("失敗：請先在主視窗確認番號。")
             messagebox.showwarning("缺少番號", "請先在主視窗確認番號，再啟動每月基準表登打。", parent=dialog)
             return
         try:
             expected_roc_year, expected_month = selected_year_month(str(fixed_roc_year), month_var.get())
         except RuntimeError as exc:
+            set_status(f"失敗：{exc}")
             messagebox.showwarning("年月錯誤", str(exc), parent=dialog)
             return
-        set_running(True)
+        set_settings_running(True)
         set_status("讀取輪休基準表並開啟勤務基準表...")
 
         def worker() -> None:
             try:
                 if on_start is not None:
-                    on_start()
+                    on_start(f"{expected_roc_year:03d}{expected_month:02d}")
                 result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month)
                 if on_finish is not None:
                     on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")
+                set_status(result)
                 run_on_dialog(lambda: show_complete_and_close(result))
             except Exception as exc:
                 log_automation_exception("monthly_base", exc)
@@ -551,7 +674,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
                 run_on_dialog(lambda: messagebox.showerror("每月基準表登打失敗", error, parent=dialog))
                 set_status(f"失敗：{error}")
             finally:
-                run_on_dialog(lambda: set_running(False))
+                run_on_dialog(lambda: set_settings_running(False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -559,25 +682,27 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         action_row,
         text="啟動登打",
         command=run_automation,
-        fg_color="#16a34a",
-        hover_color="#15803d",
-        font=FONT_BUTTON,
-        height=38,
+        fg_color="#2563EB" if embedded else "#16a34a",
+        hover_color="#1D4ED8" if embedded else "#15803d",
+        font=FONT_CONTROL_EMPHASIS if embedded else FONT_BUTTON,
+        height=50 if embedded else 38,
+        corner_radius=9 if embedded else 6,
     )
-    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-    close_button = ctk.CTkButton(
-        action_row,
-        text="關閉",
-        command=close_dialog,
-        fg_color="#e2e8f0",
-        text_color=UI_TEXT,
-        hover_color="#cbd5e1",
-        font=FONT_BUTTON,
-        width=90,
-        height=38,
-    )
-    close_button.grid(row=0, column=1, sticky=tk.E)
-    return dialog
+    start_button.grid(row=0, column=0, sticky=tk.EW, padx=(0, 0 if embedded else 8))
+    if not embedded:
+        close_button = ctk.CTkButton(
+            action_row,
+            text="關閉",
+            command=close_dialog,
+            fg_color="#e2e8f0",
+            text_color=UI_TEXT,
+            hover_color="#cbd5e1",
+            font=FONT_BUTTON,
+            width=90,
+            height=38,
+        )
+        close_button.grid(row=0, column=1, sticky=tk.E)
+    return root if embedded else dialog
 
 
 def default_workbook_path() -> Path:

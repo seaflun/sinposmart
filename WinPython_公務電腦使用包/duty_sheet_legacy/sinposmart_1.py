@@ -28,6 +28,28 @@ from copy import copy
 # 隱藏 Excel 格式警告，保持黑視窗乾淨
 warnings.filterwarnings("ignore", category=UserWarning)
 
+
+def position_browser_on_right(driver) -> None:
+    try:
+        screen = driver.execute_script(
+            "return {left: screen.availLeft || 0, top: screen.availTop || 0, "
+            "width: screen.availWidth || screen.width, height: screen.availHeight || screen.height};"
+        ) or {}
+        screen_left = int(screen.get("left", 0))
+        screen_top = int(screen.get("top", 0))
+        screen_width = max(1, int(screen.get("width", 1920)))
+        screen_height = max(1, int(screen.get("height", 1040)))
+        browser_width = min(screen_width, max(720, screen_width // 2))
+        driver.set_window_rect(
+            x=screen_left + screen_width - browser_width,
+            y=screen_top,
+            width=browser_width,
+            height=screen_height,
+        )
+    except Exception:
+        pass
+
+
 # 全域狀態更新函數 (確保執行緒安全)
 def log_status(msg):
     try:
@@ -43,7 +65,7 @@ def clean_status_message(msg):
     return re.sub(r'^(?:[➡⏳📂✅⚠❌🧠🖼☁🎉️]\s*)+', '', text).strip()
 
 def sync_status_to_gui(msg):
-    status_var.set(f"狀態: {clean_status_message(msg)}")
+    status_var.set(clean_status_message(msg))
     if 'log_text' in globals():
         log_text.insert(tk.END, f"{msg}\n")
         log_text.see(tk.END)
@@ -1226,6 +1248,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     driver = webdriver.Chrome()
+    position_browser_on_right(driver)
     try:
         driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
     except Exception:
@@ -1782,7 +1805,7 @@ if __name__ == "__main__":
     # ==========================================
     # 底部狀態列 (Status Bar)
     # ==========================================
-    status_var = tk.StringVar(value="狀態: 準備就緒")
+    status_var = tk.StringVar(value="準備就緒")
     status_bar = ttk.Label(root, textvariable=status_var, relief="sunken", anchor="w", padding=5)
     status_bar.pack(side="bottom", fill="x")
 

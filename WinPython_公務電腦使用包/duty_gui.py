@@ -41,6 +41,7 @@ from uuid import uuid4
 DAILY_SCREENSHOT_DIR = "每日勤務表"
 NIGHT_SCREENSHOT_DIR = "夜間勤務"
 RUNTIME_OUTPUT_DIR = Path("runtime_outputs")
+TOOL_USAGE_HISTORY_PATH = RUNTIME_OUTPUT_DIR / "tool_usage_history.json"
 SCHEDULE_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "schedule"
 COMPARISON_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "comparison"
 REHEARSAL_OUTPUT_DIR = RUNTIME_OUTPUT_DIR / "rehearsal"
@@ -61,13 +62,23 @@ AUTO_CLEAN_RULES = (
     (FORM_TEST_OUTPUT_DIR, "*.json", 7),
     (SNAPSHOT_OUTPUT_DIR, "*.json", 14),
 )
+DAILY_TOOL_NAMES = {"duty_sheet", "daily_vehicle", "rescue_video"}
+MONTHLY_TOOL_NAMES = {"rest_time", "monthly_base"}
+ANIMATED_SIDE_TOOL_NAMES = {"duty_sheet", "daily_vehicle", "rest_time", "monthly_base"}
+TOOL_USAGE_RESULT_LABELS = {
+    "duty_sheet": "勤務表",
+    "daily_vehicle": "車輛保養清點",
+    "rest_time": "休息時間",
+    "monthly_base": "勤務基準表",
+}
+RESCUE_VIDEO_WINDOW_TITLE = "救護行車影片分類"
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 
 from daily_vehicle_automation import start_daily_vehicle_automation
-from duty_sheet_automation import open_duty_sheet_dialog
+from duty_sheet_automation import normalize_side_status_message, open_duty_sheet_dialog, side_status_style
 from rest_time_automation import open_monthly_base_dialog, open_rest_time_dialog
 
 ctk.set_appearance_mode("light")
@@ -844,15 +855,37 @@ UI_RED = "#dc2626"
 UI_RED_HOVER = "#b91c1c"
 UI_SOFT_ACTION = "#f1f5f9"
 UI_SOFT_ACTION_HOVER = "#e2e8f0"
-FONT_BODY = (UI_FONT, 12)
-FONT_SMALL = (UI_FONT, 11)
-FONT_TITLE = (UI_FONT, 14, "bold")
-FONT_SECTION = (UI_FONT, 12, "bold")
-FONT_BUTTON = (UI_FONT, 12, "bold")
-FONT_CLOCK = (UI_FONT, 30, "bold")
-FONT_DUTY_TIME = (UI_FONT, 18, "bold")
-FONT_TABLE = (UI_FONT, 12)
-FONT_TABLE_HEAD = (UI_FONT, 12, "bold")
+TYPE_SIZE_CAPTION = 11
+TYPE_SIZE_BODY = 12
+TYPE_SIZE_LABEL = 13
+TYPE_SIZE_CONTROL = 14
+TYPE_SIZE_SECTION_TITLE = 15
+TYPE_SIZE_WINDOW_TITLE = 16
+TYPE_SIZE_PANEL_TITLE = 18
+TYPE_SIZE_NAV_ICON = 24
+TYPE_SIZE_DISPLAY = 30
+FONT_SMALL = (UI_FONT, TYPE_SIZE_CAPTION)
+FONT_CAPTION_EMPHASIS = (UI_FONT, TYPE_SIZE_CAPTION, "bold")
+FONT_BODY = (UI_FONT, TYPE_SIZE_BODY)
+FONT_BODY_EMPHASIS = (UI_FONT, TYPE_SIZE_BODY, "bold")
+FONT_BUTTON = FONT_BODY_EMPHASIS
+FONT_SECTION = FONT_BODY_EMPHASIS
+FONT_LABEL = (UI_FONT, TYPE_SIZE_LABEL)
+FONT_LABEL_EMPHASIS = (UI_FONT, TYPE_SIZE_LABEL, "bold")
+FONT_CONTROL = (UI_FONT, TYPE_SIZE_CONTROL)
+FONT_CONTROL_EMPHASIS = (UI_FONT, TYPE_SIZE_CONTROL, "bold")
+FONT_TITLE = FONT_CONTROL_EMPHASIS
+FONT_SECTION_TITLE = (UI_FONT, TYPE_SIZE_SECTION_TITLE, "bold")
+FONT_WINDOW_TITLE = (UI_FONT, TYPE_SIZE_WINDOW_TITLE, "bold")
+FONT_PANEL_TITLE = (UI_FONT, TYPE_SIZE_PANEL_TITLE, "bold")
+FONT_NAV_ICON = (UI_FONT, TYPE_SIZE_NAV_ICON)
+FONT_CLOCK = (UI_FONT, TYPE_SIZE_DISPLAY, "bold")
+FONT_DUTY_TIME = FONT_PANEL_TITLE
+FONT_TABLE = FONT_BODY
+FONT_TABLE_HEAD = FONT_BODY_EMPHASIS
+ctk.ThemeManager.theme["CTkFont"].update(
+    {"family": UI_FONT, "size": TYPE_SIZE_BODY, "weight": "normal"}
+)
 CTK_COMBO_STYLE = {
     "fg_color": UI_PANEL,
     "border_color": "#bfdbfe",
@@ -894,6 +927,7 @@ class DutyGui(ctk.CTk):
         self.apply_window_icon(self)
         self.geometry("550x800")
         self.minsize(530, 760)
+        self.resizable(False, False)
 
         self.preview_path = tk.StringVar(value=str(DEFAULT_PREVIEW))
         self.audit_date = tk.StringVar(value=today_roc_date())
@@ -957,6 +991,13 @@ class DutyGui(ctk.CTk):
         self.duty_task_refresh_full_requested = False
         self.last_duty_refresh_minute = ""
         self.saved_accounts: list[dict[str, str]] = []
+        self.tool_usage_history = self.load_tool_usage_history()
+        self.active_tool_usage_ids: dict[str, str] = {}
+        self.tool_usage_side_views: dict[str, dict[str, object]] = {}
+        self.rescue_video_process: subprocess.Popen | None = None
+        self.last_tool_usage_time = tk.StringVar(value="尚無紀錄")
+        self.last_tool_usage_people = tk.StringVar(value="-")
+        self.last_tool_usage_report = tk.StringVar(value="-")
         self.work_log_defaults = load_work_log_defaults()
         self.review_widgets: list[tk.Widget] = []
         self.duty_widgets: list[tk.Widget] = []
@@ -1044,14 +1085,34 @@ class DutyGui(ctk.CTk):
         style.configure("AuditCaption.TLabel", background=UI_BG, foreground=UI_MUTED, font=FONT_SMALL)
         style.configure("Treeview", rowheight=38, font=FONT_TABLE, background=UI_PANEL, fieldbackground=UI_PANEL, bordercolor=UI_BORDER, lightcolor=UI_BORDER, darkcolor=UI_BORDER)
         style.configure("Treeview.Heading", font=FONT_TABLE_HEAD, background="#edf3fb", foreground=UI_TEXT, relief=tk.FLAT, bordercolor=UI_BORDER)
-        style.configure("Audit.Treeview", rowheight=34, font=(UI_FONT, 11), background=UI_PANEL, fieldbackground=UI_PANEL, borderwidth=0, relief=tk.FLAT)
-        style.configure("Audit.Treeview.Heading", font=(UI_FONT, 11, "bold"), background="#f1f5f9", foreground="#0f172a", relief=tk.FLAT, borderwidth=0)
+        style.configure("Audit.Treeview", rowheight=34, font=FONT_SMALL, background=UI_PANEL, fieldbackground=UI_PANEL, borderwidth=0, relief=tk.FLAT)
+        style.configure("Audit.Treeview.Heading", font=FONT_CAPTION_EMPHASIS, background="#f1f5f9", foreground="#0f172a", relief=tk.FLAT, borderwidth=0)
         style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", UI_TEXT)])
 
         root = ctk.CTkFrame(self, fg_color=UI_BG, corner_radius=0)
         root.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
         self.root_panel = root
-        self.audit_panel = ctk.CTkFrame(root, fg_color="transparent")
+        self.duty_main_width = 522
+        self.audit_main_width = 752
+        self.tool_side_width = 400
+        widget_scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        self.duty_main_width_px = round(self.duty_main_width * widget_scaling)
+        self.audit_main_width_px = round(self.audit_main_width * widget_scaling)
+        self.tool_side_width_px = round(self.tool_side_width * widget_scaling)
+        root.grid_columnconfigure(0, minsize=self.duty_main_width_px, weight=0)
+        root.grid_columnconfigure(1, minsize=0, weight=0)
+        root.grid_rowconfigure(0, weight=1)
+        self.main_content_host = ctk.CTkFrame(root, width=self.duty_main_width, fg_color="transparent")
+        self.main_content_host.grid(row=0, column=0, sticky=tk.NSEW)
+        self.main_content_host.grid_propagate(False)
+        self.tool_side_panel = ctk.CTkFrame(root, width=self.tool_side_width, fg_color="#FCFDFF", border_color="#D9E1EC", border_width=1, corner_radius=16)
+        self.tool_side_panel.pack_propagate(False)
+        self.tool_side_content_frame: ctk.CTkFrame | None = None
+        self.tool_side_animation_job: str | None = None
+        self.tool_side_animation_offset = 0
+        self.tool_side_animation_target: int | None = None
+        self.active_tool_side_name = ""
+        self.audit_panel = ctk.CTkFrame(self.main_content_host, fg_color="transparent")
 
         top = ttk.LabelFrame(self.audit_panel, text="預演資料", padding=10)
         top.pack(fill=tk.X)
@@ -1121,7 +1182,7 @@ class DutyGui(ctk.CTk):
             bg, fg = colors[key]
             card = ctk.CTkFrame(summary, fg_color=bg, border_color="#d8e0ec", border_width=1, corner_radius=8)
             card.grid(row=0, column=idx, sticky=tk.EW, padx=(0 if idx == 0 else 6, 0))
-            ctk.CTkLabel(card, textvariable=self.summary_vars[key], text_color=fg, font=(UI_FONT, 16, "bold")).pack(fill=tk.X, padx=8, pady=8)
+            ctk.CTkLabel(card, textvariable=self.summary_vars[key], text_color=fg, font=FONT_WINDOW_TITLE).pack(fill=tk.X, padx=8, pady=8)
             summary.columnconfigure(idx, weight=1)
 
         tools = ctk.CTkFrame(self.audit_panel, fg_color="transparent")
@@ -1133,8 +1194,8 @@ class DutyGui(ctk.CTk):
 
         date_card = ctk.CTkFrame(tools, fg_color="#eff6ff", border_color="#bfdbfe", border_width=1, corner_radius=8)
         date_card.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 5))
-        ctk.CTkLabel(date_card, text="日期切換", text_color="#1e3a8a", font=(UI_FONT, 14, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 0))
-        ctk.CTkLabel(date_card, text="勤務日期", text_color="#475569", font=(UI_FONT, 13)).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
+        ctk.CTkLabel(date_card, text="日期切換", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(8, 0))
+        ctk.CTkLabel(date_card, text="勤務日期", text_color="#475569", font=FONT_LABEL).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
         self.audit_date_combo = ctk.CTkComboBox(
             date_card,
             variable=self.audit_date,
@@ -1142,23 +1203,23 @@ class DutyGui(ctk.CTk):
             width=118,
             height=36,
             state="readonly",
-            font=(UI_FONT, 14),
-            dropdown_font=(UI_FONT, 14),
+            font=FONT_CONTROL,
+            dropdown_font=FONT_CONTROL,
             **CTK_COMBO_STYLE,
             command=lambda _value: self.load_audit_date(),
         )
         self.audit_date_combo.grid(row=2, column=0, sticky=tk.W, padx=12, pady=(0, 10))
-        ctk.CTkButton(date_card, text="<", width=38, height=36, font=(UI_FONT, 14, "bold"), fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(-1)).grid(row=2, column=1, padx=(4, 2), pady=(0, 10))
-        ctk.CTkButton(date_card, text=">", width=38, height=36, font=(UI_FONT, 14, "bold"), fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(1)).grid(row=2, column=2, padx=2, pady=(0, 10))
-        self.refresh_compare_button = ctk.CTkButton(date_card, text="重新查詢", width=92, height=36, font=(UI_FONT, 14, "bold"), fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=self.refresh_current_comparison)
+        ctk.CTkButton(date_card, text="<", width=38, height=36, font=FONT_CONTROL_EMPHASIS, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(-1)).grid(row=2, column=1, padx=(4, 2), pady=(0, 10))
+        ctk.CTkButton(date_card, text=">", width=38, height=36, font=FONT_CONTROL_EMPHASIS, fg_color="#dbeafe", text_color="#1d4ed8", hover_color="#bfdbfe", command=lambda: self.shift_audit_date(1)).grid(row=2, column=2, padx=2, pady=(0, 10))
+        self.refresh_compare_button = ctk.CTkButton(date_card, text="重新查詢", width=92, height=36, font=FONT_CONTROL_EMPHASIS, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=self.refresh_current_comparison)
         self.refresh_compare_button.grid(row=2, column=3, sticky=tk.E, padx=(8, 12), pady=(0, 10))
         date_card.columnconfigure(3, weight=1)
 
         filter_card = ctk.CTkFrame(tools, fg_color="#eff6ff", border_color="#bfdbfe", border_width=1, corner_radius=8)
         filter_card.grid(row=0, column=1, sticky=tk.NSEW, padx=(5, 0))
-        ctk.CTkLabel(filter_card, text="篩選條件", text_color="#1e3a8a", font=(UI_FONT, 14, "bold")).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(8, 0))
-        ctk.CTkLabel(filter_card, text="狀態", text_color=UI_MUTED, font=(UI_FONT, 13)).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
-        ctk.CTkLabel(filter_card, text="類型", text_color=UI_MUTED, font=(UI_FONT, 13)).grid(row=1, column=1, sticky=tk.W, padx=(8, 12), pady=(0, 0))
+        ctk.CTkLabel(filter_card, text="篩選條件", text_color="#1e3a8a", font=FONT_TITLE).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(8, 0))
+        ctk.CTkLabel(filter_card, text="狀態", text_color=UI_MUTED, font=FONT_LABEL).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(0, 0))
+        ctk.CTkLabel(filter_card, text="類型", text_color=UI_MUTED, font=FONT_LABEL).grid(row=1, column=1, sticky=tk.W, padx=(8, 12), pady=(0, 0))
         ctk.CTkComboBox(
             filter_card,
             variable=self.status_filter,
@@ -1166,8 +1227,8 @@ class DutyGui(ctk.CTk):
             width=150,
             height=36,
             state="readonly",
-            font=(UI_FONT, 14),
-            dropdown_font=(UI_FONT, 14),
+            font=FONT_CONTROL,
+            dropdown_font=FONT_CONTROL,
             **CTK_COMBO_STYLE,
             command=lambda _value: self.refresh_tasks(),
         ).grid(row=2, column=0, sticky=tk.EW, padx=12, pady=(0, 10))
@@ -1178,8 +1239,8 @@ class DutyGui(ctk.CTk):
             width=130,
             height=36,
             state="readonly",
-            font=(UI_FONT, 14),
-            dropdown_font=(UI_FONT, 14),
+            font=FONT_CONTROL,
+            dropdown_font=FONT_CONTROL,
             **CTK_COMBO_STYLE,
             command=lambda _value: self.refresh_tasks(),
         ).grid(row=2, column=1, sticky=tk.EW, padx=(8, 12), pady=(0, 10))
@@ -1259,7 +1320,7 @@ class DutyGui(ctk.CTk):
         self.detail = ctk.CTkTextbox(bottom, height=118, wrap=tk.WORD, font=FONT_BODY, fg_color="#ffffff", border_width=0)
         self.detail.pack(fill=tk.BOTH, expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.show_selected_detail)
-        self.build_duty_panel(root)
+        self.build_duty_panel(self.main_content_host)
         self.apply_mode()
 
     def build_duty_panel(self, root: ttk.Frame) -> None:
@@ -1277,8 +1338,8 @@ class DutyGui(ctk.CTk):
         login_panel.pack(fill=tk.BOTH, expand=True, padx=14, pady=(8, 6))
         duty_header = ctk.CTkFrame(login_panel, fg_color="transparent")
         duty_header.pack(fill=tk.X)
-        ctk.CTkLabel(duty_header, text="消防勤務管理系統", text_color="#1e3a8a", font=(UI_FONT, 16, "bold")).pack(side=tk.LEFT)
-        self.work_log_settings_button = ctk.CTkButton(duty_header, text="⚙", width=34, height=34, font=FONT_BUTTON, fg_color="transparent", text_color="#334155", hover_color="#eef2ff", border_width=0, command=self.open_work_log_defaults_dialog)
+        ctk.CTkLabel(duty_header, text="消防勤務管理系統", text_color="#1e3a8a", font=FONT_WINDOW_TITLE).pack(side=tk.LEFT)
+        self.work_log_settings_button = ctk.CTkButton(duty_header, text="⚙", width=34, height=34, font=FONT_BUTTON, fg_color="transparent", text_color="#334155", hover_color="#eef2ff", border_width=0, command=lambda: self.toggle_tool_side_panel("work_log_defaults", "工作紀錄預設內容", self.open_work_log_defaults_dialog))
         self.work_log_settings_button.pack(side=tk.RIGHT)
         self.work_log_settings_button.pack_forget()
 
@@ -1336,7 +1397,7 @@ class DutyGui(ctk.CTk):
         self.login_status_row = ctk.CTkFrame(login_panel, fg_color="transparent")
         self.login_status_row.pack(fill=tk.X, pady=(4, 0))
         self.login_status_row.columnconfigure(0, weight=1)
-        self.login_status_label = ctk.CTkLabel(self.login_status_row, textvariable=self.login_status, text_color="#166534", font=(UI_FONT, 14), wraplength=430, justify=tk.LEFT, anchor=tk.W, height=24)
+        self.login_status_label = ctk.CTkLabel(self.login_status_row, textvariable=self.login_status, text_color="#166534", font=FONT_CONTROL, wraplength=430, justify=tk.LEFT, anchor=tk.W, height=24)
         self.login_status_label.grid(row=0, column=0, sticky=tk.EW, pady=(0, 0))
         self.logout_button = ctk.CTkButton(self.login_status_row, text="登出", width=74, height=30, font=FONT_BUTTON, fg_color=UI_PANEL, text_color="#b91c1c", hover_color="#fef2f2", border_color="#fecaca", border_width=1, command=self.clear_login)
         self.logout_widgets.append(self.logout_button)
@@ -1350,19 +1411,18 @@ class DutyGui(ctk.CTk):
         tools_panel.columnconfigure(1, weight=1, uniform="duty_tools")
         tools_panel.columnconfigure(2, weight=1, uniform="duty_tools")
         tools_panel.columnconfigure(3, weight=1, uniform="duty_tools")
-        ctk.CTkLabel(tools_panel, text="每日作業", text_color="#1D4ED8", font=(UI_FONT, 13, "bold")).grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=(0, 8))
-        self.duty_sheet_button = ctk.CTkButton(tools_panel, text="勤務表登打", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_duty_sheet_automation)
-        self.duty_sheet_button.grid(row=0, column=1, sticky=tk.EW, pady=(0, 8), padx=(0, 4))
-        self.daily_vehicle_button = ctk.CTkButton(tools_panel, text="車輛保養清點", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=self.open_daily_vehicle_automation)
+        ctk.CTkLabel(tools_panel, text="每日作業", text_color="#1D4ED8", font=FONT_LABEL_EMPHASIS).grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=(0, 8))
+        self.duty_sheet_button = ctk.CTkButton(tools_panel, text="勤務表登打", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=lambda: self.toggle_tool_side_panel("duty_sheet", "勤務表登打", self.open_duty_sheet_automation))
+        self.duty_sheet_button.grid(row=0, column=1, sticky=tk.EW, pady=(0, 8), padx=4)
+        self.daily_vehicle_button = ctk.CTkButton(tools_panel, text="車輛保養清點", height=40, font=FONT_BUTTON, fg_color="#DBEAFE", text_color="#1D4ED8", hover_color="#BFDBFE", border_color="#BFDBFE", border_width=1, command=lambda: self.toggle_tool_side_panel("daily_vehicle", "車輛保養清點", self.open_daily_vehicle_automation))
         self.daily_vehicle_button.grid(row=0, column=2, sticky=tk.EW, pady=(0, 8), padx=4)
         self.rescue_video_button = ctk.CTkButton(tools_panel, text="行車紀錄器（BETA）", height=40, font=FONT_BUTTON, fg_color="#FEF3C7", text_color="#92400E", hover_color="#FDE68A", border_color="#FCD34D", border_width=1, command=self.open_rescue_video_tool)
-        self.rescue_video_button.grid(row=0, column=3, sticky=tk.EW, pady=(0, 8), padx=(4, 0))
-        ctk.CTkLabel(tools_panel, text="每月作業", text_color="#3730A3", font=(UI_FONT, 13, "bold")).grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
-        self.rest_time_button = ctk.CTkButton(tools_panel, text="休息時間登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=self.open_rest_time_automation)
-        self.rest_time_button.grid(row=1, column=1, sticky=tk.EW, padx=(0, 4))
-        self.monthly_base_button = ctk.CTkButton(tools_panel, text="勤務基準表登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=self.open_monthly_base_automation)
-        self.monthly_base_button.grid(row=1, column=2, sticky=tk.EW, padx=(4, 0))
-
+        self.rescue_video_button.grid(row=0, column=3, sticky=tk.EW, pady=(0, 8), padx=4)
+        ctk.CTkLabel(tools_panel, text="每月作業", text_color="#3730A3", font=FONT_LABEL_EMPHASIS).grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
+        self.rest_time_button = ctk.CTkButton(tools_panel, text="休息時間登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=lambda: self.toggle_tool_side_panel("rest_time", "休息時間登打", self.open_rest_time_automation))
+        self.rest_time_button.grid(row=1, column=1, sticky=tk.EW, padx=4)
+        self.monthly_base_button = ctk.CTkButton(tools_panel, text="勤務基準表登打", height=40, font=FONT_BUTTON, fg_color="#EEF2FF", text_color="#3730A3", hover_color="#E0E7FF", border_color="#C7D2FE", border_width=1, command=lambda: self.toggle_tool_side_panel("monthly_base", "勤務基準表登打", self.open_monthly_base_automation))
+        self.monthly_base_button.grid(row=1, column=2, sticky=tk.EW, padx=4)
         controls = ctk.CTkFrame(panel, fg_color="transparent")
         controls.pack(fill=tk.X, pady=(10, 0), side=tk.BOTTOM)
         self.duty_controls = controls
@@ -1469,7 +1529,7 @@ class DutyGui(ctk.CTk):
                 render(date(y, m, 1))
 
             ttk.Button(header, text="◀", width=3, command=lambda: move(-1)).pack(side=tk.LEFT)
-            ttk.Label(header, text=f"{month_date.year}/{month_date.month:02d}", font=("Microsoft JhengHei", 11, "bold")).pack(side=tk.LEFT, expand=True)
+            ttk.Label(header, text=f"{month_date.year}/{month_date.month:02d}", font=FONT_CAPTION_EMPHASIS).pack(side=tk.LEFT, expand=True)
             ttk.Button(header, text="▶", width=3, command=lambda: move(1)).pack(side=tk.RIGHT)
 
             for col, label in enumerate(("一", "二", "三", "四", "五", "六", "日")):
@@ -1524,8 +1584,8 @@ class DutyGui(ctk.CTk):
         ctk.CTkLabel(modes, text="模式", text_color="#22324a", font=FONT_SECTION).pack(anchor=tk.W, padx=10, pady=(8, 0))
         mode_row = ctk.CTkFrame(modes, fg_color="transparent")
         mode_row.pack(fill=tk.X, padx=10, pady=(6, 10))
-        ctk.CTkRadioButton(mode_row, text="值班模式", variable=self.mode, value="值班模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8").pack(side=tk.LEFT, padx=(0, 20))
-        ctk.CTkRadioButton(mode_row, text="審核模式", variable=self.mode, value="審核模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8").pack(side=tk.LEFT)
+        ctk.CTkRadioButton(mode_row, text="值班模式", variable=self.mode, value="值班模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8", font=FONT_BODY).pack(side=tk.LEFT, padx=(0, 20))
+        ctk.CTkRadioButton(mode_row, text="審核模式", variable=self.mode, value="審核模式", text_color="#334155", fg_color="#2563eb", hover_color="#1d4ed8", font=FONT_BODY).pack(side=tk.LEFT)
 
         buttons = ctk.CTkFrame(frame, fg_color="transparent")
         buttons.pack(fill=tk.X, pady=(18, 0))
@@ -2523,6 +2583,152 @@ class DutyGui(ctk.CTk):
             },
         )
 
+    def load_tool_usage_history(self) -> list[dict[str, str]]:
+        try:
+            payload = json.loads(TOOL_USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)][-100:]
+
+    def save_tool_usage_history(self) -> None:
+        try:
+            RUNTIME_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            history = self.__dict__.get("tool_usage_history", [])
+            TOOL_USAGE_HISTORY_PATH.write_text(json.dumps(history[-100:], ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print(f"tool usage history skipped: {exc}", file=sys.stderr)
+
+    def tool_usage_people_label(self, tool_name: str) -> str:
+        session = self.__dict__.get("session")
+        if session is not None and getattr(session, "verified", False):
+            actor_no = str(getattr(session, "actor_no", "") or "").strip()
+            user_id = str(getattr(session, "user_id", "") or "").strip()
+            return self.current_account_display_name(actor_no, user_id) or "目前登入人員"
+        actor_var = self.__dict__.get("actor_no")
+        user_var = self.__dict__.get("user_id")
+        actor_no = str(actor_var.get() if actor_var is not None else "").strip()
+        user_id = str(user_var.get() if user_var is not None else "").strip()
+        return self.current_account_display_name(actor_no, user_id) if actor_no or user_id else "目前登入人員"
+
+    def recorded_tool_operator_label(self, entry: dict[str, str]) -> str:
+        operator = str(entry.get("operator", "") or "").strip()
+        if operator:
+            return operator
+        return "舊紀錄未保存操作人員" if entry else "尚無紀錄"
+
+    def recorded_tool_report_label(self, tool_name: str, entry: dict[str, str]) -> str:
+        report = str(entry.get("report", "") or "").strip()
+        if report not in ("已完成", "失敗"):
+            return "尚無執行紀錄"
+        business_roc_date = str(entry.get("usage_period", "") or entry.get("business_roc_date", "") or "").strip()
+        if not business_roc_date:
+            try:
+                recorded_at = datetime.strptime(str(entry.get("time", "")), "%Y-%m-%d %H:%M")
+                business_roc_date = duty_business_roc_date(recorded_at)
+            except ValueError:
+                business_roc_date = duty_business_roc_date()
+        period = business_roc_date[:5] if tool_name in MONTHLY_TOOL_NAMES else business_roc_date[:7]
+        tool_label = TOOL_USAGE_RESULT_LABELS.get(tool_name, str(entry.get("tool_label", "") or "工具"))
+        return f"{period} {tool_label}{report}"
+
+    def latest_finished_tool_usage(self, tool_name: str) -> dict[str, str]:
+        history = self.__dict__.get("tool_usage_history", [])
+        return next(
+            (
+                item
+                for item in reversed(history)
+                if item.get("tool_name") == tool_name and item.get("report") in ("已完成", "失敗")
+            ),
+            {},
+        )
+
+    def refresh_tool_usage_side_cards(self, tool_name: str = "") -> None:
+        views = self.__dict__.get("tool_usage_side_views", {})
+        names = (tool_name,) if tool_name else tuple(views)
+        for name in names:
+            view = views.get(name)
+            if not view:
+                continue
+            latest = self.latest_finished_tool_usage(name)
+            result = self.recorded_tool_report_label(name, latest)
+            view["time_var"].set(str(latest.get("time", "尚無紀錄")))
+            view["people_var"].set(self.recorded_tool_operator_label(latest))
+            view["result_var"].set(result)
+            result_label = view.get("result_label")
+            if result_label is not None:
+                style = side_status_style(result if latest else "準備就緒。")
+                try:
+                    result_label.configure(text_color=style["text_color"])
+                except tk.TclError:
+                    continue
+
+    def refresh_last_tool_usage_card(self) -> None:
+        self.refresh_tool_usage_side_cards()
+        time_var = self.__dict__.get("last_tool_usage_time")
+        people_var = self.__dict__.get("last_tool_usage_people")
+        report_var = self.__dict__.get("last_tool_usage_report")
+        if not (time_var and people_var and report_var):
+            return
+        history = self.__dict__.get("tool_usage_history", [])
+        latest = history[-1] if history else {}
+        time_var.set(str(latest.get("time", "尚無紀錄")))
+        people_var.set(self.recorded_tool_operator_label(latest))
+        report_var.set(str(latest.get("report", "-")))
+
+    def record_tool_usage_started(self, tool_name: str, tool_label: str, usage_period: str = "") -> None:
+        entry_id = uuid4().hex
+        active_ids = self.__dict__.setdefault("active_tool_usage_ids", {})
+        history = self.__dict__.setdefault("tool_usage_history", [])
+        active_ids[tool_name] = entry_id
+        operator = self.tool_usage_people_label(tool_name)
+        business_roc_date = duty_business_roc_date()
+        period_digits = "".join(character for character in str(usage_period) if character.isdigit())
+        normalized_period = (
+            period_digits[:5] if tool_name in MONTHLY_TOOL_NAMES and len(period_digits) >= 5
+            else business_roc_date[:5] if tool_name in MONTHLY_TOOL_NAMES
+            else period_digits[:7] if len(period_digits) >= 7
+            else business_roc_date
+        )
+        history.append(
+            {
+                "id": entry_id,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "business_roc_date": business_roc_date,
+                "usage_period": normalized_period,
+                "tool_name": tool_name,
+                "tool_label": tool_label,
+                "people": operator,
+                "operator": operator,
+                "report": "",
+            }
+        )
+        self.save_tool_usage_history()
+        self.refresh_last_tool_usage_card()
+
+    def record_tool_usage_finished(self, tool_name: str, status: str, result: str = "") -> None:
+        active_ids = self.__dict__.setdefault("active_tool_usage_ids", {})
+        history = self.__dict__.setdefault("tool_usage_history", [])
+        entry_id = active_ids.pop(tool_name, "")
+        report = {"completed": "已完成", "opened": "已開啟", "failed": "失敗"}.get(status, status)
+        for entry in reversed(history):
+            if entry.get("id") == entry_id:
+                entry["report"] = report
+                date_match = re.search(r"(?<!\d)(\d{7})(?!\d)", result)
+                month_match = re.search(r"(?<!\d)(\d{3})年0?(\d{1,2})月", result)
+                if date_match is not None:
+                    entry["usage_period"] = date_match.group(1)
+                elif month_match is not None:
+                    entry["usage_period"] = f"{month_match.group(1)}{int(month_match.group(2)):02d}"
+                break
+        self.save_tool_usage_history()
+        after = self.__dict__.get("after")
+        if after is not None:
+            after(0, self.refresh_last_tool_usage_card)
+        else:
+            self.refresh_last_tool_usage_card()
+
     def sinposmart_tool_event_callbacks(self, tool_name: str, tool_label: str):
         state = {"started": False, "finished": False, "timer": None, "business_roc_date": ""}
         lock = threading.Lock()
@@ -2538,6 +2744,7 @@ class DutyGui(ctk.CTk):
             if timer is not None:
                 timer.cancel()
             self.send_tool_finish_event(tool_name, tool_label, status, result=result, error=error)
+            self.record_tool_usage_finished(tool_name, status, result=result)
             return True
 
         def completion_notification(result: str) -> str:
@@ -2554,13 +2761,14 @@ class DutyGui(ctk.CTk):
             seconds = sinposmart_tool_timeout_seconds()
             finish_once("failed", error=f"{tool_label}逾時未完成，已超過 {seconds} 秒。")
 
-        def start() -> None:
+        def start(usage_period: str = "") -> None:
             with lock:
                 if state["started"]:
                     return
                 state["started"] = True
                 state["business_roc_date"] = duty_business_roc_date()
             self.send_tool_start_event(tool_name, tool_label)
+            self.record_tool_usage_started(tool_name, tool_label, usage_period=usage_period)
             timer = threading.Timer(sinposmart_tool_timeout_seconds(), timeout)
             timer.daemon = True
             with lock:
@@ -3530,6 +3738,7 @@ class DutyGui(ctk.CTk):
         self.set_duty_status("勤務系統登入失效，已停止背景查詢與自動登打。請登出/清除後用新密碼重新登入。", hold_seconds=15)
         self.send_sinposmart_backend_event("login_expired", status="failed", trigger_type="login", error=error, user_id=user_id)
         self.notify_user(APP_DISPLAY_NAME, "勤務系統登入失效，已停止背景查詢與自動登打。請重新登入。", duration_ms=7000)
+        self.update_duty_window_geometry()
         self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
@@ -3618,7 +3827,9 @@ class DutyGui(ctk.CTk):
         if self.simple_mode.get():
             self.filter_actor.set(True)
             self.status_filter.set("需處理")
+        self.update_duty_window_geometry()
         self.update_login_panel()
+        self.position_window_on_left_work_area()
         login_target_date = duty_business_roc_date()
         self.refresh_schedule_background(login_target_date, "login-today", target_dates=[login_target_date])
         self.ensure_duty_window_background(login_target_date, "login")
@@ -3642,6 +3853,7 @@ class DutyGui(ctk.CTk):
         snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
         self.send_sinposmart_backend_event("login_failed", status="failed", trigger_type="login", error=error, snapshot=snapshot)
         messagebox.showerror("登入失敗", error)
+        self.update_duty_window_geometry()
         self.update_login_panel()
         self.refresh_tasks()
 
@@ -3655,6 +3867,7 @@ class DutyGui(ctk.CTk):
         self.clear_manual_pause_state()
         self.login_status.set("登入逾時：請確認帳號密碼或勤務系統是否有回應。")
         messagebox.showerror("登入逾時", "登入超過 45 秒沒有完成，已恢復登入按鈕。")
+        self.update_duty_window_geometry()
         self.update_login_panel()
         self.refresh_tasks()
 
@@ -3913,6 +4126,7 @@ class DutyGui(ctk.CTk):
             self.manual_completed_keys = self.restore_manual_completed_keys(self.duty_data["target_date"], self.duty_actions)
         if self.duty_data.get("target_date"):
             self.duty_action_compare = self.apply_manual_completed_overrides(self.build_comparison(self.duty_data, self.duty_actions), self.duty_actions)
+        self.update_duty_window_geometry()
         self.update_login_panel()
         self.refresh_tasks()
         self.refresh_duty_tasks()
@@ -3946,13 +4160,122 @@ class DutyGui(ctk.CTk):
         )
         return True
 
+    def update_duty_window_geometry(self) -> None:
+        simple_mode = self.__dict__.get("simple_mode")
+        if simple_mode is None or not simple_mode.get():
+            return
+        root_panel = self.__dict__.get("root_panel")
+        main_content_host = self.__dict__.get("main_content_host")
+        if root_panel is None or main_content_host is None:
+            return
+        root_panel.grid_columnconfigure(0, minsize=self.duty_main_width_px, weight=0)
+        root_panel.grid_columnconfigure(1, minsize=0, weight=0)
+        main_content_host.configure(width=self.duty_main_width)
+        session = self.__dict__.get("session")
+        if session and session.verified:
+            self.geometry("550x800")
+            self.minsize(530, 760)
+            return
+        tool_side_panel = self.__dict__.get("tool_side_panel")
+        if self.__dict__.get("active_tool_side_name") and tool_side_panel is not None and tool_side_panel.winfo_manager():
+            tool_side_panel.grid_remove()
+            self.active_tool_side_name = ""
+        self.geometry("550x320")
+        self.minsize(530, 300)
+
+    def position_window_on_left_work_area(self) -> None:
+        left = 0
+        top = 0
+        try:
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = (
+                    ("cbSize", ctypes.c_ulong),
+                    ("rcMonitor", ctypes.c_long * 4),
+                    ("rcWork", ctypes.c_long * 4),
+                    ("dwFlags", ctypes.c_ulong),
+                )
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromWindow.restype = ctypes.c_void_p
+            monitor = user32.MonitorFromWindow(ctypes.c_void_p(self.winfo_id()), 2)
+            info = MonitorInfo()
+            info.cbSize = ctypes.sizeof(info)
+            if monitor and user32.GetMonitorInfoW(ctypes.c_void_p(monitor), ctypes.byref(info)):
+                left = int(info.rcWork[0])
+                top = int(info.rcWork[1])
+        except Exception:
+            pass
+        x_offset = f"+{left}" if left >= 0 else str(left)
+        y_offset = f"+{top}" if top >= 0 else str(top)
+        self.geometry(f"{x_offset}{y_offset}")
+
+    def cancel_tool_side_animation(self) -> None:
+        animation_job = self.__dict__.get("tool_side_animation_job")
+        self.tool_side_animation_job = None
+        self.tool_side_animation_target = None
+        if animation_job is None:
+            return
+        try:
+            self.after_cancel(animation_job)
+        except tk.TclError:
+            pass
+
+    def finish_animated_side_panel_close(self) -> None:
+        if self.active_tool_side_name not in ANIMATED_SIDE_TOOL_NAMES:
+            return
+        self.tool_side_panel.grid_remove()
+        self.active_tool_side_name = ""
+        self.tool_side_content_frame = None
+        self.root_panel.grid_columnconfigure(0, minsize=self.duty_main_width_px, weight=0)
+        self.root_panel.grid_columnconfigure(1, minsize=0, weight=0)
+        self.minsize(530, 760)
+        self.geometry("550x800")
+
+    def animate_tool_side_panel(self, opening: bool) -> None:
+        tool_name = self.active_tool_side_name
+        if tool_name not in ANIMATED_SIDE_TOOL_NAMES:
+            return
+        content = self.__dict__.get("tool_side_content_frame")
+        if content is None or not content.winfo_exists():
+            if not opening:
+                self.finish_animated_side_panel_close()
+            return
+        start_offset = int(self.__dict__.get("tool_side_animation_offset", -self.tool_side_width if opening else 0))
+        target_offset = 0 if opening else -self.tool_side_width
+        self.cancel_tool_side_animation()
+        self.tool_side_animation_target = target_offset
+        distance = abs(target_offset - start_offset)
+        if distance == 0:
+            if not opening:
+                self.finish_animated_side_panel_close()
+            return
+        base_duration_ms = 140 if opening else 110
+        duration_ms = max(32, round(base_duration_ms * distance / self.tool_side_width))
+        steps = max(2, round(duration_ms / 16))
+
+        def step(frame: int) -> None:
+            if self.active_tool_side_name != tool_name or not content.winfo_exists():
+                self.cancel_tool_side_animation()
+                return
+            progress = min(1.0, frame / steps)
+            eased = 1.0 - ((1.0 - progress) ** 3) if opening else progress ** 3
+            offset = round(start_offset + ((target_offset - start_offset) * eased))
+            self.tool_side_animation_offset = offset
+            content.place_configure(x=offset)
+            if frame >= steps:
+                self.tool_side_animation_job = None
+                self.tool_side_animation_target = None
+                if not opening:
+                    self.finish_animated_side_panel_close()
+                return
+            self.tool_side_animation_job = self.after(16, lambda: step(frame + 1))
+
+        self.tool_side_animation_job = self.after(16, lambda: step(1))
+
     def update_login_panel(self) -> None:
         if not hasattr(self, "login_button"):
             return
         if self.session and self.session.verified:
-            if self.simple_mode.get():
-                    self.geometry("550x800")
-                    self.minsize(530, 760)
             for widget in self.login_form_widgets:
                 widget.pack_forget()
             self.button_row.pack_forget()
@@ -3961,9 +4284,6 @@ class DutyGui(ctk.CTk):
                 self.work_log_settings_button.pack(side=tk.RIGHT)
             self.set_duty_action_buttons_visible(True)
         else:
-            if self.simple_mode.get():
-                self.geometry("550x320")
-                self.minsize(530, 300)
             self.logout_button.grid_forget()
             self.credentials_grid.pack_forget()
             self.button_row.pack_forget()
@@ -4052,33 +4372,48 @@ class DutyGui(ctk.CTk):
                 hour = 0
             action.setdefault("fields", {})["工作概述"] = work_handoff_description(self.work_log_defaults, self.handoff_vehicle_out_count(hour))
 
-    def open_work_log_defaults_dialog(self) -> None:
+    def open_work_log_defaults_dialog(self, container: tk.Widget | None = None, on_close=None) -> ctk.CTkToplevel | ctk.CTkFrame:
         self.work_log_defaults = load_work_log_defaults()
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("工作紀錄預設內容")
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.configure(fg_color=UI_BG)
-        dialog.geometry("560x720")
-        dialog.minsize(540, 660)
-        self.apply_window_icon(dialog)
+        embedded = container is not None
+        mount = container
+        if embedded:
+            dialog = None
+        else:
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("工作紀錄預設內容")
+            dialog.transient(self)
+            dialog.grab_set()
+            dialog.configure(fg_color=UI_BG)
+            dialog.geometry("560x720")
+            dialog.minsize(540, 660)
+            self.apply_window_icon(dialog)
 
-        container = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
-        container.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
-        container.grid_columnconfigure(0, weight=1)
-        container.grid_rowconfigure(1, weight=1)
+        panel = ctk.CTkFrame(mount if embedded else dialog, fg_color="transparent" if embedded else UI_BG, corner_radius=0)
+        panel.pack(fill=tk.BOTH if not embedded else tk.X, expand=not embedded, padx=0 if embedded else 14, pady=0 if embedded else 14)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(container, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
-        header.grid(row=0, column=0, sticky=tk.EW)
-        ctk.CTkLabel(header, text="工作紀錄預設內容", text_color=UI_TEXT, font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 0))
-        ctk.CTkLabel(header, text="消防救護車出勤由未返隊案件帶入，例外可調整單筆案件台數。", text_color="#0369a1", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(0, 10))
+        if not embedded:
+            header = ctk.CTkFrame(panel, fg_color=UI_PANEL_TINT, border_color=UI_BORDER, border_width=1, corner_radius=8)
+            header.grid(row=0, column=0, sticky=tk.EW)
+            ctk.CTkLabel(header, text="工作紀錄預設內容", text_color=UI_TEXT, font=FONT_TITLE).pack(anchor=tk.W, padx=12, pady=(10, 0))
+            ctk.CTkLabel(header, text="消防救護車出勤由未返隊案件帶入，例外可調整單筆案件台數。", text_color="#0369a1", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(0, 10))
 
-        content = ctk.CTkFrame(container, fg_color="transparent", corner_radius=0)
-        content.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
+        def close_page() -> None:
+            if embedded:
+                if on_close is not None:
+                    on_close()
+                elif panel.winfo_exists():
+                    panel.destroy()
+            elif dialog is not None:
+                dialog.destroy()
+
+        content = ctk.CTkFrame(panel, fg_color="transparent", corner_radius=0)
+        content.grid(row=1, column=0, sticky=tk.NSEW, pady=(0 if embedded else 10, 0))
         content.grid_columnconfigure(0, weight=1)
 
-        form = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
-        form.pack(fill=tk.X, pady=(10, 0))
+        form = ctk.CTkFrame(content, fg_color="transparent" if embedded else UI_PANEL, border_color=UI_BORDER, border_width=0 if embedded else 1, corner_radius=0 if embedded else 8)
+        form.pack(fill=tk.X, pady=(0 if embedded else 10, 0))
         vars_by_key: dict[str, tk.StringVar] = {}
 
         def add_setting_spin(parent: tk.Widget, row: int, col: int, key: str, label: str, unit: str) -> None:
@@ -4091,33 +4426,56 @@ class DutyGui(ctk.CTk):
         def add_item_label(row: int, text: str) -> None:
             ctk.CTkLabel(form, text=text, text_color=UI_TEXT, font=FONT_SMALL, width=72, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, padx=(12, 2), pady=6)
 
-        add_item_label(0, "無線電")
-        add_setting_spin(form, 0, 1, "radio_count", "良好", "支")
-        add_item_label(1, "消防及救護車")
-        add_setting_spin(form, 1, 1, "emergency_vehicles_in_station", "在隊", "台")
-        add_setting_spin(form, 1, 4, "emergency_vehicles_repair", "報修", "台")
-        add_item_label(2, "後勤車")
-        add_setting_spin(form, 2, 1, "support_vehicles_in_station", "在隊", "台")
-        add_setting_spin(form, 2, 4, "support_vehicles_out", "出勤", "台")
-        add_setting_spin(form, 2, 7, "support_vehicles_repair", "報修", "台")
-        add_item_label(3, "救災器材")
-        add_setting_spin(form, 3, 1, "rescue_equipment_in_station", "在隊", "台")
-        add_setting_spin(form, 3, 4, "rescue_equipment_out", "出勤", "台")
-        add_item_label(4, "TIC")
-        add_setting_spin(form, 4, 1, "tic_count", "隊上", "支")
+        setting_groups = (
+            ("無線電", (("radio_count", "良好", "支"),)),
+            ("消防及救護車", (("emergency_vehicles_in_station", "在隊", "台"), ("emergency_vehicles_repair", "報修", "台"))),
+            ("後勤車", (("support_vehicles_in_station", "在隊", "台"), ("support_vehicles_out", "出勤", "台"), ("support_vehicles_repair", "報修", "台"))),
+            ("救災器材", (("rescue_equipment_in_station", "在隊", "台"), ("rescue_equipment_out", "出勤", "台"))),
+            ("TIC", (("tic_count", "隊上", "支"),)),
+        )
+        if embedded:
+            for row_index, (item_label, settings) in enumerate(setting_groups):
+                ctk.CTkLabel(form, text=item_label, text_color=UI_TEXT, font=FONT_SMALL, width=88, anchor=tk.W).grid(row=row_index, column=0, sticky=tk.W, pady=5)
+                column = 1
+                for key, label, unit in settings:
+                    ctk.CTkLabel(form, text=label, text_color="#475569", font=FONT_SMALL).grid(row=row_index, column=column, sticky=tk.W, padx=(0, 3), pady=5)
+                    var = tk.StringVar(value=str(int_setting(self.work_log_defaults, key, int_setting(DEFAULT_WORK_LOG_DEFAULTS, key, 0))))
+                    vars_by_key[key] = var
+                    ctk.CTkEntry(form, textvariable=var, width=34, height=28, font=FONT_SMALL, justify=tk.CENTER, fg_color=UI_PANEL, border_color=UI_BORDER).grid(row=row_index, column=column + 1, pady=5)
+                    ctk.CTkLabel(form, text=unit, text_color=UI_MUTED, font=FONT_SMALL).grid(row=row_index, column=column + 2, sticky=tk.W, padx=(2, 7), pady=5)
+                    column += 3
+        else:
+            add_item_label(0, "無線電")
+            add_setting_spin(form, 0, 1, "radio_count", "良好", "支")
+            add_item_label(1, "消防及救護車")
+            add_setting_spin(form, 1, 1, "emergency_vehicles_in_station", "在隊", "台")
+            add_setting_spin(form, 1, 4, "emergency_vehicles_repair", "報修", "台")
+            add_item_label(2, "後勤車")
+            add_setting_spin(form, 2, 1, "support_vehicles_in_station", "在隊", "台")
+            add_setting_spin(form, 2, 4, "support_vehicles_out", "出勤", "台")
+            add_setting_spin(form, 2, 7, "support_vehicles_repair", "報修", "台")
+            add_item_label(3, "救災器材")
+            add_setting_spin(form, 3, 1, "rescue_equipment_in_station", "在隊", "台")
+            add_setting_spin(form, 3, 4, "rescue_equipment_out", "出勤", "台")
+            add_item_label(4, "TIC")
+            add_setting_spin(form, 4, 1, "tic_count", "隊上", "支")
 
-        note_card = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
-        note_card.pack(fill=tk.X, pady=(10, 0))
-        ctk.CTkLabel(note_card, text="重要記事", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(8, 2))
+        if embedded:
+            ctk.CTkFrame(content, height=1, fg_color="#E5E7EB", corner_radius=0).pack(fill=tk.X, pady=(10, 8))
+        note_card = ctk.CTkFrame(content, fg_color="transparent" if embedded else UI_PANEL, border_color=UI_BORDER, border_width=0 if embedded else 1, corner_radius=0 if embedded else 8)
+        note_card.pack(fill=tk.X, pady=(0, 0) if embedded else (10, 0))
+        ctk.CTkLabel(note_card, text="重要記事", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=0 if embedded else 12, pady=(0 if embedded else 8, 4))
         note_text = ctk.CTkTextbox(note_card, height=48, wrap=tk.WORD, font=FONT_SMALL, fg_color=UI_PANEL, border_width=1, border_color="#cbd5e1")
-        note_text.pack(fill=tk.X, padx=12, pady=(0, 10))
+        note_text.pack(fill=tk.X, padx=0 if embedded else 12, pady=(0, 4 if embedded else 10))
         note_text.insert("1.0", str(self.work_log_defaults.get("important_note", "")))
 
-        case_card = ctk.CTkFrame(content, fg_color=UI_PANEL, border_color=UI_BORDER, border_width=1, corner_radius=8)
-        case_card.pack(fill=tk.X, pady=(10, 0))
-        ctk.CTkLabel(case_card, text="未返隊案件出勤估算", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=12, pady=(8, 4))
-        case_rows = ctk.CTkFrame(case_card, fg_color=UI_PANEL)
-        case_rows.pack(fill=tk.X, padx=12)
+        if embedded:
+            ctk.CTkFrame(content, height=1, fg_color="#E5E7EB", corner_radius=0).pack(fill=tk.X, pady=(10, 8))
+        case_card = ctk.CTkFrame(content, fg_color="transparent" if embedded else UI_PANEL, border_color=UI_BORDER, border_width=0 if embedded else 1, corner_radius=0 if embedded else 8)
+        case_card.pack(fill=tk.X, pady=(0, 0) if embedded else (10, 0))
+        ctk.CTkLabel(case_card, text="未返隊案件出勤估算", text_color="#334155", font=FONT_SMALL).pack(anchor=tk.W, padx=0 if embedded else 12, pady=(0 if embedded else 8, 4))
+        case_rows = ctk.CTkFrame(case_card, fg_color="transparent" if embedded else UI_PANEL, corner_radius=0)
+        case_rows.pack(fill=tk.X, padx=0 if embedded else 12)
         case_vars: dict[str, tk.StringVar] = {}
         items = self.work_log_case_items()
         if not items:
@@ -4129,14 +4487,15 @@ class DutyGui(ctk.CTk):
             if len(date_text) == 7 and date_text.isdigit():
                 date_text = f"{date_text[:3]}/{date_text[3:5]}/{date_text[5:7]}"
             label = f"{date_text} {item.get('report_time', '')} {item.get('category', '案件')}"
-            ctk.CTkLabel(row, text=label, text_color=UI_TEXT, font=FONT_SMALL, width=330, anchor=tk.W).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(item.get("count", item.get("default_count", 0))))
             case_vars[str(item["key"])] = var
-            ctk.CTkEntry(row, textvariable=var, width=42, height=28, font=FONT_SMALL, justify=tk.CENTER, fg_color=UI_PANEL, border_color=UI_BORDER).pack(side=tk.LEFT)
-            ctk.CTkLabel(row, text="台", text_color=UI_MUTED, font=FONT_SMALL).pack(side=tk.LEFT, padx=(3, 0))
+            row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(row, text=label, text_color=UI_TEXT, font=FONT_SMALL, anchor=tk.W, justify=tk.LEFT, wraplength=230 if embedded else 330).grid(row=0, column=0, sticky=tk.EW)
+            ctk.CTkEntry(row, textvariable=var, width=42, height=28, font=FONT_SMALL, justify=tk.CENTER, fg_color=UI_PANEL, border_color=UI_BORDER).grid(row=0, column=1, padx=(6, 0))
+            ctk.CTkLabel(row, text="台", text_color=UI_MUTED, font=FONT_SMALL).grid(row=0, column=2, padx=(3, 0))
 
-        preview = ctk.CTkLabel(case_card, text="", fg_color="#f8fafc", text_color="#1e3a8a", font=FONT_SMALL, justify=tk.LEFT, anchor=tk.W, wraplength=500)
-        preview.pack(fill=tk.X, padx=12, pady=(8, 10))
+        preview = ctk.CTkLabel(case_card, text="", fg_color="#f8fafc", text_color="#1e3a8a", font=FONT_SMALL, justify=tk.LEFT, anchor=tk.W, wraplength=320 if embedded else 500)
+        preview.pack(fill=tk.X, padx=0 if embedded else 12, pady=(8, 4 if embedded else 10))
 
         def collect_settings() -> dict[str, Any]:
             settings = dict(self.work_log_defaults)
@@ -4172,7 +4531,7 @@ class DutyGui(ctk.CTk):
         note_text.bind("<KeyRelease>", refresh_preview)
         refresh_preview()
 
-        buttons = ctk.CTkFrame(container, fg_color=UI_BG)
+        buttons = ctk.CTkFrame(panel, fg_color="transparent" if embedded else UI_BG)
         buttons.grid(row=2, column=0, sticky=tk.EW, pady=(12, 0))
 
         def reset_defaults() -> None:
@@ -4192,60 +4551,98 @@ class DutyGui(ctk.CTk):
             self.refresh_work_log_handoff_descriptions()
             self.refresh_duty_tasks()
             self.set_duty_status("已儲存工作紀錄預設內容。", hold_seconds=6)
-            dialog.destroy()
+            close_page()
 
-        ctk.CTkButton(buttons, text="還原預設", width=104, height=38, font=FONT_BUTTON, fg_color=UI_SOFT_ACTION, text_color=UI_TEXT, hover_color=UI_SOFT_ACTION_HOVER, command=reset_defaults).pack(side=tk.LEFT)
-        ctk.CTkButton(buttons, text="取消", width=86, height=38, font=FONT_BUTTON, fg_color=UI_SOFT_ACTION, text_color=UI_TEXT, hover_color=UI_SOFT_ACTION_HOVER, command=dialog.destroy).pack(side=tk.RIGHT)
-        ctk.CTkButton(buttons, text="儲存", width=86, height=38, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=save_settings).pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(buttons, text="還原預設", width=104, height=38, corner_radius=8 if embedded else 6, font=FONT_BUTTON, fg_color="#F1F5F9" if embedded else UI_SOFT_ACTION, text_color=UI_TEXT, hover_color="#E2E8F0" if embedded else UI_SOFT_ACTION_HOVER, border_color="#CBD5E1" if embedded else UI_SOFT_ACTION, border_width=1 if embedded else 0, command=reset_defaults).pack(side=tk.LEFT)
+        ctk.CTkButton(buttons, text="取消", width=86, height=38, corner_radius=8 if embedded else 6, font=FONT_BUTTON, fg_color="#F1F5F9" if embedded else UI_SOFT_ACTION, text_color=UI_TEXT, hover_color="#E2E8F0" if embedded else UI_SOFT_ACTION_HOVER, border_color="#CBD5E1" if embedded else UI_SOFT_ACTION, border_width=1 if embedded else 0, command=close_page).pack(side=tk.RIGHT)
+        ctk.CTkButton(buttons, text="儲存", width=86, height=38, corner_radius=8 if embedded else 6, font=FONT_BUTTON, fg_color="#2563EB" if embedded else UI_BLUE, hover_color="#1D4ED8" if embedded else UI_BLUE_HOVER, command=save_settings).pack(side=tk.RIGHT, padx=(0, 8))
+        return panel if embedded else dialog
 
-    def open_duty_sheet_automation(self) -> None:
-        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
-        password = self.session.password if self.session and self.session.verified else self.password.get()
-        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("duty_sheet", "勤務表登打")
-        open_duty_sheet_dialog(
-            self,
-            user_id=user_id,
-            password=password,
-            on_start=on_start,
-            on_finish=on_finish,
-            on_error=on_error,
-        )
+    def toggle_tool_side_panel(self, tool_name: str, tool_label: str, launch_tool) -> None:
+        if self.active_tool_side_name == tool_name and self.tool_side_panel.winfo_manager():
+            if tool_name in ANIMATED_SIDE_TOOL_NAMES:
+                animation_is_closing = self.__dict__.get("tool_side_animation_target") == -self.tool_side_width
+                self.animate_tool_side_panel(opening=animation_is_closing)
+                return
+            self.cancel_tool_side_animation()
+            self.tool_side_panel.grid_remove()
+            self.active_tool_side_name = ""
+            self.tool_side_content_frame = None
+            self.root_panel.grid_columnconfigure(0, minsize=self.duty_main_width_px, weight=0)
+            self.root_panel.grid_columnconfigure(1, minsize=0, weight=0)
+            self.minsize(530, 760)
+            self.geometry("550x800")
+            return
+        self.cancel_tool_side_animation()
+        self.tool_side_panel.grid_remove()
+        self.root_panel.grid_columnconfigure(1, minsize=0, weight=0)
+        for child in self.tool_side_panel.winfo_children():
+            child.destroy()
+        self.active_tool_side_name = tool_name
+        self.root_panel.grid_columnconfigure(0, minsize=self.duty_main_width_px, weight=0)
 
-    def open_rest_time_automation(self) -> None:
-        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
-        password = self.session.password if self.session and self.session.verified else self.password.get()
-        actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
-        display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
-        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("rest_time", "休息時間登打")
-        open_rest_time_dialog(
-            self,
-            user_id=user_id,
-            password=password,
-            actor_no=actor_no,
-            display_name=display_name,
-            on_start=on_start,
-            on_finish=on_finish,
-            on_error=on_error,
-        )
+        side_content = ctk.CTkFrame(self.tool_side_panel, width=self.tool_side_width, fg_color="transparent", corner_radius=16)
+        self.tool_side_content_frame = side_content
+        header = ctk.CTkFrame(side_content, fg_color="#FCFDFF", corner_radius=0)
+        header.pack(fill=tk.X, padx=16, pady=(16, 10))
+        ctk.CTkButton(header, text="‹", width=36, height=36, corner_radius=18, font=FONT_NAV_ICON, fg_color="#FFFFFF", text_color="#334155", hover_color="#EFF6FF", border_color="#CBD5E1", border_width=1, command=lambda: self.toggle_tool_side_panel(tool_name, tool_label, launch_tool)).pack(side=tk.LEFT)
+        ctk.CTkLabel(header, text=tool_label, text_color="#0F172A", font=FONT_PANEL_TITLE, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(11, 0))
 
-    def open_monthly_base_automation(self) -> None:
-        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
-        password = self.session.password if self.session and self.session.verified else self.password.get()
-        actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
-        display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
-        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("monthly_base", "勤務基準表登打")
-        open_monthly_base_dialog(
-            self,
-            user_id=user_id,
-            password=password,
-            actor_no=actor_no,
-            display_name=display_name,
-            on_start=on_start,
-            on_finish=on_finish,
-            on_error=on_error,
-        )
+        action = ctk.CTkFrame(side_content, fg_color="#FCFDFF", corner_radius=0)
+        action.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
+        if tool_name != "work_log_defaults":
+            self.add_tool_side_section_header(action, "上次使用", "#22C55E")
+            self.add_tool_usage_card_to_frame(action, tool_name)
+            ctk.CTkFrame(action, height=2, fg_color="#D1D1D6", corner_radius=0).pack(fill=tk.X, pady=(14, 14))
+        section_titles = {
+            "duty_sheet": "來源檔案及日期設定",
+            "daily_vehicle": "車輛保養設定",
+            "rest_time": "來源檔案及月份設定",
+            "monthly_base": "來源及月份設定",
+            "work_log_defaults": "工作紀錄預設",
+        }
+        section_descriptions = {
+            "daily_vehicle": "會使用目前登入帳密開啟瀏覽器。依序至車輛平日保養檢查清點、定期保養檢查頁，勾選保養（日、週、月、半年）；再至隨車器材清點頁，勾選清點。",
+            "rest_time": "登打以勤務表為主；若個人有補欠時數歸還，請自行修正。",
+            "monthly_base": "登打以 Google 試算表為主；若後續有更改假別，請自行修正。",
+        }
+        self.add_tool_side_section_header(action, section_titles.get(tool_name, "工具設定"), "#2563EB")
+        description = section_descriptions.get(tool_name, "")
+        if description:
+            ctk.CTkLabel(action, text=description, text_color="#64748B", font=FONT_SMALL, justify=tk.LEFT, anchor=tk.W, wraplength=360).pack(fill=tk.X, pady=(0, 12))
+        if tool_name == "daily_vehicle":
+            initial_status_style = side_status_style("準備就緒。")
+            status_card = ctk.CTkFrame(action, fg_color=initial_status_style["fg_color"], border_color=initial_status_style["border_color"], border_width=1, corner_radius=10)
+            status_card.pack(fill=tk.X, pady=(2, 6))
+            status_bar = ctk.CTkLabel(status_card, text="準備就緒。", fg_color="transparent", text_color=initial_status_style["text_color"], font=FONT_BODY, anchor=tk.W, height=38)
+            status_bar.pack(fill=tk.X, padx=12, pady=1)
+            self.daily_vehicle_status_card = status_card
+            self.daily_vehicle_status_bar = status_bar
+            self.daily_vehicle_start_button = ctk.CTkButton(action, text="啟動登打", height=50, corner_radius=9, font=FONT_CONTROL_EMPHASIS, fg_color="#2563EB", hover_color="#1D4ED8", command=self.start_daily_vehicle_from_side_panel)
+            self.daily_vehicle_start_button.pack(fill=tk.X)
+        else:
+            form_host = ctk.CTkFrame(action, fg_color="transparent", corner_radius=0)
+            form_host.pack(fill=tk.X)
+            launch_tool(
+                container=form_host,
+                on_close=lambda: self.toggle_tool_side_panel(tool_name, tool_label, launch_tool),
+            )
+        if tool_name in ANIMATED_SIDE_TOOL_NAMES:
+            self.tool_side_animation_offset = -self.tool_side_width
+            side_content.place(x=-self.tool_side_width, y=0, relheight=1.0)
+        else:
+            self.tool_side_animation_offset = 0
+            side_content.pack(fill=tk.BOTH, expand=True)
+        self.tool_side_panel.update_idletasks()
+        self.root_panel.grid_columnconfigure(1, minsize=self.tool_side_width_px, weight=0)
+        self.tool_side_panel.grid(row=0, column=1, sticky=tk.NSEW, padx=(14, 0))
+        self.minsize(944, 760)
+        self.geometry("964x800")
+        self.update_idletasks()
+        if tool_name in ANIMATED_SIDE_TOOL_NAMES:
+            self.animate_tool_side_panel(opening=True)
 
-    def open_daily_vehicle_automation(self) -> None:
+    def start_daily_vehicle_from_side_panel(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
         on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("daily_vehicle", "車輛保養清點")
@@ -4256,9 +4653,216 @@ class DutyGui(ctk.CTk):
             on_start=on_start,
             on_finish=on_finish,
             on_error=on_error,
+            on_status=lambda message: self.after(0, lambda: self.set_daily_vehicle_side_status(message)),
+            confirm=False,
         )
 
+    def set_daily_vehicle_side_status(self, message: str) -> None:
+        status_card = self.__dict__.get("daily_vehicle_status_card")
+        status_bar = self.__dict__.get("daily_vehicle_status_bar")
+        if status_card is None or status_bar is None:
+            return
+        try:
+            if not status_card.winfo_exists() or not status_bar.winfo_exists():
+                return
+            text = normalize_side_status_message(message)
+            style = side_status_style(text)
+            status_card.configure(fg_color=style["fg_color"], border_color=style["border_color"])
+            status_bar.configure(text=text, text_color=style["text_color"])
+            start_button = self.__dict__.get("daily_vehicle_start_button")
+            if start_button is not None and start_button.winfo_exists():
+                running = style["text_color"] == "#007AFF"
+                start_button.configure(state=tk.DISABLED if running else tk.NORMAL, text="啟動中..." if running else "啟動登打")
+        except tk.TclError:
+            return
+
+    def add_tool_side_section_header(self, parent: tk.Widget, title: str, marker_color: str) -> None:
+        header = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
+        header.pack(fill=tk.X, pady=(0, 8))
+        ctk.CTkFrame(header, width=4, height=20, fg_color=marker_color, corner_radius=2).pack(side=tk.LEFT)
+        ctk.CTkLabel(header, text=title, text_color="#1E3A5F" if marker_color != "#22C55E" else "#166534", font=FONT_SECTION_TITLE, anchor=tk.W).pack(side=tk.LEFT, padx=(7, 0))
+
+    def add_tool_usage_card_to_frame(self, parent: tk.Widget, tool_name: str) -> None:
+        latest = self.latest_finished_tool_usage(tool_name)
+        card = ctk.CTkFrame(parent, fg_color="#F1F7FF", border_color="#D0E3FA", border_width=1, corner_radius=10)
+        card.pack(fill=tk.X)
+        card.columnconfigure(1, weight=1)
+        result = self.recorded_tool_report_label(tool_name, latest)
+        result_style = side_status_style(result if latest else "準備就緒。")
+        time_var = tk.StringVar(value=str(latest.get("time", "尚無紀錄")))
+        people_var = tk.StringVar(value=self.recorded_tool_operator_label(latest))
+        result_var = tk.StringVar(value=result)
+        usage_rows = (
+            ("時間", time_var, "#0F172A"),
+            ("人員", people_var, "#0F172A"),
+            ("結果", result_var, result_style["text_color"]),
+        )
+        result_label = None
+        for row, (label, value_var, color) in enumerate(usage_rows):
+            ctk.CTkLabel(card, text=label, text_color="#475569", font=FONT_LABEL, width=38, anchor=tk.W).grid(row=row, column=0, sticky=tk.NW, padx=(12, 8), pady=(10 if row == 0 else 0, 6 if row < 2 else 10))
+            value_label = ctk.CTkLabel(card, textvariable=value_var, text_color=color, font=FONT_CONTROL_EMPHASIS, anchor=tk.W, justify=tk.LEFT, wraplength=270)
+            value_label.grid(row=row, column=1, sticky=tk.EW, padx=(0, 12), pady=(10 if row == 0 else 0, 6 if row < 2 else 10))
+            if label == "結果":
+                result_label = value_label
+        self.__dict__.setdefault("tool_usage_side_views", {})[tool_name] = {
+            "time_var": time_var,
+            "people_var": people_var,
+            "result_var": result_var,
+            "result_label": result_label,
+        }
+
+    def add_tool_usage_card_to_dialog(self, dialog: ctk.CTkToplevel, tool_name: str) -> None:
+        if getattr(dialog, "_tool_usage_card_name", "") == tool_name:
+            return
+        root = next((child for child in dialog.winfo_children() if isinstance(child, ctk.CTkFrame)), None)
+        if root is None:
+            return
+        latest = self.latest_finished_tool_usage(tool_name)
+        result = self.recorded_tool_report_label(tool_name, latest)
+        result_style = side_status_style(result if latest else "準備就緒。")
+        card = ctk.CTkFrame(root, fg_color="#EFF6FF", border_color="#BFDBFE", border_width=1, corner_radius=10)
+        card.pack(fill=tk.X, padx=10, pady=(0, 10), side=tk.BOTTOM)
+        card.columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="上次使用", text_color="#1E3A8A", font=FONT_SECTION).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(8, 4))
+        for row, (label, value, color) in enumerate((
+            ("時間", str(latest.get("time", "尚無紀錄")), UI_MUTED),
+            ("人員", self.recorded_tool_operator_label(latest), UI_TEXT),
+            ("結果", result, result_style["text_color"]),
+        ), start=1):
+            ctk.CTkLabel(card, text=label, text_color=UI_MUTED, font=FONT_SMALL).grid(row=row, column=0, sticky=tk.NW, padx=(10, 6), pady=(0, 4 if row < 3 else 8))
+            ctk.CTkLabel(card, text=value, text_color=color, font=FONT_SMALL, anchor=tk.W, justify=tk.LEFT, wraplength=350).grid(row=row, column=1, sticky=tk.EW, padx=(0, 10), pady=(0, 4 if row < 3 else 8))
+        dialog._tool_usage_card_name = tool_name
+
+    def present_tool_side_dialog(self, dialog: ctk.CTkToplevel | None, tool_name: str) -> None:
+        if dialog is None:
+            return
+        self.add_tool_usage_card_to_dialog(dialog, tool_name)
+        root = next((child for child in dialog.winfo_children() if isinstance(child, ctk.CTkFrame)), None)
+        if root is not None and not getattr(dialog, "_side_panel_chrome", False):
+            side_header = ctk.CTkFrame(root, fg_color="#FFFFFF", corner_radius=0)
+            children = root.winfo_children()
+            side_header.pack(fill=tk.X, before=children[0] if children else None, padx=10, pady=(10, 6))
+            ctk.CTkButton(side_header, text="‹", width=36, height=36, corner_radius=18, font=FONT_NAV_ICON, fg_color="#FFFFFF", text_color="#1E3A8A", hover_color="#EFF6FF", border_color="#CBD5E1", border_width=1, command=dialog.destroy).pack(side=tk.LEFT)
+            ctk.CTkLabel(side_header, text=dialog.title().replace("SinpoSmart - ", ""), text_color="#0F172A", font=FONT_WINDOW_TITLE).pack(side=tk.LEFT, padx=10)
+            dialog._side_panel_chrome = True
+        dialog.overrideredirect(True)
+        dialog.update_idletasks()
+        width = max(dialog.winfo_width(), dialog.winfo_reqwidth())
+        height = max(self.winfo_height(), dialog.winfo_height(), dialog.winfo_reqheight())
+        target_x = self.winfo_rootx() + self.winfo_width() + 12
+        if target_x + width > dialog.winfo_screenwidth() - 12:
+            target_x = max(12, self.winfo_rootx() - width - 12)
+        target_y = max(12, min(self.winfo_rooty(), dialog.winfo_screenheight() - height - 12))
+        start_x = target_x + 32 if target_x > self.winfo_rootx() else target_x - 32
+        dialog.geometry(f"{width}x{height}+{start_x}+{target_y}")
+        dialog.deiconify()
+
+        def slide(step: int = 0) -> None:
+            current_x = round(start_x + (target_x - start_x) * min(step, 6) / 6)
+            dialog.geometry(f"{width}x{height}+{current_x}+{target_y}")
+            if step < 6 and dialog.winfo_exists():
+                dialog.after(20, lambda: slide(step + 1))
+            elif dialog.winfo_exists():
+                dialog.lift()
+                dialog.focus_force()
+
+        slide()
+
+    def open_daily_vehicle_side_dialog(self, user_id: str, password: str, on_start, on_finish, on_error) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("SinpoSmart - 車輛保養清點")
+        dialog.geometry("400x238")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=UI_BG)
+        dialog.transient(self)
+        root = ctk.CTkFrame(dialog, fg_color=UI_BG, corner_radius=0)
+        root.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+        ctk.CTkLabel(root, text="車輛保養清點", text_color="#1e3a8a", font=FONT_TITLE).pack(anchor=tk.W)
+        ctk.CTkLabel(root, text="按下啟動後，會以目前登入帳密開啟瀏覽器執行清點。", text_color=UI_MUTED, font=FONT_BODY, justify=tk.LEFT, wraplength=350).pack(anchor=tk.W, pady=(12, 0))
+        buttons = ctk.CTkFrame(root, fg_color="transparent")
+        buttons.pack(fill=tk.X, side=tk.BOTTOM, pady=(18, 0))
+        ctk.CTkButton(buttons, text="取消", width=86, height=36, font=FONT_BUTTON, fg_color=UI_SOFT_ACTION, text_color=UI_TEXT, hover_color=UI_SOFT_ACTION_HOVER, command=dialog.destroy).pack(side=tk.RIGHT)
+
+        def start() -> None:
+            dialog.destroy()
+            start_daily_vehicle_automation(self, user_id=user_id, password=password, on_start=on_start, on_finish=on_finish, on_error=on_error, confirm=False)
+
+        ctk.CTkButton(buttons, text="啟動", width=86, height=36, font=FONT_BUTTON, fg_color=UI_BLUE, hover_color=UI_BLUE_HOVER, command=start).pack(side=tk.RIGHT, padx=(0, 8))
+        self.present_tool_side_dialog(dialog, "daily_vehicle")
+
+    def open_duty_sheet_automation(self, container: tk.Widget | None = None, on_close=None) -> None:
+        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
+        password = self.session.password if self.session and self.session.verified else self.password.get()
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("duty_sheet", "勤務表登打")
+        dialog = open_duty_sheet_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
+            container=container,
+            on_close=on_close,
+        )
+        if container is None:
+            self.present_tool_side_dialog(dialog, "duty_sheet")
+
+    def open_rest_time_automation(self, container: tk.Widget | None = None, on_close=None) -> None:
+        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
+        password = self.session.password if self.session and self.session.verified else self.password.get()
+        actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
+        display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("rest_time", "休息時間登打")
+        dialog = open_rest_time_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            actor_no=actor_no,
+            display_name=display_name,
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
+            container=container,
+            on_close=on_close,
+        )
+        if container is None:
+            self.present_tool_side_dialog(dialog, "rest_time")
+
+    def open_monthly_base_automation(self, container: tk.Widget | None = None, on_close=None) -> None:
+        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
+        password = self.session.password if self.session and self.session.verified else self.password.get()
+        actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
+        display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("monthly_base", "勤務基準表登打")
+        dialog = open_monthly_base_dialog(
+            self,
+            user_id=user_id,
+            password=password,
+            actor_no=actor_no,
+            display_name=display_name,
+            on_start=on_start,
+            on_finish=on_finish,
+            on_error=on_error,
+            container=container,
+            on_close=on_close,
+        )
+        if container is None:
+            self.present_tool_side_dialog(dialog, "monthly_base")
+
+    def open_daily_vehicle_automation(self) -> None:
+        user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
+        password = self.session.password if self.session and self.session.verified else self.password.get()
+        on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("daily_vehicle", "車輛保養清點")
+        self.open_daily_vehicle_side_dialog(user_id, password, on_start, on_finish, on_error)
+
     def open_rescue_video_tool(self) -> None:
+        if self.focus_rescue_video_window():
+            return
+        running_process = self.__dict__.get("rescue_video_process")
+        if running_process is not None and running_process.poll() is None:
+            self.after(200, self.focus_rescue_video_window)
+            return
+
         tool_path = Path(__file__).resolve().parent / "rescue_video" / "救護影片分類GUI.py"
         if not tool_path.is_file():
             messagebox.showerror("找不到行車紀錄器", f"找不到工具檔案：{tool_path}", parent=self)
@@ -4267,7 +4871,7 @@ class DutyGui(ctk.CTk):
         pythonw_path = Path(sys.executable).with_name("pythonw.exe")
         executable = str(pythonw_path if pythonw_path.is_file() else Path(sys.executable))
         try:
-            subprocess.Popen(
+            self.rescue_video_process = subprocess.Popen(
                 [executable, str(tool_path)],
                 cwd=str(tool_path.parent),
                 creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
@@ -4275,7 +4879,19 @@ class DutyGui(ctk.CTk):
         except OSError as exc:
             messagebox.showerror("無法開啟行車紀錄器", str(exc), parent=self)
             return
-        self.notify_user(APP_DISPLAY_NAME, "已開啟行車紀錄器（BETA）。")
+        self.record_tool_usage_started("rescue_video", "行車紀錄器（BETA）")
+        self.record_tool_usage_finished("rescue_video", "opened")
+
+    def focus_rescue_video_window(self) -> bool:
+        if os.name != "nt":
+            return False
+        user32 = ctypes.windll.user32
+        window_handle = user32.FindWindowW(None, RESCUE_VIDEO_WINDOW_TITLE)
+        if not window_handle:
+            return False
+        user32.ShowWindow(window_handle, 9 if user32.IsIconic(window_handle) else 5)
+        user32.SetForegroundWindow(window_handle)
+        return True
 
     def set_login_buttons_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -4979,7 +5595,7 @@ class DutyGui(ctk.CTk):
         self.duty_card_rows[iid] = card
         self.duty_card_borders[iid] = border
 
-        time_label = ctk.CTkLabel(row, text=task_time, text_color="#0f172a", font=(UI_FONT, 13, "bold"), width=DUTY_TASK_COLUMN_WIDTHS[0], anchor=tk.CENTER, justify=tk.CENTER)
+        time_label = ctk.CTkLabel(row, text=task_time, text_color="#0f172a", font=FONT_LABEL_EMPHASIS, width=DUTY_TASK_COLUMN_WIDTHS[0], anchor=tk.CENTER, justify=tk.CENTER)
         time_label.grid(row=0, column=0, sticky=tk.EW, padx=0, pady=5)
         system_label = ctk.CTkLabel(row, text=system_text, text_color="#1d4ed8" if system_text == "出入" else "#047857", font=FONT_BUTTON, width=DUTY_TASK_COLUMN_WIDTHS[1], anchor=tk.CENTER)
         system_label.grid(row=0, column=1, sticky=tk.EW, padx=0, pady=5)
@@ -5768,14 +6384,19 @@ class DutyGui(ctk.CTk):
 
         self.mode.set("值班模式" if self.simple_mode.get() else "審核模式")
         if self.simple_mode.get():
-            self.geometry("550x800")
-            self.minsize(530, 760)
+            self.update_duty_window_geometry()
             self.filter_actor.set(True)
             if self.status_filter.get() not in ("需處理", "全部", "已登打", "已存在", "手動", "尚未到點", "疑似異動", "可能臨時調整", "時間近似", "人工確認"):
                 self.status_filter.set("需處理")
             self.title(f"{APP_DISPLAY_NAME} - 值班模式")
             self.duty_panel.pack(fill=tk.BOTH, expand=True)
         else:
+            if self.tool_side_panel.winfo_manager():
+                self.tool_side_panel.grid_remove()
+                self.active_tool_side_name = ""
+            self.root_panel.grid_columnconfigure(0, minsize=self.audit_main_width_px, weight=0)
+            self.root_panel.grid_columnconfigure(1, minsize=0, weight=0)
+            self.main_content_host.configure(width=self.audit_main_width)
             self.geometry("780x650")
             self.minsize(720, 560)
             self.filter_actor.set(False)

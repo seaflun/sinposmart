@@ -405,6 +405,27 @@ def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
         print(f"[artifacts] skipped screenshot/html capture: {error}")
 
 
+def position_browser_on_right(driver) -> None:
+    try:
+        screen = driver.execute_script(
+            "return {left: screen.availLeft || 0, top: screen.availTop || 0, "
+            "width: screen.availWidth || screen.width, height: screen.availHeight || screen.height};"
+        ) or {}
+        screen_left = int(screen.get("left", 0))
+        screen_top = int(screen.get("top", 0))
+        screen_width = max(1, int(screen.get("width", 1920)))
+        screen_height = max(1, int(screen.get("height", 1040)))
+        browser_width = min(screen_width, max(720, screen_width // 2))
+        driver.set_window_rect(
+            x=screen_left + screen_width - browser_width,
+            y=screen_top,
+            width=browser_width,
+            height=screen_height,
+        )
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     parse_args(argv)
     config = load_config()
@@ -430,6 +451,8 @@ def main(argv: list[str] | None = None) -> None:
     else:
         print("[driver] using local chrome")
         driver = webdriver.Chrome(options=options)
+    if not config["headless"]:
+        position_browser_on_right(driver)
 
     wait = WebDriverWait(driver, int(config["timeout_seconds"]))
     driver.set_page_load_timeout(max(15, int(config["timeout_seconds"])))

@@ -207,32 +207,51 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
         clear_running_pid(project_dir, pid)
 
 
-def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> None:
+def start_daily_vehicle_automation(
+    parent: tk.Tk,
+    user_id: str = "",
+    password: str = "",
+    on_start: Callable[[], None] | None = None,
+    on_finish: Callable[[str], None] | None = None,
+    on_error: Callable[[str], None] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    confirm: bool = True,
+) -> None:
     base_dir = Path(__file__).resolve().parent
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
         searched = "\n".join(str(path) for path in candidate_project_dirs(base_dir))
+        if on_status is not None:
+            on_status("失敗：找不到車輛保養清點專案。")
         messagebox.showerror(WINDOW_TITLE, f"找不到車輛保養清點專案，已搜尋：\n{searched}", parent=parent)
         return
 
     script_path = project_dir / AUTOMATION_SCRIPT
     if not script_path.exists():
+        if on_status is not None:
+            on_status("失敗：找不到車輛保養清點自動化腳本。")
         messagebox.showerror(WINDOW_TITLE, f"找不到自動化腳本：\n{script_path}", parent=parent)
         return
 
     account = user_id.strip()
     pwd = password
     if not account or not pwd:
+        if on_status is not None:
+            on_status("失敗：請先在外層登入。")
         messagebox.showwarning(WINDOW_TITLE, "請先在外層登入後再執行車輛保養清點。", parent=parent)
         return
 
     if is_running(project_dir):
+        if on_status is not None:
+            on_status("車輛保養清點目前正在執行。")
         messagebox.showinfo(WINDOW_TITLE, "車輛保養清點目前正在執行。", parent=parent)
         return
 
-    if not messagebox.askyesno(WINDOW_TITLE, "將開啟瀏覽器執行車輛保養清點，是否繼續？", parent=parent):
+    if confirm and not messagebox.askyesno(WINDOW_TITLE, "將開啟瀏覽器執行車輛保養清點，是否繼續？", parent=parent):
         return
 
+    if on_status is not None:
+        on_status("開始車輛保養清點...")
     if on_start is not None:
         on_start()
     default_env = load_dotenv_like(project_dir / ENV_EXAMPLE)
@@ -278,20 +297,25 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                 raise RuntimeError(f"車輛保養清點逾時未完成，已超過 {automation_timeout_seconds()} 秒。")
             return_code = process.returncode
             if return_code == 0:
+                if on_status is not None:
+                    on_status("車輛保養清點已完成。")
                 if on_finish is not None:
                     on_finish("車輛保養清點已完成。")
-                run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
                 detail = output_tail(output)
                 raw_error = f"車輛保養清點執行失敗，代碼：{return_code}；{detail}"
                 print(f"[automation-error] daily_vehicle: {raw_error}", file=sys.stderr)
                 error = format_automation_error(raw_error)
+                if on_status is not None:
+                    on_status(f"失敗：{error}")
                 if on_error is not None:
                     on_error(error)
                 run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, error, parent=parent))
         except Exception as exc:
             log_automation_exception("daily_vehicle", exc)
             error = format_automation_error(exc)
+            if on_status is not None:
+                on_status(f"失敗：{error}")
             if on_error is not None:
                 on_error(error)
             run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, error, parent=parent))

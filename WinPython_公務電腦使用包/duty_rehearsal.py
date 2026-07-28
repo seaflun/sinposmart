@@ -2629,6 +2629,27 @@ def print_summary(today: DutySheet, yesterday: DutySheet | None, cases: list[Cas
             )
 
 
+def position_browser_on_right(driver) -> None:
+    try:
+        screen = driver.execute_script(
+            "return {left: screen.availLeft || 0, top: screen.availTop || 0, "
+            "width: screen.availWidth || screen.width, height: screen.availHeight || screen.height};"
+        ) or {}
+        screen_left = int(screen.get("left", 0))
+        screen_top = int(screen.get("top", 0))
+        screen_width = max(1, int(screen.get("width", 1920)))
+        screen_height = max(1, int(screen.get("height", 1040)))
+        browser_width = min(screen_width, max(720, screen_width // 2))
+        driver.set_window_rect(
+            x=screen_left + screen_width - browser_width,
+            y=screen_top,
+            width=browser_width,
+            height=screen_height,
+        )
+    except Exception:
+        pass
+
+
 def build_driver(headless: bool) -> webdriver.Chrome:
     options = Options()
     if headless:
@@ -2636,6 +2657,8 @@ def build_driver(headless: bool) -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--window-size=1280,900")
     driver = webdriver.Chrome(options=options)
+    if not headless:
+        position_browser_on_right(driver)
     try:
         driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
     except Exception:

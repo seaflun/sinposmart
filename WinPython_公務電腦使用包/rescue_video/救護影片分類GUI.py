@@ -13,7 +13,7 @@ import customtkinter as ctk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Iterable, Mapping
 
 import classify_rescue_video as classifier
@@ -31,6 +31,25 @@ MODES = {
     "delete": (True, True),
 }
 PUBLIC_GUI_MODES = ("preview", "delete")
+UI_FONT = "Microsoft JhengHei UI"
+TYPE_SIZE_CAPTION = 11
+TYPE_SIZE_BODY = 12
+TYPE_SIZE_CONTROL = 14
+TYPE_SIZE_SECTION_TITLE = 15
+TYPE_SIZE_PANEL_TITLE = 18
+TYPE_SIZE_DISPLAY = 24
+FONT_CAPTION = (UI_FONT, TYPE_SIZE_CAPTION)
+FONT_CAPTION_EMPHASIS = (UI_FONT, TYPE_SIZE_CAPTION, "bold")
+FONT_BODY = (UI_FONT, TYPE_SIZE_BODY)
+FONT_BODY_EMPHASIS = (UI_FONT, TYPE_SIZE_BODY, "bold")
+FONT_BUTTON = FONT_BODY_EMPHASIS
+FONT_CONTROL = (UI_FONT, TYPE_SIZE_CONTROL)
+FONT_CONTROL_EMPHASIS = (UI_FONT, TYPE_SIZE_CONTROL, "bold")
+FONT_SECTION_TITLE = (UI_FONT, TYPE_SIZE_SECTION_TITLE, "bold")
+FONT_PANEL_TITLE = (UI_FONT, TYPE_SIZE_PANEL_TITLE, "bold")
+FONT_DISPLAY = (UI_FONT, TYPE_SIZE_DISPLAY, "bold")
+FONT_TABLE = FONT_BODY
+FONT_TABLE_HEAD = FONT_BODY_EMPHASIS
 
 
 @dataclass(frozen=True)
@@ -369,9 +388,28 @@ class RescueVideoApp:
         self.summary_var = tk.StringVar(value="尚未執行")
         self.source_health_var = tk.StringVar(value="來源：尚未指定，執行時會自動偵測")
 
+        self._configure_apple_typography()
         self._build_public_duty_gui()
         self.root.after(100, self._refresh_automatic_state)
         self.root.after(100, self._poll_events)
+
+    def _configure_apple_typography(self) -> None:
+        self.root.option_add("*Font", FONT_BODY)
+        ctk.ThemeManager.theme["CTkFont"].update(
+            {"family": UI_FONT, "size": TYPE_SIZE_BODY, "weight": "normal"}
+        )
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(font_name).configure(family=UI_FONT, size=TYPE_SIZE_BODY)
+            except tk.TclError:
+                continue
+        style = ttk.Style(self.root)
+        style.configure("TLabel", font=FONT_BODY)
+        style.configure("TButton", font=FONT_BUTTON)
+        style.configure("TEntry", font=FONT_BODY)
+        style.configure("TCheckbutton", font=FONT_BODY)
+        style.configure("Treeview", font=FONT_TABLE)
+        style.configure("Treeview.Heading", font=FONT_TABLE_HEAD)
 
     def _build_form(self) -> None:
         form = ttk.LabelFrame(self.root, text="分類設定", padding=10)
@@ -447,20 +485,20 @@ class RescueVideoApp:
         ctk.CTkLabel(
             header,
             text="救護行車影片分類",
-            font=ctk.CTkFont(family="Microsoft JhengHei UI", size=23, weight="bold"),
+            font=FONT_DISPLAY,
             text_color="white",
         ).pack(side="left", padx=24, pady=14)
         self.status_badge = ctk.CTkLabel(
             header,
             text="● 自動檢查中",
-            font=ctk.CTkFont(family="Microsoft JhengHei UI", size=12, weight="bold"),
+            font=FONT_BODY_EMPHASIS,
             text_color="#bfdbfe",
         )
         self.status_badge.pack(side="right", padx=24, pady=14)
 
         settings = ctk.CTkFrame(self.root, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         settings.pack(fill="x", padx=24, pady=(16, 8))
-        ctk.CTkLabel(settings, text="車號", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(settings, text="車號", font=FONT_CONTROL_EMPHASIS).grid(
             row=0, column=0, padx=(16, 8), pady=14
         )
         self.vehicle_combo = ctk.CTkComboBox(
@@ -470,12 +508,14 @@ class RescueVideoApp:
             command=lambda _value: self._refresh_automatic_state(),
             state="disabled",
             width=140,
+            font=FONT_BODY,
+            dropdown_font=FONT_BODY,
         )
         self.vehicle_combo.grid(row=0, column=1, padx=(0, 24), pady=14)
-        ctk.CTkLabel(settings, text="日期", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(settings, text="日期", font=FONT_CONTROL_EMPHASIS).grid(
             row=0, column=2, padx=(0, 8), pady=14
         )
-        date_entry = ctk.CTkEntry(settings, textvariable=self.date_var, width=150)
+        date_entry = ctk.CTkEntry(settings, textvariable=self.date_var, width=150, font=FONT_BODY)
         date_entry.grid(row=0, column=3, padx=(0, 24), pady=14)
         self.date_var.trace_add("write", lambda *_args: self._schedule_automatic_refresh())
         settings.grid_columnconfigure(4, weight=1)
@@ -483,15 +523,16 @@ class RescueVideoApp:
             settings,
             text="車號由當日案件資料夾自動取得；工作紀錄、報告位置與時間偏移均自動處理。",
             text_color="#52627a",
+            font=FONT_CAPTION,
         ).grid(row=0, column=4, sticky="w", padx=(0, 16), pady=14)
 
         status_card = ctk.CTkFrame(self.root, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         status_card.pack(fill="x", padx=24, pady=(0, 8))
-        ctk.CTkLabel(status_card, text="自動檢查", font=ctk.CTkFont(size=14, weight="bold")).pack(
+        ctk.CTkLabel(status_card, text="自動檢查", font=FONT_CONTROL_EMPHASIS).pack(
             anchor="w", padx=14, pady=(10, 2)
         )
         self.auto_status_var = tk.StringVar(value="正在檢查記憶卡、Z 槽與工作紀錄。")
-        ctk.CTkLabel(status_card, textvariable=self.auto_status_var, justify="left", anchor="w", wraplength=980).pack(
+        ctk.CTkLabel(status_card, textvariable=self.auto_status_var, justify="left", anchor="w", wraplength=980, font=FONT_BODY).pack(
             fill="x", padx=14, pady=(0, 10)
         )
         self.manual_source_button = ctk.CTkButton(
@@ -499,6 +540,7 @@ class RescueVideoApp:
             text="手動選取記憶卡資料夾",
             command=self._select_manual_source,
             fg_color="#52627a",
+            font=FONT_BUTTON,
         )
 
         actions = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -509,6 +551,7 @@ class RescueVideoApp:
             command=lambda: self._start("preview"),
             state="disabled",
             fg_color="#2563eb",
+            font=FONT_BUTTON,
         )
         self.preview_button.pack(side="left", padx=(0, 8))
         self.delete_button = ctk.CTkButton(
@@ -517,6 +560,7 @@ class RescueVideoApp:
             command=lambda: self._start("delete"),
             state="disabled",
             fg_color="#b42318",
+            font=FONT_BUTTON,
         )
         self.delete_button.pack(side="left")
         self.buttons = [self.preview_button, self.delete_button]
@@ -527,7 +571,7 @@ class RescueVideoApp:
 
         results_card = ctk.CTkFrame(self.root, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         results_card.pack(fill="both", expand=True, padx=24, pady=(0, 8))
-        ctk.CTkLabel(results_card, text="分類結果", font=ctk.CTkFont(size=15, weight="bold")).pack(
+        ctk.CTkLabel(results_card, text="分類結果", font=FONT_SECTION_TITLE).pack(
             anchor="w", padx=12, pady=(10, 4)
         )
         table_frame = ttk.Frame(results_card)
@@ -547,7 +591,7 @@ class RescueVideoApp:
         self.tree.pack(side="left", fill="both", expand=True)
         y_scroll.pack(side="right", fill="y")
         self.summary_var.set("等待自動檢查完成。")
-        ctk.CTkLabel(self.root, textvariable=self.summary_var, text_color="#52627a").pack(
+        ctk.CTkLabel(self.root, textvariable=self.summary_var, text_color="#52627a", font=FONT_CAPTION).pack(
             anchor="w", padx=24, pady=(0, 14)
         )
 
@@ -659,20 +703,20 @@ class RescueVideoApp:
         ctk.CTkLabel(
             header,
             text="救護行車影片分類",
-            font=ctk.CTkFont(family="Microsoft JhengHei UI", size=23, weight="bold"),
+            font=FONT_DISPLAY,
             text_color="white",
         ).pack(side="left", padx=24, pady=(15, 2))
         self.status_badge = ctk.CTkLabel(
             header,
             text="● 請先執行自檢",
-            font=ctk.CTkFont(family="Microsoft JhengHei UI", size=12, weight="bold"),
+            font=FONT_BODY_EMPHASIS,
             text_color="#bfdbfe",
         )
         self.status_badge.pack(side="right", padx=24, pady=(17, 2))
         ctk.CTkLabel(
             self.root,
             text="依 SINPOSMART 工作／返隊時間，將記憶卡影片歸入案件資料夾。自檢不會寫入、複製或刪除檔案。",
-            font=ctk.CTkFont(family="Microsoft JhengHei UI", size=13),
+            font=FONT_BODY,
             text_color="#52627a",
         ).pack(anchor="w", padx=24, pady=(8, 8))
 
@@ -685,10 +729,10 @@ class RescueVideoApp:
             health.grid_columnconfigure(index, weight=1)
             card = ctk.CTkFrame(health, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
             card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 5, 0 if index == 2 else 5))
-            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=12, weight="bold"), text_color="#344054").pack(
+            ctk.CTkLabel(card, text=title, font=FONT_BODY_EMPHASIS, text_color="#344054").pack(
                 anchor="w", padx=12, pady=(8, 0)
             )
-            label = ctk.CTkLabel(card, text="尚未檢查", font=ctk.CTkFont(size=12), text_color="#667085")
+            label = ctk.CTkLabel(card, text="尚未檢查", font=FONT_BODY, text_color="#667085")
             label.pack(anchor="w", padx=12, pady=(0, 8))
             self.health_labels[name] = label
 
@@ -700,7 +744,7 @@ class RescueVideoApp:
         settings = ctk.CTkFrame(content, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         settings.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         settings.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(settings, text="本次分類設定", font=ctk.CTkFont(size=15, weight="bold")).grid(
+        ctk.CTkLabel(settings, text="本次分類設定", font=FONT_SECTION_TITLE).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=14, pady=(12, 6)
         )
         self._add_dashboard_path_row(settings, 1, "記憶卡來源", self.source_var, (("自動偵測", self._detect_source), ("瀏覽", self._browse_source)))
@@ -719,7 +763,7 @@ class RescueVideoApp:
 
         check_card = ctk.CTkFrame(content, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         check_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        ctk.CTkLabel(check_card, text="執行前自檢", font=ctk.CTkFont(size=15, weight="bold")).pack(
+        ctk.CTkLabel(check_card, text="執行前自檢", font=FONT_SECTION_TITLE).pack(
             anchor="w", padx=14, pady=(12, 2)
         )
         ctk.CTkLabel(check_card, text="自檢只讀取狀態，不會建立測試檔。", text_color="#667085").pack(
@@ -735,7 +779,7 @@ class RescueVideoApp:
 
         actions = ctk.CTkFrame(self.root, fg_color="transparent")
         actions.pack(fill="x", padx=24, pady=(0, 8))
-        ctk.CTkLabel(actions, text="分類操作", font=ctk.CTkFont(size=14, weight="bold"), text_color="#344054").pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(actions, text="分類操作", font=FONT_CONTROL_EMPHASIS, text_color="#344054").pack(side="left", padx=(0, 12))
         for text, mode, color in (
             ("1　預覽分類", "preview", "#2563eb"),
             ("2　執行複製", "copy", "#2563eb"),
@@ -751,7 +795,7 @@ class RescueVideoApp:
 
         results_card = ctk.CTkFrame(self.root, fg_color="#ffffff", border_width=1, border_color="#d7e2ee")
         results_card.pack(fill="both", expand=True, padx=24, pady=(0, 8))
-        ctk.CTkLabel(results_card, text="分類結果", font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(results_card, text="分類結果", font=FONT_SECTION_TITLE).pack(anchor="w", padx=12, pady=(10, 4))
         table_frame = ttk.Frame(results_card)
         table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         columns = ("source", "time", "case", "status", "destination", "note")
@@ -836,14 +880,15 @@ class RescueVideoApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("Microsoft JhengHei UI", 20, "bold"), foreground="#172033")
+        self._configure_apple_typography()
+        style.configure("Title.TLabel", font=FONT_PANEL_TITLE, foreground="#172033")
         style.configure("Subtitle.TLabel", foreground="#62708a")
         style.configure("Card.TLabelframe", padding=4)
-        style.configure("Card.TLabelframe.Label", font=("Microsoft JhengHei UI", 11, "bold"), foreground="#24415f")
+        style.configure("Card.TLabelframe.Label", font=FONT_CAPTION_EMPHASIS, foreground="#24415f")
         style.configure("Hint.TLabel", foreground="#667085")
-        style.configure("Status.TLabel", font=("Microsoft JhengHei UI", 11, "bold"), foreground="#176b3a")
-        style.configure("Primary.TButton", padding=(14, 8), font=("Microsoft JhengHei UI", 10, "bold"))
-        style.configure("Danger.TButton", padding=(14, 8), foreground="#a51d2d", font=("Microsoft JhengHei UI", 10, "bold"))
+        style.configure("Status.TLabel", font=FONT_CAPTION_EMPHASIS, foreground="#176b3a")
+        style.configure("Primary.TButton", padding=(14, 8), font=FONT_BUTTON)
+        style.configure("Danger.TButton", padding=(14, 8), foreground="#a51d2d", font=FONT_BUTTON)
 
         width = min(1320, max(1040, self.root.winfo_screenwidth() - 100))
         height = min(860, max(680, self.root.winfo_screenheight() - 120))
@@ -924,7 +969,7 @@ class RescueVideoApp:
 
         action_card = ttk.Frame(self.root, padding=(24, 4, 24, 8))
         action_card.pack(fill="x")
-        ttk.Label(action_card, text="執行操作", font=("Microsoft JhengHei UI", 11, "bold")).pack(side="left", padx=(0, 14))
+        ttk.Label(action_card, text="執行操作", font=FONT_CAPTION_EMPHASIS).pack(side="left", padx=(0, 14))
         self.buttons = []
         preview_button = ttk.Button(action_card, text="1  預覽分類", style="Primary.TButton", command=lambda: self._start("preview"))
         copy_button = ttk.Button(action_card, text="2  執行複製", style="Primary.TButton", command=lambda: self._start("copy"))
@@ -942,7 +987,7 @@ class RescueVideoApp:
 
         summary_bar = ttk.Frame(self.root, padding=(24, 0, 24, 6))
         summary_bar.pack(fill="x")
-        ttk.Label(summary_bar, text="結果摘要", font=("Microsoft JhengHei UI", 11, "bold")).pack(side="left")
+        ttk.Label(summary_bar, text="結果摘要", font=FONT_CAPTION_EMPHASIS).pack(side="left")
         ttk.Label(summary_bar, textvariable=self.summary_var, style="Hint.TLabel").pack(side="left", padx=(12, 0))
 
         results_card = ttk.LabelFrame(self.root, text="分類結果", padding=8, style="Card.TLabelframe")
