@@ -11,6 +11,7 @@ import re
 import warnings
 import json
 import os
+import sys
 import tempfile
 import shutil
 from datetime import datetime, timedelta
@@ -20,6 +21,12 @@ import threading
 from pathlib import Path
 from openpyxl.utils import get_column_letter
 from copy import copy
+
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+
+from duty_rehearsal import build_driver
 
 # ==========================================
 # [區塊一] 模組導入與全域設定 (Imports & Config)
@@ -1247,8 +1254,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     log_status("✅ 勤務表檢查通過，未發現重複或漏排")
     
     # ---------------- 2. 瀏覽器自動化 ----------------
-    driver = webdriver.Chrome()
-    position_browser_on_right(driver)
+    driver = build_driver(headless=False)
     try:
         driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
     except Exception:

@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 import time
 import traceback
 import urllib.error
@@ -21,6 +22,13 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+
+PACKAGE_DIR = Path(__file__).resolve().parents[2]
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+
+from duty_rehearsal import build_driver
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -450,7 +458,18 @@ def main(argv: list[str] | None = None) -> None:
         driver = webdriver.Remote(command_executor=remote_url, options=options)
     else:
         print("[driver] using local chrome")
-        driver = webdriver.Chrome(options=options)
+        driver = build_driver(
+            headless=bool(config["headless"]),
+            option_arguments=(
+                "--window-size=1440,1200",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-features=Translate,BackForwardCache",
+                "--dns-prefetch-disable",
+            ),
+            page_load_strategy="none",
+        )
     if not config["headless"]:
         position_browser_on_right(driver)
 

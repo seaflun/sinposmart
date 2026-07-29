@@ -10,19 +10,27 @@ from __future__ import annotations
 
 
 import argparse
+import base64
 import getpass
 import json
 import os
+import queue
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -2650,13 +2658,109 @@ def position_browser_on_right(driver) -> None:
         pass
 
 
-def build_driver(headless: bool) -> webdriver.Chrome:
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--window-size=1280,900")
-    driver = webdriver.Chrome(options=options)
+def duty_browser_profile_dir() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "SinpoSmart" / "duty_browser_profiles"
+    root.mkdir(parents=True, exist_ok=True)
+    profile_dir = root / f"duty_gui_{uuid4().hex}"
+    profile_dir.mkdir()
+    return profile_dir
+
+
+def chrome_start_attempts() -> int:
+    try:
+        return max(1, min(int(os.environ.get("SELENIUM_CHROME_START_ATTEMPTS", "2")), 3))
+    except ValueError:
+        return 2
+
+
+def chrome_start_timeout_seconds() -> float:
+    try:
+        return max(float(os.environ.get("SELENIUM_CHROME_START_TIMEOUT_SECONDS", "20")), 1)
+    except ValueError:
+        return 20
+
+
+def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+    timed_out = threading.Event()
+
+    def start() -> None:
+        try:
+            driver = webdriver.Chrome(options=options)
+        except BaseException as exc:
+            if not timed_out.is_set():
+                result_queue.put(("error", exc))
+            return
+        if timed_out.is_set():
+            with suppress(Exception):
+                driver.quit()
+            return
+        result_queue.put(("driver", driver))
+
+    thread = threading.Thread(target=start, name="sinposmart-chrome-startup", daemon=True)
+    thread.start()
+    thread.join(chrome_start_timeout_seconds())
+    if thread.is_alive():
+        timed_out.set()
+        raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。")
+    kind, value = result_queue.get_nowait()
+    if kind == "error":
+        raise value
+    return value
+
+
+def cleanup_duty_browser_startup_failure(profile_dir: Path) -> None:
+    profile_token = base64.b64encode(str(profile_dir).encode("utf-8")).decode("ascii")
+    script = (
+        "$target = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+        + profile_token
+        + "')); Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'chrome.exe' -and $_.CommandLine -like \"*$target*\" } | "
+        "Sort-Object ProcessId -Descending | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    with suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    with suppress(OSError):
+        shutil.rmtree(profile_dir)
+
+
+def build_driver(
+    headless: bool,
+    option_arguments: tuple[str, ...] = (),
+    page_load_strategy: str = "",
+) -> webdriver.Chrome:
+    attempts = chrome_start_attempts()
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        profile_dir = duty_browser_profile_dir()
+        options = Options()
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--window-size=1280,900")
+        for argument in option_arguments:
+            options.add_argument(argument)
+        if page_load_strategy:
+            options.page_load_strategy = page_load_strategy
+        try:
+            driver = create_webdriver_chrome_with_timeout(options)
+        except (OSError, TimeoutError, WebDriverException) as exc:
+            last_error = exc
+            cleanup_duty_browser_startup_failure(profile_dir)
+            if attempt < attempts:
+                time.sleep(1)
+                continue
+            raise WebDriverException(f"Chrome 啟動失敗，已重試 {attempts} 次。") from exc
+        break
+    else:
+        raise WebDriverException(f"Chrome 啟動失敗，已重試 {attempts} 次。") from last_error
     if not headless:
         position_browser_on_right(driver)
     try:

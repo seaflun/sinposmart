@@ -965,9 +965,12 @@ class PackageSmokeTests(unittest.TestCase):
         rehearsal_source = (package_dir() / "duty_rehearsal.py").read_text(encoding="utf-8-sig")
         duty_source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
         vehicle_source = (package_dir() / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
-        for source in (rehearsal_source, duty_source, vehicle_source):
-            self.assertIn("def position_browser_on_right(driver) -> None:", source)
-            self.assertIn("position_browser_on_right(driver)", source)
+        self.assertIn("def position_browser_on_right(driver) -> None:", rehearsal_source)
+        self.assertIn("position_browser_on_right(driver)", rehearsal_source)
+        self.assertIn("from duty_rehearsal import build_driver", duty_source)
+        self.assertIn("driver = build_driver(headless=False)", duty_source)
+        self.assertIn("from duty_rehearsal import build_driver", vehicle_source)
+        self.assertIn("driver = build_driver(", vehicle_source)
         self.assertIn('if not config["headless"]:\n        position_browser_on_right(driver)', vehicle_source)
 
     def test_gui_typography_uses_one_apple_role_scale(self) -> None:
@@ -2047,6 +2050,51 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("notify_user: bool = True", source)
         self.assertIn("notify_user=False", source)
         self.assertIn("if notify_user:", source)
+
+    def test_build_driver_retries_only_with_its_own_temporary_profile(self) -> None:
+        module = duty_rehearsal_module()
+        profiles = [Path("C:/Temp/duty_gui_first"), Path("C:/Temp/duty_gui_second")]
+        cleaned: list[Path] = []
+        driver = mock.Mock()
+
+        with mock.patch.object(module, "chrome_start_attempts", return_value=2), mock.patch.object(
+            module, "duty_browser_profile_dir", side_effect=profiles
+        ), mock.patch.object(
+            module,
+            "create_webdriver_chrome_with_timeout",
+            side_effect=[module.WebDriverException("Chrome failed to start"), driver],
+        ) as start_chrome, mock.patch.object(
+            module, "cleanup_duty_browser_startup_failure", side_effect=cleaned.append
+        ), mock.patch.object(module.time, "sleep"):
+            result = module.build_driver(
+                headless=False,
+                option_arguments=("--test-duty-option",),
+                page_load_strategy="none",
+            )
+
+        self.assertIs(result, driver)
+        self.assertEqual(cleaned, [profiles[0]])
+        first_options = start_chrome.call_args_list[0].args[0]
+        second_options = start_chrome.call_args_list[1].args[0]
+        self.assertIn(f"--user-data-dir={profiles[0]}", first_options.arguments)
+        self.assertIn(f"--user-data-dir={profiles[1]}", second_options.arguments)
+        self.assertIn("--test-duty-option", first_options.arguments)
+        self.assertIn("--test-duty-option", second_options.arguments)
+        self.assertEqual(first_options.page_load_strategy, "none")
+        self.assertEqual(second_options.page_load_strategy, "none")
+        self.assertNotEqual(profiles[0], profiles[1])
+
+    def test_all_local_duty_tools_use_the_safe_chrome_startup(self) -> None:
+        root = package_dir()
+        duty_sheet_source = (root / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
+        vehicle_source = (root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("from duty_rehearsal import build_driver", duty_sheet_source)
+        self.assertIn("driver = build_driver(headless=False)", duty_sheet_source)
+        self.assertIn("from duty_rehearsal import build_driver", vehicle_source)
+        self.assertIn("driver = build_driver(", vehicle_source)
+        self.assertIn('page_load_strategy="none"', vehicle_source)
+        self.assertIn("driver = webdriver.Remote(command_executor=remote_url, options=options)", vehicle_source)
 
     def test_next_morning_0600_rest_includes_manual_return_at_0800(self) -> None:
         module = duty_rehearsal_module()
