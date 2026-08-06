@@ -175,7 +175,7 @@ class DutySheetService:
         group = str(group or "").strip()
         code = str(code or "").strip()
         plate = str(plate or "").strip()
-        if group not in ("attack", "amb"):
+        if group not in ("attack", "stop", "amb"):
             raise DutySheetValidationError("車輛類型不正確。")
         if not code or not plate:
             raise DutySheetValidationError("請輸入車輛代號與車牌號碼。")
@@ -196,7 +196,7 @@ class DutySheetService:
     def remove_vehicle_option(self, group: str, value: str) -> str:
         group = str(group or "").strip()
         value = str(value or "").strip()
-        if group not in ("attack", "amb"):
+        if group not in ("attack", "stop", "amb"):
             raise DutySheetValidationError("車輛類型不正確。")
         if not value:
             raise DutySheetValidationError("請選擇要移除的車輛。")
@@ -214,7 +214,13 @@ class DutySheetService:
 
         fallback = str(values[0]) if values else ""
         last = config.setdefault("last_selection", {})
-        fields = ("attack",) if group == "attack" else ("amb1", "amb2")
+        fields = (
+            ("attack",)
+            if group == "attack"
+            else ("stop",)
+            if group == "stop"
+            else ("amb1", "amb2")
+        )
         for field_name in fields:
             if str(last.get(field_name, "") or "").strip() == value:
                 last[field_name] = fallback

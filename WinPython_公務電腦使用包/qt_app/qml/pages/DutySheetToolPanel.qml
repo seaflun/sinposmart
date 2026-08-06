@@ -38,8 +38,9 @@ ToolSidePanel {
         onOpened: {
             dutyVehicleCodeField.text = "";
             dutyVehiclePlateField.text = "";
+            dutyVehicleAddFunction.currentIndex = 0;
         }
-        onAccepted: dutySheetDialog.controller.addVehicleOption(dutyVehicleAddType.currentIndex === 0 ? "attack" : "amb", dutyVehicleCodeField.text, dutyVehiclePlateField.text)
+        onAccepted: dutySheetDialog.controller.addVehicleOption(dutyVehicleAddType.currentIndex === 0 ? (dutyVehicleAddFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleCodeField.text, dutyVehiclePlateField.text)
 
         contentItem: ColumnLayout {
             spacing: 10
@@ -55,6 +56,19 @@ ToolSidePanel {
                 Layout.fillWidth: true
                 model: ["消防車", "救護車"]
                 currentIndex: 1
+            }
+            Label {
+                visible: dutyVehicleAddType.currentIndex === 0
+                text: "車輛功能"
+                color: window.muted
+            }
+            AppleComboBox {
+                id: dutyVehicleAddFunction
+                objectName: "dutyVehicleAddFunction"
+                visible: dutyVehicleAddType.currentIndex === 0
+                compact: true
+                Layout.fillWidth: true
+                model: ["攻擊車", "中繼車"]
             }
             Label {
                 text: "車輛代號"
@@ -90,7 +104,7 @@ ToolSidePanel {
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "移除車輛"
         acceptTone: "dangerFilled"
-        onAccepted: dutySheetDialog.controller.removeVehicleOption(dutyVehicleRemoveType.currentIndex === 0 ? "attack" : "amb", dutyVehicleRemoveValue.currentText)
+        onAccepted: dutySheetDialog.controller.removeVehicleOption(dutyVehicleRemoveType.currentIndex === 0 ? (dutyVehicleRemoveFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleRemoveValue.currentText)
 
         contentItem: ColumnLayout {
             spacing: 10
@@ -108,6 +122,19 @@ ToolSidePanel {
                 currentIndex: 1
             }
             Label {
+                visible: dutyVehicleRemoveType.currentIndex === 0
+                text: "車輛功能"
+                color: window.muted
+            }
+            AppleComboBox {
+                id: dutyVehicleRemoveFunction
+                objectName: "dutyVehicleRemoveFunction"
+                visible: dutyVehicleRemoveType.currentIndex === 0
+                compact: true
+                Layout.fillWidth: true
+                model: ["攻擊車", "中繼車"]
+            }
+            Label {
                 text: "車輛代號／車牌號碼"
                 color: window.muted
             }
@@ -116,7 +143,7 @@ ToolSidePanel {
                 objectName: "dutyVehicleRemoveValue"
                 compact: true
                 Layout.fillWidth: true
-                model: dutyVehicleRemoveType.currentIndex === 0 ? dutySheetDialog.controller.attackOptions : dutySheetDialog.controller.ambOptions
+                model: dutyVehicleRemoveType.currentIndex === 0 ? (dutyVehicleRemoveFunction.currentIndex === 0 ? dutySheetDialog.controller.attackOptions : dutySheetDialog.controller.stopOptions) : dutySheetDialog.controller.ambOptions
             }
         }
     }

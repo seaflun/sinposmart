@@ -14,6 +14,13 @@ from app_core.session import SessionState
 from qt_app.workers.duty_sheet_worker import DutySheetWorker
 
 
+VEHICLE_GROUP_LABELS = {
+    "attack": "消防車（攻擊車）",
+    "stop": "消防車（中繼車）",
+    "amb": "救護車",
+}
+
+
 class DutySheetController(QObject):
     stateChanged = Signal()
     confirmationRequested = Signal()
@@ -146,7 +153,7 @@ class DutySheetController(QObject):
             self._set_error(str(exc))
             return
         self._apply_defaults(defaults)
-        vehicle_type = "消防車" if group == "attack" else "救護車"
+        vehicle_type = VEHICLE_GROUP_LABELS.get(group, "車輛")
         self._status_text = f"已新增{vehicle_type}：{value}"
         self.stateChanged.emit()
 
@@ -159,7 +166,7 @@ class DutySheetController(QObject):
             self._set_error(str(exc))
             return
         self._apply_defaults(defaults)
-        vehicle_type = "消防車" if group == "attack" else "救護車"
+        vehicle_type = VEHICLE_GROUP_LABELS.get(group, "車輛")
         self._status_text = f"已移除{vehicle_type}：{removed}"
         self.stateChanged.emit()
 

@@ -349,6 +349,7 @@ Rectangle {
                 text: "手動登打"
                 tone: "primary"
                 emphasizedBorder: true
+                enabled: dutyTaskArea.backend.dutyController.canManualSubmitSelected
                 onClicked: dutyTaskArea.backend.dutyController.prepareManualSubmission()
             }
         }

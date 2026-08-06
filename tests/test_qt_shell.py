@@ -826,6 +826,16 @@ class DutySheetServiceTests(unittest.TestCase):
             self.assertIn(added, after_remove["hidden_car_options"]["amb"])
             self.assertEqual(after_remove["last_selection"]["amb1"], "新坡91/BGV-2310")
 
+            relay = service.add_vehicle_option("stop", "F-01", "ABC-100")
+            self.assertEqual(relay, "F-01/ABC-100")
+            after_relay_add = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIn(relay, after_relay_add["car_options"]["stop"])
+
+            service.remove_vehicle_option("stop", relay)
+            after_relay_remove = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertNotIn(relay, after_relay_remove["car_options"]["stop"])
+            self.assertIn(relay, after_relay_remove["hidden_car_options"]["stop"])
+
     def test_execute_calls_legacy_engine_without_persisting_session_password(self) -> None:
         from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
 
@@ -2975,6 +2985,24 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0]["content_hash"], payload["content_hash"])
 
+    def test_board_payload_accepts_legacy_time_separators(self) -> None:
+        from app_core.operational_sync_service import build_duty_board_payload
+
+        for slot in ("08-10", "08~10", "08～10"):
+            payload = build_duty_board_payload(
+                {
+                    "today": {
+                        "roc_date": "1150806",
+                        "rows": [{"slot": slot, "columns": {"值班": ["12"]}}],
+                        "staff": {"12": {"name": "測試員"}},
+                    }
+                }
+            )
+
+            self.assertEqual(payload["days"][0]["slots"][0]["slot"], slot)
+            self.assertEqual(payload["days"][0]["slots"][0]["start_hour"], 8)
+            self.assertEqual(payload["days"][0]["slots"][0]["end_hour"], 10)
+
     def test_managed_board_sync_is_synchronous_and_deduplicates_content(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
 
@@ -3288,6 +3316,9 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn("Behavior on border.color", apple_combo)
         self.assertIn("property string acceptText", apple_dialog)
         self.assertIn("property string acceptTone", apple_dialog)
+        self.assertIn("footer: Item", apple_dialog)
+        self.assertIn("height: Design.borderWidth", apple_dialog)
+        self.assertNotIn("footer: Rectangle", apple_dialog)
         self.assertIn("tone: appleDialog.acceptTone", apple_dialog)
         self.assertIn("property bool hasBeenOpened: false", side_panel)
         self.assertIn("visible: opened || (hasBeenOpened && opacity > 0)", side_panel)
@@ -4215,6 +4246,10 @@ class QtShellTests(unittest.TestCase):
             ),
             2,
         )
+        self.assertIn(
+            "enabled: dutyTaskArea.backend.dutyController.canManualSubmitSelected",
+            action_row,
+        )
         self.assertIn("emphasizedBorder: true", action_row)
         self.assertEqual(action_row.count("DutyActionButton {"), 3)
 
@@ -4236,6 +4271,9 @@ class QtShellTests(unittest.TestCase):
             'objectName: "dutyPreviousDateButton"',
             'objectName: "dutyNextDateButton"',
             'objectName: "dutyDateCalendarButton"',
+            'objectName: "dutyVehicleAddFunction"',
+            'objectName: "dutyVehicleRemoveFunction"',
+            'model: ["攻擊車", "中繼車"]',
             'dateFormat: "slash"',
             "onToggled: dutySheetDialog.controller.setNotificationEnabled(checked)",
             "dutySheetDialog.controller.notificationEnabled)",
@@ -4244,6 +4282,8 @@ class QtShellTests(unittest.TestCase):
             "ToolUsageHistory {",
         ):
             self.assertIn(expected, panel)
+        self.assertIn('"attack" : "stop"', panel)
+        self.assertIn("dutySheetDialog.controller.stopOptions", panel)
         for unauthorized in (
             'text: "勤務日期"',
             'text: "指揮車"',
@@ -6242,21 +6282,30 @@ if return_code != 0 or loaded:
         class FakeService:
             def __init__(self):
                 self.attack_options = ["A"]
+                self.stop_options = ["S"]
                 self.amb_options = ["M1"]
 
             def load_defaults(self):
                 return DutySheetDefaults(
                     "duty.xlsm", "2026/07/30", "A", "S", "M1", "M1",
-                    tuple(self.attack_options), ("S",), tuple(self.amb_options), False,
+                    tuple(self.attack_options), tuple(self.stop_options), tuple(self.amb_options), False,
                 )
 
             def add_vehicle_option(self, group, code, plate):
                 value = f"{code}/{plate}"
-                (self.attack_options if group == "attack" else self.amb_options).append(value)
+                {
+                    "attack": self.attack_options,
+                    "stop": self.stop_options,
+                    "amb": self.amb_options,
+                }[group].append(value)
                 return value
 
             def remove_vehicle_option(self, group, value):
-                (self.attack_options if group == "attack" else self.amb_options).remove(value)
+                {
+                    "attack": self.attack_options,
+                    "stop": self.stop_options,
+                    "amb": self.amb_options,
+                }[group].remove(value)
                 return value
 
         service = FakeService()
@@ -6271,6 +6320,13 @@ if return_code != 0 or loaded:
         controller.removeVehicleOption("amb", "新坡93/BSL-9230")
         self.assertNotIn("新坡93/BSL-9230", controller.ambOptions)
         self.assertIn("已移除救護車", controller.statusText)
+
+        controller.addVehicleOption("stop", "新坡16", "KET-0001")
+        self.assertIn("新坡16/KET-0001", controller.stopOptions)
+        self.assertIn("消防車（中繼車）", controller.statusText)
+
+        controller.removeVehicleOption("stop", "新坡16/KET-0001")
+        self.assertNotIn("新坡16/KET-0001", controller.stopOptions)
 
     def test_duty_sheet_controller_requires_confirmation_and_runs_in_worker(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -7657,6 +7713,38 @@ if return_code != 0 or loaded:
         self.assertEqual(confirmation_spy.count(), 1)
         self.assertEqual(controller._pending_manual_indices, [0])
 
+    def test_completed_selected_task_disables_manual_submission(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150806",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "fields": {},
+                    }
+                ],
+            },
+            comparisons={0: {"compare": "已登打", "group": "done", "matched": []}},
+        )
+        confirmation_spy = QSignalSpy(controller.manualSubmissionConfirmationRequested)
+        controller.toggleTaskSelection(0)
+
+        self.assertFalse(controller.canManualSubmitSelected)
+        controller.prepareManualSubmission()
+
+        self.assertEqual(confirmation_spy.count(), 0)
+        self.assertEqual(controller._pending_manual_indices, [])
+
     def test_manual_submission_excludes_near_group_task(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
@@ -8950,6 +9038,12 @@ if return_code != 0 or loaded:
                     wait_for("dutyVehicleAddType").height(),
                     duty_workbook_browse.height(),
                 )
+                wait_for("dutyVehicleAddType").setProperty("currentIndex", 0)
+                self.assertTrue(wait_for("dutyVehicleAddFunction").property("visible"))
+                self.assertEqual(
+                    wait_for("dutyVehicleAddFunction").height(),
+                    duty_workbook_browse.height(),
+                )
                 self.assertTrue(QMetaObject.invokeMethod(add_dialog, "reject", Qt.DirectConnection))
                 click(wait_for("dutyVehicleRemoveButton"))
                 remove_dialog = root.findChild(QObject, "dutyVehicleRemoveDialog")
@@ -8957,6 +9051,12 @@ if return_code != 0 or loaded:
                 self.assertTrue(remove_dialog.property("visible"))
                 self.assertEqual(
                     wait_for("dutyVehicleRemoveType").height(),
+                    duty_workbook_browse.height(),
+                )
+                wait_for("dutyVehicleRemoveType").setProperty("currentIndex", 0)
+                self.assertTrue(wait_for("dutyVehicleRemoveFunction").property("visible"))
+                self.assertEqual(
+                    wait_for("dutyVehicleRemoveFunction").height(),
                     duty_workbook_browse.height(),
                 )
                 self.assertEqual(

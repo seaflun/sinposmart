@@ -40,11 +40,16 @@ Dialog {
         }
     }
 
-    footer: Rectangle {
+    footer: Item {
         implicitHeight: 52
-        color: Design.subtleSurface
-        border.width: Design.borderWidth
-        border.color: Design.divider
+
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Design.borderWidth
+            color: Design.divider
+        }
 
         RowLayout {
             anchors.right: parent.right

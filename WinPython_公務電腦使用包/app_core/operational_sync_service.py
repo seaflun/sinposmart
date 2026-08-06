@@ -49,7 +49,7 @@ def normalize_duty_board_day(raw_day: Mapping[str, Any]) -> dict[str, Any] | Non
         if not isinstance(raw_row, Mapping):
             continue
         slot = str(raw_row.get("slot", "")).strip()
-        match = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", slot)
+        match = re.fullmatch(r"\s*(\d{1,2})\s*[~～-]\s*(\d{1,2})\s*", slot)
         columns = raw_row.get("columns")
         duty_nos = columns.get("值班", []) if isinstance(columns, Mapping) else []
         if match is None or not isinstance(duty_nos, list):

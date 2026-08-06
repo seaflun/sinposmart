@@ -196,6 +196,12 @@ class DutyController(QObject):
 
         return self._can_adjust_selected_schedule()
 
+    @Property(bool, notify=scheduleChanged)
+    def canManualSubmitSelected(self) -> bool:
+        """Whether every selected task can be submitted manually."""
+
+        return self._can_manually_submit_selected()
+
     @Property(str, notify=scheduleChanged)
     def manualConfirmationSummary(self) -> str:
         return self._manual_confirmation_summary
@@ -295,6 +301,10 @@ class DutyController(QObject):
 
     @Slot()
     def prepareManualSubmission(self) -> None:
+        if not self._can_manually_submit_selected():
+            self._schedule_status = "選取項目包含已登打或不可手動登打的勤務"
+            self._refresh_projection()
+            return
         ready: list[int] = []
         for index in sorted(self._selected_indices):
             if not 0 <= index < len(self._actions):
@@ -368,6 +378,32 @@ class DutyController(QObject):
             ):
                 return False
         return True
+
+    def _can_manually_submit_selected(self) -> bool:
+        """Require all selected tasks to be manually eligible before enabling the action."""
+
+        return bool(self._selected_indices) and all(
+            self._is_manual_submission_eligible(index) for index in self._selected_indices
+        )
+
+    def _is_manual_submission_eligible(self, index: int) -> bool:
+        if not 0 <= index < len(self._actions):
+            return False
+        action = self._actions[index]
+        comparison = self._comparisons.get(index, {})
+        is_manual_external_review = (
+            comparison.get("group") == "review"
+            and str(action.get("source", "") or "").startswith("外勤")
+        )
+        return (
+            action.get("kind") in ("work_log", "entry_log")
+            and index not in self._submitting_indices
+            and index not in self._executed_indices
+            and (
+                comparison.get("group") not in ("done", "near", "review")
+                or is_manual_external_review
+            )
+        )
 
     def set_actor_no(self, actor_no: str) -> None:
         actor_no = str(actor_no or "").strip()
