@@ -281,6 +281,10 @@ ApplicationWindow {
     Connections {
         target: window.backend.updateController
 
+        function onUpdateReady(_latestVersion) {
+            actionConfirmations.openUpdateConfirmation()
+        }
+
         function onErrorOccurred(message) {
             window.showAppError(message)
         }

@@ -18,7 +18,12 @@ from app_core.daily_vehicle_service import DailyVehicleService
 from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot
 from app_core.duty_sheet_service import DutySheetService
 from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult, DutySubmissionService
-from app_core.duty_task_projection import action_completion_key, compact_action_snapshot
+from app_core.duty_task_projection import (
+    action_completion_key,
+    action_summary,
+    compact_action_snapshot,
+    target_short_label,
+)
 from app_core.login_verifier import LoginVerifier
 from app_core.operational_sync_service import OperationalSyncService
 from app_core.rescue_video_service import RescueVideoService
@@ -161,6 +166,10 @@ class AppController(QObject):
         self._hourly_refresh_timer.setInterval(60_000)
         self._hourly_refresh_timer.timeout.connect(self._refresh_hourly_live_schedule)
         self._hourly_refresh_timer.start()
+        self._board_retry_timer = QTimer(self)
+        self._board_retry_timer.setInterval(60_000)
+        self._board_retry_timer.timeout.connect(self._retry_current_duty_board)
+        self._board_retry_timer.start()
         self._tomorrow_schedule_request_id = 0
         self._tomorrow_schedule_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
         self._tomorrow_schedule_timer = QTimer(self)
@@ -183,6 +192,7 @@ class AppController(QObject):
         self._duty_execution_controller.actionStarted.connect(self._duty_controller.mark_submission_enqueued)
         self._duty_execution_controller.actionFinished.connect(self._duty_controller.handle_submission_result)
         self._duty_execution_controller.actionFailed.connect(self._duty_controller.handle_submission_failure)
+        self._duty_execution_controller.allLanesUnavailable.connect(self._handle_execution_unavailable)
         self._duty_sheet_controller.runStarted.connect(
             lambda: self._tool_run_started("duty_sheet", "勤務表登打")
         )
@@ -225,13 +235,7 @@ class AppController(QObject):
             )
         )
         self._duty_execution_controller.actionStarted.connect(
-            lambda _index: self._tray_controller.notify("SinpoSmart", "開始執行自動登打")
-        )
-        self._duty_execution_controller.actionFinished.connect(
-            lambda _index, _status, message, _path: self._tray_controller.notify("SinpoSmart", message)
-        )
-        self._duty_execution_controller.actionFailed.connect(
-            lambda _index, message, _code: self._tray_controller.notify("SinpoSmart", message)
+            self._notify_duty_action_started
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
@@ -416,6 +420,7 @@ class AppController(QObject):
         if logged_in and self._session_controller.displayName:
             self._last_login_display_name = self._session_controller.displayName
         if logged_in and user_id:
+            self._duty_execution_controller.reset_parallel_lanes()
             if user_id != self._last_login_user_id:
                 self._last_login_actor_no = actor_no
             elif actor_no:
@@ -541,6 +546,22 @@ class AppController(QObject):
             self._send_operational_event("login", status="ok", trigger_type="login")
         if str(schedule_data.get("target_date") or "") == business_roc_date():
             self._start_operational_sync("board", schedule_data=schedule_data)
+
+    @Slot()
+    def _retry_current_duty_board(self) -> None:
+        """Retry a failed Google duty-board post without repeating a successful hash."""
+
+        if self._read_only_acceptance or not self._duty_mode_active:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        if not bool(getattr(self._operational_sync_service, "board_enabled", True)):
+            return
+        schedule_data = dict(self._duty_controller._schedule_data)
+        if str(schedule_data.get("target_date") or "") != business_roc_date():
+            return
+        self._start_operational_sync("board", schedule_data=schedule_data)
 
     @Slot(str)
     def _refresh_after_fire_day_change(self, target_roc_date: str) -> None:
@@ -798,6 +819,32 @@ class AppController(QObject):
             return dict(actions[request.action_index])
         return {}
 
+    @staticmethod
+    def _format_duty_notification(
+        action: Mapping,
+        staff: Mapping[str, Mapping],
+        outcome: str,
+    ) -> str:
+        """Keep duty notifications specific enough for parallel submissions."""
+
+        kind = "出入" if action.get("kind") == "entry_log" else "工作"
+        summary = action_summary(action) or "勤務登打"
+        target = target_short_label(action, staff)
+        target_text = f" {target}" if target and target != "-" else ""
+        return f"{kind}｜{summary}{target_text}｜{outcome}"
+
+    @Slot(int)
+    def _notify_duty_action_started(self, action_index: int) -> None:
+        actions = self._duty_controller._actions
+        if not 0 <= action_index < len(actions):
+            return
+        message = self._format_duty_notification(
+            actions[action_index],
+            self._operational_staff,
+            "開始登打",
+        )
+        self._tray_controller.notify("SinpoSmart", message)
+
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
@@ -830,6 +877,11 @@ class AppController(QObject):
                 "completion_key": action_completion_key(action),
             },
         )
+        outcome = "登打完成" if result.status == "submitted" else "已有資料，略過"
+        self._tray_controller.notify(
+            "SinpoSmart",
+            self._format_duty_notification(action, self._operational_staff, outcome),
+        )
 
     @Slot(object, str, str, str)
     def _submission_failed(
@@ -853,6 +905,15 @@ class AppController(QObject):
                 "error_code": error_code,
             },
         )
+        detail = str(message or "登打失敗").strip()
+        self._tray_controller.notify(
+            "SinpoSmart",
+            self._format_duty_notification(
+                action,
+                self._operational_staff,
+                f"登打失敗：{detail}",
+            ),
+        )
         if not result_path or error_code == "validation_error":
             return
         try:
@@ -873,8 +934,14 @@ class AppController(QObject):
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
+        session = self._session_state.session
+        actor_no = self._session_controller.actorNo
+        actor_name = str(session.actor_name or "").strip() if session is not None else ""
         operator = (
-            self._session_controller.displayName
+            f"{actor_no}番 {actor_name}"
+            if actor_no and actor_name
+            else actor_name
+            or self._session_controller.displayName
             or self._session_controller.userId
             or "目前登入人員"
         )
@@ -1090,6 +1157,11 @@ class AppController(QObject):
             if self._duty_execution_controller.enqueue(request):
                 self._duty_controller.mark_submission_enqueued(request.action_index)
 
+    @Slot(str)
+    def _handle_execution_unavailable(self, message: str) -> None:
+        self._duty_controller.disable_auto_execution()
+        self._tray_controller.notify("SinpoSmart", message)
+
     @Slot(object)
     def _enqueue_manual_tasks(self, indices: list[int]) -> None:
         if self._read_only_acceptance:
@@ -1177,6 +1249,7 @@ class AppController(QObject):
     @Slot()
     def shutdown(self) -> None:
         self._hourly_refresh_timer.stop()
+        self._board_retry_timer.stop()
         self._tomorrow_schedule_timer.stop()
         self._operational_sync_shutting_down = True
         if self._scheduled_folder_timer is not None:

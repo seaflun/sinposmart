@@ -25,6 +25,10 @@ Item {
         dailyVehicleConfirmation.open()
     }
 
+    function openUpdateConfirmation() {
+        updateConfirmation.open()
+    }
+
     AppleDialog {
         id: manualSubmissionConfirmation
         objectName: "manualSubmissionConfirmation"

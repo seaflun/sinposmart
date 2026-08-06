@@ -264,15 +264,26 @@ class ToolController(QObject):
             rows.append(
                 {
                     "timeText": str(entry.get("time", "") or "—"),
-                    "peopleText": str(
-                        entry.get("operator", "") or entry.get("people", "") or "目前登入人員"
-                    ),
+                    "peopleText": self._usage_people_text(entry),
                     "resultText": self._result_text(tool_id, entry, report),
                     "tone": "error" if report == "失敗" else "success",
                 }
             )
             break
         return rows
+
+    @staticmethod
+    def _usage_people_text(entry: dict[str, str]) -> str:
+        """Keep legacy history readable while omitting rank from the tool card."""
+
+        text = str(
+            entry.get("operator", "") or entry.get("people", "") or "目前登入人員"
+        ).strip()
+        return re.sub(
+            r"(?<=\d番)\s+(?:副小隊長|小隊長|分隊長|副中隊長|中隊長|大隊長|隊員)\s+",
+            " ",
+            text,
+        )
 
     def _result_text(
         self,

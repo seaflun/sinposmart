@@ -31,6 +31,7 @@ def launch_update_process(script_path: Path) -> Any:
 class UpdateController(QObject):
     stateChanged = Signal()
     errorOccurred = Signal(str)
+    updateReady = Signal(str)
 
     def __init__(
         self,
@@ -130,6 +131,8 @@ class UpdateController(QObject):
             else "目前已是最新版"
         )
         self.stateChanged.emit()
+        if info.update_available:
+            self.updateReady.emit(info.latest_version)
 
     @Slot(int, str)
     def _check_failed(self, request_id: int, message: str) -> None:

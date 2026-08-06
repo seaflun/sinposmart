@@ -6,10 +6,11 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Property, Signal, Slot
+from PySide6.QtCore import QObject, Property, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -24,11 +25,40 @@ except Exception:
     pscon = None
     shell = None
 
+try:
+    from win11toast import toast as win11_toast
+except Exception:
+    win11_toast = None
+
 
 APP_DISPLAY_NAME = "SinpoSmart"
 APP_USER_MODEL_ID = "TYFD.DutyAutomation"
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 APP_ICON_PATH = PACKAGE_ROOT / "duty_tray_icon.ico"
+
+
+class _WindowsToastRunnable(QRunnable):
+    """Run the blocking Windows Toast callback loop off the Qt UI thread."""
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self._title = title
+        self._message = message
+
+    def run(self) -> None:
+        if win11_toast is None:
+            return
+        try:
+            win11_toast(
+                self._title,
+                self._message,
+                app_id=APP_USER_MODEL_ID,
+                on_click=lambda _args=None: None,
+                on_dismissed=lambda _reason=None: None,
+                on_failed=lambda _error=None: None,
+            )
+        except Exception:
+            pass
 
 
 def configure_windows_notification_identity() -> None:
@@ -88,6 +118,20 @@ def ensure_windows_notification_shortcut() -> bool:
             pass
 
 
+def show_windows_notification(title: str, message: str) -> bool:
+    """Use the same Windows Toast path as the legacy duty GUI when available."""
+
+    if os.name != "nt" or win11_toast is None or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        return False
+    try:
+        configure_windows_notification_identity()
+        ensure_windows_notification_shortcut()
+        QThreadPool.globalInstance().start(_WindowsToastRunnable(str(title), str(message)))
+        return True
+    except Exception:
+        return False
+
+
 class TrayController(QObject):
     stateChanged = Signal()
 
@@ -96,11 +140,13 @@ class TrayController(QObject):
         app: QApplication | None,
         *,
         tray_available: bool | None = None,
+        native_notifier: Callable[[str, str], bool] = show_windows_notification,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._app = app
         self._availability_override = tray_available
+        self._native_notifier = native_notifier
         self._available = bool(tray_available) if tray_available is not None else False
         self._quit_requested = False
         self._window: Any | None = None
@@ -178,8 +224,12 @@ class TrayController(QObject):
 
     @Slot(str, str)
     def notify(self, title: str, message: str) -> None:
+        notification_title = str(title or APP_DISPLAY_NAME).strip() or APP_DISPLAY_NAME
+        notification_message = str(message)
+        if self._native_notifier(notification_title, notification_message):
+            return
         if self._tray is not None and self._available:
-            self._tray.showMessage(APP_DISPLAY_NAME, str(message), QSystemTrayIcon.Information, 5000)
+            self._tray.showMessage(APP_DISPLAY_NAME, notification_message, QSystemTrayIcon.Information, 5000)
 
     @Slot()
     def requestQuit(self) -> None:

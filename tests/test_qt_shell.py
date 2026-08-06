@@ -2626,6 +2626,27 @@ class ToolControllerTests(unittest.TestCase):
                 "11508 勤務基準表已登打完成",
             )
 
+    def test_tool_usage_history_hides_rank_but_keeps_the_operator_number_and_name(self) -> None:
+        from qt_app.controllers.tool_controller import ToolController
+        from qt_app.models.tool_model import ToolUsageListModel
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = ToolController(Path(temp_dir))
+            controller.record_started(
+                "daily_vehicle",
+                "車輛保養清點",
+                "8番 隊員 曾彥綸",
+                actor_no="8",
+            )
+            controller.record_finished("daily_vehicle", "completed")
+
+            model = controller.usageModel("daily_vehicle", "", "", "", False)
+
+        self.assertEqual(
+            model.data(model.index(0, 0), ToolUsageListModel.PeopleRole),
+            "8番 曾彥綸",
+        )
+
     def test_usage_model_shows_latest_daily_result_and_current_monthly_operator(self) -> None:
         from datetime import datetime
 
@@ -2750,6 +2771,39 @@ class TrayControllerTests(unittest.TestCase):
         self.assertTrue(window.hidden)
         controller.shutdown()
 
+    def test_notification_prefers_native_windows_toast_then_uses_system_tray(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        from qt_app.controllers.tray_controller import TrayController
+
+        app = QApplication.instance() or QApplication(["test_tray_notification"])
+        sent: list[tuple[str, str]] = []
+        controller = TrayController(
+            app,
+            tray_available=False,
+            native_notifier=lambda title, message: sent.append((title, message)) or True,
+        )
+        controller.notify("SinpoSmart", "原生通知")
+        self.assertEqual(sent, [("SinpoSmart", "原生通知")])
+
+        class FakeTray:
+            def __init__(self) -> None:
+                self.messages: list[tuple[str, str]] = []
+
+            def showMessage(self, title, message, *_args) -> None:
+                self.messages.append((title, message))
+
+        fallback = TrayController(
+            app,
+            tray_available=True,
+            native_notifier=lambda _title, _message: False,
+        )
+        fake_tray = FakeTray()
+        fallback._tray = fake_tray
+        fallback._available = True
+        fallback.notify("SinpoSmart", "系統匣備援")
+        self.assertEqual(fake_tray.messages, [("SinpoSmart", "系統匣備援")])
+
 
 class UpdateControllerTests(unittest.TestCase):
     @classmethod
@@ -2831,6 +2885,30 @@ class UpdateControllerTests(unittest.TestCase):
 
             self.assertEqual(launched, [script_path])
             self.assertIn("已開啟更新程式", controller.statusText)
+
+    def test_update_controller_emits_ready_signal_only_when_a_newer_version_exists(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.update_repository import UpdateRepository, VersionInfo
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.07.29.1000\n", encoding="utf-8")
+            controller = UpdateController(UpdateRepository(version_path))
+            ready_spy = QSignalSpy(controller.updateReady)
+
+            controller._check_succeeded(
+                0,
+                VersionInfo("2026.07.29.1000", "2026.07.29.1000", False),
+            )
+            self.assertEqual(ready_spy.count(), 0)
+            controller._check_succeeded(
+                0,
+                VersionInfo("2026.07.29.1000", "2026.07.29.1100", True),
+            )
+            self.assertEqual(ready_spy.count(), 1)
+            self.assertEqual(ready_spy.at(0)[0], "2026.07.29.1100")
 
 
 class DiagnosticsServiceTests(unittest.TestCase):
@@ -3716,6 +3794,8 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn('text: "執行複製"', rescue_video)
         self.assertIn('text: "複製後刪除已驗證來源"', rescue_video)
         self.assertIn("id: updateConfirmation", source)
+        self.assertIn("function onUpdateReady(_latestVersion)", source)
+        self.assertIn("actionConfirmations.openUpdateConfirmation()", source)
         self.assertIn("updateController.launchUpdate()", source)
         self.assertIn("dutyOperationBar.backend.exportIssuePackage()", source)
         self.assertIn("未返隊案件出勤估算", source)
@@ -6456,7 +6536,7 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.confirmationSummary, "")
         self.assertEqual(controller.statusText, "自動檢查通過")
 
-    def test_duty_execution_controller_runs_entry_and_work_lanes_and_deduplicates_queue(self) -> None:
+    def test_duty_execution_controller_runs_two_entry_lanes_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
         from app_core.duty_submission_service import (
@@ -6465,7 +6545,7 @@ if return_code != 0 or loaded:
         )
         from qt_app.controllers.duty_execution_controller import DutyExecutionController
 
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(3)
 
         class FakeService:
             def validate(self, request):
@@ -6486,26 +6566,154 @@ if return_code != 0 or loaded:
             "target_date": "1150729",
             "actions": [
                 {"kind": "entry_log", "time": "08:00", "actor": "10"},
+                {"kind": "entry_log", "time": "08:00", "actor": "11"},
                 {"kind": "work_log", "time": "08:00", "actor": "10"},
             ],
         }
         controller = DutyExecutionController(FakeService())
         finished_spy = QSignalSpy(controller.actionFinished)
-        entry_request = DutySubmissionRequest("user10", "secret", 0, data)
-        work_request = DutySubmissionRequest("user10", "secret", 1, data)
+        first_entry_request = DutySubmissionRequest("user10", "secret", 0, data)
+        second_entry_request = DutySubmissionRequest("user10", "secret", 1, data)
+        work_request = DutySubmissionRequest("user10", "secret", 2, data)
 
-        self.assertTrue(controller.enqueue(entry_request))
+        self.assertTrue(controller.enqueue(first_entry_request))
+        self.assertTrue(controller.enqueue(second_entry_request))
         self.assertTrue(controller.enqueue(work_request))
         self.assertFalse(controller.enqueue(work_request))
         for _ in range(20):
-            if finished_spy.count() == 2 and not controller.isBusy:
+            if finished_spy.count() == 3 and not controller.isBusy:
                 break
             finished_spy.wait(250)
             QTest.qWait(10)
 
-        self.assertEqual(finished_spy.count(), 2)
+        self.assertEqual(finished_spy.count(), 3)
         self.assertFalse(controller.isBusy)
-        self.assertEqual({finished_spy.at(0)[0], finished_spy.at(1)[0]}, {0, 1})
+        self.assertEqual({finished_spy.at(index)[0] for index in range(finished_spy.count())}, {0, 1, 2})
+
+    def test_duty_notification_identifies_the_completed_action_and_target(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        message = AppController._format_duty_notification(
+            {
+                "kind": "entry_log",
+                "target": "8",
+                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            },
+            {"8": {"name": "曾彥綸"}},
+            "登打完成",
+        )
+
+        self.assertEqual(message, "出入｜值班 / 值班 08 曾彥綸｜登打完成")
+
+    def test_duty_execution_controller_falls_back_work_startup_failure_to_entry_lane(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError,
+            DutySubmissionRequest,
+            DutySubmissionResult,
+        )
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        first_work_started = threading.Event()
+        release_first_work = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+                self.first_work_failed = False
+
+            def validate(self, request):
+                return request
+
+            def execute(self, request, *, status_callback=None):
+                self.calls.append(request.action_index)
+                if request.action_index == 0 and not self.first_work_failed:
+                    first_work_started.set()
+                    release_first_work.wait(timeout=2)
+                    self.first_work_failed = True
+                    raise DutySubmissionExecutionError("背景瀏覽器啟動失敗", "browser_startup")
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    f"完成 {request.action_index}",
+                    Path(f"fallback-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+        data = {
+            "target_date": "1150806",
+            "actions": [
+                {"kind": "work_log", "time": "18:00", "actor": "17"},
+                {"kind": "work_log", "time": "18:00", "actor": "17"},
+                {"kind": "entry_log", "time": "18:00", "actor": "17"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", 0, data)))
+        self.assertTrue(first_work_started.wait(timeout=2))
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", 1, data)))
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", 2, data)))
+        release_first_work.set()
+        for _ in range(40):
+            if finished_spy.count() == 3 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(service.calls.count(0), 2)
+        self.assertEqual(set(service.calls), {0, 1, 2})
+        self.assertLess(max(index for index, value in enumerate(service.calls) if value == 0), service.calls.index(1))
+        self.assertEqual(controller._disabled_lanes, {"work"})
+        self.assertEqual({finished_spy.at(index)[0] for index in range(finished_spy.count())}, {0, 1, 2})
+        self.assertFalse(controller.isBusy)
+        controller.reset_parallel_lanes()
+        self.assertEqual(controller._disabled_lanes, set())
+
+    def test_duty_execution_controller_blocks_manual_duplicate_while_due_task_is_running(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class FakeService:
+            def validate(self, request):
+                return request
+
+            def execute(self, request, *, status_callback=None):
+                started.set()
+                release.wait(timeout=2)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "完成",
+                    Path("duplicate.json"),
+                    {"group": "done"},
+                )
+
+        data = {
+            "target_date": "1150806",
+            "actions": [{"kind": "entry_log", "time": "18:00", "actor": "17"}],
+        }
+        controller = DutyExecutionController(FakeService())
+        due_request = DutySubmissionRequest("user17", "secret", 0, data, trigger_type="due")
+        manual_request = DutySubmissionRequest("user17", "secret", 0, data, trigger_type="manual")
+
+        self.assertTrue(controller.enqueue(due_request))
+        self.assertTrue(started.wait(timeout=2))
+        self.assertFalse(controller.enqueue(manual_request))
+        release.set()
+        for _ in range(20):
+            if not controller.isBusy:
+                break
+            QTest.qWait(50)
+        self.assertFalse(controller.isBusy)
 
     def test_duty_execution_controller_keeps_all_three_1800_handoff_actions(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -6535,8 +6743,8 @@ if return_code != 0 or loaded:
         data = {
             "target_date": "1150806",
             "actions": [
-                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17"},
-                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5"},
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5", "source": "值班交接"},
                 {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17"},
             ],
         }
@@ -6826,6 +7034,49 @@ if return_code != 0 or loaded:
             self.assertIsNot(operational_sync.boards[0][1], self.app.thread())
         finally:
             controller.shutdown()
+
+    def test_app_controller_retries_current_google_duty_board_after_a_failed_post(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.schedule_repository import business_roc_date
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeOperationalSyncService:
+            board_enabled = True
+
+            def __init__(self) -> None:
+                self.boards = []
+
+            def enqueue_event(self, _record_type, **_fields):
+                return {}
+
+            def sync_board_async(self, schedule_data):
+                self.boards.append(schedule_data)
+                return True
+
+        service = FakeOperationalSyncService()
+        controller = AppController(operational_sync_service=service)
+        try:
+            attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                attempt_id,
+                LoginSession("10", "user10", "secret", verified=True),
+            )
+            controller._duty_controller._schedule_data = {
+                "target_date": business_roc_date(),
+            }
+
+            controller._retry_current_duty_board()
+            for _ in range(100):
+                if service.boards and not controller._operational_sync_workers:
+                    break
+                QTest.qWait(10)
+        finally:
+            controller.shutdown()
+
+        self.assertEqual(len(service.boards), 1)
+        self.assertEqual(service.boards[0]["target_date"], business_roc_date())
 
     def test_app_controller_has_no_direct_async_operational_sync_call(self) -> None:
         source = (
