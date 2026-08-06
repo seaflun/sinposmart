@@ -1,6 +1,3 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-from tkcalendar import DateEntry
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -8,6 +5,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 import openpyxl
 import re
+import sys
 import warnings
 import json
 import os
@@ -20,6 +18,13 @@ import threading
 from pathlib import Path
 from openpyxl.utils import get_column_letter
 from copy import copy
+import unicodedata
+
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+
+from duty_rehearsal import build_driver, quit_driver
 
 # ==========================================
 # [區塊一] 模組導入與全域設定 (Imports & Config)
@@ -29,11 +34,20 @@ from copy import copy
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # 全域狀態更新函數 (確保執行緒安全)
+_runtime_status_callback = None
+
+
 def log_status(msg):
     try:
         print(msg)
     except Exception:
         pass
+    callback = globals().get("_runtime_status_callback")
+    if callable(callback):
+        try:
+            callback(clean_status_message(msg))
+        except Exception:
+            pass
     # 確保在有視窗的狀態下，將文字更新回 GUI 的狀態列
     if 'root' in globals() and 'status_var' in globals():
         root.after(0, lambda: sync_status_to_gui(msg))
@@ -41,6 +55,20 @@ def log_status(msg):
 def clean_status_message(msg):
     text = str(msg).strip()
     return re.sub(r'^(?:[➡⏳📂✅⚠❌🧠🖼☁🎉️]\s*)+', '', text).strip()
+
+def truncate_external_duty_name(value, max_units=24):
+    """Keep external-duty labels within the website's 12 CJK-character limit."""
+
+    kept = []
+    used_units = 0
+    for character in str(value or ""):
+        character_units = 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        if used_units + character_units > max_units:
+            break
+        kept.append(character)
+        used_units += character_units
+    return "".join(kept)
+
 
 def sync_status_to_gui(msg):
     status_var.set(f"狀態: {clean_status_message(msg)}")
@@ -960,8 +988,12 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                 for i in range(2, 8):
                     inp = wait.until(EC.presence_of_element_located((By.ID, f"_txtNAME{i}")))
                     inp.clear()
-                    if (i-2) < len(out_duty_names): 
-                        inp.send_keys(out_duty_names[i-2])
+                    if (i-2) < len(out_duty_names):
+                        raw_name = out_duty_names[i-2]
+                        task_name = truncate_external_duty_name(raw_name)
+                        if task_name != str(raw_name or ""):
+                            log_status(f"外勤項目超過 12 個中文字限制，已截短：{task_name}")
+                        inp.send_keys(task_name)
                 
                 time.sleep(0.5)
                 driver.find_element(By.ID, "_btnSave").click()
@@ -1173,10 +1205,31 @@ def step_fill_mission_cells(driver, mission_map):
 # ==========================================
 
 # 6-1. 單次勤務登打流程
-def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
+def start_automation(
+    user_id,
+    user_pwd,
+    target_date,
+    excel_path,
+    cars_config,
+    status_callback=None,
+    success_callback=None,
+    error_callback=None,
+    show_dialogs=True,
+    close_driver=False,
+    raise_errors=False,
+    stage_callback=None,
+):
+    def report_stage(stage):
+        if callable(stage_callback):
+            stage_callback(stage)
+
+    global _runtime_status_callback
+    previous_status_callback = _runtime_status_callback
+    _runtime_status_callback = status_callback
     # 紀錄流程開始的時間
     start_time = time.time()
     # ---------------- 1. 解析 Excel ----------------
+    report_stage("source_load")
     day_int = int(target_date[-2:])
     log_status(f"📂 讀取 Excel {day_int}號 分頁...")
     wb = openpyxl.load_workbook(excel_path, data_only=True, keep_vba=True)
@@ -1215,17 +1268,23 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     }
 
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
+    report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
     if preflight_issues:
         preflight_message = format_daily_sheet_preflight_message(preflight_issues)
         log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
-        root.after(0, lambda msg=preflight_message: messagebox.showerror("勤務表檢查未通過", msg))
+        if callable(error_callback):
+            error_callback(preflight_message)
+        elif show_dialogs and "root" in globals():
+            root.after(0, lambda msg=preflight_message: messagebox.showerror("勤務表檢查未通過", msg))
         wb.close()
+        _runtime_status_callback = previous_status_callback
         return False
     log_status("✅ 勤務表檢查通過，未發現重複或漏排")
     
     # ---------------- 2. 瀏覽器自動化 ----------------
-    driver = webdriver.Chrome()
+    report_stage("browser_start")
+    driver = build_driver(headless=False)
     try:
         driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
     except Exception:
@@ -1237,7 +1296,9 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
     wait = WebDriverWait(driver, 20)
 
     try:
+        report_stage("login")
         step_login(driver, user_id, user_pwd)
+        report_stage("duty_form_open")
         step_navigate_menu(driver, wait)
         
         if step_prepare_content(driver, wait):
@@ -1297,8 +1358,10 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
             log_status(f"✅ 勤務基準表運算完畢，共填入 {len(duty_map)} 格")
 
             # --- 填入基準表並儲存 ---
+            report_stage("duty_fill")
             step_batch_fill_duty(driver, duty_map)
             time.sleep(1)
+            report_stage("duty_save")
             driver.execute_script("""
                 function clickSave(win) {
                     var btn = win.document.getElementById('_btnSave');
@@ -1320,6 +1383,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
             time.sleep(2)
             
             # --- 進入救災任務編組表 ---
+            report_stage("vehicle_form_open")
             step_navigate_to_task_table(driver, wait) 
             driver.switch_to.default_content()
             wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
@@ -1390,6 +1454,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                     except NoSuchFrameException:
                         continue
 
+                report_stage("vehicle_fill")
                 step_fill_mission_cells(driver, mission_map)
                 time.sleep(1)
                 try:
@@ -1397,6 +1462,7 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
                 except NoAlertPresentException:
                     pass
             
+            report_stage("report")
             notification_status = ""
             notification_config = load_config().get("notification", {})
             try:
@@ -1431,12 +1497,33 @@ def start_automation(user_id, user_pwd, target_date, excel_path, cars_config):
             
             # 將秒數加入到最後的彈出視窗中
             success_msg = f"已登打並存檔完畢！{notification_status}\n本次自動化總共花費：{elapsed_time} 秒\n請回網頁做最後的複查。"
-            root.after(0, lambda: messagebox.showinfo("成功", success_msg))
+            if callable(success_callback):
+                success_callback(success_msg)
+            elif show_dialogs and "root" in globals():
+                root.after(0, lambda: messagebox.showinfo("成功", success_msg))
+            return True
+
+        error_message = "勤務表頁面準備失敗，未執行登打。"
+        log_status(error_message)
+        if callable(error_callback):
+            error_callback(error_message)
+        return False
 
     except Exception as e:
         log_status(f"❌ 流程中斷：{e}")
+        if callable(error_callback):
+            error_callback(str(e))
+        if raise_errors:
+            raise
+        return False
     finally:
         wb.close()
+        if close_driver:
+            try:
+                quit_driver(driver)
+            except Exception:
+                pass
+        _runtime_status_callback = previous_status_callback
 
 
 # ==========================================
@@ -1493,6 +1580,11 @@ def on_submit():
 
 # 7-2. GUI 初始化與畫面配置
 if __name__ == "__main__":
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+    from tkcalendar import DateEntry
+
     # 🌟 1. 先讀取設定檔
     current_config = load_config()
     login = current_config["login"]

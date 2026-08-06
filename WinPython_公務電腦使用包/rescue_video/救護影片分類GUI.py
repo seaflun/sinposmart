@@ -8,13 +8,10 @@ import argparse
 import os
 import queue
 import threading
-import tkinter as tk
-import customtkinter as ctk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import classify_rescue_video as classifier
 
@@ -31,6 +28,15 @@ MODES = {
     "delete": (True, True),
 }
 PUBLIC_GUI_MODES = ("preview", "delete")
+
+
+def _load_tk_ui() -> None:
+    global ctk, filedialog, messagebox, tk, ttk
+
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    import customtkinter as ctk
 
 
 @dataclass(frozen=True)
@@ -335,8 +341,15 @@ def format_summary(summary: Mapping[str, int]) -> str:
     return "；".join(f"{status}: {count}" for status, count in sorted(summary.items()))
 
 
-def run_classification(args: argparse.Namespace) -> list[classifier.Result]:
+def run_classification(
+    args: argparse.Namespace,
+    stage_callback: Callable[[str], None] | None = None,
+) -> list[classifier.Result]:
+    if stage_callback is not None:
+        stage_callback("classification")
     results = classifier.classify_with_work_logs(args)
+    if stage_callback is not None:
+        stage_callback("report_write")
     classifier.write_report(results, args.report)
     return results
 
@@ -1194,6 +1207,7 @@ class RescueVideoApp:
 
 
 def main() -> int:
+    _load_tk_ui()
     root = ctk.CTk()
     RescueVideoApp(root)
     root.mainloop()

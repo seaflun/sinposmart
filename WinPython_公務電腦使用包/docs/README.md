@@ -18,7 +18,7 @@
 RUN_DUTY_GUI_WINPYTHON.vbs
 ```
 
-這個啟動方式會用 `pythonw.exe`，正常情況不會出現小黑窗。
+這個啟動方式會由隱藏執行的 VBS／批次檔使用 WinPython `python.exe` 開啟 PySide6 + QML 正式介面，不會出現小黑窗。`duty_gui.py` 的 Tk 介面僅保留為回退版本，不是正式啟動入口。
 
 ## WinPython 放哪裡
 

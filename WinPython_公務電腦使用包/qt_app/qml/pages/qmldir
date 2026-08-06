@@ -1,0 +1,10 @@
+SessionHeader 1.0 SessionHeader.qml
+DutySheetToolPanel 1.0 DutySheetToolPanel.qml
+RestTimeToolPanel 1.0 RestTimeToolPanel.qml
+MonthlyBaseToolPanel 1.0 MonthlyBaseToolPanel.qml
+DailyVehicleToolPanel 1.0 DailyVehicleToolPanel.qml
+AuditFilterPanel 1.0 AuditFilterPanel.qml
+WorkLogSettingsPanel 1.0 WorkLogSettingsPanel.qml
+DutyQuickToolsPanel 1.0 DutyQuickToolsPanel.qml
+DutyOperationBar 1.0 DutyOperationBar.qml
+DutyTaskArea 1.0 DutyTaskArea.qml

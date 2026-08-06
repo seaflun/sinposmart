@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-from duty_gui import main
+from qt_app.main import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

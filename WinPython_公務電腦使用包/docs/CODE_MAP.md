@@ -1,10 +1,42 @@
 ﻿# SinpoSmart_值班台程式地圖
 
-本文件先記錄目前大檔案的責任分區。這次整理只新增註解與文件，不搬動函式、不改執行邏輯。
+本文件記錄 2026-07-29 PySide6 + QML 正式架構，以及仍保留的 Tk 回退邊界。
 
-## duty_gui.py
+## 正式啟動路徑
 
-Tkinter 控制台主程式，負責登入畫面、值班模式、審核模式、背景查詢與提前登打佇列。
+- `duty_gui.pyw`：QML 正式入口，只呼叫 `qt_app.main.main()`；無黑窗由 VBS 隱藏啟動鏈負責。
+- `qt_app/main.py`：載入 `.env`、建立 QApplication、單一執行個體鎖、QML engine、系統匣及 AppController。
+- `qt_app/qml/Main.qml`：Apple-inspired 直向主介面；保留原介面的登入、值班、審核、工具與設定操作順序，並以全域 design token、共用控制項及 `AppleDialog` 統一畫面格式。
+- `check_environment.py`：正式 Qt runtime 與 Chrome/ChromeDriver 檢查；不把舊 Tk GUI 套件列為 Qt 啟動條件。
+
+## qt_app
+
+- `controllers/app_controller.py`：QML 唯一 context facade，協調 session、排程、登打、工具、同步、更新與系統匣；不直接執行 Selenium。
+- `controllers/session_controller.py`：登入 Slot 僅接受帳號、密碼及記住設定；包含 single-flight、120 秒安全逾時、逾時 worker 清理期間的重試阻擋、帳號選擇、DPAPI 儲存、登出與帳密同步確認，勤務番號只由登入後既有勤務網站查詢自動回填。
+- `controllers/duty_controller.py`：任務投影、勤務查詢 `isRefreshing` 狀態、審核日期、手動暫停／恢復、到點判定與自動登出條件。
+- `controllers/duty_execution_controller.py`：正式登打的 entry/work 雙通道佇列。
+- `controllers/rescue_video_controller.py`：救護行車影片預覽、分類、來源清理二次確認與結果狀態協調。
+- `controllers/tool_controller.py`：原生工具目錄與可用狀態；正式 Qt 路徑不啟動任何外部 Tk 工具視窗。
+- 其他 controllers：勤務表、每日車輛、休息時間、勤務基準表、更新、工具、系統匣與工作紀錄設定。
+- `models/`：QML 使用的帳號、工具、勤務任務與救護影片結果 ListModel。
+- `workers/`：登入、帳密同步、即時勤務查詢、正式登打、工具、後台事件／值班看板同步、排程資料夾及更新檢查的 QThread worker；避免阻塞 QML 主執行緒，並由 Controller 在結束程式時等待清理。
+
+## app_core
+
+UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
+
+- `login_verifier.py`、`session.py`、`credential_repository.py`、`credential_sync_service.py`：登入與帳密邊界，不重複實作勤務表番號查詢。
+- `schedule_capture_service.py`、`schedule_repository.py`、`duty_task_projection.py`：沿用 `duty_rehearsal` 取得即時勤務快照，再由網站登入身分與當日 `staff` 自動回填番號，並負責本機排程與任務投影。
+- `duty_submission_service.py`：重複檢查、填表、儲存與儲存後驗證。
+- `duty_sheet_service.py`、`daily_vehicle_service.py`、`rest_monthly_service.py`：勤務表、每日車輛、休息時間與勤務基準表工具流程。
+- `rescue_video_service.py`：不載入 Tk UI 的救護影片分類邊界，沿用既有分類核心並限制預覽／確認後清理模式。
+- `work_log_settings_service.py`：工作紀錄預設值、未返隊案件車數例外與描述預覽。
+- `operational_sync_service.py`、`diagnostics_service.py`：後台事件、值班看板與去敏問題包。
+- `scheduled_folder_service.py`：16:30／21:55 Windows 截圖資料夾排程。
+
+## duty_gui.py（回退）
+
+舊 Tkinter／CustomTkinter 主程式目前保留作為回退與行為參考。正式 Qt 入口不 import 此檔；不要把新 QML 功能再橋接回隱藏 Tk 視窗。
 
 目前區塊：
 
@@ -67,16 +99,19 @@ Tkinter 控制台主程式，負責登入畫面、值班模式、審核模式、
 - 若本機包內找不到 `duty_sheet_legacy`，才回退搜尋同層舊專案 `勤務表自動化`。
 - 不直接使用舊 GUI 的 `__main__` 區塊，避免舊 Tk globals 取代目前 SinpoSmart 主視窗。
 
-## 後續拆檔建議
+## 後續重構原則
 
-下一階段若要真的拆檔，建議先從低耦合處理：
+後續應沿用目前邊界：
 
-1. 先拆 `compare_rehearsal_records.py`，因為它主要吃 JSON 與輸出比對結果。
-2. 再拆 `duty_rehearsal.py` 的表單填寫與勤務表規則，避免瀏覽器操作和排程規則混在一起。
-3. 最後拆 `duty_gui.py`，先保留主視窗，再把帳號管理、值班任務表、審核表抽成小模組。
+1. QML 只做顯示與使用者操作，不持有帳密或 Selenium driver。
+2. Controller 只協調狀態與 worker，不把長時間工作放在 GUI thread。
+3. 可單元測試的規則留在 `app_core`；既有網站欄位規則仍以 `duty_rehearsal.py` 為唯一來源。
+4. 未經使用者確認，不刪除 `duty_gui.py` 或其他回退檔案。
 
 每次拆檔後都應先跑：
 
 ```powershell
-py -m py_compile .\duty_gui.py .\duty_gui.pyw .\duty_rehearsal.py .\compare_rehearsal_records.py .\duty_sheet_automation.py .\daily_vehicle_automation.py .\rest_time_automation.py .\check_environment.py
+py -3 -m compileall -q .\app_core .\qt_app
+pyside6-qmllint .\qt_app\qml\Main.qml
+py -3 -m unittest tests.test_smoke tests.test_qt_shell tests.test_credential_repository
 ```

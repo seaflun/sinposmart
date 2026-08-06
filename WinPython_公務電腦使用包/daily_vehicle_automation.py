@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -207,7 +208,7 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
         clear_running_pid(project_dir, pid)
 
 
-def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> None:
+def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, on_stage: Callable[[str], None] | None = None) -> None:
     base_dir = Path(__file__).resolve().parent
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
@@ -259,6 +260,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
     def worker() -> None:
         process: subprocess.Popen[str] | None = None
         try:
+            if on_stage is not None:
+                on_stage("process_start")
             process = subprocess.Popen(
                 command,
                 cwd=project_dir,
@@ -268,9 +271,12 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             set_running(project_dir, True, process.pid)
             try:
+                if on_stage is not None:
+                    on_stage("process_running")
                 output, _ = process.communicate(timeout=automation_timeout_seconds())
             except subprocess.TimeoutExpired:
                 process.kill()
@@ -282,6 +288,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                     on_finish("車輛保養清點已完成。")
                 run_on_parent(lambda: messagebox.showinfo(WINDOW_TITLE, "車輛保養清點已完成。", parent=parent))
             else:
+                if on_stage is not None:
+                    on_stage(last_reported_stage(output, "process_running"))
                 detail = output_tail(output)
                 raw_error = f"車輛保養清點執行失敗，代碼：{return_code}；{detail}"
                 print(f"[automation-error] daily_vehicle: {raw_error}", file=sys.stderr)
@@ -290,6 +298,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
                     on_error(error)
                 run_on_parent(lambda: messagebox.showerror(WINDOW_TITLE, error, parent=parent))
         except Exception as exc:
+            if on_stage is not None:
+                on_stage("process_start" if process is None else "process_running")
             log_automation_exception("daily_vehicle", exc)
             error = format_automation_error(exc)
             if on_error is not None:
@@ -299,3 +309,8 @@ def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: s
             set_running(project_dir, False, process.pid if process else None)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def last_reported_stage(output: str, fallback: str) -> str:
+    stages = re.findall(r"^\[sinposmart-stage\]\s+([a-z0-9_]+)\s*$", str(output or ""), re.MULTILINE)
+    return stages[-1] if stages else fallback

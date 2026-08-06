@@ -14,9 +14,6 @@ import traceback
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-import tkinter as tk
-import customtkinter as ctk
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -28,7 +25,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from duty_rehearsal import build_driver, js_click, login, open_ap
+from duty_rehearsal import build_driver, js_click, login, open_ap, quit_driver
 
 UI_FONT = "Microsoft JhengHei UI"
 UI_BG = "#f5f7fb"
@@ -241,7 +238,12 @@ def extract_base_month_from_text(text: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
+def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, on_stage: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    import customtkinter as ctk
+
     existing = getattr(parent, "_rest_time_dialog", None)
     if existing is not None:
         try:
@@ -358,7 +360,12 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     def set_status(message: str) -> None:
         run_on_dialog(lambda: status_var.set(message))
 
+    def report_stage(stage: str) -> None:
+        if on_stage is not None:
+            on_stage(stage)
+
     def run_automation() -> None:
+        report_stage("preflight")
         uid = user_id.strip()
         pwd = password
         workbook_path = Path(file_var.get().strip())
@@ -383,7 +390,7 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
 
         def worker() -> None:
             try:
-                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month)
+                result = submit_rest_entries(uid, pwd, workbook_path, False, set_status, keep_browser_open=True, actor_no=actor_no, expected_roc_year=expected_roc_year, expected_month=expected_month, stage_callback=report_stage)
                 if on_finish is not None:
                     on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
@@ -428,7 +435,12 @@ def open_rest_time_dialog(parent: tk.Tk, user_id: str = "", password: str = "", 
     return dialog
 
 
-def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
+def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "", actor_no: str = "", display_name: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, on_stage: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    import customtkinter as ctk
+
     existing = getattr(parent, "_monthly_base_dialog", None)
     if existing is not None:
         try:
@@ -517,7 +529,12 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
         messagebox.showinfo("完成", result, parent=dialog)
         close_dialog()
 
+    def report_stage(stage: str) -> None:
+        if on_stage is not None:
+            on_stage(stage)
+
     def run_automation() -> None:
+        report_stage("preflight")
         uid = user_id.strip()
         pwd = password
         actor = actor_no.strip()
@@ -539,7 +556,7 @@ def open_monthly_base_dialog(parent: tk.Tk, user_id: str = "", password: str = "
             try:
                 if on_start is not None:
                     on_start()
-                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month)
+                result = submit_monthly_base_entries(uid, pwd, actor, False, set_status, keep_browser_open=True, expected_roc_year=expected_roc_year, expected_month=expected_month, stage_callback=report_stage)
                 if on_finish is not None:
                     on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")
                 run_on_dialog(lambda: show_complete_and_close(result))
@@ -618,7 +635,7 @@ def retain_driver(driver: object) -> None:
     while len(RETAINED_DRIVERS) > MAX_RETAINED_DRIVERS:
         old_driver = RETAINED_DRIVERS.pop(0)
         try:
-            old_driver.quit()
+            quit_driver(old_driver)
         except Exception:
             pass
 
@@ -631,31 +648,46 @@ def submit_rest_entries(
     status: Callable[[str], None] | None = None,
     keep_browser_open: bool = False,
     actor_no: str = "",
+    actor_name: str = "",
     expected_roc_year: int | None = None,
     expected_month: int | None = None,
+    stage_callback: Callable[[str], None] | None = None,
 ) -> str:
     status = status or (lambda _message: None)
+    report_stage = stage_callback or (lambda _stage: None)
+    report_stage("source_load")
     if expected_roc_year is not None and expected_month is not None:
         validate_workbook_year_month(workbook_path, expected_roc_year, expected_month)
-    target_name = workbook_person_name(workbook_path, actor_no)
+    actor_name = str(actor_name or "").strip()
+    target_name = actor_name or workbook_person_name(workbook_path, actor_no)
+    report_stage("browser_start")
     driver = build_driver(headless=headless)
     inserted = 0
     skipped = 0
     deleted_duplicates = 0
     success = False
     try:
+        report_stage("login")
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
+        report_stage("form_open")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
         if expected_roc_year is not None and expected_month is not None:
             status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
             select_base_month(driver, expected_roc_year, expected_month)
-        person = find_person_link(driver, user_id, target_no=actor_no, target_name=target_name)
+        person = find_person_link(
+            driver,
+            user_id,
+            target_no="" if actor_name else actor_no,
+            target_name=target_name,
+            strict_target_name=bool(actor_name),
+        )
         status(f"找到個人連結：{person.name}（系統儲存列 {person.staff_no}）")
         entries = parse_rest_entries(workbook_path, target_name=person.name, target_no=person.staff_no)
         if not entries:
             raise RuntimeError(f"勤務表內找不到 {person.name} 的休息時間。")
+        report_stage("fill")
         open_person_popup(driver, person)
         deleted_duplicates = delete_duplicate_rest_rows(driver, status)
         for entry in entries:
@@ -668,6 +700,7 @@ def submit_rest_entries(
             fill_and_insert_entry(driver, entry)
             inserted += 1
         close_current_popup(driver)
+        report_stage("save")
         click_person_save(driver, person.staff_no)
         if keep_browser_open:
             retain_driver(driver)
@@ -675,7 +708,7 @@ def submit_rest_entries(
         return f"完成：新增 {inserted} 筆，略過已存在 {skipped} 筆，刪除重複休息 {deleted_duplicates} 筆，已按個人儲存。"
     finally:
         if not keep_browser_open or not success:
-            driver.quit()
+            quit_driver(driver)
 
 
 def submit_monthly_base_entries(
@@ -687,25 +720,34 @@ def submit_monthly_base_entries(
     keep_browser_open: bool = False,
     expected_roc_year: int | None = None,
     expected_month: int | None = None,
+    actor_name: str = "",
+    stage_callback: Callable[[str], None] | None = None,
 ) -> str:
     status = status or (lambda _message: None)
+    report_stage = stage_callback or (lambda _stage: None)
+    report_stage("source_load")
     actor_no = str(actor_no or "").strip()
-    plan = fetch_monthly_base_plan(actor_no)
+    plan = fetch_monthly_base_plan(actor_no, actor_name=actor_name)
     if expected_roc_year is not None and expected_month is not None:
         validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
+    report_stage("browser_start")
     driver = build_driver(headless=headless)
     success = False
     try:
+        report_stage("login")
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
+        report_stage("form_open")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
         status(f"切換到 {plan.roc_year}年{plan.month:02d}月並查詢...")
         select_base_month(driver, plan.roc_year, plan.month)
         wait_for_person_name_row(driver, plan.name)
         status(f"找到本人列：{plan.name}（{plan.actor_no}番）")
+        report_stage("fill")
         filled = fill_monthly_base_row(driver, plan.name, plan.day_symbols, plan.days)
         status(f"已填入 {filled} 格，按個人儲存...")
+        report_stage("save")
         click_person_row_save(driver, plan.name)
         if keep_browser_open:
             retain_driver(driver)
@@ -713,7 +755,7 @@ def submit_monthly_base_entries(
         return f"完成：{plan.roc_year}年{plan.month:02d}月 {plan.name} 已填入 {filled} 格並個人儲存。"
     finally:
         if not keep_browser_open or not success:
-            driver.quit()
+            quit_driver(driver)
 
 
 def delete_duplicate_rest_rows(driver, status: Callable[[str], None]) -> int:
@@ -860,7 +902,7 @@ def build_entry(duty_day: int, start_hour: int, end_hour: int) -> RestEntry:
     return RestEntry(duty_day, start_day, start_hour, end_day, end_hour)
 
 
-def fetch_monthly_base_plan(actor_no: str) -> MonthlyBasePlan:
+def fetch_monthly_base_plan(actor_no: str, *, actor_name: str = "") -> MonthlyBasePlan:
     csv_text = download_monthly_base_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
     if len(rows) < 4:
@@ -874,14 +916,30 @@ def fetch_monthly_base_plan(actor_no: str) -> MonthlyBasePlan:
     actor_row = rows[1]
     name_row = rows[2]
     actor_no = str(actor_no or "").strip()
+    actor_name = str(actor_name or "").strip()
     column_index = None
-    for index in range(2, max(len(actor_row), len(name_row))):
-        current_actor = str(actor_row[index] if index < len(actor_row) else "").strip()
-        if current_actor == actor_no:
-            column_index = index
-            break
+    if actor_name:
+        normalized_name = "".join(actor_name.split())
+        name_matches = [
+            index
+            for index in range(2, max(len(actor_row), len(name_row)))
+            if "".join(str(name_row[index] if index < len(name_row) else "").split())
+            == normalized_name
+        ]
+        if len(name_matches) != 1:
+            raise RuntimeError(
+                f"輪休基準表找不到唯一的姓名欄位：{actor_name}。"
+            )
+        column_index = name_matches[0]
+    else:
+        for index in range(2, max(len(actor_row), len(name_row))):
+            current_actor = str(actor_row[index] if index < len(actor_row) else "").strip()
+            if current_actor == actor_no:
+                column_index = index
+                break
     if column_index is None:
         raise RuntimeError(f"輪休基準表找不到 {actor_no} 番。")
+    source_actor_no = str(actor_row[column_index] if column_index < len(actor_row) else "").strip()
     person_name = str(name_row[column_index] if column_index < len(name_row) else "").strip()
     if not person_name:
         raise RuntimeError(f"輪休基準表的 {actor_no} 番沒有姓名。")
@@ -893,7 +951,13 @@ def fetch_monthly_base_plan(actor_no: str) -> MonthlyBasePlan:
         day = int(day_text)
         raw_code = str(row[column_index] if column_index < len(row) else "").strip()
         day_symbols[day] = translate_monthly_base_code(raw_code, day, person_name)
-    return MonthlyBasePlan(roc_year=roc_year, month=month, actor_no=actor_no, name=person_name, day_symbols=day_symbols)
+    return MonthlyBasePlan(
+        roc_year=roc_year,
+        month=month,
+        actor_no=source_actor_no,
+        name=person_name,
+        day_symbols=day_symbols,
+    )
 
 
 def download_monthly_base_csv() -> str:
@@ -1199,7 +1263,14 @@ def current_login_name(driver) -> str:
     return ""
 
 
-def find_person_link(driver, user_id: str, target_no: str = "", target_name: str = "") -> PersonLink:
+def find_person_link(
+    driver,
+    user_id: str,
+    target_no: str = "",
+    target_name: str = "",
+    *,
+    strict_target_name: bool = False,
+) -> PersonLink:
     links = driver.execute_script(
         """
         return Array.from(document.querySelectorAll('a._name')).map((a, index) => ({
@@ -1239,6 +1310,8 @@ def find_person_link(driver, user_id: str, target_no: str = "", target_name: str
             person = link_person(row_matches[0])
             if person:
                 return person
+        if strict_target_name:
+            raise RuntimeError(f"勤務基準表找不到唯一的姓名列：{target_name}。")
     for link in links:
         onclick = link.get("onclick", "")
         if user_id and user_id in onclick:

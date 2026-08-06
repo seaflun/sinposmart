@@ -103,6 +103,28 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertTrue((root / relative).is_file())
 
+        windowed_entry = (root / "duty_gui.pyw").read_text(encoding="utf-8-sig")
+        self.assertIn("from qt_app.main import main", windowed_entry)
+        self.assertNotIn("from duty_gui import main", windowed_entry)
+
+        launcher = (root / "RUN_DUTY_GUI_WINPYTHON.bat").read_text(encoding="utf-8-sig")
+        self.assertIn('set "PYTHONW_EXE=%%F"', launcher)
+        self.assertIn('start "" /b "%PYTHONW_EXE%" "%~dp0duty_gui.pyw"', launcher)
+        self.assertIn("-Windowed", launcher)
+        self.assertIn("exit /b 0", launcher)
+        self.assertNotIn("System.Diagnostics.ProcessStartInfo", launcher)
+        self.assertNotIn("PYTHON_EXE", launcher)
+
+    def test_environment_check_targets_qt_runtime_not_legacy_tk(self) -> None:
+        source = (package_dir() / "check_environment.py").read_text(encoding="utf-8-sig")
+
+        self.assertNotIn("import tkinter", source)
+        self.assertNotIn('"customtkinter"', source)
+        self.assertNotIn('"tkcalendar"', source)
+        self.assertNotIn('"pystray"', source)
+        self.assertIn("from PySide6.QtQml import QQmlApplicationEngine", source)
+        self.assertIn("PySide6/QML runtime imports succeeded", source)
+
     def test_rescue_video_beta_tool_is_packaged_and_launches_without_delete_flags(self) -> None:
         root = package_dir()
         gui_source = (root / "duty_gui.py").read_text(encoding="utf-8-sig")
@@ -184,6 +206,15 @@ class PackageSmokeTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, script)
+
+    def test_update_package_preserves_existing_work_log_settings(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        preserve_section = script[
+            script.index("$preserveIfExistsFiles = @("):
+            script.index("$skipExtensions = @(")
+        ]
+
+        self.assertIn('"work_log_defaults.json"', preserve_section)
 
     def test_sinposmart_events_include_installed_version(self) -> None:
         source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
@@ -435,6 +466,19 @@ class PackageSmokeTests(unittest.TestCase):
             module.clean_to_list("1,2 3，4.5．6、7·8。9"),
             ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
         )
+
+    def test_duty_sheet_truncates_external_duty_names_to_24_display_units(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        self.assertEqual(module.truncate_external_duty_name("測" * 13), "測" * 12)
+        self.assertEqual(
+            module.truncate_external_duty_name("救護" + "A" * 21),
+            "救護" + "A" * 20,
+        )
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("task_name = truncate_external_duty_name(raw_name)", source)
 
     def test_fire_mission_does_not_reuse_people_across_disaster_vehicles(self) -> None:
         module = legacy_duty_sheet_module()
@@ -1720,6 +1764,193 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("notify_user=False", source)
         self.assertIn("if notify_user:", source)
 
+    def test_build_driver_retries_only_with_its_own_temporary_profile(self) -> None:
+        module = duty_rehearsal_module()
+        profiles = [Path("C:/Temp/duty_gui_first"), Path("C:/Temp/duty_gui_second")]
+        cleaned: list[Path] = []
+        driver = mock.Mock()
+
+        with mock.patch.object(module, "chrome_start_attempts", return_value=2), mock.patch.object(
+            module, "duty_browser_profile_dir", side_effect=profiles
+        ), mock.patch.object(
+            module, "prune_stale_duty_browser_profiles", return_value=0
+        ), mock.patch.object(
+            module,
+            "create_webdriver_chrome_with_timeout",
+            side_effect=[module.WebDriverException("Chrome failed to start"), driver],
+        ) as start_chrome, mock.patch.object(
+            module, "cleanup_duty_browser_startup_failure", side_effect=cleaned.append
+        ), mock.patch.object(module.time, "sleep"
+        ):
+            result = module.build_driver(
+                headless=False,
+                option_arguments=("--test-duty-option",),
+                page_load_strategy="none",
+            )
+
+        self.assertIs(result, driver)
+        self.assertEqual(cleaned, [profiles[0]])
+        first_options = start_chrome.call_args_list[0].args[0]
+        second_options = start_chrome.call_args_list[1].args[0]
+        self.assertIn(f"--user-data-dir={profiles[0]}", first_options.arguments)
+        self.assertIn(f"--user-data-dir={profiles[1]}", second_options.arguments)
+        self.assertIn("--test-duty-option", first_options.arguments)
+        self.assertIn("--test-duty-option", second_options.arguments)
+        self.assertEqual(first_options.page_load_strategy, "none")
+        self.assertEqual(second_options.page_load_strategy, "none")
+        self.assertNotEqual(profiles[0], profiles[1])
+        self.assertEqual(getattr(driver, "_sinposmart_duty_browser_profile"), str(profiles[1]))
+
+    def test_visible_driver_is_positioned_at_top_right_without_explicit_position(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock()
+
+        with mock.patch.object(module, "chrome_start_attempts", return_value=1), mock.patch.object(
+            module, "duty_browser_profile_dir", return_value=Path("C:/Temp/duty_gui_visible")
+        ), mock.patch.object(
+            module, "prune_stale_duty_browser_profiles", return_value=0
+        ), mock.patch.object(
+            module, "create_webdriver_chrome_with_timeout", return_value=driver
+        ), mock.patch.object(module, "position_duty_browser_at_top_right") as position_browser:
+            result = module.build_driver(headless=False)
+
+        self.assertIs(result, driver)
+        position_browser.assert_called_once_with(driver)
+
+    def test_stale_profile_cleanup_is_bounded_and_skips_active_profiles(self) -> None:
+        module = duty_rehearsal_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stale_one = root / "duty_gui_stale_one"
+            stale_two = root / "duty_gui_stale_two"
+            active = root / "duty_gui_active"
+            unrelated = root / "other_profile"
+            for profile in (stale_one, stale_two, active, unrelated):
+                profile.mkdir()
+                os.utime(profile, (1, 1))
+
+            removed = module.prune_stale_duty_browser_profiles(
+                root=root,
+                active_profiles={active},
+                now=1_000,
+                minimum_age_seconds=60,
+                maximum_profiles=1,
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(stale_one.exists())
+            self.assertTrue(stale_two.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_browser_profile_process_checks_never_open_a_console(self) -> None:
+        module = duty_rehearsal_module()
+        process_result = mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(module.subprocess, "run", return_value=process_result) as run_process:
+            self.assertEqual(
+                module._active_duty_browser_profiles(Path("C:/owned"), [Path("C:/owned/duty_gui_one")]),
+                set(),
+            )
+
+        self.assertEqual(
+            run_process.call_args.kwargs["creationflags"],
+            getattr(module.subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def test_browser_profile_cleanup_never_opens_a_console(self) -> None:
+        module = duty_rehearsal_module()
+        process_result = mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(module, "_is_owned_duty_browser_profile", return_value=True), mock.patch.object(
+            module.subprocess, "run", return_value=process_result
+        ) as run_process, mock.patch.object(module.shutil, "rmtree"):
+            module.cleanup_duty_browser_profile(Path("C:/owned/duty_gui_one"), terminate_processes=True)
+
+        self.assertEqual(
+            run_process.call_args.kwargs["creationflags"],
+            getattr(module.subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def test_chromedriver_starts_without_a_console(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock()
+
+        with mock.patch.object(module.webdriver, "Chrome", return_value=driver) as launch_chrome:
+            self.assertIs(module.create_webdriver_chrome_with_timeout(module.Options()), driver)
+
+        service = launch_chrome.call_args.kwargs["service"]
+        self.assertEqual(
+            service.creation_flags,
+            getattr(module.subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def test_legacy_daily_vehicle_launcher_never_opens_a_console(self) -> None:
+        source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("process = subprocess.Popen(", source)
+        self.assertIn('creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)', source)
+
+    def test_quit_driver_cleans_only_the_attached_private_profile(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock()
+        driver.service = mock.Mock()
+        setattr(driver, "_sinposmart_duty_browser_profile", "C:/owned/duty_gui_profile")
+
+        with mock.patch.object(module, "cleanup_duty_browser_profile") as cleanup:
+            module.quit_driver(driver)
+
+        driver.quit.assert_called_once_with()
+        driver.service.stop.assert_called_once_with()
+        cleanup.assert_called_once_with(Path("C:/owned/duty_gui_profile"), terminate_processes=False)
+
+    def test_browser_startup_failure_writes_safe_diagnostic(self) -> None:
+        module = duty_rehearsal_module()
+        profiles = [Path("C:/Temp/duty_gui_first"), Path("C:/Temp/duty_gui_second")]
+        diagnostics: list[dict[str, object]] = []
+
+        def record(event: str, **fields: object) -> None:
+            diagnostics.append({"event": event, **fields})
+
+        with mock.patch.object(module, "chrome_start_attempts", return_value=2), mock.patch.object(
+            module, "prune_stale_duty_browser_profiles", return_value=3
+        ), mock.patch.object(module, "duty_browser_profile_dir", side_effect=profiles), mock.patch.object(
+            module,
+            "create_webdriver_chrome_with_timeout",
+            side_effect=TimeoutError("startup timed out"),
+        ), mock.patch.object(module, "cleanup_duty_browser_startup_failure"), mock.patch.object(
+            module, "_write_duty_browser_startup_diagnostic", side_effect=record
+        ), mock.patch.object(module.time, "sleep"):
+            with self.assertRaises(module.DutyBrowserStartupError) as raised:
+                module.build_driver(headless=True)
+
+        self.assertEqual(raised.exception.diagnostic_category, "startup_timeout")
+        self.assertEqual(
+            diagnostics,
+            [
+                {
+                    "event": "startup_failed",
+                    "category": "startup_timeout",
+                    "attempts": 2,
+                    "profiles_pruned": 3,
+                }
+            ],
+        )
+
+    def test_all_local_duty_tools_use_the_safe_chrome_startup(self) -> None:
+        root = package_dir()
+        duty_sheet_source = (root / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
+        vehicle_source = (root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("from duty_rehearsal import build_driver", duty_sheet_source)
+        self.assertIn("quit_driver(driver)", duty_sheet_source)
+        self.assertIn("driver = build_driver(headless=False)", duty_sheet_source)
+        self.assertIn("from duty_rehearsal import build_driver", vehicle_source)
+        self.assertIn("quit_driver(driver)", vehicle_source)
+        self.assertIn("driver = build_driver(", vehicle_source)
+        self.assertIn('page_load_strategy="none"', vehicle_source)
+        self.assertIn("driver = webdriver.Remote(command_executor=remote_url, options=options)", vehicle_source)
+
     def test_next_morning_0600_rest_includes_manual_return_at_0800(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(
@@ -2223,7 +2454,102 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertIn("function Send-UpdateLogoutEvent", script)
         self.assertIn("update_logout", script)
+        self.assertIn("NamedPipeClientStream", script)
+        self.assertIn("TYFD.SinpoSmart.DutyAutomation.Qt", script)
         self.assertLess(script.index("Send-UpdateLogoutEvent"), script.index("$wasRunning = Stop-RunningDutyGui"))
+
+    def test_update_backup_includes_qt_application_directories(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("$backupDirectories", script)
+        self.assertIn('"app_core"', script)
+        self.assertIn('"qt_app"', script)
+
+    def test_update_package_requires_qt_windowed_entrypoint(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        start_section = script[
+            script.index("function Start-DutyGui"):
+            script.index("function Restart-DutyGuiIfRunning")
+        ]
+
+        self.assertIn('Join-Path $packageDir "duty_gui.pyw"', start_section)
+        self.assertNotIn('Join-Path $packageDir "duty_gui.py"', start_section)
+        self.assertNotIn("-Windowed", start_section)
+        self.assertIn("CreateNoWindow = $true", start_section)
+        self.assertIn("UseShellExecute = $false", start_section)
+        self.assertIn('Join-Path $_.FullName "duty_gui.pyw"', script)
+
+    def test_update_package_rejects_incomplete_qt_archive_before_install(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("$requiredQtPackageFiles", script)
+        for relative in (
+            "duty_gui.pyw",
+            "qt_app\\main.py",
+            "qt_app\\qml\\Main.qml",
+            "qt_app\\qml\\components\\AppleButton.qml",
+            "qt_app\\qml\\components\\AppleCheckBox.qml",
+            "qt_app\\qml\\components\\AppleComboBox.qml",
+            "qt_app\\qml\\components\\AppleDialog.qml",
+            "qt_app\\qml\\components\\AppleTabButton.qml",
+            "qt_app\\qml\\components\\AppleTextArea.qml",
+            "qt_app\\qml\\components\\AppleTextField.qml",
+            "qt_app\\qml\\components\\AuditSummaryCard.qml",
+            "qt_app\\qml\\components\\DataSectionTitle.qml",
+            "qt_app\\qml\\components\\DataTableCell.qml",
+            "qt_app\\qml\\components\\DangerButton.qml",
+            "qt_app\\qml\\components\\DutyActionButton.qml",
+            "qt_app\\qml\\components\\DutyTaskCard.qml",
+            "qt_app\\qml\\components\\DutyTaskStatusPill.qml",
+            "qt_app\\qml\\components\\FormFieldTitle.qml",
+            "qt_app\\qml\\components\\PrimaryButton.qml",
+            "qt_app\\qml\\components\\SettingsButton.qml",
+            "qt_app\\qml\\components\\StrongHeaderTitle.qml",
+            "qt_app\\qml\\components\\ToolAddButton.qml",
+            "qt_app\\qml\\components\\ToolBrowseButton.qml",
+            "qt_app\\qml\\components\\ToolCloseButton.qml",
+            "qt_app\\qml\\components\\ToolDateStepButton.qml",
+            "qt_app\\qml\\components\\ToolFieldLabel.qml",
+            "qt_app\\qml\\components\\ToolFormCard.qml",
+            "qt_app\\qml\\components\\ToolMonthCombo.qml",
+            "qt_app\\qml\\components\\ToolPanelContent.qml",
+            "qt_app\\qml\\components\\ToolPanelHeader.qml",
+            "qt_app\\qml\\components\\ToolPanelTitle.qml",
+            "qt_app\\qml\\components\\ToolRemoveButton.qml",
+            "qt_app\\qml\\components\\ToolRunButton.qml",
+            "qt_app\\qml\\components\\ToolSectionTitle.qml",
+            "qt_app\\qml\\components\\ToolSidePanel.qml",
+            "qt_app\\qml\\components\\ToolStatusBar.qml",
+            "qt_app\\qml\\components\\WorkLogValueControl.qml",
+            "qt_app\\qml\\components\\qmldir",
+            "qt_app\\qml\\dialogs\\AccountManagerWindow.qml",
+            "qt_app\\qml\\dialogs\\RescueVideoWindow.qml",
+            "qt_app\\qml\\dialogs\\ActionConfirmations.qml",
+            "qt_app\\qml\\dialogs\\qmldir",
+            "qt_app\\qml\\pages\\DutySheetToolPanel.qml",
+            "qt_app\\qml\\pages\\RestTimeToolPanel.qml",
+            "qt_app\\qml\\pages\\MonthlyBaseToolPanel.qml",
+            "qt_app\\qml\\pages\\DailyVehicleToolPanel.qml",
+            "qt_app\\qml\\pages\\AuditFilterPanel.qml",
+            "qt_app\\qml\\pages\\WorkLogSettingsPanel.qml",
+            "qt_app\\qml\\pages\\DutyQuickToolsPanel.qml",
+            "qt_app\\qml\\pages\\DutyOperationBar.qml",
+            "qt_app\\qml\\pages\\DutyTaskArea.qml",
+            "qt_app\\qml\\pages\\SessionHeader.qml",
+            "qt_app\\qml\\pages\\qmldir",
+            "qt_app\\qml\\styles\\Design.qml",
+            "qt_app\\qml\\styles\\qmldir",
+            "qt_app\\workers\\operational_sync_worker.py",
+            "app_core\\operational_sync_service.py",
+            "app_core\\credential_repository.py",
+        ):
+            with self.subTest(relative=relative):
+                self.assertIn(f'"{relative}"', script)
+        self.assertIn("Update zip is missing required PySide6/QML file", script)
+        self.assertLess(
+            script.index("$requiredQtPackageFiles"),
+            script.index("$wasRunning = Stop-RunningDutyGui"),
+        )
 
     def test_powershell_scripts_parse(self) -> None:
         root = package_dir()
@@ -2244,17 +2570,19 @@ class PackageSmokeTests(unittest.TestCase):
             with self.subTest(script=str(script.relative_to(PROJECT_ROOT))):
                 env = os.environ.copy()
                 env["PS_PARSE_PATH"] = str(script)
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", parser],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=30,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                with tempfile.TemporaryFile(mode="w+b") as output:
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", parser],
+                        cwd=PROJECT_ROOT,
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        timeout=30,
+                    )
+                    output.seek(0)
+                    diagnostic = output.read().decode("utf-8", errors="replace")
+                self.assertEqual(result.returncode, 0, diagnostic)
 
     def test_duty_board_payload_keeps_full_days_and_stable_hash(self) -> None:
         module = duty_gui_module()

@@ -12,7 +12,6 @@ This GUI is intentionally conservative:
 
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
@@ -31,12 +30,33 @@ import urllib.error
 import urllib.request
 import zipfile
 import customtkinter as ctk
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 from uuid import uuid4
+
+from app_core.credential_repository import CredentialRepository
+from app_core.duty_task_projection import (
+    action_datetime as projected_action_datetime,
+    build_schedule_comparisons,
+    comparison_dates,
+    duty_people_label as projected_duty_people_label,
+    duty_task_columns as projected_duty_task_columns,
+    is_auto_duty_action as projected_is_auto_duty_action,
+    person_short_label as projected_person_short_label,
+    previous_duty_actor_nos as projected_previous_duty_actor_nos,
+    target_short_label as projected_target_short_label,
+)
+from app_core.login_verifier import (
+    LoginVerificationError,
+    LoginVerifier,
+    identify_logged_in_actor as identify_login_actor,
+    page_identity_text as login_page_identity_text,
+    resolve_verified_actor_no as resolve_login_actor_no,
+)
+from app_core.session import LoginSession, SessionState
 
 DAILY_SCREENSHOT_DIR = "每日勤務表"
 NIGHT_SCREENSHOT_DIR = "夜間勤務"
@@ -873,19 +893,67 @@ def duty_window_dates(base_roc_date: str) -> list[str]:
     return [roc_date_after(base_roc_date, -1), base_roc_date, roc_date_after(base_roc_date, 1)]
 
 
-# Session model
-
-@dataclass
-class LoginSession:
-    actor_no: str
-    user_id: str
-    password: str
-    verified: bool = False
-
-
 # Main GUI controller
 
 class DutyGui(ctk.CTk):
+    def _session_state_value(self) -> SessionState:
+        state = self.__dict__.get("_session_state")
+        if state is None:
+            state = SessionState()
+            self.__dict__["_session_state"] = state
+        return state
+
+    def _credential_repository_value(self) -> CredentialRepository:
+        repository = self.__dict__.get("_credential_repository")
+        if (
+            repository is None
+            or repository.path != SAVED_LOGIN_PATH
+            or repository.dpapi is not win32crypt
+        ):
+            repository = CredentialRepository(SAVED_LOGIN_PATH, APP_DISPLAY_NAME, win32crypt)
+            self.__dict__["_credential_repository"] = repository
+        return repository
+
+    @property
+    def session(self) -> LoginSession | None:
+        return self._session_state_value().session
+
+    @session.setter
+    def session(self, value: LoginSession | None) -> None:
+        self._session_state_value().session = value
+
+    @property
+    def login_running(self) -> bool:
+        return self._session_state_value().login_running
+
+    @login_running.setter
+    def login_running(self, value: bool) -> None:
+        self._session_state_value().login_running = value
+
+    @property
+    def login_attempt_id(self) -> int:
+        return self._session_state_value().attempt_id
+
+    @login_attempt_id.setter
+    def login_attempt_id(self, value: int) -> None:
+        self._session_state_value().attempt_id = value
+
+    @property
+    def saved_login_needs_backup(self) -> bool:
+        return self._credential_repository_value().needs_backup
+
+    @saved_login_needs_backup.setter
+    def saved_login_needs_backup(self, value: bool) -> None:
+        self._credential_repository_value().needs_backup = bool(value)
+
+    @property
+    def saved_login_can_persist(self) -> bool:
+        return self._credential_repository_value().can_persist
+
+    @saved_login_can_persist.setter
+    def saved_login_can_persist(self, value: bool) -> None:
+        self._credential_repository_value().can_persist = bool(value)
+
     def __init__(self) -> None:
         super().__init__()
         self.option_add("*Font", FONT_BODY)
@@ -932,7 +1000,8 @@ class DutyGui(ctk.CTk):
         self.duty_actions: list[dict[str, Any]] = []
         self.duty_data: dict[str, Any] = {}
         self.duty_action_compare: dict[int, dict[str, Any]] = {}
-        self.session: LoginSession | None = None
+        self._session_state = SessionState()
+        self._credential_repository = CredentialRepository(SAVED_LOGIN_PATH, APP_DISPLAY_NAME, win32crypt)
         self.last_update_logout_identity: dict[str, str] = {"actor_no": "", "user_id": ""}
         self.executed_due: set[int] = set()
         self.manual_completed_keys: set[str] = set()
@@ -982,10 +1051,6 @@ class DutyGui(ctk.CTk):
         self.pending_auto_logout_handoff_at: datetime | None = None
         self.pending_auto_logout_actor_no = ""
         self.auto_logout_login_started_at: datetime | None = None
-        self.saved_login_needs_backup = False
-        self.saved_login_can_persist = True
-        self.login_running = False
-        self.login_attempt_id = 0
         self.active_webdrivers: set[Any] = set()
         self.active_webdrivers_lock = threading.Lock()
         self.tray_icon: Any | None = None
@@ -2052,76 +2117,11 @@ class DutyGui(ctk.CTk):
     def build_comparison(self, data: dict[str, Any], actions: list[dict[str, Any]] | None = None) -> dict[int, dict[str, Any]]:
         target_date = data.get("target_date", "")
         actions = actions if actions is not None else self.build_audit_actions(data)
-        comparison_staff = {**data.get("yesterday", {}).get("staff", {}), **data.get("today", {}).get("staff", {})}
-        comparison_cache: dict[str, dict[str, Any]] = {}
-        for offset in sorted({int(action.get("date_offset", 0) or 0) for action in actions} | {0}):
-            action_date = roc_date_after(target_date, offset) if target_date else ""
-            comparison_data = self.load_comparison_data(action_date) if action_date else {}
-            entry_source = comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", []))
-            work_source = comparison_data.get("visible_work_rows", data.get("visible_work_rows", []))
-            comparison_cache[action_date] = {
-                "entry_rows": flatten_rows(entry_source, action_date) if action_date else [],
-                "work_rows": flatten_rows(work_source, action_date) if action_date else [],
-            }
-        result: dict[int, dict[str, Any]] = {}
-        external_targets: dict[str, set[str]] = {}
-        for action in [a for a in actions if a.get("kind") == "entry_log" and a.get("source", "").startswith("外勤")]:
-            fields = action.get("fields", {})
-            action_date = self.action_target_roc_date(action, target_date)
-            key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
-            external_targets.setdefault(key, set()).add(comparison_staff.get(str(action.get("target", "")), {}).get("name", ""))
-
-        for index, action in enumerate(actions):
-            fields = action.get("fields", {})
-            action_date = self.action_target_roc_date(action, target_date)
-            entry_rows = comparison_cache.get(action_date, {}).get("entry_rows", [])
-            work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
-            if action.get("kind") == "entry_log":
-                reason = fields.get("領用事由及地點", "")
-                if is_future_action(target_date, action):
-                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
-                    continue
-                if reason in ("休息", "休息返隊"):
-                    result[index] = self.compare_rest_entry(actions, action, action_date, entry_rows, target_date, comparison_staff)
-                    continue
-                exact = find_entry_matches(entry_rows, action_date, comparison_staff, action, allow_near=False)
-                arrival_exists = [] if exact else find_arrival_entry_exists(entry_rows, action_date, comparison_staff, action)
-                near = [] if exact else find_entry_matches(entry_rows, action_date, comparison_staff, action, allow_near=True)
-                if exact:
-                    result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
-                elif arrival_exists:
-                    result[index] = {"compare": "已存在(時間不同)", "group": "done", "matched": arrival_exists[:1]}
-                elif is_possible_handoff_adjustment(entry_rows, action_date, comparison_staff, action):
-                    result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
-                elif near:
-                    result[index] = {"compare": "時間近似", "group": "near", "matched": near[:1]}
-                elif reason in ("到勤", "退勤", "休息後退勤"):
-                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
-                elif action.get("source", "").startswith("外勤"):
-                    result[index] = {"compare": "人工確認", "group": "review", "matched": []}
-                else:
-                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
-            else:
-                if is_future_action(target_date, action):
-                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
-                    continue
-                matches = find_case_work_matches(work_rows, action_date, action) if action.get("source") == "案件工作審核" else find_work_matches(work_rows, action_date, comparison_staff, action)
-                if matches:
-                    result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
-                else:
-                    result[index] = {"compare": "未找到", "group": "todo", "matched": []}
-
-        for index, action in enumerate(actions):
-            # A matching external record under a different name means the planned
-            # row needs human confirmation, not automatic補登.
-            if action.get("kind") != "entry_log" or not action.get("source", "").startswith("外勤"):
-                continue
-            fields = action.get("fields", {})
-            action_date = self.action_target_roc_date(action, target_date)
-            key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
-            if result.get(index, {}).get("compare") == "人工確認" and external_targets.get(key):
-                result[index]["compare"] = "外勤確認"
-        return result
+        comparison_data = {
+            action_date: self.load_comparison_data(action_date)
+            for action_date in comparison_dates(actions, target_date)
+        }
+        return build_schedule_comparisons(data, actions, comparison_data)
 
     def action_completion_key(self, action: dict[str, Any]) -> str:
         duplicate_key = str(action.get("duplicate_key", "") or "").strip()
@@ -2220,94 +2220,33 @@ class DutyGui(ctk.CTk):
     # Saved account management
 
     def protect_password(self, password: str) -> str:
-        if not password or win32crypt is None:
-            return ""
-        encrypted = win32crypt.CryptProtectData(password.encode("utf-8"), APP_DISPLAY_NAME, None, None, None, 0)
-        return base64.b64encode(encrypted).decode("ascii")
+        return self._credential_repository_value().protect_password(password)
 
     def unprotect_password(self, encrypted_password: str) -> str:
-        if not encrypted_password or win32crypt is None:
-            return ""
-        try:
-            _, decrypted = win32crypt.CryptUnprotectData(base64.b64decode(encrypted_password), None, None, None, 0)
-        except Exception:
-            return ""
-        return decrypted.decode("utf-8")
+        return self._credential_repository_value().unprotect_password(encrypted_password)
 
     def account_password_from_payload(self, account: dict[str, Any]) -> str:
-        encrypted_password = str(account.get("password_dpapi", "") or "")
-        if encrypted_password:
-            password = self.unprotect_password(encrypted_password)
-            if not password:
-                self.saved_login_can_persist = False
-            return password
-        return str(account.get("password", "") or "")
+        return self._credential_repository_value().password_from_payload(account)
 
     def backup_invalid_saved_login(self) -> None:
-        if not self.saved_login_needs_backup or not SAVED_LOGIN_PATH.exists():
-            return
-        backup_path = SAVED_LOGIN_PATH.with_name(f"{SAVED_LOGIN_PATH.stem}.invalid-{datetime.now():%Y%m%d-%H%M%S}.bak")
-        backup_path.write_text(SAVED_LOGIN_PATH.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-        self.saved_login_needs_backup = False
+        self._credential_repository_value().backup_invalid_file()
 
     def saved_account_payload(self, account: dict[str, str]) -> dict[str, str]:
-        return {
-            "actor_no": str(account.get("actor_no", "") or ""),
-            "user_id": str(account.get("user_id", "") or ""),
-            "password_dpapi": self.protect_password(str(account.get("password", "") or "")),
-            "display_name": str(account.get("display_name", "") or ""),
-            "name": str(account.get("name", "") or ""),
-            "id_number": str(account.get("id_number", "") or ""),
-        }
+        return self._credential_repository_value().account_payload(account)
 
     def load_saved_login(self) -> None:
-        if not SAVED_LOGIN_PATH.exists():
+        repository = self._credential_repository_value()
+        if not repository.path.exists():
             return
-        self.saved_login_can_persist = win32crypt is not None
-        try:
-            payload = json.loads(SAVED_LOGIN_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            self.saved_login_needs_backup = True
+        snapshot = repository.load()
+        if snapshot.invalid_file:
             return
-        accounts = payload.get("accounts")
-        if not isinstance(accounts, list):
-            legacy_account = {
-                "actor_no": str(payload.get("actor_no", "") or ""),
-                "user_id": str(payload.get("user_id", "") or ""),
-                "password": str(payload.get("password", "") or ""),
-                "display_name": "",
-            }
-            accounts = [legacy_account] if legacy_account["user_id"] or legacy_account["actor_no"] else []
-            payload = {
-                "last_selected": legacy_account["user_id"] or legacy_account["actor_no"],
-                "accounts": accounts,
-            }
-        normalized: list[dict[str, str]] = []
-        for account in accounts:
-            if not isinstance(account, dict):
-                continue
-            actor_no = str(account.get("actor_no", "") or "").strip()
-            user_id = str(account.get("user_id", "") or "").strip()
-            if not actor_no and not user_id:
-                continue
-            normalized.append(
-                {
-                    "actor_no": actor_no,
-                    "user_id": user_id,
-                    "password": self.account_password_from_payload(account),
-                    "display_name": str(account.get("display_name", "") or ""),
-                    "name": str(account.get("name", "") or account.get("person_name", "") or ""),
-                    "id_number": str(account.get("id_number", "") or account.get("national_id", "") or ""),
-                }
-            )
-        self.saved_accounts = normalized
-        last_selected = str(payload.get("last_selected", "") or "")
-        if not last_selected and self.saved_accounts:
-            last_selected = self.account_identity(self.saved_accounts[0])
+        self.saved_accounts = snapshot.accounts
+        last_selected = snapshot.last_selected
         self.refresh_saved_account_choices()
         if last_selected:
             self.select_saved_account(last_selected, persist=False)
-        if self.saved_login_can_persist and (payload.get("accounts") != normalized or "accounts" not in payload):
+        if snapshot.can_persist and snapshot.needs_rewrite:
             self.persist_saved_accounts(last_selected)
 
     def save_login_locally(self, actor_no: str, user_id: str, password: str, display_name: str = "", name: str = "", id_number: str = "") -> None:
@@ -2315,7 +2254,7 @@ class DutyGui(ctk.CTk):
         if not identity:
             return
         if password and win32crypt is not None:
-            self.saved_login_can_persist = True
+            self._credential_repository_value().enable_persistence()
         updated = {
             "actor_no": actor_no,
             "user_id": user_id,
@@ -2342,16 +2281,8 @@ class DutyGui(ctk.CTk):
         self.select_saved_account(identity, persist=False)
 
     def persist_saved_accounts(self, last_selected: str = "") -> None:
-        if win32crypt is None or not self.saved_login_can_persist:
+        if not self._credential_repository_value().save(self.saved_accounts, last_selected):
             self.login_status.set("無法儲存帳號：缺少 Windows DPAPI 模組或既有密碼無法解密。")
-            return
-        SAVED_LOGIN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.backup_invalid_saved_login()
-        payload = {
-            "last_selected": last_selected,
-            "accounts": [self.saved_account_payload(account) for account in self.saved_accounts],
-        }
-        SAVED_LOGIN_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def account_identity(self, account: dict[str, str]) -> str:
         return str(account.get("user_id", "") or account.get("actor_no", "") or "").strip()
@@ -2502,7 +2433,7 @@ class DutyGui(ctk.CTk):
             },
         )
 
-    def send_tool_finish_event(self, tool_name: str, tool_label: str, status: str, result: str = "", error: str = "") -> None:
+    def send_tool_finish_event(self, tool_name: str, tool_label: str, status: str, result: str = "", error: str = "", failure_stage: str = "") -> None:
         error_snapshot: dict[str, str] = {}
         if error:
             if contains_unsafe_error_detail(error):
@@ -2510,21 +2441,24 @@ class DutyGui(ctk.CTk):
             safe_error = frontend_error_payload(error)
             error = safe_error["message"]
             error_snapshot = safe_error
+        snapshot = {
+            "tool_name": tool_name,
+            "tool_label": tool_label,
+            **error_snapshot,
+        }
+        if failure_stage:
+            snapshot["failure_stage"] = failure_stage
         self.send_sinposmart_backend_event(
             "tool_action_finished",
             status=status,
             trigger_type="tool_finish",
             content=result,
             error=error,
-            snapshot={
-                "tool_name": tool_name,
-                "tool_label": tool_label,
-                **error_snapshot,
-            },
+            snapshot=snapshot,
         )
 
     def sinposmart_tool_event_callbacks(self, tool_name: str, tool_label: str):
-        state = {"started": False, "finished": False, "timer": None, "business_roc_date": ""}
+        state = {"started": False, "finished": False, "timer": None, "business_roc_date": "", "failure_stage": "preflight"}
         lock = threading.Lock()
 
         def finish_once(status: str, result: str = "", error: str = "") -> bool:
@@ -2537,7 +2471,14 @@ class DutyGui(ctk.CTk):
                 state["timer"] = None
             if timer is not None:
                 timer.cancel()
-            self.send_tool_finish_event(tool_name, tool_label, status, result=result, error=error)
+            self.send_tool_finish_event(
+                tool_name,
+                tool_label,
+                status,
+                result=result,
+                error=error,
+                failure_stage=state["failure_stage"] if status == "failed" else "",
+            )
             return True
 
         def completion_notification(result: str) -> str:
@@ -2569,6 +2510,12 @@ class DutyGui(ctk.CTk):
                 state["timer"] = timer
             timer.start()
 
+        def stage(value: str) -> None:
+            normalized = re.sub(r"[^a-z0-9_]", "", str(value or "").lower())
+            if normalized:
+                with lock:
+                    state["failure_stage"] = normalized
+
         def finish(result: str) -> None:
             if finish_once("completed", result=result):
                 message = completion_notification(result)
@@ -2577,6 +2524,7 @@ class DutyGui(ctk.CTk):
         def fail(error: str) -> None:
             finish_once("failed", error=error)
 
+        fail.stage_callback = stage
         return start, finish, fail
 
     def send_sinposmart_backend_event(
@@ -3109,17 +3057,15 @@ class DutyGui(ctk.CTk):
         return ""
 
     def resolve_verified_actor_no(self, typed_actor_no: str, user_id: str, detected_actor_no: str) -> str:
-        typed_actor_no = str(typed_actor_no or "").strip()
-        detected_actor_no = str(detected_actor_no or "").strip()
-        account_actor_no = str(self.actor_no_from_user_id(user_id) or "").strip()
-        resolved_actor_no = detected_actor_no or account_actor_no or typed_actor_no
-        if typed_actor_no and resolved_actor_no and typed_actor_no != resolved_actor_no:
-            raise LoginFailedError(
-                f"登入帳號辨識為 {resolved_actor_no} 番，與輸入的 {typed_actor_no} 番不一致。請選擇正確番號或帳號。"
+        try:
+            return resolve_login_actor_no(
+                typed_actor_no,
+                user_id,
+                detected_actor_no,
+                self.actor_no_from_user_id,
             )
-        if not resolved_actor_no:
-            raise LoginFailedError("登入後頁面沒有顯示可辨識的姓名。")
-        return resolved_actor_no
+        except LoginVerificationError as exc:
+            raise LoginFailedError(str(exc)) from exc
 
     def verify_login(self) -> None:
         if self.login_running:
@@ -3132,9 +3078,9 @@ class DutyGui(ctk.CTk):
             messagebox.showwarning("資料不足", "請輸入帳號、密碼。")
             return
 
-        self.login_running = True
-        self.login_attempt_id += 1
-        attempt_id = self.login_attempt_id
+        attempt_id = self._session_state_value().begin_login()
+        if attempt_id is None:
+            return
         self.set_login_buttons_enabled(False)
         self.login_status.set("登入中")
         self.after(45000, lambda value=attempt_id: self._login_timed_out(value))
@@ -3142,22 +3088,28 @@ class DutyGui(ctk.CTk):
         thread.start()
 
     def _verify_login_worker(self, attempt_id: int, actor_no: str, user_id: str, password: str) -> None:
-        driver = None
         try:
-            options = background_chrome_options()
-            driver = self.register_webdriver(webdriver.Chrome(options=options))
-            configure_webdriver_timeouts(driver)
-            login(driver, user_id, password)
-            detected_actor_no, actor_name = self.identify_logged_in_actor(driver)
-            actor_no = self.resolve_verified_actor_no(actor_no, user_id, detected_actor_no)
+            verifier = LoginVerifier(
+                options_factory=lambda: background_chrome_options(),
+                driver_factory=lambda options: self.register_webdriver(webdriver.Chrome(options=options)),
+                configure_driver=configure_webdriver_timeouts,
+                login_function=login,
+                driver_cleanup=self.quit_registered_webdriver,
+            )
+            result = verifier.verify(
+                typed_actor_no=actor_no,
+                user_id=user_id,
+                password=password,
+                actor_no_from_user_id=self.actor_no_from_user_id,
+                actor_no_from_name=self.actor_no_from_name,
+                staff=self.staff,
+            )
         except Exception as exc:
             log_automation_exception("verify_login", exc)
             safe_error = frontend_error_payload(exc, context="login")
             self.after(0, lambda value=attempt_id, payload=safe_error: self._login_failed(value, payload["message"], payload["error_code"], payload["timestamp"]))
             return
-        finally:
-            self.quit_registered_webdriver(driver)
-        self.after(0, lambda value=attempt_id, resolved_name=actor_name: self._login_succeeded(value, actor_no, user_id, password, resolved_name))
+        self.after(0, lambda value=attempt_id, login_result=result: self._login_succeeded(value, login_result.actor_no, user_id, password, login_result.actor_name))
 
     def write_schedule_snapshot(self, driver: webdriver.Chrome, target_roc_date: str, slot_label: str = "") -> Path:
         target_date = parse_roc_date(target_roc_date)
@@ -3536,49 +3488,15 @@ class DutyGui(ctk.CTk):
         return True
 
     def identify_logged_in_actor(self, driver: webdriver.Chrome) -> tuple[str, str]:
-        texts = [self.page_identity_text(driver)]
-        frames = driver.find_elements("tag name", "frame") + driver.find_elements("tag name", "iframe")
-        for frame in frames:
-            try:
-                driver.switch_to.default_content()
-                driver.switch_to.frame(frame)
-                texts.append(self.page_identity_text(driver))
-            except Exception:
-                continue
-        driver.switch_to.default_content()
-        page_text = "\n".join(texts)
-        greeting_match = re.search(r"([^\s,，]+)\s*[,，]\s*您好", page_text)
-        if greeting_match:
-            actor_name = greeting_match.group(1).strip()
-            actor_no = self.actor_no_from_name(actor_name)
-            if actor_no:
-                return actor_no, actor_name
-            return "", actor_name
-        candidates = []
-        for no, info in self.staff.items():
-            name = info.get("name", "")
-            if name and name in page_text:
-                candidates.append((str(no), name))
-        if len(candidates) == 1:
-            return candidates[0]
-        return "", ""
+        return identify_login_actor(driver, self.actor_no_from_name, self.staff)
 
     def page_identity_text(self, driver: webdriver.Chrome) -> str:
-        return driver.execute_script(
-            """
-            const body = document.body ? document.body.innerText : '';
-            const values = Array.from(document.querySelectorAll('input,select,textarea'))
-              .map(el => el.value || el.options?.[el.selectedIndex]?.text || '')
-              .filter(Boolean)
-              .join('\\n');
-            return [document.title || '', body, values].join('\\n');
-            """
-        ) or ""
+        return login_page_identity_text(driver)
 
     def _login_succeeded(self, attempt_id: int, actor_no: str, user_id: str, password: str, actor_name: str = "") -> None:
-        if attempt_id != self.login_attempt_id:
+        session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
+        if not self._session_state_value().complete_login(attempt_id, session):
             return
-        self.login_running = False
         self.set_login_buttons_enabled(True)
         self.clear_duty_status_override()
         self.executed_due.clear()
@@ -3595,7 +3513,6 @@ class DutyGui(ctk.CTk):
         self.submit_comparison_refresh_scheduled = False
         self.cancel_auto_logout()
         self.auto_logout_login_started_at = datetime.now()
-        self.session = LoginSession(actor_no=actor_no, user_id=user_id, password=password, verified=True)
         self.last_update_logout_identity = {"actor_no": actor_no, "user_id": user_id}
         self.send_sinposmart_backend_event("login", status="ok", trigger_type="login", actor_no=actor_no, user_id=user_id)
         actor_name = str(actor_name or "").strip()
@@ -3632,11 +3549,9 @@ class DutyGui(ctk.CTk):
             self.refresh_comparison_background(login_target_date, "login", comparison_dates=duty_window_dates(login_target_date))
 
     def _login_failed(self, attempt_id: int, error: str, error_code: str = "", error_timestamp: str = "") -> None:
-        if attempt_id != self.login_attempt_id:
+        if not self._session_state_value().fail_login(attempt_id):
             return
-        self.login_running = False
         self.set_login_buttons_enabled(True)
-        self.session = None
         self.clear_manual_pause_state()
         self.login_status.set(error)
         snapshot = {"error_code": error_code, "message": error, "timestamp": error_timestamp} if error_code else None
@@ -3646,12 +3561,9 @@ class DutyGui(ctk.CTk):
         self.refresh_tasks()
 
     def _login_timed_out(self, attempt_id: int) -> None:
-        if attempt_id != self.login_attempt_id or not self.login_running:
+        if not self._session_state_value().timeout_login(attempt_id):
             return
-        self.login_running = False
-        self.login_attempt_id += 1
         self.set_login_buttons_enabled(True)
-        self.session = None
         self.clear_manual_pause_state()
         self.login_status.set("登入逾時：請確認帳號密碼或勤務系統是否有回應。")
         messagebox.showerror("登入逾時", "登入超過 45 秒沒有完成，已恢復登入按鈕。")
@@ -4202,6 +4114,7 @@ class DutyGui(ctk.CTk):
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
         on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("duty_sheet", "勤務表登打")
+        on_stage = on_error.stage_callback
         open_duty_sheet_dialog(
             self,
             user_id=user_id,
@@ -4209,6 +4122,7 @@ class DutyGui(ctk.CTk):
             on_start=on_start,
             on_finish=on_finish,
             on_error=on_error,
+            on_stage=on_stage,
         )
 
     def open_rest_time_automation(self) -> None:
@@ -4217,6 +4131,7 @@ class DutyGui(ctk.CTk):
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
         on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("rest_time", "休息時間登打")
+        on_stage = on_error.stage_callback
         open_rest_time_dialog(
             self,
             user_id=user_id,
@@ -4226,6 +4141,7 @@ class DutyGui(ctk.CTk):
             on_start=on_start,
             on_finish=on_finish,
             on_error=on_error,
+            on_stage=on_stage,
         )
 
     def open_monthly_base_automation(self) -> None:
@@ -4234,6 +4150,7 @@ class DutyGui(ctk.CTk):
         actor_no = self.session.actor_no if self.session and self.session.verified else self.actor_no.get().strip()
         display_name = self.current_account_display_name(actor_no, user_id) if user_id or actor_no else ""
         on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("monthly_base", "勤務基準表登打")
+        on_stage = on_error.stage_callback
         open_monthly_base_dialog(
             self,
             user_id=user_id,
@@ -4243,12 +4160,14 @@ class DutyGui(ctk.CTk):
             on_start=on_start,
             on_finish=on_finish,
             on_error=on_error,
+            on_stage=on_stage,
         )
 
     def open_daily_vehicle_automation(self) -> None:
         user_id = self.session.user_id if self.session and self.session.verified else self.user_id.get().strip()
         password = self.session.password if self.session and self.session.verified else self.password.get()
         on_start, on_finish, on_error = self.sinposmart_tool_event_callbacks("daily_vehicle", "車輛保養清點")
+        on_stage = on_error.stage_callback
         start_daily_vehicle_automation(
             self,
             user_id=user_id,
@@ -4256,6 +4175,7 @@ class DutyGui(ctk.CTk):
             on_start=on_start,
             on_finish=on_finish,
             on_error=on_error,
+            on_stage=on_stage,
         )
 
     def open_rescue_video_tool(self) -> None:
@@ -4444,21 +4364,7 @@ class DutyGui(ctk.CTk):
         return action.get("kind") == "work_log" and action.get("source") == "值班交接"
 
     def previous_duty_actor_nos(self, actor_no: str) -> set[str]:
-        previous: set[str] = set()
-        for action in self.duty_actions:
-            if action.get("kind") != "entry_log":
-                continue
-            fields = action.get("fields", {})
-            if action.get("source") != "值班交接":
-                continue
-            if str(action.get("target", "")) != str(actor_no):
-                continue
-            if fields.get("出或入", "") != "值班":
-                continue
-            action_actor = str(action.get("actor", ""))
-            if action_actor and action_actor != str(actor_no):
-                previous.add(action_actor)
-        return previous
+        return projected_previous_duty_actor_nos(self.duty_actions, str(actor_no))
 
     def action_minutes(self, action: dict[str, Any]) -> int:
         value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
@@ -4469,19 +4375,10 @@ class DutyGui(ctk.CTk):
         return int(action.get("date_offset", 0) or 0) * 1440 + hour * 60 + minute
 
     def action_datetime(self, action: dict[str, Any]) -> datetime:
-        value = action.get("fields", {}).get("登打時間") or action.get("fields", {}).get("工作時間") or action.get("time", "00:00")
-        try:
-            hour, minute = [int(part) for part in value.split(":", 1)]
-        except ValueError:
-            hour, minute = 0, 0
-        extra_days, hour = divmod(hour, 24)
-        try:
-            base_date = parse_roc_date(self.duty_data.get("target_date") or today_roc_date())
-        except ValueError:
-            base_date = date.today()
-        offset = int(action.get("date_offset", 0) or 0) + extra_days
-        target_date = base_date + timedelta(days=offset)
-        return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+        return projected_action_datetime(
+            action,
+            self.duty_data.get("target_date") or today_roc_date(),
+        )
 
     def action_display_time(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
@@ -4531,14 +4428,7 @@ class DutyGui(ctk.CTk):
         return self.action_datetime(action), index
 
     def is_auto_duty_action(self, action: dict[str, Any]) -> bool:
-        if action.get("kind") == "work_log":
-            return True
-        if action.get("kind") != "entry_log":
-            return False
-        fields = action.get("fields", {})
-        outin = fields.get("出或入", "")
-        reason = fields.get("領用事由及地點", "")
-        return outin in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤")
+        return projected_is_auto_duty_action(action)
 
     def compare_needs_manual_review(self, compare: dict[str, Any]) -> bool:
         return compare.get("group") in ("near", "adjust", "review")
@@ -5913,12 +5803,7 @@ class DutyGui(ctk.CTk):
         return f"{number}番"
 
     def person_short_label(self, number: str) -> str:
-        if not number:
-            return "-"
-        info = self.staff.get(str(number), {})
-        name = info.get("name", "")
-        display_no = str(number).zfill(2) if str(number).isdigit() else str(number)
-        return f"{display_no} {name}" if name else display_no
+        return projected_person_short_label(number, self.staff)
 
     def target_label(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
@@ -5935,11 +5820,7 @@ class DutyGui(ctk.CTk):
         return str(action.get("target", "") or "-")
 
     def target_short_label(self, action: dict[str, Any]) -> str:
-        fields = action.get("fields", {})
-        if action.get("kind") == "work_log":
-            people = fields.get("服勤人員", [])
-            return ",".join(self.person_short_label(str(no)) for no in people) if people else self.person_short_label(str(action.get("target", "") or ""))
-        return self.person_short_label(str(action.get("target", "") or ""))
+        return projected_target_short_label(action, self.staff)
 
     def action_summary(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})
@@ -5964,38 +5845,10 @@ class DutyGui(ctk.CTk):
         return f"{self.action_summary(action)}｜{self.target_short_label(action)}"
 
     def duty_task_columns(self, action: dict[str, Any]) -> tuple[str, str, str, str]:
-        fields = action.get("fields", {})
-        if action.get("kind") == "entry_log":
-            direction = str(fields.get("出或入", "") or "-")
-            reason = str(fields.get("領用事由及地點", "") or "-")
-            people = self.target_short_label(action)
-            return "出入", direction, f"{direction} / {reason}", people
-
-        if action.get("source") in ("無線電試話", "無線電測試"):
-            return "工作", "其他", "其他 / 無線電測試", self.duty_standby_people_label(action)
-        duty_type = str(fields.get("勤務項目", "") or action.get("source", "") or "工作")
-        detail_parts = [
-            str(value).strip()
-            for value in (duty_type, fields.get("事由", ""), fields.get("訓練項目", ""))
-            if str(value).strip()
-        ]
-        detail = " / ".join(dict.fromkeys(detail_parts)) or duty_type
-        if action.get("source") == "在隊訓練":
-            topic = str(fields.get("訓練項目", "") or "").strip()
-            detail = f"在隊訓練 / {topic}" if topic else "在隊訓練"
-        people = self.duty_standby_people_label(action)
-        return "工作", "工作", detail, people
+        return projected_duty_task_columns(action, self.staff)
 
     def duty_standby_people_label(self, action: dict[str, Any]) -> str:
-        if action.get("source") == "在隊訓練":
-            return "備勤人員"
-        fields = action.get("fields", {})
-        people = fields.get("服勤人員", [])
-        if isinstance(people, list) and len(people) > 1:
-            return f"備勤人員 {len(people)}人"
-        if isinstance(people, list) and len(people) == 1:
-            return self.person_short_label(str(people[0]))
-        return self.target_short_label(action)
+        return projected_duty_people_label(action, self.staff)
 
     def notification_action_summary(self, action: dict[str, Any]) -> str:
         fields = action.get("fields", {})

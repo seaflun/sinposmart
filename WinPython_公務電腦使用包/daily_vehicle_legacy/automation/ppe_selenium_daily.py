@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 import time
 import traceback
 import urllib.error
@@ -21,6 +22,13 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+
+PACKAGE_DIR = Path(__file__).resolve().parents[2]
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+
+from duty_rehearsal import build_driver, quit_driver
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -422,6 +430,7 @@ def main(argv: list[str] | None = None) -> None:
     options.page_load_strategy = "none"
 
     remote_url = str(config["selenium_remote_url"])
+    print("[sinposmart-stage] browser_start", flush=True)
     if remote_url:
         print(f"[driver] using remote selenium: {remote_url}")
         wait_for_remote_selenium(remote_url, int(config["selenium_remote_ready_timeout_seconds"]))
@@ -429,7 +438,18 @@ def main(argv: list[str] | None = None) -> None:
         driver = webdriver.Remote(command_executor=remote_url, options=options)
     else:
         print("[driver] using local chrome")
-        driver = webdriver.Chrome(options=options)
+        driver = build_driver(
+            headless=bool(config["headless"]),
+            option_arguments=(
+                "--window-size=1440,1200",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-features=Translate,BackForwardCache",
+                "--dns-prefetch-disable",
+            ),
+            page_load_strategy="none",
+        )
 
     wait = WebDriverWait(driver, int(config["timeout_seconds"]))
     driver.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
@@ -444,9 +464,13 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 50)
 
     try:
+        print("[sinposmart-stage] login", flush=True)
         login(driver, wait, str(config["username"]), str(config["password"]))
+        print("[sinposmart-stage] maintenance_check", flush=True)
         process_maintain_checks(driver, wait, today_strings, today)
+        print("[sinposmart-stage] equipment_check", flush=True)
         process_equip_checks(driver, wait)
+        print("[sinposmart-stage] artifact_write", flush=True)
         save_artifacts(driver, "last-run")
         print("[done] automation finished")
         if config["send_line_result"]:
@@ -469,7 +493,7 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if driver is not None and not config["keep_browser_open"]:
             try:
-                driver.quit()
+                quit_driver(driver)
             except WebDriverException as error:
                 print(f"[driver] quit skipped: {error}")
 

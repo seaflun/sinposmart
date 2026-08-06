@@ -6,21 +6,18 @@ from __future__ import annotations
 import importlib.util
 import platform
 import sys
-import tkinter as tk
 
 
 REQUIRED_MODULES = [
-    "customtkinter",
     "selenium",
-    "pystray",
     "PIL",
     "win32crypt",
     "win32com",
     "win11toast",
     "openpyxl",
-    "tkcalendar",
     "requests",
     "google.cloud.storage",
+    "PySide6",
 ]
 
 
@@ -50,12 +47,12 @@ def main() -> int:
         fail(f"Selenium import failed: {exc}")
 
     try:
-        root = tk.Tk()
-        root.withdraw()
-        root.destroy()
+        from PySide6.QtQml import QQmlApplicationEngine
+        from PySide6.QtWidgets import QApplication
     except Exception as exc:
-        fail(f"Tkinter GUI is unavailable: {exc}")
-    ok("Tkinter GUI is available.")
+        fail(f"PySide6/QML runtime import failed: {exc}")
+    _ = QApplication, QQmlApplicationEngine
+    ok("PySide6/QML runtime imports succeeded.")
 
     options = Options()
     options.add_argument("--headless=new")
@@ -69,7 +66,7 @@ def main() -> int:
         fail(f"Chrome / ChromeDriver test failed: {exc}")
     ok("Chrome / ChromeDriver can start.")
 
-    ok("Environment check passed. Start SinpoSmart with duty_gui.pyw.")
+    ok("Environment check passed. Start the PySide6/QML SinpoSmart with duty_gui.pyw.")
     return 0
 
 

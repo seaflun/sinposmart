@@ -31,15 +31,17 @@ RUN_DUTY_GUI_WINPYTHON.vbs
 或直接執行：
 
 ```powershell
-pythonw duty_gui.pyw
+python duty_gui.pyw
 ```
 
 ## 需要一起帶走的檔案
 
 程式必要檔：
 
-- `duty_gui.py`
-- `duty_gui.pyw`
+- `duty_gui.pyw`：PySide6 + QML 正式入口
+- `qt_app/`：QML 介面、controller、model 與 worker
+- `app_core/`：登入、班表、登打、同步與診斷服務
+- `duty_gui.py`：舊 Tk 回退介面
 - `duty_rehearsal.py`
 - `compare_rehearsal_records.py`
 - `duty_sheet_automation.py`
@@ -64,4 +66,4 @@ pythonw duty_gui.pyw
 
 - Selenium 會自動處理 ChromeDriver，但電腦必須能啟動 Chrome。
 - 若公司或機關電腦封鎖 Selenium Manager 下載驅動，環境檢查會卡在 ChromeDriver 啟動失敗；那時再改成手動放置 `chromedriver.exe`。
-- 目前 GUI 還是預演/審核與登入狀態階段，尚未正式送出登打資料。
+- 正式 GUI 會在登入後即時讀取勤務與比對資料；自動登打仍會先做重複查詢與送出後驗證。

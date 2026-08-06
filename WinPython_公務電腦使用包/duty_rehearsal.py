@@ -10,20 +10,30 @@ from __future__ import annotations
 
 
 import argparse
+import base64
+import ctypes
 import getpass
 import json
 import os
+import queue
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -713,14 +723,21 @@ def quit_driver(driver: webdriver.Chrome | None) -> None:
     if not driver:
         return
     service = getattr(driver, "service", None)
+    profile_dir = getattr(driver, "_sinposmart_duty_browser_profile", "")
+    quit_failed = False
     try:
         driver.quit()
+    except Exception:
+        quit_failed = True
+        raise
     finally:
         if service:
             try:
                 service.stop()
             except Exception:
                 pass
+        if profile_dir:
+            cleanup_duty_browser_profile(Path(str(profile_dir)), terminate_processes=quit_failed)
 
 
 def set_work_log_content_fields(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
@@ -1464,6 +1481,82 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
         time.sleep(0.25)
     # The legacy app can keep login119 in the address bar after posting. The
     # real proof is whether authenticated AP pages load, so callers verify that.
+
+
+def query_authenticated_person_name(driver: webdriver.Chrome, user_id: str) -> str:
+    """Read the logged-in person's name from the work-log form without saving."""
+
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return ""
+
+    def read_matching_names() -> list[str]:
+        values = driver.execute_script(
+            """
+            const normalize = value => String(value || '').trim().toLowerCase();
+            const loginId = normalize(arguments[0]);
+            const loginAliases = new Set([
+              loginId,
+              loginId.replace(/^[a-z]+/, ''),
+              loginId.replace(/^[a-z]+/, '').replace(/^0+/, '')
+            ].filter(Boolean));
+            const names = [];
+            const pushName = value => {
+              for (const part of String(value || '').split(/[,，]/)) {
+                const name = part.trim();
+                if (name && !/^\\d+$/.test(name) && !names.includes(name)) names.push(name);
+              }
+            };
+            const matchesLogin = value => {
+              const parts = String(value || '').split(/[,，|;\\s]+/)
+                .map(normalize)
+                .flatMap(part => /^\\d+$/.test(part) ? [part, part.replace(/^0+/, '')] : [part])
+                .filter(Boolean);
+              return parts.some(part => loginAliases.has(part));
+            };
+
+            const directIds = ['_hidManId', '_txtUserId', '_hidUserId', '_txtLoginId']
+              .map(id => document.getElementById(id)?.value || '')
+              .filter(Boolean);
+            if (directIds.some(matchesLogin)) {
+              for (const id of ['_areMan', '_txtMan', '_txtUserName', '_hidUserName']) {
+                pushName(document.getElementById(id)?.value || '');
+              }
+            }
+
+            for (const id of ['_selMan', '_selManData']) {
+              const select = document.getElementById(id);
+              for (const option of Array.from(select?.options || [])) {
+                if (matchesLogin(option.value)) pushName(option.text);
+              }
+            }
+            for (const checkbox of document.querySelectorAll('input[name="_chkUser"]')) {
+              if (!matchesLogin(checkbox.value)) continue;
+              const parts = String(checkbox.value || '').split(',');
+              if (parts.length > 1) pushName(parts.slice(1).join(','));
+            }
+            return names;
+            """,
+            user_id,
+        ) or []
+        return [str(value or "").strip() for value in values if str(value or "").strip()]
+
+    if ensure_ap(driver, WORK_LOG_AP):
+        time.sleep(1)
+    names = read_matching_names()
+    if len(names) == 1:
+        return names[0]
+
+    form_ready = driver.execute_script(
+        "return Boolean(document.getElementById('_txtDATE') && document.getElementById('_areDescription'));"
+    )
+    if not form_ready:
+        insert_result = click_insert_control(driver)
+        if not insert_result.get("ok"):
+            return ""
+        time.sleep(2)
+        names = read_matching_names()
+    return names[0] if len(names) == 1 else ""
 
 
 def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutySheet:
@@ -2629,13 +2722,302 @@ def print_summary(today: DutySheet, yesterday: DutySheet | None, cases: list[Cas
             )
 
 
-def build_driver(headless: bool) -> webdriver.Chrome:
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--window-size=1280,900")
-    driver = webdriver.Chrome(options=options)
+_DUTY_BROWSER_PROFILE_PREFIX = "duty_gui_"
+_DUTY_BROWSER_PROFILE_ATTRIBUTE = "_sinposmart_duty_browser_profile"
+_DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH = Path("runtime_outputs") / "browser" / "browser_startup.jsonl"
+_DUTY_BROWSER_STARTUP_MESSAGE = (
+    "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
+    "一般 Chrome 不需關閉；若仍失敗請匯出問題包。"
+)
+
+
+class DutyBrowserStartupError(WebDriverException):
+    """Safe browser-start failure that carries no profile or credential details."""
+
+    def __init__(self, *, category: str, attempts: int, profiles_pruned: int) -> None:
+        super().__init__(_DUTY_BROWSER_STARTUP_MESSAGE)
+        self.diagnostic_category = category
+        self.attempts = attempts
+        self.profiles_pruned = profiles_pruned
+
+
+def duty_browser_profile_root() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "SinpoSmart" / "duty_browser_profiles"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def duty_browser_profile_dir() -> Path:
+    profile_dir = duty_browser_profile_root() / f"{_DUTY_BROWSER_PROFILE_PREFIX}{uuid4().hex}"
+    profile_dir.mkdir()
+    return profile_dir
+
+
+def _is_owned_duty_browser_profile(profile_dir: Path, *, root: Path | None = None) -> bool:
+    try:
+        profile_root = (Path(root) if root is not None else duty_browser_profile_root()).resolve()
+        candidate = Path(profile_dir).resolve()
+    except OSError:
+        return False
+    return candidate.parent == profile_root and candidate.name.startswith(_DUTY_BROWSER_PROFILE_PREFIX)
+
+
+def _active_duty_browser_profiles(root: Path, candidates: list[Path]) -> set[Path]:
+    """Return only owned profiles currently referenced by a Chrome process.
+
+    If Windows process inspection fails, return all candidates so cleanup fails
+    closed instead of risking a live browser profile.
+    """
+
+    if not candidates:
+        return set()
+    root_token = base64.b64encode(str(root).encode("utf-8")).decode("ascii")
+    script = (
+        "$target = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+        + root_token
+        + "')); Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'chrome.exe' -and $_.CommandLine -like \"*$target*\" } | "
+        "ForEach-Object { $_.CommandLine }"
+    )
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set(candidates)
+    if result.returncode:
+        return set(candidates)
+    command_lines = str(result.stdout or "").casefold()
+    return {candidate for candidate in candidates if str(candidate).casefold() in command_lines}
+
+
+def prune_stale_duty_browser_profiles(
+    *,
+    root: Path | None = None,
+    active_profiles: set[Path] | None = None,
+    now: float | None = None,
+    minimum_age_seconds: int = 600,
+    maximum_profiles: int = 12,
+) -> int:
+    """Bounded cleanup for old private profiles; never touches regular Chrome data."""
+
+    profile_root = Path(root) if root is not None else duty_browser_profile_root()
+    if not profile_root.is_dir() or maximum_profiles < 1:
+        return 0
+    current_time = time.time() if now is None else now
+    try:
+        candidates = [
+            item
+            for item in profile_root.iterdir()
+            if item.is_dir() and not item.is_symlink() and item.name.startswith(_DUTY_BROWSER_PROFILE_PREFIX)
+        ]
+    except OSError:
+        return 0
+    try:
+        candidates.sort(key=lambda item: item.stat().st_mtime)
+    except OSError:
+        return 0
+    active = active_profiles if active_profiles is not None else _active_duty_browser_profiles(profile_root, candidates)
+    removed = 0
+    for profile_dir in candidates:
+        if removed >= maximum_profiles or profile_dir in active:
+            continue
+        try:
+            age = current_time - profile_dir.stat().st_mtime
+        except OSError:
+            continue
+        if age < minimum_age_seconds or not _is_owned_duty_browser_profile(profile_dir, root=profile_root):
+            continue
+        try:
+            shutil.rmtree(profile_dir)
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
+def _write_duty_browser_startup_diagnostic(
+    event: str,
+    *,
+    category: str,
+    attempts: int,
+    profiles_pruned: int,
+) -> None:
+    """Persist a credential-free startup record for the QML issue package."""
+
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        "category": category,
+        "attempts": attempts,
+        "profiles_pruned": profiles_pruned,
+    }
+    output_path = Path(__file__).resolve().parent / _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def chrome_start_attempts() -> int:
+    try:
+        return max(1, min(int(os.environ.get("SELENIUM_CHROME_START_ATTEMPTS", "2")), 3))
+    except ValueError:
+        return 2
+
+
+def chrome_start_timeout_seconds() -> float:
+    try:
+        return max(float(os.environ.get("SELENIUM_CHROME_START_TIMEOUT_SECONDS", "20")), 1)
+    except ValueError:
+        return 20
+
+
+def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+    timed_out = threading.Event()
+
+    def start() -> None:
+        try:
+            service = ChromeService(
+                popen_kw={"creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+            )
+            driver = webdriver.Chrome(service=service, options=options)
+        except BaseException as exc:
+            if not timed_out.is_set():
+                result_queue.put(("error", exc))
+            return
+        if timed_out.is_set():
+            with suppress(Exception):
+                driver.quit()
+            return
+        result_queue.put(("driver", driver))
+
+    thread = threading.Thread(target=start, name="sinposmart-chrome-startup", daemon=True)
+    thread.start()
+    thread.join(chrome_start_timeout_seconds())
+    if thread.is_alive():
+        timed_out.set()
+        raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。")
+    kind, value = result_queue.get_nowait()
+    if kind == "error":
+        raise value
+    return value
+
+
+def cleanup_duty_browser_profile(profile_dir: Path, *, terminate_processes: bool = False) -> None:
+    """Remove exactly one program-owned profile, optionally ending its Chrome process."""
+
+    if not _is_owned_duty_browser_profile(profile_dir):
+        return
+    if terminate_processes:
+        profile_token = base64.b64encode(str(profile_dir).encode("utf-8")).decode("ascii")
+        script = (
+            "$target = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+            + profile_token
+            + "')); Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'chrome.exe' -and $_.CommandLine -like \"*$target*\" } | "
+            "Sort-Object ProcessId -Descending | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        with suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    with suppress(OSError):
+        shutil.rmtree(profile_dir)
+
+
+def cleanup_duty_browser_startup_failure(profile_dir: Path) -> None:
+    cleanup_duty_browser_profile(profile_dir, terminate_processes=True)
+
+
+def _browser_startup_failure_category(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "startup_timeout"
+    if isinstance(error, OSError):
+        return "os_startup"
+    return "webdriver_startup"
+
+
+def position_duty_browser_at_top_right(driver: webdriver.Chrome) -> None:
+    """Place a visible tool browser at the upper right of the primary display."""
+
+    if os.name != "nt":
+        return
+    try:
+        screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+        browser_width = int(driver.get_window_size().get("width", 1280))
+        driver.set_window_position(max(0, screen_width - browser_width), 0)
+    except (AttributeError, OSError, TypeError, ValueError, WebDriverException):
+        return
+
+
+def build_driver(
+    headless: bool,
+    option_arguments: tuple[str, ...] = (),
+    page_load_strategy: str = "",
+) -> webdriver.Chrome:
+    attempts = chrome_start_attempts()
+    profiles_pruned = prune_stale_duty_browser_profiles()
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        profile_dir = duty_browser_profile_dir()
+        options = Options()
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--window-size=1280,900")
+        for argument in option_arguments:
+            options.add_argument(argument)
+        if page_load_strategy:
+            options.page_load_strategy = page_load_strategy
+        try:
+            driver = create_webdriver_chrome_with_timeout(options)
+        except (OSError, TimeoutError, WebDriverException) as exc:
+            last_error = exc
+            cleanup_duty_browser_startup_failure(profile_dir)
+            if attempt < attempts:
+                time.sleep(1)
+                continue
+            category = _browser_startup_failure_category(exc)
+            _write_duty_browser_startup_diagnostic(
+                "startup_failed",
+                category=category,
+                attempts=attempts,
+                profiles_pruned=profiles_pruned,
+            )
+            raise DutyBrowserStartupError(
+                category=category,
+                attempts=attempts,
+                profiles_pruned=profiles_pruned,
+            ) from exc
+        break
+    else:
+        category = _browser_startup_failure_category(last_error or WebDriverException())
+        _write_duty_browser_startup_diagnostic(
+            "startup_failed",
+            category=category,
+            attempts=attempts,
+            profiles_pruned=profiles_pruned,
+        )
+        raise DutyBrowserStartupError(
+            category=category,
+            attempts=attempts,
+            profiles_pruned=profiles_pruned,
+        ) from last_error
     try:
         driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
     except Exception:
@@ -2644,6 +3026,16 @@ def build_driver(headless: bool) -> webdriver.Chrome:
         driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
     except Exception:
         pass
+    if not headless and not any(argument.startswith("--window-position=") for argument in option_arguments):
+        position_duty_browser_at_top_right(driver)
+    setattr(driver, _DUTY_BROWSER_PROFILE_ATTRIBUTE, str(profile_dir))
+    if profiles_pruned or attempt > 1:
+        _write_duty_browser_startup_diagnostic(
+            "startup_recovered",
+            category="recovered",
+            attempts=attempt,
+            profiles_pruned=profiles_pruned,
+        )
     return driver
 
 

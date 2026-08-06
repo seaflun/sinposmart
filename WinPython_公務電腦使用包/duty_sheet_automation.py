@@ -165,7 +165,7 @@ def load_legacy_module(project_dir: Path) -> ModuleType:
     return module
 
 
-def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
+def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, on_stage: Callable[[str], None] | None = None) -> ctk.CTkToplevel | None:
     existing = getattr(parent, "_duty_sheet_dialog", None)
     if existing is not None:
         try:
@@ -543,7 +543,12 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
         except tk.TclError:
             pass
 
+    def report_stage(stage: str) -> None:
+        if on_stage is not None:
+            on_stage(stage)
+
     def run_automation() -> None:
+        report_stage("preflight")
         uid = user_var.get().strip()
         pwd = password_var.get()
         excel_path = file_var.get().strip()
@@ -586,7 +591,14 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
                         car_options=opts,
                         hidden_car_options=hidden_opts,
                     )
-                    automation_result = legacy.start_automation(uid, pwd, target_date, excel_path, cars_config)
+                    automation_result = legacy.start_automation(
+                        uid,
+                        pwd,
+                        target_date,
+                        excel_path,
+                        cars_config,
+                        stage_callback=report_stage,
+                    )
                 if automation_result is False:
                     error = "勤務表檢查未通過，已停止登打。"
                     if on_error is not None:

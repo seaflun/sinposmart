@@ -59,7 +59,8 @@ $alwaysSkipFiles = @(
     "daily_vehicle_legacy/.env"
 )
 $preserveIfExistsFiles = @(
-    "rest_time_automation_config.json"
+    "rest_time_automation_config.json",
+    "work_log_defaults.json"
 )
 $skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token", ".jsonl")
 
@@ -98,26 +99,27 @@ function Get-RunningDutyGuiProcesses {
 }
 
 function Send-UpdateLogoutEvent {
-    $client = $null
-    $stream = $null
-    $asyncResult = $null
+    $pipe = $null
+    $readResult = $null
     try {
-        $client = [System.Net.Sockets.TcpClient]::new()
-        $asyncResult = $client.BeginConnect("127.0.0.1", 47631, $null, $null)
-        if (-not $asyncResult.AsyncWaitHandle.WaitOne(1500)) {
-            Write-Warning "Could not report update logout: command server timeout."
-            return $false
-        }
-
-        $client.EndConnect($asyncResult)
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 5000
-        $stream.WriteTimeout = 5000
+        $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+            ".",
+            "TYFD.SinpoSmart.DutyAutomation.Qt",
+            [System.IO.Pipes.PipeDirection]::InOut,
+            [System.IO.Pipes.PipeOptions]::Asynchronous
+        )
+        $pipe.Connect(1500)
         $bytes = [System.Text.Encoding]::UTF8.GetBytes("update_logout`n")
-        $stream.Write($bytes, 0, $bytes.Length)
+        $pipe.Write($bytes, 0, $bytes.Length)
+        $pipe.Flush()
 
         $buffer = New-Object byte[] 64
-        $count = $stream.Read($buffer, 0, $buffer.Length)
+        $readResult = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+        if (-not $readResult.AsyncWaitHandle.WaitOne(1500)) {
+            Write-Warning "Could not confirm update logout: command server timeout."
+            return $false
+        }
+        $count = $pipe.EndRead($readResult)
         if ($count -gt 0) {
             $response = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count).Trim()
             Write-Host "Update logout event: $response"
@@ -127,14 +129,11 @@ function Send-UpdateLogoutEvent {
         Write-Warning "Could not report update logout: $_"
         return $false
     } finally {
-        if ($stream) {
-            $stream.Dispose()
+        if ($readResult -and $readResult.AsyncWaitHandle) {
+            $readResult.AsyncWaitHandle.Dispose()
         }
-        if ($client) {
-            $client.Close()
-        }
-        if ($asyncResult -and $asyncResult.AsyncWaitHandle) {
-            $asyncResult.AsyncWaitHandle.Dispose()
+        if ($pipe) {
+            $pipe.Dispose()
         }
     }
 }
@@ -161,24 +160,27 @@ function Stop-RunningDutyGui {
 function Start-DutyGui {
     $entrypoint = Join-Path $packageDir "duty_gui.pyw"
     if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
-        $entrypoint = Join-Path $packageDir "duty_gui.py"
-    }
-    if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
-        Write-Warning "Could not restart app because duty_gui.pyw/duty_gui.py was not found."
+        Write-Warning "Could not restart app because the PySide6/QML entrypoint duty_gui.pyw was not found."
         return
     }
 
     $finder = Join-Path $packageDir "find_winpython.ps1"
-    $pythonw = ""
+    $python = ""
     if (Test-Path -LiteralPath $finder -PathType Leaf) {
-        $pythonw = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder -Windowed | Select-Object -First 1)
+        $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
     }
-    if (-not $pythonw) {
-        Write-Warning "Could not restart app because WinPython pythonw.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
+    if (-not $python) {
+        Write-Warning "Could not restart app because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
         return
     }
 
-    Start-Process -FilePath $pythonw -ArgumentList "`"$entrypoint`"" -WorkingDirectory $packageDir
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $python
+    $startInfo.Arguments = [char]34 + $entrypoint + [char]34
+    $startInfo.WorkingDirectory = $packageDir
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
     Write-Host "Restarted SinpoSmart app."
 }
 
@@ -291,6 +293,10 @@ function New-PackageBackup {
         "requirements.txt",
         "work_log_defaults.json"
     )
+    $backupDirectories = @(
+        "app_core",
+        "qt_app"
+    )
 
     $copied = 0
     foreach ($relative in $backupFiles) {
@@ -311,11 +317,33 @@ function New-PackageBackup {
         $copied += 1
     }
 
+    foreach ($relativeDirectory in $backupDirectories) {
+        $sourceDirectory = Join-Path $SourceDir $relativeDirectory
+        if (-not (Test-Path -LiteralPath $sourceDirectory -PathType Container)) {
+            continue
+        }
+        $sourceRoot = $SourceDir.TrimEnd([char]92) + [string][char]92
+        foreach ($sourceFile in @(Get-ChildItem -LiteralPath $sourceDirectory -Recurse -File -Force)) {
+            $relative = $sourceFile.FullName.Substring($sourceRoot.Length)
+            if (Test-SkipPackagePath -RelativePath $relative) {
+                continue
+            }
+            $target = Join-Path $StageDir $relative
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $sourceFile.FullName -Destination $target -Force
+            $copied += 1
+        }
+    }
+
     $manifestPath = Join-Path $StageDir "backup-manifest.txt"
     @(
         "Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
         "Source: $SourceDir",
         "Files: $copied",
+        "Directories: $($backupDirectories -join ', ')",
         "",
         ($backupFiles -join [Environment]::NewLine)
     ) | Set-Content -LiteralPath $manifestPath -Encoding UTF8
@@ -379,13 +407,80 @@ try {
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
 
     $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.py") } |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.pyw") } |
         Select-Object -First 1 -ExpandProperty FullName
-    if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.py"))) {
+    if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.pyw"))) {
         $sourceDir = $extractDir
     }
     if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
         throw "Update zip does not contain a valid package folder."
+    }
+
+    $requiredQtPackageFiles = @(
+        "duty_gui.pyw",
+        "qt_app\main.py",
+        "qt_app\qml\Main.qml",
+        "qt_app\qml\components\AppleButton.qml",
+        "qt_app\qml\components\AppleCheckBox.qml",
+        "qt_app\qml\components\AppleComboBox.qml",
+        "qt_app\qml\components\AppleDialog.qml",
+        "qt_app\qml\components\AppleTabButton.qml",
+        "qt_app\qml\components\AppleTextArea.qml",
+        "qt_app\qml\components\AppleTextField.qml",
+        "qt_app\qml\components\AuditSummaryCard.qml",
+        "qt_app\qml\components\DataSectionTitle.qml",
+        "qt_app\qml\components\DataTableCell.qml",
+        "qt_app\qml\components\DangerButton.qml",
+        "qt_app\qml\components\DutyActionButton.qml",
+        "qt_app\qml\components\DutyTaskCard.qml",
+        "qt_app\qml\components\DutyTaskStatusPill.qml",
+        "qt_app\qml\components\FormFieldTitle.qml",
+        "qt_app\qml\components\PrimaryButton.qml",
+        "qt_app\qml\components\SettingsButton.qml",
+        "qt_app\qml\components\StrongHeaderTitle.qml",
+        "qt_app\qml\components\ToolAddButton.qml",
+        "qt_app\qml\components\ToolBrowseButton.qml",
+        "qt_app\qml\components\ToolCloseButton.qml",
+        "qt_app\qml\components\ToolDateStepButton.qml",
+        "qt_app\qml\components\ToolFieldLabel.qml",
+        "qt_app\qml\components\ToolFormCard.qml",
+        "qt_app\qml\components\ToolMonthCombo.qml",
+        "qt_app\qml\components\ToolPanelContent.qml",
+        "qt_app\qml\components\ToolPanelHeader.qml",
+        "qt_app\qml\components\ToolPanelTitle.qml",
+        "qt_app\qml\components\ToolRemoveButton.qml",
+        "qt_app\qml\components\ToolRunButton.qml",
+        "qt_app\qml\components\ToolSectionTitle.qml",
+        "qt_app\qml\components\ToolSidePanel.qml",
+        "qt_app\qml\components\ToolStatusBar.qml",
+        "qt_app\qml\components\WorkLogValueControl.qml",
+        "qt_app\qml\components\qmldir",
+        "qt_app\qml\dialogs\AccountManagerWindow.qml",
+        "qt_app\qml\dialogs\RescueVideoWindow.qml",
+        "qt_app\qml\dialogs\ActionConfirmations.qml",
+        "qt_app\qml\dialogs\qmldir",
+        "qt_app\qml\pages\DutySheetToolPanel.qml",
+        "qt_app\qml\pages\RestTimeToolPanel.qml",
+        "qt_app\qml\pages\MonthlyBaseToolPanel.qml",
+        "qt_app\qml\pages\DailyVehicleToolPanel.qml",
+        "qt_app\qml\pages\AuditFilterPanel.qml",
+        "qt_app\qml\pages\WorkLogSettingsPanel.qml",
+        "qt_app\qml\pages\DutyQuickToolsPanel.qml",
+        "qt_app\qml\pages\DutyOperationBar.qml",
+        "qt_app\qml\pages\DutyTaskArea.qml",
+        "qt_app\qml\pages\SessionHeader.qml",
+        "qt_app\qml\pages\qmldir",
+        "qt_app\qml\styles\Design.qml",
+        "qt_app\qml\styles\qmldir",
+        "qt_app\workers\operational_sync_worker.py",
+        "app_core\operational_sync_service.py",
+        "app_core\credential_repository.py"
+    )
+    foreach ($relative in $requiredQtPackageFiles) {
+        $requiredPath = Join-Path $sourceDir $relative
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "Update zip is missing required PySide6/QML file: $relative"
+        }
     }
 
     $packageVersionPath = Join-Path $sourceDir "VERSION.txt"

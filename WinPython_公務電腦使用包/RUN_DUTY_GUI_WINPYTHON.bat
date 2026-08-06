@@ -15,4 +15,5 @@ if not defined PYTHONW_EXE (
   exit /b 1
 )
 
-start "" "%PYTHONW_EXE%" "%~dp0duty_gui.pyw"
+start "" /b "%PYTHONW_EXE%" "%~dp0duty_gui.pyw"
+exit /b 0
