@@ -285,8 +285,12 @@ ApplicationWindow {
             actionConfirmations.openUpdateConfirmation()
         }
 
+        function onCheckCompleted(message) {
+            actionConfirmations.openUpdateStatus(message)
+        }
+
         function onErrorOccurred(message) {
-            window.showAppError(message)
+            actionConfirmations.openUpdateStatus(message)
         }
     }
 

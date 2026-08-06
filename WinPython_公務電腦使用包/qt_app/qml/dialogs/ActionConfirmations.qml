@@ -6,6 +6,7 @@ Item {
     id: actionConfirmations
     required property var hostWindow
     required property var backend
+    property string updateStatusText: ""
 
     anchors.fill: parent
 
@@ -27,6 +28,11 @@ Item {
 
     function openUpdateConfirmation() {
         updateConfirmation.open()
+    }
+
+    function openUpdateStatus(message) {
+        updateStatusText = String(message || "檢查更新完成。")
+        updateStatusDialog.open()
     }
 
     AppleDialog {
@@ -62,6 +68,22 @@ Item {
         Label {
             width: parent.width
             text: "將開啟更新視窗。更新程式可能關閉背景程式、安裝需求套件並重新啟動 SinpoSmart，是否繼續？"
+            color: actionConfirmations.hostWindow.ink
+            wrapMode: Text.Wrap
+        }
+    }
+
+    AppleDialog {
+        id: updateStatusDialog
+        anchors.centerIn: parent
+        width: Math.min(actionConfirmations.hostWindow.width - 72, 460)
+        modal: true
+        title: "檢查更新"
+        standardButtons: Dialog.Close
+
+        Label {
+            width: parent.width
+            text: actionConfirmations.updateStatusText
             color: actionConfirmations.hostWindow.ink
             wrapMode: Text.Wrap
         }

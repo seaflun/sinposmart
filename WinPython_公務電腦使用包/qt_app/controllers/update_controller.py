@@ -32,6 +32,7 @@ class UpdateController(QObject):
     stateChanged = Signal()
     errorOccurred = Signal(str)
     updateReady = Signal(str)
+    checkCompleted = Signal(str)
 
     def __init__(
         self,
@@ -133,6 +134,8 @@ class UpdateController(QObject):
         self.stateChanged.emit()
         if info.update_available:
             self.updateReady.emit(info.latest_version)
+        else:
+            self.checkCompleted.emit(self._status_text)
 
     @Slot(int, str)
     def _check_failed(self, request_id: int, message: str) -> None:

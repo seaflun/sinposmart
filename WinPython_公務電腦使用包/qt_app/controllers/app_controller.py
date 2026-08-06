@@ -347,7 +347,7 @@ class AppController(QObject):
             trigger_type="update",
             actor_no=actor_no,
             user_id=user_id,
-            display_name=display_name,
+            display_name=self._operational_display_name(actor_no, display_name),
             content="更新前登出",
             immediate=True,
         )
@@ -1046,11 +1046,34 @@ class AppController(QObject):
             "display_name": self._session_controller.displayName,
         }
         event_fields.update(fields)
+        event_fields["display_name"] = self._operational_display_name(
+            str(event_fields.get("actor_no") or ""),
+            str(event_fields.get("display_name") or ""),
+        )
         self._start_operational_sync(
             "event",
             record_type=record_type,
             fields=event_fields,
         )
+
+    @staticmethod
+    def _operational_display_name(actor_no: str, display_name: str) -> str:
+        """Keep NAS login records in the single ``番號 姓名`` display format."""
+
+        actor = str(actor_no or "").strip().removesuffix("番").strip()
+        raw = str(display_name or "").strip()
+        if not actor:
+            match = re.match(r"^(\d+)\s*番(?:\s+|$)", raw)
+            if match is not None:
+                actor = match.group(1)
+        name = re.sub(r"^\s*\d+\s*番\s*", "", raw)
+        name = re.sub(
+            r"^(?:(?:副小隊長|小隊長|分隊長|副中隊長|中隊長|大隊長|隊員)\s+)+",
+            "",
+            name,
+        ).strip()
+        name = re.sub(r"\s+", " ", name)
+        return f"{actor}番 {name}".strip() if actor else name
 
     def _start_operational_sync(
         self,
@@ -1123,24 +1146,30 @@ class AppController(QObject):
 
     def _drain_queued_operational_sync(self) -> None:
         while self._operational_sync_queue:
-            request_id, operation, record_type, fields, schedule_data = (
+            _request_id, operation, record_type, fields, schedule_data = (
                 self._operational_sync_queue.popleft()
             )
-            worker = OperationalSyncWorker(
-                request_id,
-                self._operational_sync_service,
-                operation,
-                record_type=record_type,
-                fields=fields,
-                schedule_data=schedule_data,
-            )
-            thread = QThread(self)
-            worker.moveToThread(thread)
-            thread.started.connect(worker.run)
-            thread.start()
-            thread.quit()
-            thread.wait(60_000)
-            thread.deleteLater()
+            try:
+                if operation == "event":
+                    self._operational_sync_service.enqueue_event(
+                        record_type,
+                        **fields,
+                        immediate=True,
+                    )
+                elif operation == "board":
+                    sync_board = getattr(self._operational_sync_service, "sync_board", None)
+                    if callable(sync_board):
+                        sync_board(schedule_data)
+                    else:
+                        sync_board_async = getattr(
+                            self._operational_sync_service,
+                            "sync_board_async",
+                            None,
+                        )
+                        if callable(sync_board_async):
+                            sync_board_async(schedule_data)
+            except Exception as exc:
+                self._operational_sync_service.record_unhandled_failure(operation, exc)
 
     @Slot(object)
     def _enqueue_due_tasks(self, indices: list[int]) -> None:

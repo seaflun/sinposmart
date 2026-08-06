@@ -2886,7 +2886,7 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(launched, [script_path])
             self.assertIn("已開啟更新程式", controller.statusText)
 
-    def test_update_controller_emits_ready_signal_only_when_a_newer_version_exists(self) -> None:
+    def test_update_controller_emits_update_prompt_or_completed_status(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
         from app_core.update_repository import UpdateRepository, VersionInfo
@@ -2897,18 +2897,22 @@ class UpdateControllerTests(unittest.TestCase):
             version_path.write_text("2026.07.29.1000\n", encoding="utf-8")
             controller = UpdateController(UpdateRepository(version_path))
             ready_spy = QSignalSpy(controller.updateReady)
+            completed_spy = QSignalSpy(controller.checkCompleted)
 
             controller._check_succeeded(
                 0,
                 VersionInfo("2026.07.29.1000", "2026.07.29.1000", False),
             )
             self.assertEqual(ready_spy.count(), 0)
+            self.assertEqual(completed_spy.count(), 1)
+            self.assertEqual(completed_spy.at(0)[0], "目前已是最新版")
             controller._check_succeeded(
                 0,
                 VersionInfo("2026.07.29.1000", "2026.07.29.1100", True),
             )
             self.assertEqual(ready_spy.count(), 1)
             self.assertEqual(ready_spy.at(0)[0], "2026.07.29.1100")
+            self.assertEqual(completed_spy.count(), 1)
 
 
 class DiagnosticsServiceTests(unittest.TestCase):
@@ -3796,6 +3800,9 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("id: updateConfirmation", source)
         self.assertIn("function onUpdateReady(_latestVersion)", source)
         self.assertIn("actionConfirmations.openUpdateConfirmation()", source)
+        self.assertIn("function onCheckCompleted(message)", source)
+        self.assertIn("actionConfirmations.openUpdateStatus(message)", source)
+        self.assertIn("id: updateStatusDialog", source)
         self.assertIn("updateController.launchUpdate()", source)
         self.assertIn("dutyOperationBar.backend.exportIssuePackage()", source)
         self.assertIn("未返隊案件出勤估算", source)
@@ -6983,7 +6990,8 @@ if return_code != 0 or loaded:
         self.assertTrue(recorded)
         self.assertEqual(len(logout_events), 1)
         self.assertEqual(logout_events[0][0], "logout")
-        self.assertEqual(logout_events[0][1]["display_name"], "10番 隊員 測試員")
+        self.assertEqual(logout_events[0][1]["actor_no"], "10")
+        self.assertEqual(logout_events[0][1]["display_name"], "10番 測試員")
         self.assertEqual(len(operational_sync.events), 1)
         record_type, fields = operational_sync.events[0]
         self.assertEqual(record_type, "logout")
@@ -6991,8 +6999,44 @@ if return_code != 0 or loaded:
         self.assertEqual(fields["content"], "更新前登出")
         self.assertEqual(fields["actor_no"], "10")
         self.assertEqual(fields["user_id"], "user10")
-        self.assertEqual(fields["display_name"], "10番 隊員 測試員")
+        self.assertEqual(fields["display_name"], "10番 測試員")
         self.assertTrue(fields["immediate"])
+
+    def test_app_controller_persists_queued_logout_before_shutdown(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+        operational_sync = FakeOperationalSyncService()
+        controller = AppController(operational_sync_service=operational_sync)
+        controller._operational_sync_queue.append(
+            (
+                1,
+                "event",
+                "logout",
+                {
+                    "status": "ok",
+                    "trigger_type": "logout",
+                    "actor_no": "10",
+                    "user_id": "user10",
+                    "display_name": "10番 測試員",
+                },
+                {},
+            )
+        )
+        controller.shutdown()
+
+        self.assertEqual(len(operational_sync.events), 1)
+        record_type, fields = operational_sync.events[0]
+        self.assertEqual(record_type, "logout")
+        self.assertTrue(fields["immediate"])
+        self.assertEqual(fields["display_name"], "10番 測試員")
 
     def test_app_controller_uses_managed_qthreads_for_operational_sync(self) -> None:
         from PySide6.QtTest import QTest
