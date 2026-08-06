@@ -232,7 +232,8 @@ Rectangle {
                     Label {
                         Layout.preferredWidth: Design.auditTaskComparisonWidth
                         text: taskRow.comparisonText
-                        color: taskRow.statusTone === "triggered" ? Design.successText : Design.warningText
+                        color: taskRow.comparisonText === "尚未到點" ? Design.blueHover
+                             : taskRow.statusTone === "triggered" ? Design.successText : Design.warningText
                         font.bold: true
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideRight
@@ -261,7 +262,7 @@ Rectangle {
                     Label {
                         Layout.preferredWidth: Design.auditTaskSystemWidth
                         text: taskRow.systemText
-                        color: dutyTaskArea.hostWindow.accent
+                        color: taskRow.systemText === "出入" ? Design.blueHover : Design.success
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideRight
                     }

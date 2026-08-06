@@ -2290,6 +2290,108 @@ class PackageSmokeTests(unittest.TestCase):
         handoff_0800 = [action for action in actions if action.source == "值班交接" and action.time == "08:00"]
         self.assertEqual(handoff_0800, [])
 
+    def test_case_query_counts_two_unreturned_ambulances_at_2200_handoff(self) -> None:
+        module = duty_rehearsal_module()
+        two_people = "choose('" + "(^w^)" * 33 + "H01,L02')"
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+                return {
+                    "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
+                    "rows": [
+                        {
+                            "cells": ["緊急救護", "21:01:00", "21:03:00", "0001/01/01 00:00:00"],
+                            "personnel_source": two_people,
+                        },
+                        {
+                            "cells": ["緊急救護", "21:05:00", "21:07:00", "0001/01/01 00:00:00"],
+                            "personnel_source": two_people,
+                        },
+                    ],
+                }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
+            module.time, "sleep"
+        ):
+            cases = module.query_cases(Driver(), "1150806")
+
+        items = module.unreturned_case_vehicle_items(
+            cases,
+            dict(module.DEFAULT_WORK_LOG_DEFAULTS),
+            "1150806",
+            before_hour=22,
+        )
+
+        self.assertEqual([case.return_time for case in cases], ["", ""])
+        self.assertEqual(sum(item["count"] for item in items), 2)
+
+    def test_case_query_counts_four_person_ems_case_as_two_vehicles(self) -> None:
+        module = duty_rehearsal_module()
+        four_people = "choose('" + "(^w^)" * 33 + "H01,L02,H03,S04')"
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+                return {
+                    "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
+                    "rows": [{
+                        "cells": ["緊急救護", "21:01:00", "21:03:00", "0001/01/01 00:00:00"],
+                        "personnel_source": four_people,
+                    }],
+                }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
+            module.time, "sleep"
+        ):
+            cases = module.query_cases(Driver(), "1150806")
+
+        items = module.unreturned_case_vehicle_items(
+            cases,
+            dict(module.DEFAULT_WORK_LOG_DEFAULTS),
+            "1150806",
+            before_hour=22,
+        )
+
+        self.assertEqual(cases[0].personnel_count, 4)
+        self.assertEqual(items[0]["count"], 2)
+
+    def test_case_query_excludes_case_with_return_time_column_value(self) -> None:
+        module = duty_rehearsal_module()
+        four_people = "choose('" + "(^w^)" * 33 + "H01,L02,H03,S04')"
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+                return {
+                    "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
+                    "rows": [{
+                        "cells": ["緊急救護", "21:01:00", "21:03:00", "21:45:00"],
+                        "personnel_source": four_people,
+                    }],
+                }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
+            module.time, "sleep"
+        ):
+            cases = module.query_cases(Driver(), "1150806")
+
+        items = module.unreturned_case_vehicle_items(
+            cases,
+            dict(module.DEFAULT_WORK_LOG_DEFAULTS),
+            "1150806",
+            before_hour=22,
+        )
+
+        self.assertEqual(cases[0].return_time, "21:45:00")
+        self.assertEqual(items, [])
+
     def test_0800_handoff_uses_yesterday_2200_duty_when_today_0608_row_absent(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(

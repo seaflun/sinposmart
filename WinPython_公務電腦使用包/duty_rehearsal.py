@@ -125,6 +125,7 @@ class CaseRecord:
     return_time: str
     category: str
     raw: list[str]
+    personnel_count: int = 0
 
 
 @dataclass
@@ -167,6 +168,24 @@ def normalize_num(n: str) -> str:
 
 def is_fire_case_category(category: str) -> bool:
     return any(keyword in category for keyword in ("火警", "火災", "救災"))
+
+
+def case_return_time(value: str) -> str:
+    text = str(value or "").strip()
+    if re.search(r"(?:^|\D)0001[/-]0?1[/-]0?1(?:\D|$)", text):
+        return ""
+    times = re.findall(r"\d{1,2}:\d{2}:\d{2}", text)
+    return times[-1] if times else ""
+
+
+def case_personnel_count(button_onclick: str) -> int:
+    match = re.search(r"choose\('(?P<payload>.*)'\)", str(button_onclick or ""), re.DOTALL)
+    if not match:
+        return 0
+    fields = match.group("payload").split("(^w^)")
+    if len(fields) <= 33:
+        return 0
+    return len({code.strip() for code in fields[33].split(",") if code.strip()})
 
 
 DEFAULT_WORK_LOG_DEFAULTS: dict[str, Any] = {
@@ -225,7 +244,7 @@ def default_case_vehicle_count(case: CaseRecord, settings: dict[str, Any]) -> in
     if is_fire_case_category(case.category):
         return 2
     if "緊急救護" in case.category:
-        return 1
+        return 2 if case.personnel_count >= 4 else 1
     return 0
 
 
@@ -1771,40 +1790,53 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
     js_set(driver, "_selETIMEM", "59")
     js_click(driver, "_btnQuery")
     time.sleep(1.5)
-    rows = driver.execute_script(
-        """
-        const textParts = (el) => {
-          const parts = [];
-          const push = (value) => {
-            value = (value || '').trim();
-            if (value && !parts.includes(value)) parts.push(value);
-          };
-          push(el.innerText);
-          push(el.textContent);
-          push(el.getAttribute('title'));
-          push(el.getAttribute('value'));
-          el.querySelectorAll('*').forEach(child => {
-            push(child.innerText);
-            push(child.textContent);
-            push(child.getAttribute('title'));
-            push(child.getAttribute('value'));
-            push(child.value);
-          });
-          return parts.join(' ');
-        };
-        return Array.from(document.querySelectorAll('tr')).map(tr =>
-          Array.from(tr.children).map(td => textParts(td)).filter(Boolean)
-        ).filter(row => row.length >= 3);
+    captured_table = driver.execute_script(
+        r"""
+        const text = (element) => (element.innerText || element.textContent || element.value || '').trim();
+        const tables = Array.from(document.querySelectorAll('table'));
+        for (const table of tables) {
+          const rows = Array.from(table.querySelectorAll('tr')).map(tr => ({
+            cells: Array.from(tr.children).map(text),
+            personnel_source: tr.querySelector("input[id^='_btnChoose']")?.getAttribute('onclick') || '',
+          }));
+          const matrix = rows.map(row => row.cells);
+          const headers = matrix.find(row => row.some(cell => /返隊/.test(cell))) || [];
+          if (headers.length && matrix.some(row => row.some(cell => /\d{1,2}:\d{2}:\d{2}/.test(cell)))) {
+            return {
+              headers,
+              rows: rows.filter(row => row.cells !== headers && row.cells.filter(Boolean).length >= 3),
+            };
+          }
+        }
+        return {headers: [], rows: []};
         """
     )
+    headers = captured_table.get("headers", []) if isinstance(captured_table, dict) else []
+    rows = captured_table.get("rows", []) if isinstance(captured_table, dict) else []
+    headers = [str(value or "") for value in headers] if isinstance(headers, list) else []
+    rows = rows if isinstance(rows, list) else []
+    return_column = next(
+        (index for index, header in enumerate(headers) if "返隊" in re.sub(r"\s+", "", header)),
+        None,
+    )
+    if return_column is None:
+        raise RuntimeError("案件查詢結果缺少返隊時間欄位。")
     cases: list[CaseRecord] = []
-    for row in rows:
+    for captured_row in rows:
+        if not isinstance(captured_row, dict):
+            continue
+        row_values = captured_row.get("cells", [])
+        if not isinstance(row_values, list):
+            continue
+        row = [str(value or "") for value in row_values]
+        personnel_count = case_personnel_count(captured_row.get("personnel_source", ""))
         joined = " ".join(row)
         if is_test_case_row(row):
             continue
         if not re.search(r"\d{1,2}:\d{2}:\d{2}", joined):
             continue
         times = re.findall(r"\d{1,2}:\d{2}:\d{2}", joined)
+        return_time = case_return_time(row[return_column]) if return_column < len(row) else ""
         category = ""
         for cell in row:
             if "緊急救護" in cell or is_fire_case_category(cell):
@@ -1813,9 +1845,10 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
         cases.append(
             CaseRecord(
                 report_time=times[0] if times else "",
-                return_time=times[-1] if len(times) > 1 else "",
+                return_time=return_time,
                 category=category,
                 raw=row,
+                personnel_count=personnel_count,
             )
         )
     return cases

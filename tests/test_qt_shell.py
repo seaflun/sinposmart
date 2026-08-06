@@ -4239,6 +4239,14 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("AppleButton {", (components_path / "DutyActionButton.qml").read_text(encoding="utf-8"))
         self.assertLess(source.index("DutyOperationBar {"), source.index("DutyTaskArea {"))
         self.assertIn("DutyTaskStatusPill {", task_delegate)
+        self.assertIn(
+            'color: taskRow.comparisonText === "尚未到點" ? Design.blueHover',
+            task_area,
+        )
+        self.assertEqual(
+            task_area.count('color: taskRow.systemText === "出入" ? Design.blueHover : Design.success'),
+            2,
+        )
         self.assertIn("selectedTaskCount > 0", action_row)
         self.assertEqual(
             action_row.count(
