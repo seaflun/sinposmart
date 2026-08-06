@@ -14,8 +14,14 @@ Window {
     property string pendingAccountLabel: ""
     objectName: "accountManagerWindow"
     visible: false
-    readonly property int accountCardWidth: 280
-    readonly property int dialogWidth: 44 + columnCount * accountCardWidth + Math.max(0, columnCount - 1) * 8
+    readonly property int windowMargin: 16
+    readonly property int preferredAccountCardWidth: 280
+    readonly property int naturalDialogWidth: 44 + columnCount * preferredAccountCardWidth + Math.max(0, columnCount - 1) * 8
+    readonly property int naturalDialogHeight: Design.appTitleBarHeight + 162 + naturalListHeight
+    readonly property int workAreaWidth: screen ? screen.desktopAvailableWidth : naturalDialogWidth + 2 * windowMargin
+    readonly property int workAreaHeight: screen ? screen.desktopAvailableHeight : naturalDialogHeight + 2 * windowMargin
+    readonly property int dialogWidth: Math.min(naturalDialogWidth, Math.max(1, workAreaWidth - 2 * windowMargin))
+    readonly property int accountCardWidth: Math.floor((dialogWidth - 44 - Math.max(0, columnCount - 1) * 8) / columnCount)
     readonly property int contentHeight: 162 + listHeight
     readonly property int dialogHeight: Design.appTitleBarHeight + contentHeight
     width: dialogWidth
@@ -33,12 +39,48 @@ Window {
     readonly property int accountCount: accountRepeater.count
     readonly property int columnCount: Math.max(2, Math.ceil(accountCount / 15))
     readonly property int maximumRows: Math.min(15, accountCount)
-    readonly property int listHeight: Math.max(60, maximumRows * 48 + 4)
+    readonly property int naturalListHeight: Math.max(60, maximumRows * 48 + 4)
+    readonly property int maximumListHeight: Math.max(
+            60,
+            workAreaHeight - 2 * windowMargin - Design.appTitleBarHeight - 162
+        )
+    readonly property int listHeight: Math.min(naturalListHeight, maximumListHeight)
+
+    function positionInAvailableWorkArea() {
+        if (!screen)
+            return
+        const availableX = screen.virtualX
+        const availableY = screen.virtualY
+        const availableWidth = screen.desktopAvailableWidth
+        const availableHeight = screen.desktopAvailableHeight
+        const maximumX = availableX + Math.max(windowMargin, availableWidth - width - windowMargin)
+        const maximumY = availableY + Math.max(windowMargin, availableHeight - height - windowMargin)
+        x = Math.max(availableX + windowMargin, Math.min(
+                    availableX + Math.round((availableWidth - width) / 2), maximumX))
+        y = Math.max(availableY + windowMargin, Math.min(
+                    availableY + Math.round((availableHeight - height) / 2), maximumY))
+    }
 
     function open() {
         show()
+        Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
         raise()
         requestActivate()
+    }
+
+    onVisibleChanged: {
+        if (visible)
+            Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
+    }
+
+    onWidthChanged: {
+        if (visible)
+            Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
+    }
+
+    onHeightChanged: {
+        if (visible)
+            Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
     }
 
     Rectangle {
@@ -152,72 +194,84 @@ Window {
             anchors.topMargin: 10
             height: accountManagerWindow.listHeight
 
-            GridLayout {
-                id: accountGrid
-                objectName: "savedAccountGrid"
+            Flickable {
+                id: accountListViewport
+                objectName: "savedAccountViewport"
                 anchors.fill: parent
-                columns: accountManagerWindow.columnCount
-                rows: Math.max(1, accountManagerWindow.maximumRows)
-                columnSpacing: 8
-                rowSpacing: 6
+                contentWidth: width
+                contentHeight: accountGrid.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+                ScrollBar.vertical: ScrollBar { }
 
-                Repeater {
-                    id: accountRepeater
-                    model: accountManagerWindow.sessionController.savedAccountsModel
+                GridLayout {
+                    id: accountGrid
+                    objectName: "savedAccountGrid"
+                    width: accountListViewport.width
+                    columns: accountManagerWindow.columnCount
+                    rows: Math.max(1, accountManagerWindow.maximumRows)
+                    columnSpacing: 8
+                    rowSpacing: 6
 
-                    delegate: Rectangle {
-                        id: savedAccountRow
-                        required property int index
-                        required property string identity
-                        required property string label
-                        Layout.row: index % 15
-                        Layout.column: Math.floor(index / 15)
-                        Layout.preferredWidth: accountManagerWindow.accountCardWidth
-                        Layout.preferredHeight: 42
-                        radius: Design.radius
-                        color: Design.panel
-                        border.color: Design.border
+                    Repeater {
+                        id: accountRepeater
+                        model: accountManagerWindow.sessionController.savedAccountsModel
 
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 10
-                            anchors.rightMargin: 10
-                            spacing: 8
+                        delegate: Rectangle {
+                            id: savedAccountRow
+                            required property int index
+                            required property string identity
+                            required property string label
+                            Layout.row: index % 15
+                            Layout.column: Math.floor(index / 15)
+                            Layout.preferredWidth: accountManagerWindow.accountCardWidth
+                            Layout.preferredHeight: 42
+                            radius: Design.radius
+                            color: Design.panel
+                            border.color: Design.border
 
-                            AppleButton {
-                                objectName: "savedAccountDeleteButton"
-                                implicitWidth: 28
-                                implicitHeight: 28
-                                leftPadding: 0
-                                rightPadding: 0
-                                text: "X"
-                                tone: "danger"
-                                onClicked: {
-                                    accountManagerWindow.pendingAccountIdentity = savedAccountRow.identity
-                                    accountManagerWindow.pendingAccountLabel = savedAccountRow.label
-                                    accountDeleteConfirmation.open()
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                spacing: 8
+
+                                AppleButton {
+                                    objectName: "savedAccountDeleteButton"
+                                    implicitWidth: 28
+                                    implicitHeight: 28
+                                    leftPadding: 0
+                                    rightPadding: 0
+                                    text: "X"
+                                    tone: "danger"
+                                    onClicked: {
+                                        accountManagerWindow.pendingAccountIdentity = savedAccountRow.identity
+                                        accountManagerWindow.pendingAccountLabel = savedAccountRow.label
+                                        accountDeleteConfirmation.open()
+                                    }
                                 }
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: savedAccountRow.label
-                                color: Design.text
-                                font.pixelSize: Design.bodySize
-                                elide: Text.ElideRight
-                            }
-                            AppleButton {
-                                objectName: "savedAccountSelectButton"
-                                implicitWidth: 56
-                                implicitHeight: 28
-                                leftPadding: 8
-                                rightPadding: 8
-                                text: "選擇"
-                                tone: "infoStrong"
-                                onClicked: {
-                                    accountManagerWindow.sessionController.selectSavedAccount(
-                                        savedAccountRow.identity
-                                    )
-                                    accountManagerWindow.close()
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: savedAccountRow.label
+                                    color: Design.text
+                                    font.pixelSize: Design.bodySize
+                                    elide: Text.ElideRight
+                                }
+                                AppleButton {
+                                    objectName: "savedAccountSelectButton"
+                                    implicitWidth: 56
+                                    implicitHeight: 28
+                                    leftPadding: 8
+                                    rightPadding: 8
+                                    text: "選擇"
+                                    tone: "infoStrong"
+                                    onClicked: {
+                                        accountManagerWindow.sessionController.selectSavedAccount(
+                                            savedAccountRow.identity
+                                        )
+                                        accountManagerWindow.close()
+                                    }
                                 }
                             }
                         }

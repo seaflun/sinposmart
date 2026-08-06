@@ -3511,6 +3511,10 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('columnCount: Math.max(2, Math.ceil(accountCount / 15))', account_manager)
         self.assertIn('Layout.row: index % 15', account_manager)
         self.assertIn('Layout.preferredWidth: accountManagerWindow.accountCardWidth', account_manager)
+        self.assertIn('function positionInAvailableWorkArea()', account_manager)
+        self.assertIn('Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)', account_manager)
+        self.assertIn('maximumListHeight', account_manager)
+        self.assertIn('objectName: "savedAccountViewport"', account_manager)
         self.assertIn('objectName: "loginStatusLabel"', source)
         self.assertIn('objectName: "loggedInStatusLabel"', source)
         logged_in_status = session_header.split('objectName: "loggedInStatusLabel"', 1)[1].split(
@@ -7433,6 +7437,8 @@ if return_code != 0 or loaded:
                     if candidate.objectName() == "accountManagerWindow"
                 )
                 self.assertFalse(account_window.isVisible())
+                account_window.setX(-5000)
+                account_window.setY(-5000)
 
                 point = account_button.mapToScene(
                     QPointF(account_button.width() / 2, account_button.height() / 2)
@@ -7447,8 +7453,21 @@ if return_code != 0 or loaded:
                 self.assertEqual(account_window.title(), "SinpoSmart - 帳號管理")
                 self.assertEqual(title_bar_requests, [])
                 self.assertEqual(account_window.property("accountCount"), 16)
-                self.assertEqual(account_window.width(), 612)
-                self.assertEqual(account_window.height(), 918)
+                account_screen = account_window.screen()
+                self.assertIsNotNone(account_screen)
+                account_available_area = account_screen.availableGeometry()
+                self.assertLessEqual(account_window.width(), account_available_area.width() - 32)
+                self.assertLessEqual(account_window.height(), account_available_area.height() - 32)
+                self.assertGreaterEqual(account_window.x(), account_available_area.x() + 16)
+                self.assertGreaterEqual(account_window.y(), account_available_area.y() + 16)
+                self.assertLessEqual(
+                    account_window.x() + account_window.width(),
+                    account_available_area.x() + account_available_area.width() - 16,
+                )
+                self.assertLessEqual(
+                    account_window.y() + account_window.height(),
+                    account_available_area.y() + account_available_area.height() - 16,
+                )
                 self.assertEqual(root.width(), 550)
                 self.assertEqual(root.height(), 352)
 
@@ -7474,6 +7493,7 @@ if return_code != 0 or loaded:
                 self.assertIsNotNone(title_bar)
                 self.assertIsNotNone(title_close_button)
                 self.assertIsNotNone(saved_account_grid)
+                self.assertIsNotNone(find_visual_item(account_content, "savedAccountViewport"))
                 self.assertEqual(account_window.property("columnCount"), 2)
                 self.assertEqual(saved_account_grid.property("columns"), 2)
                 self.assertEqual((title_close_button.width(), title_close_button.height()), (40, 32))
