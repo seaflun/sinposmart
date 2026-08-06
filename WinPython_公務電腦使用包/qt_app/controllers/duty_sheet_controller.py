@@ -88,6 +88,16 @@ class DutySheetController(QObject):
     def notificationEnabled(self) -> bool:
         return self._notification_enabled
 
+    @Slot(bool)
+    def setNotificationEnabled(self, enabled: bool) -> None:
+        """Keep the screenshot-notification choice as the QML source of truth."""
+
+        enabled = bool(enabled)
+        if enabled == self._notification_enabled:
+            return
+        self._notification_enabled = enabled
+        self.stateChanged.emit()
+
     @Property(str, notify=stateChanged)
     def statusText(self) -> str:
         return self._status_text

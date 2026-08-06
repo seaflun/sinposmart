@@ -34,6 +34,7 @@ from app_core.login_verifier import (
 from app_core.schedule_capture_service import ScheduleCaptureService
 from app_core.scheduled_folder_service import ScheduledFolderService
 from qt_app.controllers.app_controller import AppController
+from qt_app.controllers.tray_controller import configure_windows_notification_identity
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -253,6 +254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     startup_smoke = STARTUP_SMOKE_ARG in arguments
     if not startup_smoke:
         load_package_env()
+    configure_windows_notification_identity()
     app = QApplication(arguments)
     app.setApplicationName("SinpoSmart")
     app.setApplicationDisplayName("SinpoSmart")

@@ -14,7 +14,8 @@ Window {
     property string pendingAccountLabel: ""
     objectName: "accountManagerWindow"
     visible: false
-    readonly property int dialogWidth: 44 + columnCount * 196 + Math.max(0, columnCount - 1) * 8
+    readonly property int accountCardWidth: 280
+    readonly property int dialogWidth: 44 + columnCount * accountCardWidth + Math.max(0, columnCount - 1) * 8
     readonly property int contentHeight: 162 + listHeight
     readonly property int dialogHeight: Design.appTitleBarHeight + contentHeight
     width: dialogWidth
@@ -30,8 +31,8 @@ Window {
     transientParent: hostWindow
 
     readonly property int accountCount: accountRepeater.count
-    readonly property int columnCount: Math.max(1, Math.ceil(accountCount / 12))
-    readonly property int maximumRows: Math.min(12, accountCount)
+    readonly property int columnCount: Math.max(2, Math.ceil(accountCount / 15))
+    readonly property int maximumRows: Math.min(15, accountCount)
     readonly property int listHeight: Math.max(60, maximumRows * 48 + 4)
 
     function open() {
@@ -152,6 +153,8 @@ Window {
             height: accountManagerWindow.listHeight
 
             GridLayout {
+                id: accountGrid
+                objectName: "savedAccountGrid"
                 anchors.fill: parent
                 columns: accountManagerWindow.columnCount
                 rows: Math.max(1, accountManagerWindow.maximumRows)
@@ -167,9 +170,9 @@ Window {
                         required property int index
                         required property string identity
                         required property string label
-                        Layout.row: index % 12
-                        Layout.column: Math.floor(index / 12)
-                        Layout.preferredWidth: 196
+                        Layout.row: index % 15
+                        Layout.column: Math.floor(index / 15)
+                        Layout.preferredWidth: accountManagerWindow.accountCardWidth
                         Layout.preferredHeight: 42
                         radius: Design.radius
                         color: Design.panel
@@ -177,13 +180,13 @@ Window {
 
                         RowLayout {
                             anchors.fill: parent
-                            anchors.leftMargin: 7
-                            anchors.rightMargin: 7
-                            spacing: 5
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            spacing: 8
 
                             AppleButton {
                                 objectName: "savedAccountDeleteButton"
-                                implicitWidth: 26
+                                implicitWidth: 28
                                 implicitHeight: 28
                                 leftPadding: 0
                                 rightPadding: 0
@@ -204,10 +207,10 @@ Window {
                             }
                             AppleButton {
                                 objectName: "savedAccountSelectButton"
-                                implicitWidth: 48
+                                implicitWidth: 56
                                 implicitHeight: 28
-                                leftPadding: 6
-                                rightPadding: 6
+                                leftPadding: 8
+                                rightPadding: 8
                                 text: "選擇"
                                 tone: "infoStrong"
                                 onClicked: {

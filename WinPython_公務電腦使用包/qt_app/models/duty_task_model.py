@@ -79,6 +79,30 @@ class DutyTaskListModel(QAbstractListModel):
     def replace_tasks(self, tasks: list[dict[str, Any]]) -> None:
         """Atomically replace rows while keeping the public role contract stable."""
 
+        updated_tasks = [dict(task) for task in tasks]
+        same_task_order = (
+            len(updated_tasks) == len(self._tasks)
+            and all(
+                previous.get("taskIndex") == updated.get("taskIndex")
+                for previous, updated in zip(self._tasks, updated_tasks)
+            )
+        )
+        if same_task_order:
+            changed_rows: list[tuple[int, list[int]]] = []
+            for row, (previous, updated) in enumerate(zip(self._tasks, updated_tasks)):
+                changed_roles = [
+                    role
+                    for role, key in self._ROLE_KEYS.items()
+                    if previous.get(key) != updated.get(key)
+                ]
+                if changed_roles:
+                    changed_rows.append((row, changed_roles))
+            self._tasks = updated_tasks
+            for row, changed_roles in changed_rows:
+                model_index = self.index(row, 0)
+                self.dataChanged.emit(model_index, model_index, changed_roles)
+            return
+
         self.beginResetModel()
-        self._tasks = [dict(task) for task in tasks]
+        self._tasks = updated_tasks
         self.endResetModel()

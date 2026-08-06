@@ -3,11 +3,89 @@
 
 from __future__ import annotations
 
+import ctypes
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+
+try:
+    import pythoncom
+    from win32com.propsys import propsys, pscon
+    from win32com.shell import shell
+except Exception:
+    pythoncom = None
+    propsys = None
+    pscon = None
+    shell = None
+
+
+APP_DISPLAY_NAME = "SinpoSmart"
+APP_USER_MODEL_ID = "TYFD.DutyAutomation"
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+APP_ICON_PATH = PACKAGE_ROOT / "duty_tray_icon.ico"
+
+
+def configure_windows_notification_identity() -> None:
+    """Associate native notifications with SinpoSmart instead of pythonw.exe."""
+
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        pass
+
+
+def ensure_windows_notification_shortcut() -> bool:
+    """Create the Start-menu shortcut Windows uses to name the toast source."""
+
+    if os.name != "nt" or not all((pythoncom, propsys, pscon, shell)):
+        return False
+    app_data = os.environ.get("APPDATA", "").strip()
+    if not app_data:
+        return False
+    try:
+        shortcut_dir = Path(app_data) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        shortcut_dir.mkdir(parents=True, exist_ok=True)
+        shortcut_path = shortcut_dir / f"{APP_DISPLAY_NAME}.lnk"
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        target = pythonw if pythonw.exists() else Path(sys.executable)
+        entrypoint = PACKAGE_ROOT / "duty_gui.pyw"
+
+        pythoncom.CoInitialize()
+        shortcut = pythoncom.CoCreateInstance(
+            shell.CLSID_ShellLink,
+            None,
+            pythoncom.CLSCTX_INPROC_SERVER,
+            shell.IID_IShellLink,
+        )
+        shortcut.SetPath(str(target))
+        shortcut.SetArguments(f'"{entrypoint}"')
+        shortcut.SetWorkingDirectory(str(PACKAGE_ROOT))
+        if APP_ICON_PATH.is_file():
+            shortcut.SetIconLocation(str(APP_ICON_PATH), 0)
+        property_store = shortcut.QueryInterface(propsys.IID_IPropertyStore)
+        property_store.SetValue(
+            pscon.PKEY_AppUserModel_ID,
+            propsys.PROPVARIANTType(APP_USER_MODEL_ID, pythoncom.VT_LPWSTR),
+        )
+        property_store.Commit()
+        persist_file = shortcut.QueryInterface(pythoncom.IID_IPersistFile)
+        persist_file.Save(str(shortcut_path), 0)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
 
 class TrayController(QObject):
@@ -41,6 +119,8 @@ class TrayController(QObject):
         self._window = window
         if self._tray is not None:
             return
+        configure_windows_notification_identity()
+        ensure_windows_notification_shortcut()
         available = (
             bool(self._availability_override)
             if self._availability_override is not None
@@ -99,7 +179,7 @@ class TrayController(QObject):
     @Slot(str, str)
     def notify(self, title: str, message: str) -> None:
         if self._tray is not None and self._available:
-            self._tray.showMessage(str(title), str(message), QSystemTrayIcon.Information, 5000)
+            self._tray.showMessage(APP_DISPLAY_NAME, str(message), QSystemTrayIcon.Information, 5000)
 
     @Slot()
     def requestQuit(self) -> None:

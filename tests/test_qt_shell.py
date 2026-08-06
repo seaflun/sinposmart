@@ -3492,6 +3492,9 @@ class QtShellTests(unittest.TestCase):
             encoding="utf-8"
         )
         entrypoint = (PACKAGE_ROOT / "qt_app" / "main.py").read_text(encoding="utf-8")
+        tray_controller = (
+            PACKAGE_ROOT / "qt_app" / "controllers" / "tray_controller.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             "accountManagerWindow.sessionController.deleteSavedAccount(",
@@ -3502,8 +3505,18 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn('passwordField.text,\n                        "",', source)
         self.assertIn('objectName: "savedAccountManagerButton"', source)
         self.assertIn('objectName: "accountManagerWindow"', account_manager)
+        self.assertIn('id: accountGrid', account_manager)
+        self.assertIn('objectName: "savedAccountGrid"', account_manager)
+        self.assertIn('maximumRows: Math.min(15, accountCount)', account_manager)
+        self.assertIn('columnCount: Math.max(2, Math.ceil(accountCount / 15))', account_manager)
+        self.assertIn('Layout.row: index % 15', account_manager)
+        self.assertIn('Layout.preferredWidth: accountManagerWindow.accountCardWidth', account_manager)
         self.assertIn('objectName: "loginStatusLabel"', source)
         self.assertIn('objectName: "loggedInStatusLabel"', source)
+        logged_in_status = session_header.split('objectName: "loggedInStatusLabel"', 1)[1].split(
+            "DangerButton {", 1
+        )[0]
+        self.assertIn("font.bold: true", logged_in_status)
         self.assertNotIn('text: window.errorMessage.length > 0', source)
         self.assertIn('text: sessionHeader.backend.sessionController.loginStatus', source)
         self.assertIn('loginStatusTone === "error"', source)
@@ -3601,7 +3614,10 @@ class QtShellTests(unittest.TestCase):
         work_log_value_control = (components_path / "WorkLogValueControl.qml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("TextField {", (components_path / "AppleTextField.qml").read_text(encoding="utf-8"))
+        apple_text_field = (components_path / "AppleTextField.qml").read_text(encoding="utf-8")
+        self.assertIn("TextField {", apple_text_field)
+        self.assertIn("HoverHandler {", apple_text_field)
+        self.assertIn("cursorShape: Qt.IBeamCursor", apple_text_field)
         self.assertIn("onTextEdited:", work_log_value_control)
         self.assertIn("acceptableInput", work_log_value_control)
         self.assertIn("TextArea {", (components_path / "AppleTextArea.qml").read_text(encoding="utf-8"))
@@ -3614,6 +3630,10 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn("delegate: Rectangle", tool_usage)
         self.assertNotIn("emptyUsageCard", tool_usage)
         self.assertIn('app.setApplicationDisplayName("SinpoSmart")', entrypoint)
+        self.assertIn("configure_windows_notification_identity()", entrypoint)
+        self.assertIn('APP_USER_MODEL_ID = "TYFD.DutyAutomation"', tray_controller)
+        self.assertIn("ensure_windows_notification_shortcut()", tray_controller)
+        self.assertIn("self._tray.showMessage(APP_DISPLAY_NAME", tray_controller)
         self.assertNotIn("SetWindowTextW", entrypoint)
         self.assertIn("def schedule_windows_title_bar", entrypoint)
         self.assertIn("QTimer.singleShot(delay", entrypoint)
@@ -3997,6 +4017,8 @@ class QtShellTests(unittest.TestCase):
             'objectName: "dutyNextDateButton"',
             'objectName: "dutyDateCalendarButton"',
             'dateFormat: "slash"',
+            "onToggled: dutySheetDialog.controller.setNotificationEnabled(checked)",
+            "dutySheetDialog.controller.notificationEnabled)",
             'objectName: "dutySheetStatusBar"',
             'toolId: "duty_sheet"',
             "ToolUsageHistory {",
@@ -5276,6 +5298,8 @@ if return_code != 0 or loaded:
         self.assertEqual(return_code, 0, output)
 
     def test_task_model_exposes_stable_roles_and_replaces_rows(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
         from qt_app.models.duty_task_model import DutyTaskListModel
 
         model = DutyTaskListModel()
@@ -5308,6 +5332,14 @@ if return_code != 0 or loaded:
         self.assertEqual(model.data(model.index(0, 0), model.TaskIndexRole), 7)
         self.assertEqual(model.data(model.index(0, 0), model.TimeTextRole), "08:00")
         self.assertTrue(model.data(model.index(0, 0), model.SelectedRole))
+
+        reset_spy = QSignalSpy(model.modelReset)
+        changed_spy = QSignalSpy(model.dataChanged)
+        model.replace_tasks([{"taskIndex": 7, "timeText": "08:00", "selected": False}])
+
+        self.assertEqual(reset_spy.count(), 0)
+        self.assertEqual(changed_spy.count(), 1)
+        self.assertEqual(changed_spy.at(0)[2], [model.SelectedRole])
 
     def test_duty_controller_projects_schedule_after_actor_is_known(self) -> None:
         from qt_app.controllers.duty_controller import DutyController
@@ -6055,9 +6087,13 @@ if return_code != 0 or loaded:
         success_spy = QSignalSpy(controller.runSucceeded)
 
         controller.loadDefaults()
+        controller.setNotificationEnabled(True)
+        self.assertTrue(controller.notificationEnabled)
+        controller.setNotificationEnabled(False)
         controller.prepareRun("duty.xlsm", "2026/07/30", "A", "S", "M1", "M2", False)
         self.assertEqual(confirmation_spy.count(), 1)
         self.assertIn("確認 2026/07/30", controller.confirmationSummary)
+        self.assertFalse(controller._pending_request.notification_enabled)
 
         controller.confirmRun()
         for _ in range(20):
@@ -7320,7 +7356,7 @@ if return_code != 0 or loaded:
                             "password": "stored-value",
                             "display_name": f"{100 + index}番 測試員",
                         }
-                        for index in range(12)
+                        for index in range(15)
                     ],
                 ]
 
@@ -7403,16 +7439,16 @@ if return_code != 0 or loaded:
                 )
                 QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, point.toPoint())
                 for _ in range(20):
-                    if account_window.property("accountCount") == 13:
+                    if account_window.property("accountCount") == 16:
                         break
                     QTest.qWait(25)
 
                 self.assertTrue(account_window.isVisible())
                 self.assertEqual(account_window.title(), "SinpoSmart - 帳號管理")
                 self.assertEqual(title_bar_requests, [])
-                self.assertEqual(account_window.property("accountCount"), 13)
-                self.assertEqual(account_window.width(), 444)
-                self.assertEqual(account_window.height(), 774)
+                self.assertEqual(account_window.property("accountCount"), 16)
+                self.assertEqual(account_window.width(), 612)
+                self.assertEqual(account_window.height(), 918)
                 self.assertEqual(root.width(), 550)
                 self.assertEqual(root.height(), 352)
 
@@ -7431,11 +7467,15 @@ if return_code != 0 or loaded:
                 close_button = find_visual_item(account_content, "savedAccountCloseButton")
                 title_bar = find_visual_item(account_content, "accountTitleBar")
                 title_close_button = find_visual_item(account_content, "accountTitleCloseButton")
+                saved_account_grid = find_visual_item(account_content, "savedAccountGrid")
                 self.assertIsNotNone(delete_button)
                 self.assertIsNotNone(select_button)
                 self.assertIsNotNone(close_button)
                 self.assertIsNotNone(title_bar)
                 self.assertIsNotNone(title_close_button)
+                self.assertIsNotNone(saved_account_grid)
+                self.assertEqual(account_window.property("columnCount"), 2)
+                self.assertEqual(saved_account_grid.property("columns"), 2)
                 self.assertEqual((title_close_button.width(), title_close_button.height()), (40, 32))
                 self.assertEqual(title_close_button.property("tone"), "windowClose")
                 self.assertEqual(title_close_button.property("iconKind"), "close")
@@ -8341,7 +8381,14 @@ if return_code != 0 or loaded:
                 self.assertEqual(wait_for("dutyStopCombo").property("currentText"), "11")
                 self.assertEqual(wait_for("dutyAmb1Combo").property("currentText"), "92")
                 self.assertEqual(wait_for("dutyAmb2Combo").property("currentText"), "93")
-                self.assertFalse(wait_for("dutyNotificationCheck").property("checked"))
+                duty_notification_check = wait_for("dutyNotificationCheck")
+                self.assertFalse(duty_notification_check.property("checked"))
+                click(duty_notification_check)
+                self.assertTrue(duty_notification_check.property("checked"))
+                self.assertTrue(controller.dutySheetController.notificationEnabled)
+                click(duty_notification_check)
+                self.assertFalse(duty_notification_check.property("checked"))
+                self.assertFalse(controller.dutySheetController.notificationEnabled)
                 self.assertTrue(
                     QMetaObject.invokeMethod(duty_date_calendar, "openForCurrentDate", Qt.DirectConnection)
                 )
@@ -8422,6 +8469,7 @@ if return_code != 0 or loaded:
                     and not controller.dutySheetController._workers,
                     "勤務表 QML 執行鍵未完成 worker 呼叫",
                 )
+                self.assertFalse(duty_sheet_service.requests[0].notification_enabled)
                 wait_until(
                     lambda: not duty_confirmation.property("visible")
                     and root.findChild(QObject, "dutySheetDialog").property("visible")

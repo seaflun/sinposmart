@@ -14,6 +14,11 @@ TextField {
     placeholderTextColor: Design.muted
     selectByMouse: true
 
+    HoverHandler {
+        enabled: appleTextField.enabled && appleTextField.clickAction === null
+        cursorShape: Qt.IBeamCursor
+    }
+
     background: Rectangle {
         radius: Design.radius
         color: parent.enabled ? Design.panel : Design.softAction

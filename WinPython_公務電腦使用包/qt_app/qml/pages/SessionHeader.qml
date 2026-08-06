@@ -76,6 +76,7 @@ ColumnLayout {
                     text: sessionHeader.backend.sessionController.loginStatus
                     color: sessionHeader.backend.sessionController.loginStatusTone === "error" ? Design.dangerStrong : sessionHeader.backend.sessionController.loginStatusTone === "warning" ? Design.warningStrong : sessionHeader.backend.sessionController.loginStatusTone === "info" ? Design.infoText : sessionHeader.backend.sessionController.loginStatusTone === "neutral" ? Design.muted : Design.successText
                     font.pixelSize: Design.controlSize
+                    font.bold: true
                     elide: Text.ElideRight
                     wrapMode: Text.NoWrap
                     verticalAlignment: Text.AlignVCenter

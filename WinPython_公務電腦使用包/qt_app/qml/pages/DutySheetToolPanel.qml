@@ -223,6 +223,7 @@ ToolSidePanel {
                         text: "完成後發送勤務表截圖"
                         checked: dutySheetDialog.controller.notificationEnabled
                         enabled: !dutySheetDialog.controller.isRunning
+                        onToggled: dutySheetDialog.controller.setNotificationEnabled(checked)
                     }
                 }
             }
@@ -340,7 +341,7 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: dutySheetDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !dutySheetDialog.controller.isRunning
-            onClicked: dutySheetDialog.controller.prepareRun(dutyWorkbookField.text, dutyDateField.text, dutyAttackCombo.currentText, dutyStopCombo.currentText, dutyAmb1Combo.currentText, dutyAmb2Combo.currentText, dutyNotificationCheck.checked)
+            onClicked: dutySheetDialog.controller.prepareRun(dutyWorkbookField.text, dutyDateField.text, dutyAttackCombo.currentText, dutyStopCombo.currentText, dutyAmb1Combo.currentText, dutyAmb2Combo.currentText, dutySheetDialog.controller.notificationEnabled)
         }
     }
 
