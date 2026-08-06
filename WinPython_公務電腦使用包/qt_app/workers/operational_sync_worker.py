@@ -36,8 +36,8 @@ class OperationalSyncWorker(QObject):
                 self._send_event()
             elif self.operation == "board":
                 self._sync_board()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.service.record_unhandled_failure(self.operation, exc)
         finally:
             self.fields = {}
             self.schedule_data = {}

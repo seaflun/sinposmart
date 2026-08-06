@@ -471,8 +471,11 @@ class SessionController(QObject):
         notify_user: bool,
     ) -> None:
         if not self._credential_sync_service.enabled:
+            message = "尚未設定 NAS 帳密同步 URL 或 token。"
             if notify_user:
-                self._set_status("尚未設定 NAS 帳密同步 URL 或 token。", error=True)
+                self._set_status(message, error=True)
+            elif self.isLoggedIn:
+                self._set_status(f"登入成功；{message}", tone="warning")
             return
         accounts = [dict(account) for account in self._accounts]
         if extra_account and extra_account.get("user_id") and extra_account.get("password"):
@@ -512,6 +515,8 @@ class SessionController(QObject):
     def _credential_sync_failed(self, _request_id: int, message: str, notify_user: bool) -> None:
         if notify_user:
             self._set_status(message, error=True)
+        elif self.isLoggedIn:
+            self._set_status(f"登入成功；{message}", tone="warning")
 
     @Slot(int)
     def _credential_sync_worker_finished(self, request_id: int) -> None:

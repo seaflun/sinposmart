@@ -12,6 +12,7 @@ import zipfile
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -586,6 +587,70 @@ class DutyTaskProjectionTests(unittest.TestCase):
         )
 
         self.assertEqual(select_due_task_indices(actions, state, now=now), [0])
+
+    def test_1800_handoff_keeps_outgoing_incoming_and_work_for_outgoing_actor(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "17",
+                "target": "17",
+                "source": "值班交接",
+                "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "17",
+                "target": "5",
+                "source": "值班交接",
+                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            },
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "17",
+                "target": "17",
+                "source": "值班交接",
+                "fields": {"工作概述": "交接工作紀錄"},
+            },
+        ]
+
+        due = select_due_task_indices(
+            actions,
+            DueTaskSelectionState(actor_no="17", target_roc_date="1150806"),
+            now=datetime(2026, 8, 6, 18, 0),
+        )
+
+        self.assertEqual(due, [0, 1, 2])
+
+    def test_handoff_adjustment_does_not_block_the_next_person_value_entry(self) -> None:
+        from compare_rehearsal_records import is_possible_handoff_adjustment
+
+        incoming_action = {
+            "kind": "entry_log",
+            "time": "18:00",
+            "target": "5",
+            "source": "值班交接",
+            "fields": {"系統寫入時間": "18:00", "出或入": "值班"},
+        }
+        rows = ["115/08/06 18:00 | 勤務 | 17番隊員 | 值退 | 值退"]
+        staff = {
+            "17": {"name": "17番隊員"},
+            "5": {"name": "5番隊員"},
+        }
+
+        self.assertFalse(
+            is_possible_handoff_adjustment(rows, "1150806", staff, incoming_action)
+        )
+        same_person_action = {**incoming_action, "target": "17"}
+        self.assertTrue(
+            is_possible_handoff_adjustment(rows, "1150806", staff, same_person_action)
+        )
 
     def test_submit_target_date_overrides_scheduled_action_date(self) -> None:
         from app_core.duty_task_projection import action_target_roc_date
@@ -2782,6 +2847,9 @@ class DiagnosticsServiceTests(unittest.TestCase):
             (root / "runtime_outputs" / "browser" / "browser_startup.jsonl").write_text(
                 '{"category":"startup_timeout"}\n', encoding="utf-8"
             )
+            (root / "runtime_outputs" / "sinposmart_operational_sync_status.json").write_text(
+                '{"event":{"state":"failed","detail":"safe"}}', encoding="utf-8"
+            )
             (root / "VERSION.txt").write_text("2026.07.29.1000", encoding="utf-8")
             (root / ".env").write_text("SECRET=do-not-package", encoding="utf-8")
             (root / "saved_login.json").write_text('{"password":"secret"}', encoding="utf-8")
@@ -2795,6 +2863,7 @@ class DiagnosticsServiceTests(unittest.TestCase):
                 manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
             self.assertIn("runtime_outputs/schedule/schedule_output_1150729.json", names)
             self.assertIn("runtime_outputs/browser/browser_startup.jsonl", names)
+            self.assertIn("runtime_outputs/sinposmart_operational_sync_status.json", names)
             self.assertIn("VERSION.txt", names)
             self.assertNotIn(".env", names)
             self.assertNotIn("saved_login.json", names)
@@ -2923,6 +2992,66 @@ class OperationalSyncServiceTests(unittest.TestCase):
 
         self.assertEqual(posted, [payload])
         self.assertEqual(pending, "")
+
+    def test_event_uses_legacy_default_url_when_only_token_is_configured(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-token"},
+                clear=True,
+            ):
+                service = OperationalSyncService(Path(temp_dir))
+
+                self.assertTrue(service.event_enabled)
+                self.assertEqual(
+                    service.event_url,
+                    "http://10.30.65.30:8080/api/sinposmart/events",
+                )
+
+    def test_event_failure_is_safely_recorded_and_kept_for_retry(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+
+        def fail_post(_payload):
+            raise RuntimeError("connection failure secret-password")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = OperationalSyncService(Path(temp_dir), event_poster=fail_post)
+            payload = service.build_event_payload("login", actor_no="12")
+
+            service.send_event_payload(payload)
+
+            status = json.loads(service.status_path.read_text(encoding="utf-8"))
+            pending = service.pending_path.read_text(encoding="utf-8")
+
+        self.assertEqual(status["event"]["state"], "failed")
+        self.assertIn("同步失敗", status["event"]["detail"])
+        self.assertNotIn("secret-password", json.dumps(status, ensure_ascii=False))
+        self.assertIn(payload["event_id"], pending)
+
+    def test_board_failure_is_safely_recorded_for_later_retry(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+
+        schedule = {
+            "today": {
+                "roc_date": "1150729",
+                "rows": [{"slot": "8-9", "columns": {"值班": ["12"]}}],
+                "staff": {"12": {"name": "測試員"}},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = OperationalSyncService(
+                Path(temp_dir),
+                board_poster=lambda _payload: (_ for _ in ()).throw(RuntimeError("board error")),
+            )
+
+            self.assertFalse(service.sync_board(schedule))
+            status = json.loads(service.status_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(status["board"]["state"], "failed")
+        self.assertIn("同步失敗", status["board"]["detail"])
 
 
 class CredentialSyncServiceTests(unittest.TestCase):
@@ -6378,6 +6507,56 @@ if return_code != 0 or loaded:
         self.assertFalse(controller.isBusy)
         self.assertEqual({finished_spy.at(0)[0], finished_spy.at(1)[0]}, {0, 1})
 
+    def test_duty_execution_controller_keeps_all_three_1800_handoff_actions(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.executed: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def execute(self, request, *, status_callback=None):
+                self.executed.append(request.action_index)
+                if status_callback:
+                    status_callback(f"執行 {request.action_index}")
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    f"完成 {request.action_index}",
+                    Path(f"handoff-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+        data = {
+            "target_date": "1150806",
+            "actions": [
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17"},
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5"},
+                {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+
+        for index in (0, 1, 2):
+            self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", index, data)))
+        for _ in range(30):
+            if finished_spy.count() == 3 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(set(service.executed), {0, 1, 2})
+        self.assertEqual([index for index in service.executed if index in (0, 1)], [0, 1])
+        self.assertEqual(finished_spy.count(), 3)
+        self.assertFalse(controller.isBusy)
+
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
@@ -6571,8 +6750,8 @@ if return_code != 0 or loaded:
                     attempt_id,
                     LoginSession("10", "user10", "secret", verified=True),
                 )
+                controller.sessionController._display_name = "10番 隊員 測試員"
                 controller._sync_session_actor()
-                controller.sessionController.logout()
                 from PySide6.QtTest import QTest
 
                 for _ in range(50):
@@ -6580,12 +6759,23 @@ if return_code != 0 or loaded:
                         break
                     QTest.qWait(10)
                 operational_sync.events.clear()
+                controller.sessionController.logout()
+
+                for _ in range(50):
+                    if not controller._operational_sync_workers:
+                        break
+                    QTest.qWait(10)
+                logout_events = list(operational_sync.events)
+                operational_sync.events.clear()
 
                 recorded = controller.recordUpdateLogout()
             finally:
                 controller.shutdown()
 
         self.assertTrue(recorded)
+        self.assertEqual(len(logout_events), 1)
+        self.assertEqual(logout_events[0][0], "logout")
+        self.assertEqual(logout_events[0][1]["display_name"], "10番 隊員 測試員")
         self.assertEqual(len(operational_sync.events), 1)
         record_type, fields = operational_sync.events[0]
         self.assertEqual(record_type, "logout")
@@ -6593,6 +6783,7 @@ if return_code != 0 or loaded:
         self.assertEqual(fields["content"], "更新前登出")
         self.assertEqual(fields["actor_no"], "10")
         self.assertEqual(fields["user_id"], "user10")
+        self.assertEqual(fields["display_name"], "10番 隊員 測試員")
         self.assertTrue(fields["immediate"])
 
     def test_app_controller_uses_managed_qthreads_for_operational_sync(self) -> None:
@@ -9085,6 +9276,28 @@ if return_code != 0 or loaded:
             self.assertEqual(controller.loginStatus, "NAS 帳密同步測試失敗。")
             self.assertFalse(controller._credential_sync_workers)
             controller.shutdown()
+
+    def test_automatic_credential_sync_failure_keeps_login_visible_as_warning(self) -> None:
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.session_controller import SessionController
+
+        state = SessionState()
+        attempt_id = state.begin_login()
+        self.assertIsNotNone(attempt_id)
+        state.complete_login(
+            attempt_id,
+            LoginSession("12", "user12", "secret", verified=True),
+        )
+        controller = SessionController(state)
+
+        controller._credential_sync_failed(
+            1,
+            "NAS 帳密同步連線失敗。",
+            notify_user=False,
+        )
+
+        self.assertEqual(controller.loginStatus, "登入成功；NAS 帳密同步連線失敗。")
+        self.assertEqual(controller.loginStatusTone, "warning")
 
     def test_session_controller_timeout_rejects_late_worker_success(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest

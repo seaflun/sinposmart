@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import threading
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
@@ -21,6 +22,8 @@ from app_core.duty_task_projection import action_summary
 
 JsonPoster = Callable[[dict[str, Any]], dict[str, Any]]
 SENSITIVE_KEY_PARTS = ("password", "passwd", "token", "secret", "cookie", "authorization")
+DEFAULT_SINPOSMART_BACKEND_EVENT_URL = "http://10.30.65.30:8080/api/sinposmart/events"
+SYNC_STATUS_FILENAME = "sinposmart_operational_sync_status.json"
 
 
 def sanitize_payload(value: Any) -> Any:
@@ -101,6 +104,7 @@ class OperationalSyncService:
     ) -> None:
         self.package_root = Path(package_root)
         self.pending_path = self.package_root / "runtime_outputs" / "sinposmart_backend_events_pending.jsonl"
+        self.status_path = self.package_root / "runtime_outputs" / SYNC_STATUS_FILENAME
         self._event_poster = event_poster
         self._board_poster = board_poster
         self._event_lock = threading.Lock()
@@ -111,9 +115,18 @@ class OperationalSyncService:
     @property
     def event_enabled(self) -> bool:
         return self._event_poster is not None or bool(
-            os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "").strip()
+            self.event_url
             and os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
         )
+
+    @property
+    def event_url(self) -> str:
+        """Keep the released Tk runtime's NAS event endpoint fallback."""
+
+        return os.environ.get(
+            "SINPOSMART_BACKEND_EVENT_URL",
+            DEFAULT_SINPOSMART_BACKEND_EVENT_URL,
+        ).strip()
 
     @property
     def board_enabled(self) -> bool:
@@ -140,6 +153,11 @@ class OperationalSyncService:
         immediate: bool = False,
     ) -> dict[str, Any] | None:
         if not self.event_enabled:
+            self._record_sync_status(
+                "event",
+                "disabled",
+                "尚未設定 NAS 後台事件 token。",
+            )
             return None
         payload = self.build_event_payload(
             record_type,
@@ -212,12 +230,35 @@ class OperationalSyncService:
                     if str(response.get("ack_id") or "") != str(entry.get("event_id") or ""):
                         break
                     sent_count = index
-            except Exception:
-                pass
-            self._write_pending_events(pending[sent_count:])
+            except Exception as exc:
+                remaining = pending[sent_count:]
+                self._write_pending_events(remaining)
+                self._record_sync_status(
+                    "event",
+                    "failed",
+                    self._safe_failure_detail(exc, "NAS 後台事件"),
+                    pending_count=len(remaining),
+                )
+                return
+            remaining = pending[sent_count:]
+            self._write_pending_events(remaining)
+            if remaining:
+                self._record_sync_status(
+                    "event",
+                    "failed",
+                    "NAS 後台事件同步失敗：未收到正確確認。",
+                    pending_count=len(remaining),
+                )
+                return
+            self._record_sync_status("event", "ok", "NAS 後台事件已同步。", pending_count=0)
 
     def sync_board_async(self, schedule_data: Mapping[str, Any]) -> bool:
         if not self.board_enabled:
+            self._record_sync_status(
+                "board",
+                "disabled",
+                "尚未設定 Google 值班名牌同步 URL 或同步密鑰。",
+            )
             return False
         payload = build_duty_board_payload(schedule_data)
         content_hash = payload["content_hash"]
@@ -232,6 +273,11 @@ class OperationalSyncService:
         """Synchronize one board snapshot in the caller's managed worker."""
 
         if not self.board_enabled:
+            self._record_sync_status(
+                "board",
+                "disabled",
+                "尚未設定 Google 值班名牌同步 URL 或同步密鑰。",
+            )
             return False
         payload = build_duty_board_payload(schedule_data)
         content_hash = payload["content_hash"]
@@ -240,20 +286,26 @@ class OperationalSyncService:
                 return False
             self._board_inflight_hashes.add(content_hash)
         try:
-            self.sync_board_payload(payload)
+            return self.sync_board_payload(payload)
         finally:
             with self._board_lock:
                 self._board_inflight_hashes.discard(content_hash)
-        return True
 
-    def sync_board_payload(self, payload: dict[str, Any]) -> None:
+    def sync_board_payload(self, payload: dict[str, Any]) -> bool:
         content_hash = str(payload.get("content_hash") or "")
         try:
             self._post_board(payload)
-        except Exception:
-            return
+        except Exception as exc:
+            self._record_sync_status(
+                "board",
+                "failed",
+                self._safe_failure_detail(exc, "Google 值班名牌"),
+            )
+            return False
         with self._board_lock:
             self._last_board_hash = content_hash
+        self._record_sync_status("board", "ok", "Google 值班名牌已同步。")
+        return True
 
     def _sync_board_worker(self, payload: dict[str, Any]) -> None:
         content_hash = str(payload.get("content_hash") or "")
@@ -266,7 +318,7 @@ class OperationalSyncService:
     def _post_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._event_poster is not None:
             return self._event_poster(payload)
-        url = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", "").strip()
+        url = self.event_url
         token = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
         request = urllib.request.Request(
             url,
@@ -317,6 +369,55 @@ class OperationalSyncService:
         self.pending_path.parent.mkdir(parents=True, exist_ok=True)
         body = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
         self.pending_path.write_text(body, encoding="utf-8")
+
+    def record_unhandled_failure(self, operation: str, error: BaseException) -> None:
+        """Persist a safe status when a Qt worker exits unexpectedly."""
+
+        channel = "board" if operation == "board" else "event"
+        label = "Google 值班名牌" if channel == "board" else "NAS 後台事件"
+        self._record_sync_status(channel, "failed", self._safe_failure_detail(error, label))
+
+    def _record_sync_status(
+        self,
+        channel: str,
+        state: str,
+        detail: str,
+        *,
+        pending_count: int | None = None,
+    ) -> None:
+        try:
+            current = self._load_sync_status()
+            status = {
+                "state": str(state or "unknown"),
+                "detail": str(detail or "")[:300],
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            if pending_count is not None:
+                status["pending_count"] = max(0, int(pending_count))
+            current[str(channel)] = status
+            current["updated_at"] = status["updated_at"]
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            self.status_path.write_text(
+                json.dumps(sanitize_payload(current), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
+    def _load_sync_status(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+    @staticmethod
+    def _safe_failure_detail(error: BaseException, label: str) -> str:
+        if isinstance(error, urllib.error.HTTPError):
+            return f"{label}同步失敗：HTTP {error.code}。"
+        if isinstance(error, (urllib.error.URLError, TimeoutError, OSError)):
+            return f"{label}同步失敗：連線或逾時。"
+        return f"{label}同步失敗，請匯出問題包。"
 
     @staticmethod
     def _timeout(name: str, default: int) -> int:

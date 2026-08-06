@@ -150,6 +150,7 @@ class AppController(QObject):
         self._synced_user_id = ""
         self._last_login_actor_no = ""
         self._last_login_user_id = ""
+        self._last_login_display_name = ""
         self._provisional_actor_no = ""
         self._actor_identity_pending = False
         self._pending_fire_day_refresh = ""
@@ -329,6 +330,11 @@ class AppController(QObject):
             if session is not None and session.verified
             else ""
         ) or self._last_login_user_id
+        display_name = (
+            self._session_controller.displayName
+            if session is not None and session.verified
+            else self._last_login_display_name
+        )
         if not actor_no and not user_id:
             return False
         self._operational_sync_service.enqueue_event(
@@ -337,6 +343,7 @@ class AppController(QObject):
             trigger_type="update",
             actor_no=actor_no,
             user_id=user_id,
+            display_name=display_name,
             content="更新前登出",
             immediate=True,
         )
@@ -406,6 +413,8 @@ class AppController(QObject):
             return
         self._synced_actor_no = actor_no
         self._synced_user_id = user_id
+        if logged_in and self._session_controller.displayName:
+            self._last_login_display_name = self._session_controller.displayName
         if logged_in and user_id:
             if user_id != self._last_login_user_id:
                 self._last_login_actor_no = actor_no
@@ -438,6 +447,7 @@ class AppController(QObject):
                 trigger_type="logout",
                 actor_no=previous_actor_no,
                 user_id=previous_user_id,
+                display_name=self._last_login_display_name,
             )
 
     @Slot(bool)
@@ -702,8 +712,11 @@ class AppController(QObject):
         if self._duty_controller.isRefreshing:
             return
         target_roc_date = shift_roc_date(business_roc_date(now), 1)
+        runtime_dir = getattr(self._schedule_capture_service, "runtime_dir", None)
+        if runtime_dir is None:
+            return
         schedule_path = (
-            self._schedule_capture_service.runtime_dir
+            Path(runtime_dir)
             / "schedule"
             / f"schedule_output_{target_roc_date}.json"
         )

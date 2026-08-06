@@ -189,7 +189,15 @@ def is_possible_handoff_adjustment(
 ) -> bool:
     fields = action.get("fields", {})
     time_value = fields.get("系統寫入時間", action.get("time", ""))
-    return is_handoff_entry(action) and has_value_rows_at_time(rows, target_date, time_value)
+    target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
+    if not is_handoff_entry(action) or not target_name:
+        return False
+    return any(
+        row_has_primary_person(row, target_name)
+        and row_has_time(row, target_date, time_value)
+        and ("值班" in row or "值退" in row)
+        for row in rows
+    )
 
 
 def find_entry_matches(

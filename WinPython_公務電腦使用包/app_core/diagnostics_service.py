@@ -48,6 +48,7 @@ class DiagnosticsService:
     def _candidate_files(self, target_date: str) -> list[Path]:
         candidates = [
             self.package_root / "duty_trigger_log.jsonl",
+            self.package_root / "runtime_outputs" / "sinposmart_operational_sync_status.json",
             self.package_root / "requirements.txt",
             self.package_root / "VERSION.txt",
             self.package_root / "docs" / "CODE_MAP.md",
