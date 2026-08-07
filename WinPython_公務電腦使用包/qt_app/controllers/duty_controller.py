@@ -13,6 +13,7 @@ from compare_rehearsal_records import build_case_work_audits
 from app_core.duty_task_projection import (
     DueTaskSelectionState,
     DutyTaskProjectionState,
+    action_completion_key,
     action_summary,
     action_datetime,
     build_schedule_comparisons,
@@ -735,6 +736,15 @@ class DutyController(QObject):
     ) -> None:
         next_target_date = str(data.get("target_date", "") or "")
         same_schedule_date = bool(next_target_date and next_target_date == self._target_date_text)
+        previous_completed_by_key = {
+            action_completion_key(self._actions[index]): {
+                **dict(self._comparisons.get(index, {})),
+                "compare": str(self._comparisons.get(index, {}).get("compare", "已登打") or "已登打"),
+                "group": "done",
+            }
+            for index in self._executed_indices
+            if 0 <= index < len(self._actions)
+        }
         actions = data.get("actions", [])
         today = data.get("today", {})
         yesterday = data.get("yesterday", {})
@@ -789,10 +799,24 @@ class DutyController(QObject):
                     if index in self._comparisons and index < len(self._actions)
                 }
             )
+            carried_completed_indices = set(self._executed_indices)
+        else:
+            carried_completed_indices = {
+                index
+                for index, action in enumerate(self._actions)
+                if action_completion_key(action) in previous_completed_by_key
+            }
+            incoming_comparisons.update(
+                {
+                    index: previous_completed_by_key[action_completion_key(action)]
+                    for index, action in enumerate(self._actions)
+                    if index in carried_completed_indices
+                }
+            )
         self._comparisons = incoming_comparisons
         self._selected_indices.clear()
         if not same_schedule_date:
-            self._executed_indices.clear()
+            self._executed_indices = carried_completed_indices
             self._submitting_indices.clear()
             self._manual_paused_indices.clear()
             self._blocked_indices.clear()

@@ -588,6 +588,30 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
         self.assertEqual(select_due_task_indices(actions, state, now=now), [0])
 
+    def test_due_selection_starts_0805_checkout_at_0800(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "10",
+                "fields": {
+                    "登打時間": "08:00",
+                    "系統寫入時間": "08:05",
+                    "出或入": "出",
+                    "領用事由及地點": "退勤",
+                },
+            }
+        ]
+        state = DueTaskSelectionState(actor_no="10", target_roc_date="1150807")
+
+        self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 7, 59)), [])
+        self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 8, 0)), [0])
+
     def test_1800_handoff_keeps_outgoing_incoming_and_work_for_outgoing_actor(self) -> None:
         from datetime import datetime
 
@@ -1185,6 +1209,62 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "paused_external")
             self.assertEqual(checked_minutes, [555])
             self.assertEqual(fills, [])
+
+    def test_due_checkout_starts_at_0800_and_writes_0805(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events: list[str] = []
+            automation = SimpleNamespace(
+                ENTRY_LOG_AP="entry",
+                WORK_LOG_AP="work",
+                build_driver=lambda headless: events.append(f"driver:{headless}") or object(),
+                login=lambda _driver, _user_id, _password: events.append("login"),
+                query_visible_table=lambda _driver, _ap_name, _date: [],
+                fill_entry_log_form_for_test=lambda _driver, action, _staff, _date, save: events.append(
+                    f"fill:{action['fields']['系統寫入時間']}:{save}"
+                )
+                or {"ok": True},
+                quit_driver=lambda _driver: events.append("quit"),
+            )
+            comparisons = iter(
+                [
+                    {0: {"compare": "尚未到點", "group": "future", "matched": []}},
+                    {0: {"compare": "已存在", "group": "done", "matched": ["saved"]}},
+                ]
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "昨日在勤且今日未在勤",
+                        "fields": {
+                            "登打時間": "08:00",
+                            "系統寫入時間": "08:05",
+                            "出或入": "出",
+                            "領用事由及地點": "退勤",
+                        },
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+            self.assertEqual(result.status, "submitted")
+            self.assertEqual(events, ["driver:True", "login", "fill:08:05:True", "quit"])
 
     def test_manual_external_review_action_can_submit_after_confirmation(self) -> None:
         from datetime import datetime
@@ -7627,6 +7707,41 @@ if return_code != 0 or loaded:
         controller._login_started_at = datetime(2026, 7, 30, 9, 0)
         controller.handle_submission_result(0, "skipped_duplicate", "已存在", "result.json")
         self.assertFalse(controller._auto_logout_timer.isActive())
+
+    def test_fire_day_reload_preserves_executed_actions_by_completion_key(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        previous_action = {
+            "kind": "entry_log",
+            "time": "07:55",
+            "date_offset": 1,
+            "actor": "10",
+            "target": "10",
+            "duplicate_key": "entry:2026-08-07:755:in:10:到勤",
+            "fields": {"登打時間": "07:55", "系統寫入時間": "07:55", "出或入": "入", "領用事由及地點": "到勤"},
+        }
+        carried_action = {**previous_action, "date_offset": 0}
+        new_action = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "duplicate_key": "entry:2026-08-07:8:值班:10",
+            "fields": {"登打時間": "08:00", "系統寫入時間": "08:00", "出或入": "值班", "領用事由及地點": "值班"},
+        }
+        controller = DutyController()
+        controller.set_actor_no("10")
+        try:
+            controller.replace_schedule_data({"target_date": "1150806", "actions": [previous_action]})
+            controller.handle_submission_result(0, "submitted", "完成", "result.json")
+
+            controller.replace_schedule_data({"target_date": "1150807", "actions": [carried_action, new_action]})
+
+            self.assertEqual(controller._executed_indices, {0})
+            self.assertEqual(controller._comparisons[0]["group"], "done")
+            self.assertNotIn(1, controller._executed_indices)
+        finally:
+            controller.shutdown()
 
     def test_manual_submission_includes_external_review_task(self) -> None:
         from PySide6.QtTest import QSignalSpy

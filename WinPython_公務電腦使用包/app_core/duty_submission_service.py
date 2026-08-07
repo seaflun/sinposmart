@@ -192,7 +192,11 @@ class DutySubmissionService:
                     "查到時間近似或需人工確認的紀錄，未自動送出。",
                     comparison,
                 )
-            if group == "future" and request.trigger_type == "due":
+            if (
+                group == "future"
+                and request.trigger_type == "due"
+                and not self._allows_scheduled_checkout_preflight(action, action_date)
+            ):
                 return self._finish(
                     request,
                     action,
@@ -363,6 +367,36 @@ class DutySubmissionService:
         if is_dataclass(value):
             return asdict(value)
         return dict(vars(value))
+
+    @staticmethod
+    def _clock_minutes(value: Any) -> int | None:
+        try:
+            hour, minute = [int(part) for part in str(value or "").split(":", 1)]
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= hour < 24 or not 0 <= minute < 60:
+            return None
+        return hour * 60 + minute
+
+    def _allows_scheduled_checkout_preflight(
+        self,
+        action: Mapping[str, Any],
+        action_date: str,
+    ) -> bool:
+        if action.get("kind") != "entry_log":
+            return False
+        fields = action.get("fields", {})
+        if not isinstance(fields, Mapping) or fields.get("領用事由及地點", "") != "退勤":
+            return False
+        now = self.now_factory()
+        if action_date != self._roc_date(now.date()):
+            return False
+        start_minutes = self._clock_minutes(fields.get("登打時間") or action.get("time", ""))
+        system_minutes = self._clock_minutes(fields.get("系統寫入時間"))
+        if start_minutes is None or system_minutes is None:
+            return False
+        current_minutes = now.hour * 60 + now.minute
+        return start_minutes <= current_minutes < system_minutes <= start_minutes + 5
 
     @staticmethod
     def _roc_date(value: date) -> str:
