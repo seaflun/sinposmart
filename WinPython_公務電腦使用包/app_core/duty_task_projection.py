@@ -348,7 +348,16 @@ def project_duty_tasks(
         return []
     now = now or datetime.now()
     previous_actors = previous_duty_actor_nos(actions, actor_no)
-    projected: list[tuple[datetime, dict[str, Any]]] = []
+    handoff_group_anchors: dict[tuple[datetime, str], int] = {}
+    for index, action in enumerate(actions):
+        if action.get("source") != "值班交接":
+            continue
+        handoff_group_anchors.setdefault(
+            (action_datetime(action, state.target_roc_date), str(action.get("actor", "") or "")),
+            index,
+        )
+
+    projected: list[tuple[tuple[datetime, int, int, int, int], dict[str, Any]]] = []
     for index, action in enumerate(actions):
         comparison = state.comparisons.get(index, {})
         is_previous_item = _is_previous_duty_item(action, previous_actors)
@@ -372,9 +381,22 @@ def project_duty_tasks(
         )
         system_text, kind_text, detail_text, people_text = duty_task_columns(action, state.staff)
         action_at = action_datetime(action, state.target_roc_date)
+        if action.get("source") == "值班交接":
+            fields = action.get("fields", {})
+            direction = str(fields.get("出或入", "") or "") if isinstance(fields, Mapping) else ""
+            handoff_priority = 0 if direction == "值退" else 1 if direction == "值班" else 2
+            sort_key = (
+                action_at,
+                handoff_group_anchors[(action_at, str(action.get("actor", "") or ""))],
+                0,
+                handoff_priority,
+                index,
+            )
+        else:
+            sort_key = (action_at, index, 1, 0, index)
         projected.append(
             (
-                action_at,
+                sort_key,
                 {
                     "taskIndex": index,
                     "timeText": format_action_time(action, state.target_roc_date),
@@ -390,7 +412,7 @@ def project_duty_tasks(
             )
         )
     projected.sort(key=lambda item: item[0])
-    return [row for _action_at, row in projected]
+    return [row for _sort_key, row in projected]
 
 
 def action_summary(action: Mapping[str, Any]) -> str:

@@ -399,6 +399,51 @@ class LoginVerifierTests(unittest.TestCase):
 
 
 class DutyTaskProjectionTests(unittest.TestCase):
+    def test_projection_keeps_handoff_work_next_to_entry_records(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "10",
+                "target": "10",
+                "source": "值班交接",
+                "fields": {"登打時間": "18:00", "出或入": "值退", "領用事由及地點": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "10",
+                "target": "11",
+                "source": "值班交接",
+                "fields": {"登打時間": "18:00", "出或入": "值班", "領用事由及地點": "值班"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "10",
+                "target": "12",
+                "source": "休息簽出",
+                "fields": {"登打時間": "18:00", "出或入": "出", "領用事由及地點": "休息"},
+            },
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "10",
+                "target": "10",
+                "source": "值班交接",
+                "fields": {"工作時間": "18:00", "勤務項目": "值班(宿)", "服勤人員": ["10"]},
+            },
+        ]
+        state = DutyTaskProjectionState(actor_no="10", target_roc_date="1150808")
+
+        rows = project_duty_tasks(actions, state, now=datetime(2026, 8, 8, 18, 0))
+
+        self.assertEqual([row["taskIndex"] for row in rows], [0, 1, 3, 2])
+
     def test_projection_filters_actor_keeps_previous_handoff_and_sorts_rows(self) -> None:
         from datetime import datetime
 
