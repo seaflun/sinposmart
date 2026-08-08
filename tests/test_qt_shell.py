@@ -400,7 +400,7 @@ class LoginVerifierTests(unittest.TestCase):
 
 class DutyTaskProjectionTests(unittest.TestCase):
     def test_projection_keeps_handoff_work_next_to_entry_records(self) -> None:
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
 
@@ -2461,6 +2461,7 @@ class RescueVideoServiceTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["sourceText"], "video001.TS")
         self.assertEqual(result.rows[0]["timeText"], "07/29 09:24:00")
         self.assertEqual(result.rows[0]["caseText"], "07290900-92")
+        self.assertEqual(result.rows[0]["timeText"], "07/29 09:24:00")
         self.assertIn("測試警告", result.warning_text)
         self.assertTrue(progress)
 
@@ -4561,7 +4562,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('objectName: "titleDragRegion"', source)
         self.assertIn("DragHandler {", source)
         self.assertIn("window.startSystemMove()", source)
-        self.assertNotIn("onPositionChanged: function(mouse)", source)
+        self.assertIn("onPositionChanged: function(mouse)", rescue_video)
         self.assertNotIn("movingWindow", source)
         self.assertIn('iconKind: "minimize"', source)
         self.assertIn('iconKind: "maximize"', source)
@@ -4761,7 +4762,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("dutySheetDialog.controller.addVehicleOption(", source)
         self.assertIn("dutySheetDialog.controller.removeVehicleOption(", source)
         self.assertIn('objectName: "rescueVideoDialog"', rescue_video)
-        self.assertIn("controller.preparePreview(", rescue_video)
+        self.assertIn("controller.checkAndPreview(", rescue_video)
         self.assertIn("controller.prepareDelete(", rescue_video)
         self.assertNotIn('text: "工具中心"', source)
         self.assertNotIn("modeTabs.currentIndex === 2", source)
@@ -5113,6 +5114,7 @@ class QtShellTests(unittest.TestCase):
             'objectName: "rescueVideoDateField"',
             'objectName: "rescueVideoCheckButton"',
             'objectName: "rescueVideoDateCalendarButton"',
+            'objectName: "rescueVideoCheckButton"',
             'dateFormat: "iso"',
             'text: "檢查及預覽分類"',
             "rescueVideoWindow.controller.checkAndPreview(",
@@ -5129,6 +5131,7 @@ class QtShellTests(unittest.TestCase):
             'text: "案件資料夾"',
             'text: "傳輸進度"',
             'text: "狀態"',
+            'text: "傳輸進度"',
             'text: "目的地"',
             'text: "備註"',
             "rescueVideoWindow.controller.hasPreview",
@@ -5137,6 +5140,11 @@ class QtShellTests(unittest.TestCase):
             "required property int transferPercent",
             "required property string transferText",
             "rescueVideoWindow.controller.isReady",
+            "rescueVideoWindow.controller.hasPreview",
+            "rescueVideoWindow.controller.isAwaitingConfirmation",
+            "rescueVideoWindow.controller.updateInputs(",
+            "required property int transferPercent",
+            "required property string transferText",
         ):
             self.assertIn(expected, panel)
         for unauthorized in (
@@ -5155,6 +5163,7 @@ class QtShellTests(unittest.TestCase):
             self.assertNotIn(unauthorized, panel)
         self.assertNotIn('text: "操作流程：1. 檢查  2. 預覽分類  3. 複製啟動。按檢查確認來源、工作紀錄與記憶卡中最大範例影片的長度。"', panel)
         self.assertNotIn("rescueTitleSize", source)
+        self.assertNotIn('text: "操作流程：1. 檢查  2. 預覽分類  3. 複製啟動。按檢查確認來源、工作紀錄與記憶卡中最大範例影片的長度。"', panel)
         self.assertNotIn("ToolUsageHistory {", panel)
         self.assertNotIn('toolId: "rescue_video"', panel)
         self.assertNotIn("Timer {", panel)
@@ -6642,7 +6651,6 @@ if return_code != 0 or loaded:
             if not controller._schedule_workers:
                 break
             spy.wait(250)
-            QTest.qWait(10)
         self.assertEqual(cached_spy.count(), 1)
         self.assertEqual(controller.taskModel.rowCount(), 0)
         controller.set_actor_no("10")
@@ -7430,6 +7438,75 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.summaryText, "請先選擇日期與車號，再按「檢查及預覽分類」。")
 
 
+    def test_rescue_video_result_model_tracks_each_video_transfer_progress(self) -> None:
+        from qt_app.models.rescue_video_result_model import RescueVideoResultModel
+
+        model = RescueVideoResultModel()
+        model.replace_rows(
+            (
+                {
+                    "sourcePath": "X:/DCIM/V0000001.TS",
+                    "sourceText": "V0000001.TS",
+                    "statusText": "預計複製",
+                    "transferPercent": 0,
+                    "transferText": "尚未傳輸",
+                },
+            )
+        )
+
+        model.prepare_transfer()
+        index = model.index(0, 0)
+        self.assertEqual(model.data(index, model.TransferPercentRole), 0)
+        self.assertEqual(model.data(index, model.TransferTextRole), "等待傳輸")
+
+        model.update_transfer("X:/DCIM/V0000001.TS", 48, 96, "傳輸中")
+        self.assertEqual(model.data(index, model.TransferPercentRole), 50)
+        self.assertEqual(model.data(index, model.TransferTextRole), "傳輸中")
+
+    def test_rescue_video_controller_names_the_failed_check_items(self) -> None:
+        from app_core.rescue_video_service import RescueVideoCheckCard, RescueVideoDefaults
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._check_requested = True
+        controller._defaults_loaded(
+            0,
+            RescueVideoDefaults(
+                "source",
+                "destination",
+                "2026-08-08",
+                ("92",),
+                "92",
+                check_cards=(
+                    RescueVideoCheckCard("source", "記憶卡來源", "來源不可用", "error"),
+                    RescueVideoCheckCard("vehicle_date", "車號與日期", "日期不可用", "error"),
+                ),
+                is_ready=False,
+            ),
+        )
+        self.assertEqual(controller.statusText, "檢查未通過：記憶卡來源、車號與日期")
+        self.assertEqual(
+            controller.summaryText,
+            "請先處理：記憶卡來源、車號與日期，再按「檢查及預覽分類」。",
+        )
+
+        controller._defaults_loaded(
+            0,
+            RescueVideoDefaults(
+                "source",
+                "destination",
+                "2026-08-08",
+                (),
+                "",
+                check_cards=(
+                    RescueVideoCheckCard("vehicle_date", "車號與日期", "日期不可用", "error"),
+                ),
+                is_ready=False,
+            ),
+        )
+        self.assertEqual(controller.statusText, "尚未選擇車號或日期")
+        self.assertEqual(controller.summaryText, "請先選擇日期與車號，再按「檢查及預覽分類」。")
+
     def test_rescue_video_controller_runs_preview_and_confirms_delete(self) -> None:
         from dataclasses import replace
 
@@ -7482,38 +7559,45 @@ if return_code != 0 or loaded:
         success_spy = QSignalSpy(controller.runSucceeded)
         error_spy = QSignalSpy(controller.errorOccurred)
         delete_spy = QSignalSpy(controller.deleteConfirmationRequested)
+        error_spy = QSignalSpy(controller.errorOccurred)
 
         controller.loadDefaults()
-        for _ in range(20):
-            if not controller._workers:
-                break
+        for _ in range(40):
             QTest.qWait(50)
+            if controller.vehicleOptions == ["92", "93"] and not controller._workers:
+                break
         self.assertEqual(controller.vehicleOptions, ["92", "93"])
         self.assertFalse(controller.isReady)
         self.assertFalse(controller.hasPreview)
         self.assertIn("影片時間會採用同張記憶卡範例影片的實際長度自動判定。", controller.checkText)
         self.assertEqual(controller.checkCards[0]["key"], "source")
 
-        self.assertEqual(error_spy.count(), 1)
+        self.assertEqual(error_spy.count(), 0)
         self.assertFalse(controller._workers)
 
         controller.checkAndPreview("source", "2026-07-29", "92")
         controller.preparePreview("source", "destination", "2026-07-29", "92", "", False)
+        self.assertEqual(error_spy.count(), 1)
+        self.assertFalse(controller._workers)
+
+        controller.checkAndPreview("source", "2026-07-29", "92")
         for _ in range(20):
             if success_spy.count() and not controller._workers:
                 break
             success_spy.wait(250)
         self.assertTrue(controller.isReady)
-            QTest.qWait(10)
         self.assertEqual(success_spy.count(), 1)
         self.assertEqual(controller.resultModel.rowCount(), 1)
         self.assertTrue(controller.hasPreview)
         self.assertIn("複製啟動", controller.summaryText)
         self.assertEqual(controller.reportPath, "report.csv")
+        self.assertTrue(controller.hasPreview)
+        self.assertIn("複製啟動", controller.summaryText)
 
         controller.prepareDelete("source", "destination", "2026-07-29", "92", "", False)
         self.assertTrue(controller.isAwaitingConfirmation)
         self.assertEqual(delete_spy.count(), 1)
+        self.assertTrue(controller.isAwaitingConfirmation)
         self.assertIn("確認刪除 92", controller.confirmationSummary)
         controller.cancelDelete()
         self.assertEqual(controller.confirmationSummary, "")
@@ -7864,6 +7948,102 @@ if return_code != 0 or loaded:
         )
 
         self.assertEqual(message, "出入｜值班 / 值班 08 曾彥綸｜登打完成")
+
+    def test_handoff_preflight_notification_is_not_labeled_as_work_submission(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        message = AppController._format_duty_notification(
+            {
+                "kind": "handoff_preflight",
+                "target": "8",
+                "fields": {"勤務項目": "值班(宿)"},
+            },
+            {"8": {"name": "接班人員"}},
+            "檢查中",
+        )
+
+        self.assertEqual(message, "交接預檢｜值班(宿) 08 接班人員｜檢查中")
+
+    def test_submission_notifications_exclude_handoff_preflight(self) -> None:
+        from pathlib import Path
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        notifications: list[tuple[str, str]] = []
+        controller._tray_controller.notify = lambda title, message: notifications.append((title, message))
+        controller._send_operational_event = lambda *_args, **_kwargs: None
+        actual_action = {
+            "kind": "entry_log",
+            "target": "8",
+            "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+        }
+        actual_request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {"target_date": "1150808", "actions": [actual_action]},
+        )
+        preflight_action = {
+            "kind": "handoff_preflight",
+            "target": "8",
+            "fields": {"勤務項目": "值班(宿)"},
+        }
+        preflight_request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {
+                "target_date": "1150808",
+                "actions": [preflight_action],
+                "_handoff_preflight_group_id": "handoff:test",
+            },
+        )
+        try:
+            controller._submission_queued(actual_request)
+            self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜準備登打")])
+            controller._submission_finished(
+                actual_request,
+                DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "完成",
+                    Path("actual.json"),
+                    {},
+                    actual_action,
+                ),
+            )
+            self.assertEqual(
+                notifications,
+                [
+                    ("SinpoSmart", "出入｜值班 / 值班 08｜準備登打"),
+                    ("SinpoSmart", "出入｜值班 / 值班 08｜登打完成"),
+                ],
+            )
+
+            notifications.clear()
+            controller._submission_queued(preflight_request)
+            controller._submission_finished(
+                preflight_request,
+                DutySubmissionResult(
+                    0,
+                    "handoff_preflight_ready",
+                    "完成",
+                    Path("preflight.json"),
+                    {},
+                    preflight_action,
+                ),
+            )
+            controller._submission_failed(
+                preflight_request,
+                "預檢失敗",
+                "timeout",
+                "",
+            )
+            self.assertEqual(notifications, [])
+        finally:
+            controller.shutdown()
 
     def test_duty_execution_controller_retries_work_browser_without_using_entry_channel(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -9247,6 +9427,78 @@ if return_code != 0 or loaded:
 
         self.assertEqual(requests, [])
 
+    def test_handoff_preflight_rejects_replaced_future_action(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("17")
+        original_action = {
+            "kind": "entry_log",
+            "time": "22:00",
+            "date_offset": 0,
+            "actor": "17",
+            "target": "8",
+            "source": "值班交接",
+            "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            "duplicate_key": "entry:1150808:22:值班:8",
+        }
+        controller.replace_schedule_data({"target_date": "1150808", "actions": [original_action]})
+        controller._handoff_preflight_groups["handoff:stale"] = {
+            "indices": (0,),
+            "actions": [dict(original_action)],
+            "pending_keys": set(),
+            "paused": False,
+            "queue_id": "",
+        }
+        preflight = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {"_handoff_preflight_group_id": "handoff:stale"},
+            trigger_type="due",
+        )
+        matching_requests = controller.handoff_group_submission_requests(
+            "user17",
+            "secret",
+            preflight,
+            submit_at=datetime(2026, 8, 8, 22, 0),
+        )
+
+        self.assertEqual(len(matching_requests), 1)
+        self.assertEqual(
+            matching_requests[0].schedule_data["actions"][0]["kind"],
+            "entry_log",
+        )
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150808",
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "date_offset": 1,
+                        "actor": "8",
+                        "target": "8",
+                        "source": "值班交接",
+                        "fields": {"勤務項目": "值班(宿)"},
+                        "duplicate_key": "work:1150809:8:值班交接:8",
+                    }
+                ],
+            }
+        )
+
+        requests = controller.handoff_group_submission_requests(
+            "user17",
+            "secret",
+            preflight,
+            submit_at=datetime(2026, 8, 8, 22, 0),
+        )
+
+        self.assertEqual(requests, [])
+
     def test_manual_submission_includes_adjust_group_task(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
@@ -9959,6 +10211,8 @@ if return_code != 0 or loaded:
                 self.copy_started = threading.Event()
                 self.release_copy = threading.Event()
                 self.requests = []
+                self.copy_started = threading.Event()
+                self.release_copy = threading.Event()
 
             def load_defaults(self, *_args, **_kwargs):
                 defaults = RescueVideoDefaults(
@@ -10003,19 +10257,25 @@ if return_code != 0 or loaded:
             ):
                 self.requests.append(request)
                 if status_callback is not None:
+                    status_callback("rescue video test running")
                 if request.mode == "delete" and transfer_callback is not None:
                     transfer_callback("X:/DCIM/clip.mp4", 50, 100, "傳輸中")
                     self.copy_started.set()
                     self.release_copy.wait(timeout=5)
                     transfer_callback("X:/DCIM/clip.mp4", 100, 100, "驗證完成")
                     status_callback("救護影片測試執行中")
+                if request.mode == "delete" and transfer_callback is not None:
+                    transfer_callback("X:/DCIM/clip.mp4", 50, 100, "傳輸中")
+                    self.copy_started.set()
+                    self.release_copy.wait(timeout=5)
+                    transfer_callback("X:/DCIM/clip.mp4", 100, 100, "驗證完成")
                 return RescueVideoRunResult(
                     summary_text="預覽完成" if request.mode == "preview" else "複製完成",
                     warning_text="",
                     report_path="report.csv",
                     rows=(
-                            "sourcePath": "X:/DCIM/clip.mp4",
                         {
+                            "sourcePath": "X:/DCIM/clip.mp4",
                             "sourceText": "clip.mp4",
                             "timeText": "09:30",
                             "caseText": "救護案件",
@@ -10025,6 +10285,8 @@ if return_code != 0 or loaded:
                             "transferPercent": 0 if request.mode == "preview" else 100,
                             "transferText": "尚未傳輸" if request.mode == "preview" else "驗證完成",
                             "tone": "ok",
+                            "transferPercent": 0 if request.mode == "preview" else 100,
+                            "transferText": "尚未傳輸" if request.mode == "preview" else "驗證完成",
                         },
                     ),
                 )
@@ -10421,6 +10683,10 @@ if return_code != 0 or loaded:
                 self.assertTrue(wait_for_visible("checkForUpdatesMenuItem").isVisible())
                 self.assertTrue(wait_for_visible("exportIssuePackageMenuItem").isVisible())
                 self.assertTrue(QMetaObject.invokeMethod(system_menu, "close", Qt.DirectConnection))
+                controller.dutyController.set_refresh_status("審核資料已更新")
+                QTest.qWait(50)
+                audit_refresh_status_text = wait_for("auditRefreshStatusText")
+                self.assertTrue(audit_refresh_status_text.property("visible"))
                 audit_todo_card = wait_for("auditTodoSummaryCard")
                 audit_date_card = wait_for("auditDateCard")
                 audit_filter_card = wait_for("auditFilterCard")
@@ -10433,6 +10699,14 @@ if return_code != 0 or loaded:
                 self.assertGreater(
                     audit_todo_card.mapToScene(QPointF(0, 0)).y(),
                     audit_date_card.mapToScene(QPointF(0, 0)).y(),
+                )
+                self.assertLess(
+                    audit_refresh_status_text.mapToScene(QPointF(0, 0)).y(),
+                    audit_todo_card.mapToScene(QPointF(0, 0)).y(),
+                )
+                self.assertLessEqual(
+                    audit_refresh_status_text.mapToScene(QPointF(0, 0)).x(),
+                    audit_todo_card.mapToScene(QPointF(0, 0)).x(),
                 )
                 self.assertGreater(audit_task_header.width(), 0)
                 audit_refresh = wait_for("auditRefreshButton")
@@ -10841,16 +11115,30 @@ if return_code != 0 or loaded:
                     rescue_title_close_button,
                     rescue_bottom_close_button,
                 ):
-                    self.assertFalse(control.property("enabled"))
+                    self.assertTrue(control.property("enabled"))
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
                 self.assertTrue(rescue_delete_confirmation.property("visible"))
+                for control in (
+                    rescue_vehicle_combo,
+                    rescue_date_field,
+                    rescue_check_button,
+                    rescue_copy_button,
+                    rescue_minimize_button,
+                    rescue_maximize_button,
+                    rescue_title_close_button,
+                    rescue_bottom_close_button,
+                ):
+                    self.assertTrue(control.property("enabled"))
+                self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
+                self.assertTrue(rescue_window.property("visible"))
                 self.assertEqual(
                     controller.rescueVideoController.confirmationSummary,
                     "複製完成後，會將確定完成內容驗證後的影片檔案刪除，確定要繼續嗎？",
                 )
                 self.assertTrue(
                     QMetaObject.invokeMethod(rescue_delete_confirmation, "accept", Qt.DirectConnection)
+                )
                 self.assertTrue(rescue_video_service.copy_started.wait(timeout=2))
                 QTest.qWait(50)
                 self.assertTrue(controller.rescueVideoController.isRunning)
@@ -10868,7 +11156,23 @@ if return_code != 0 or loaded:
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
                 rescue_video_service.release_copy.set()
-                )
+                self.assertTrue(rescue_video_service.copy_started.wait(timeout=2))
+                QTest.qWait(50)
+                self.assertTrue(controller.rescueVideoController.isRunning)
+                for control in (
+                    rescue_vehicle_combo,
+                    rescue_date_field,
+                    rescue_check_button,
+                    rescue_copy_button,
+                    rescue_minimize_button,
+                    rescue_maximize_button,
+                    rescue_title_close_button,
+                    rescue_bottom_close_button,
+                ):
+                    self.assertFalse(control.property("enabled"))
+                self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
+                self.assertTrue(rescue_window.property("visible"))
+                rescue_video_service.release_copy.set()
                 wait_until(
                     lambda: len(rescue_video_service.requests) == 2
                     and not controller.rescueVideoController._workers,
@@ -10877,6 +11181,21 @@ if return_code != 0 or loaded:
                 self.assertEqual(
                     [request.mode for request in rescue_video_service.requests],
                     ["preview", "delete"],
+                )
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_model.index(0, 0),
+                        rescue_result_model.TransferPercentRole,
+                    ),
+                    100,
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_model.index(0, 0),
+                        rescue_result_model.TransferTextRole,
+                    ),
+                    "驗證完成",
+                )
+                )
                 self.assertEqual(
                     rescue_result_model.data(
                         rescue_result_model.index(0, 0),
@@ -10890,7 +11209,6 @@ if return_code != 0 or loaded:
                         rescue_result_model.TransferTextRole,
                     ),
                     "驗證完成",
-                )
                 )
                 rescue_dialog = root.findChild(QObject, "rescueVideoDialog")
                 self.assertTrue(QMetaObject.invokeMethod(rescue_dialog, "close", Qt.DirectConnection))

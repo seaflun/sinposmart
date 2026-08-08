@@ -882,7 +882,12 @@ class AppController(QObject):
     ) -> str:
         """Keep duty notifications specific enough for parallel submissions."""
 
-        kind = "出入" if action.get("kind") == "entry_log" else "工作"
+        if action.get("kind") == "handoff_preflight":
+            kind = "交接預檢"
+        elif action.get("kind") == "entry_log":
+            kind = "出入"
+        else:
+            kind = "工作"
         summary = action_summary(action) or "勤務登打"
         target = target_short_label(action, staff)
         target_text = f" {target}" if target and target != "-" else ""
@@ -903,10 +908,11 @@ class AppController(QObject):
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
-        self._tray_controller.notify(
-            "SinpoSmart",
-            self._format_duty_notification(action, self._operational_staff, "準備登打"),
-        )
+        if not self._duty_controller.is_handoff_preflight_request(request):
+            self._tray_controller.notify(
+                "SinpoSmart",
+                self._format_duty_notification(action, self._operational_staff, "準備登打"),
+            )
         self._send_operational_event(
             "action_queued",
             status="pending_write_automation",
@@ -925,7 +931,8 @@ class AppController(QObject):
         result: DutySubmissionResult,
     ) -> None:
         queue_id = self._external_return_queue_id(request)
-        if self._duty_controller.is_handoff_preflight_request(request):
+        is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
+        if is_handoff_preflight:
             if result.status == "paused_external":
                 self._duty_controller.handle_handoff_preflight_paused(request)
             elif result.status == "handoff_preflight_ready":
@@ -967,11 +974,12 @@ class AppController(QObject):
                 "completion_key": action_completion_key(action),
             },
         )
-        outcome = "登打完成" if result.status == "submitted" else "已有資料，略過"
-        self._tray_controller.notify(
-            "SinpoSmart",
-            self._format_duty_notification(action, self._operational_staff, outcome),
-        )
+        if not is_handoff_preflight:
+            outcome = "登打完成" if result.status == "submitted" else "已有資料，略過"
+            self._tray_controller.notify(
+                "SinpoSmart",
+                self._format_duty_notification(action, self._operational_staff, outcome),
+            )
 
     @Slot(object, str, str, str)
     def _submission_failed(
@@ -983,7 +991,8 @@ class AppController(QObject):
     ) -> None:
         queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
-        if self._duty_controller.is_handoff_preflight_request(request):
+        is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
+        if is_handoff_preflight:
             self._duty_controller.handle_handoff_preflight_failure(request, message, error_code)
             if error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()
@@ -1016,15 +1025,16 @@ class AppController(QObject):
                 "error_code": error_code,
             },
         )
-        detail = str(message or "登打失敗").strip()
-        self._tray_controller.notify(
-            "SinpoSmart",
-            self._format_duty_notification(
-                action,
-                self._operational_staff,
-                f"登打失敗：{detail}",
-            ),
-        )
+        if not is_handoff_preflight:
+            detail = str(message or "登打失敗").strip()
+            self._tray_controller.notify(
+                "SinpoSmart",
+                self._format_duty_notification(
+                    action,
+                    self._operational_staff,
+                    f"登打失敗：{detail}",
+                ),
+            )
         if not result_path or error_code == "validation_error":
             return
         try:

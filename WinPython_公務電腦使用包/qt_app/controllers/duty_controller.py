@@ -451,6 +451,8 @@ class DutyController(QObject):
             return
         previous_actor = self._actor_no
         self._actor_no = actor_no
+        if actor_no != previous_actor:
+            self._handoff_preflight_groups.clear()
         if actor_no and actor_no != previous_actor:
             self._login_started_at = datetime.now()
         if not actor_no:
@@ -1305,11 +1307,29 @@ class DutyController(QObject):
                 submit_at=current,
             )
 
-        group_indices = tuple(state.get("indices", ()))
         actions = [dict(action) for action in self._actions]
+        action_indices_by_completion_key = {
+            action_completion_key(action): index
+            for index, action in enumerate(actions)
+        }
+        group_indices = tuple(
+            action_indices_by_completion_key.get(action_completion_key(action), -1)
+            for action in state.get("actions", [])
+        )
+        if not group_indices or any(index < 0 for index in group_indices):
+            return []
         target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
         for index in group_indices:
-            if not 0 <= index < len(actions):
+            if (
+                not 0 <= index < len(actions)
+                or str(actions[index].get("actor", "") or "") != self._actor_no
+                or action_datetime(
+                    actions[index],
+                    self._target_date_text,
+                    fallback_date=current.date(),
+                )
+                > current
+            ):
                 return []
             action = self._stamped_submission_action(actions[index], current)
             if action is None:
