@@ -2207,8 +2207,6 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
         for key in list(active.keys()):
             if key not in current:
                 duty_name, no = key
-                if no in row.columns.get("休息", []):
-                    continue
                 block_start = active.pop(key)
                 block_end = start
                 if block_end == 8 and next_sheet and no in people_at(next_sheet, 8, duty_name):
@@ -2543,8 +2541,6 @@ def planned_actions(
 
     for no, start, end in rest_blocks(today, tomorrow):
         if no not in today_on or (start == 8 and no not in yesterday_on):
-            continue
-        if rest_is_external_route(today, no, start, end):
             continue
         start_offset = 1 if start < 8 else 0
         end_offset = 1 if end is not None and (end <= 8 or end >= 24) else 0

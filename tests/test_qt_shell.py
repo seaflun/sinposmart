@@ -444,7 +444,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
         self.assertEqual([row["taskIndex"] for row in rows], [0, 1, 3, 2])
 
-    def test_projection_filters_actor_keeps_previous_handoff_and_sorts_rows(self) -> None:
+    def test_projection_excludes_previous_handoff_and_keeps_own_rows(self) -> None:
         from datetime import datetime
 
         from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
@@ -482,12 +482,92 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
         rows = project_duty_tasks(actions, state, now=datetime(2026, 7, 29, 8, 0))
 
-        self.assertEqual([row["taskIndex"] for row in rows], [1, 0])
-        self.assertEqual(rows[0]["statusText"], "前班手動")
-        self.assertEqual(rows[0]["systemText"], "出入")
-        self.assertEqual(rows[1]["detailText"], "巡邏")
-        self.assertEqual(rows[1]["peopleText"], "10 本班")
-        self.assertEqual(rows[1]["statusText"], "等待")
+        self.assertEqual([row["taskIndex"] for row in rows], [0])
+        self.assertEqual(rows[0]["detailText"], "巡邏")
+        self.assertEqual(rows[0]["peopleText"], "10 本班")
+        self.assertEqual(rows[0]["statusText"], "等待")
+
+    def test_projection_shows_previous_external_without_handoff(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "19",
+                "source": "值班交接",
+                "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "27",
+                "source": "值班交接",
+                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            },
+            {
+                "kind": "work_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "19",
+                "source": "值班交接",
+                "fields": {"勤務項目": "值班(宿)", "服勤人員": ["19"]},
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "25",
+                "source": "外勤簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "防溺車巡暨車輛駕訓"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "15",
+                "source": "休息簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "休息"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "15",
+                "source": "休息結束",
+                "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+            },
+        ]
+        comparisons = {
+            3: {"compare": "外勤確認", "group": "review", "matched": []},
+            4: {"compare": "未找到", "group": "todo", "matched": []},
+            5: {"compare": "尚未到時", "group": "future", "matched": []},
+        }
+
+        incoming_rows = project_duty_tasks(
+            actions,
+            DutyTaskProjectionState(actor_no="27", target_roc_date="1150808", comparisons=comparisons),
+            now=datetime(2026, 8, 8, 16, 1),
+        )
+        outgoing_rows = project_duty_tasks(
+            actions,
+            DutyTaskProjectionState(actor_no="19", target_roc_date="1150808", comparisons=comparisons),
+            now=datetime(2026, 8, 8, 16, 1),
+        )
+
+        self.assertEqual([row["taskIndex"] for row in incoming_rows], [3, 4, 5])
+        external_row = next(row for row in incoming_rows if row["taskIndex"] == 3)
+        self.assertEqual(external_row["statusText"], "外勤確認")
+        rest_row = next(row for row in incoming_rows if row["taskIndex"] == 4)
+        self.assertEqual(rest_row["statusText"], "前班手動")
+        rest_return_row = next(row for row in incoming_rows if row["taskIndex"] == 5)
+        self.assertEqual(rest_return_row["statusText"], "前班手動")
+        external_row = next(row for row in outgoing_rows if row["taskIndex"] == 3)
+        self.assertEqual(external_row["statusText"], "外勤確認")
 
     def test_projection_formats_cross_day_time_and_status_precedence(self) -> None:
         from datetime import datetime
@@ -514,7 +594,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(rows[0]["statusText"], "正在登打")
         self.assertEqual(rows[0]["statusTone"], "running")
 
-    def test_next_task_text_matches_legacy_candidate_and_previous_duty_fallback(self) -> None:
+    def test_next_task_text_ignores_previous_handoff_and_uses_own_candidate(self) -> None:
         from datetime import datetime
 
         from app_core.duty_task_projection import DutyTaskProjectionState, next_duty_task_text
@@ -551,7 +631,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
         )
         self.assertEqual(
             next_duty_task_text(actions, completed_state, now=datetime(2026, 7, 29, 8, 0)),
-            "前一班尚有 1 筆待手動處理",
+            "今日目前沒有未完成的當班任務",
         )
         self.assertEqual(
             next_duty_task_text(actions, DutyTaskProjectionState(actor_no="", target_roc_date="1150729")),
@@ -9018,6 +9098,49 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.selectedTaskCount, 3)
         controller.toggleTaskSelection(0)
         self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_due_submission_rejects_stale_future_handoff_index(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("27")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1880101",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "18:00",
+                        "actor": "27",
+                        "target": "27",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "18:00",
+                        "actor": "27",
+                        "target": "5",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "18:00",
+                        "actor": "27",
+                        "target": "27",
+                        "source": "值班交接",
+                        "fields": {"勤務項目": "值班(宿)", "服勤人員": ["27"]},
+                    },
+                ],
+            }
+        )
+        controller.enable_auto_execution()
+        controller._due_task_indices = [1]
+
+        requests = controller.due_submission_requests("user27", "secret", [1])
+
+        self.assertEqual(requests, [])
 
     def test_manual_submission_includes_adjust_group_task(self) -> None:
         from PySide6.QtTest import QSignalSpy

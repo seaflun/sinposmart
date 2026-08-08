@@ -291,11 +291,12 @@ def _is_previous_duty_item(
     action: Mapping[str, Any],
     previous_actor_nos: set[str],
 ) -> bool:
-    if str(action.get("actor", "") or "") not in previous_actor_nos:
+    if action.get("kind") != "entry_log":
         return False
-    return action.get("kind") == "entry_log" or (
-        action.get("kind") == "work_log" and action.get("source") == "值班交接"
-    )
+    source = str(action.get("source", "") or "")
+    if not (source.startswith("外勤") or source in ("休息簽出", "休息結束")):
+        return False
+    return str(action.get("actor", "") or "") in previous_actor_nos
 
 
 def _display_status(value: Any) -> str:
@@ -367,9 +368,10 @@ def project_duty_tasks(
             and index not in state.forced_visible_indices
         ):
             continue
-        if is_previous_item and comparison and comparison.get("group") in ("done", "near", "adjust", "future"):
+        if is_previous_item and comparison and comparison.get("group") in ("done", "near", "adjust"):
             continue
-        if comparison.get("group") == "review" and not is_previous_item:
+        is_external_action = str(action.get("source", "") or "").startswith("外勤")
+        if comparison.get("group") == "review" and not is_previous_item and not is_external_action:
             continue
         status_text, status_tone = _task_status(
             index,

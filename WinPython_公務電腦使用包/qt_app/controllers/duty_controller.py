@@ -564,8 +564,11 @@ class DutyController(QObject):
             return []
         requests: list[DutySubmissionRequest] = []
         handled_group_ids: set[str] = set()
+        current = datetime.now()
         for index in indices:
             if index not in self._due_task_indices or not 0 <= index < len(self._actions):
+                continue
+            if action_datetime(self._actions[index], self._target_date_text, fallback_date=current.date()) > current:
                 continue
             group_indices = self._handoff_group_indices(index)
             if not group_indices:

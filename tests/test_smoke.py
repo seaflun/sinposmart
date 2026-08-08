@@ -485,6 +485,38 @@ class PackageSmokeTests(unittest.TestCase):
             source.index("driver = build_driver(headless=False)"),
         )
 
+    def test_external_duty_followed_by_rest_returns_before_rest_starts(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150808",
+            rows=[
+                module.DutyRow("14~15", {"值班": ["19"], "備勤": ["5", "25"]}),
+                module.DutyRow("15~16", {"值班": ["19"], "備勤": ["5", "25"]}),
+                module.DutyRow("16~17", {"值班": ["27"], "休息": ["15"], "防溺車巡暨車輛駕訓": ["5", "25"]}),
+                module.DutyRow("17~18", {"值班": ["27"], "休息": ["15"], "防溺車巡暨車輛駕訓": ["5", "25"]}),
+                module.DutyRow("18~19", {"值班": ["5"], "休息": ["25"]}),
+                module.DutyRow("19~20", {"值班": ["5"], "休息": ["25"]}),
+            ],
+            summary={"在勤": ["5", "15", "19", "25", "27"]},
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150808"), [], None)
+        person_actions = [
+            (action.time, action.source, action.actor, action.fields.get("出或入"), action.fields.get("領用事由及地點"))
+            for action in actions
+            if action.target == "25" and action.source in ("外勤簽出", "外勤簽入", "休息簽出", "休息結束")
+        ]
+
+        self.assertEqual(
+            person_actions,
+            [
+                ("16:00", "外勤簽出", "19", "出", "防溺車巡暨車輛駕訓"),
+                ("18:00", "外勤簽入", "27", "入", "返隊"),
+                ("18:00", "休息簽出", "27", "出", "休息"),
+                ("20:00", "休息結束", "5", "入", "休息返隊"),
+            ],
+        )
+
     def test_duty_sheet_truncates_external_duty_names_to_24_display_units(self) -> None:
         module = legacy_duty_sheet_module()
 
