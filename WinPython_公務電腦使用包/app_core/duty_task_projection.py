@@ -287,16 +287,42 @@ def previous_duty_actor_nos(actions: Sequence[Mapping[str, Any]], actor_no: str)
     return previous
 
 
+def previous_duty_handoff_times(
+    actions: Sequence[Mapping[str, Any]],
+    actor_no: str,
+    target_roc_date: str,
+) -> dict[str, set[datetime]]:
+    handoff_times: dict[str, set[datetime]] = {}
+    for action in actions:
+        fields = action.get("fields", {})
+        if not isinstance(fields, Mapping):
+            fields = {}
+        if (
+            action.get("kind") == "entry_log"
+            and action.get("source") == "值班交接"
+            and str(action.get("target", "")) == actor_no
+            and fields.get("出或入", "") == "值班"
+        ):
+            action_actor = str(action.get("actor", "") or "")
+            if action_actor and action_actor != actor_no:
+                handoff_times.setdefault(action_actor, set()).add(
+                    action_datetime(action, target_roc_date)
+                )
+    return handoff_times
+
+
 def _is_previous_duty_item(
     action: Mapping[str, Any],
-    previous_actor_nos: set[str],
+    previous_handoff_times: Mapping[str, set[datetime]],
+    target_roc_date: str,
 ) -> bool:
     if action.get("kind") != "entry_log":
         return False
     source = str(action.get("source", "") or "")
     if not (source.startswith("外勤") or source in ("休息簽出", "休息結束")):
         return False
-    return str(action.get("actor", "") or "") in previous_actor_nos
+    actor_no = str(action.get("actor", "") or "")
+    return action_datetime(action, target_roc_date) in previous_handoff_times.get(actor_no, set())
 
 
 def _display_status(value: Any) -> str:
@@ -348,7 +374,11 @@ def project_duty_tasks(
     if not actor_no:
         return []
     now = now or datetime.now()
-    previous_actors = previous_duty_actor_nos(actions, actor_no)
+    previous_handoff_times = previous_duty_handoff_times(
+        actions,
+        actor_no,
+        state.target_roc_date,
+    )
     handoff_group_anchors: dict[tuple[datetime, str], int] = {}
     for index, action in enumerate(actions):
         if action.get("source") != "值班交接":
@@ -361,7 +391,11 @@ def project_duty_tasks(
     projected: list[tuple[tuple[datetime, int, int, int, int], dict[str, Any]]] = []
     for index, action in enumerate(actions):
         comparison = state.comparisons.get(index, {})
-        is_previous_item = _is_previous_duty_item(action, previous_actors)
+        is_previous_item = _is_previous_duty_item(
+            action,
+            previous_handoff_times,
+            state.target_roc_date,
+        )
         if (
             str(action.get("actor", "") or "") != actor_no
             and not is_previous_item

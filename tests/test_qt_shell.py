@@ -487,7 +487,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(rows[0]["peopleText"], "10 本班")
         self.assertEqual(rows[0]["statusText"], "等待")
 
-    def test_projection_shows_previous_external_without_handoff(self) -> None:
+    def test_projection_shows_previous_items_at_handoff_time_only(self) -> None:
         from datetime import datetime
 
         from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
@@ -559,13 +559,12 @@ class DutyTaskProjectionTests(unittest.TestCase):
             now=datetime(2026, 8, 8, 16, 1),
         )
 
-        self.assertEqual([row["taskIndex"] for row in incoming_rows], [3, 4, 5])
+        self.assertEqual([row["taskIndex"] for row in incoming_rows], [3, 4])
         external_row = next(row for row in incoming_rows if row["taskIndex"] == 3)
         self.assertEqual(external_row["statusText"], "外勤確認")
         rest_row = next(row for row in incoming_rows if row["taskIndex"] == 4)
         self.assertEqual(rest_row["statusText"], "前班手動")
-        rest_return_row = next(row for row in incoming_rows if row["taskIndex"] == 5)
-        self.assertEqual(rest_return_row["statusText"], "前班手動")
+        self.assertNotIn(5, [row["taskIndex"] for row in incoming_rows])
         external_row = next(row for row in outgoing_rows if row["taskIndex"] == 3)
         self.assertEqual(external_row["statusText"], "外勤確認")
 
