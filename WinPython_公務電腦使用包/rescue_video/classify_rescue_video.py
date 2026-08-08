@@ -20,7 +20,7 @@ import sys
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 
 CASE_RE = re.compile(r"^(?P<md>\d{4})(?P<hm>\d{4})-(?P<vehicle>\d+)(?P<suffix>.*)$")
@@ -31,6 +31,11 @@ RETURN_TIME_RE = re.compile(
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})"
 )
 MONTH_RE = re.compile(r"^(\d{1,2})月?$", re.IGNORECASE)
+TS_PACKET_SIZE = 188
+TS_PTS_CLOCK_HZ = 90_000
+TS_PTS_WRAP = 1 << 33
+TS_DURATION_SAMPLE_BYTES = 2 * 1024 * 1024
+COPY_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,8 @@ class Result:
     destination: Path | None
     status: str
     note: str = ""
+    video_start: datetime | None = None
+    video_duration: timedelta | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,8 +232,9 @@ def discover_vehicles(destination: Path, selected_date: date) -> list[str]:
     return sorted(vehicles, key=lambda vehicle: (int(vehicle), vehicle))
 
 
-def choose_offset_minutes(scores: Mapping[int, int]) -> int:
-    return max((scores.get(offset, 0), offset == 6, -offset, offset) for offset in (5, 6, 7))[3]
+def choose_offset_minutes(_scores: Mapping[int, int]) -> int:
+    """Keep the recording end time unchanged; duration determines the start time."""
+    return 0
 
 
 def roc_datetime(roc_date: str, hour: int, minute: int, second: int = 0) -> datetime | None:
@@ -351,6 +359,104 @@ def discover_sources(source: Path, extension: str) -> list[Path]:
     return sorted(files, key=sort_key)
 
 
+def _ts_packet_offset(data: bytes) -> int | None:
+    """Return a packet boundary from a TS byte sample, if one is present."""
+    minimum_packets = 4
+    maximum_offset = min(TS_PACKET_SIZE, len(data))
+    for offset in range(maximum_offset):
+        if offset + TS_PACKET_SIZE * (minimum_packets - 1) >= len(data):
+            break
+        if all(data[offset + TS_PACKET_SIZE * index] == 0x47 for index in range(minimum_packets)):
+            return offset
+    return None
+
+
+def _decode_pts(value: bytes) -> int:
+    if len(value) != 5:
+        raise ValueError("MPEG-TS PTS 長度不正確")
+    return (
+        ((value[0] >> 1) & 0x07) << 30
+        | (value[1] << 22)
+        | ((value[2] >> 1) & 0x7F) << 15
+        | (value[3] << 7)
+        | ((value[4] >> 1) & 0x7F)
+    )
+
+
+def _ts_pts_by_pid(data: bytes) -> dict[int, list[int]]:
+    offset = _ts_packet_offset(data)
+    if offset is None:
+        return {}
+
+    points: dict[int, list[int]] = {}
+    while offset + TS_PACKET_SIZE <= len(data):
+        packet = data[offset : offset + TS_PACKET_SIZE]
+        offset += TS_PACKET_SIZE
+        if packet[0] != 0x47 or not (packet[1] & 0x40):
+            continue
+        adaptation_control = (packet[3] >> 4) & 0x03
+        if adaptation_control not in (1, 3):
+            continue
+        payload_offset = 4
+        if adaptation_control == 3:
+            payload_offset += 1 + packet[4]
+        if payload_offset + 14 > len(packet):
+            continue
+        payload = packet[payload_offset:]
+        if payload[:3] != b"\x00\x00\x01":
+            continue
+        if ((payload[7] >> 6) & 0x03) not in (2, 3):
+            continue
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        points.setdefault(pid, []).append(_decode_pts(payload[9:14]))
+    return points
+
+
+def _read_ts_sample(path: Path, *, from_end: bool) -> bytes:
+    size = path.stat().st_size
+    if size < TS_PACKET_SIZE * 4:
+        raise ValueError("影片檔太小，無法讀取 MPEG-TS 時長")
+    with path.open("rb") as video:
+        if from_end and size > TS_DURATION_SAMPLE_BYTES:
+            video.seek(size - TS_DURATION_SAMPLE_BYTES)
+        return video.read(TS_DURATION_SAMPLE_BYTES)
+
+
+def read_ts_duration(path: Path) -> timedelta:
+    """Read a TS recording duration from its beginning and ending PES PTS values."""
+    start_points = _ts_pts_by_pid(_read_ts_sample(path, from_end=False))
+    end_points = _ts_pts_by_pid(_read_ts_sample(path, from_end=True))
+    candidates: list[float] = []
+    for pid, start_values in start_points.items():
+        end_values = end_points.get(pid)
+        if not end_values:
+            continue
+        elapsed_ticks = end_values[-1] - start_values[0]
+        if elapsed_ticks < 0:
+            elapsed_ticks += TS_PTS_WRAP
+        seconds = elapsed_ticks / TS_PTS_CLOCK_HZ
+        if 0 < seconds <= 24 * 60 * 60:
+            candidates.append(seconds)
+    if not candidates:
+        raise ValueError("找不到可判定影片長度的 MPEG-TS 時間戳")
+    candidates.sort()
+    return timedelta(seconds=candidates[len(candidates) // 2])
+
+
+def read_card_duration(sources: list[Path]) -> tuple[Path, timedelta]:
+    """Read the largest TS duration for a memory card's shared recorder setting."""
+    if not sources:
+        raise ValueError("記憶卡內找不到 .TS 影片")
+    try:
+        sample = max(sources, key=lambda path: path.stat().st_size)
+    except OSError as exc:
+        raise ValueError(f"無法選擇記憶卡範例影片：{exc}") from exc
+    try:
+        return sample, read_ts_duration(sample)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"無法讀取記憶卡範例影片 {sample.name} 的實際長度：{exc}") from exc
+
+
 def choose_case(
     video_start: datetime,
     video_end: datetime,
@@ -395,16 +501,27 @@ def same_file_metadata(source: Path, destination: Path) -> bool:
     )
 
 
-def copy_preserving_time(source: Path, destination: Path) -> None:
+def copy_preserving_time(
+    source: Path,
+    destination: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> None:
     """Copy through a temporary file, verify size, then atomically rename."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part")
     source_stat = source.stat()
     try:
+        copied_bytes = 0
         with source.open("rb") as input_file, temporary.open("wb") as output_file:
-            shutil.copyfileobj(input_file, output_file, length=8 * 1024 * 1024)
+            while chunk := input_file.read(COPY_CHUNK_BYTES):
+                output_file.write(chunk)
+                copied_bytes += len(chunk)
+                if progress_callback is not None:
+                    progress_callback(copied_bytes, source_stat.st_size)
             output_file.flush()
             os.fsync(output_file.fileno())
+        if progress_callback is not None and source_stat.st_size == 0:
+            progress_callback(0, 0)
         if temporary.stat().st_size != source_stat.st_size:
             raise IOError(
                 f"大小驗證失敗：來源 {source_stat.st_size}，暫存檔 {temporary.stat().st_size}"
@@ -456,19 +573,23 @@ def finalize_source_cleanup(
     return f"{status}並刪除來源", ""
 
 
-def classify(args: argparse.Namespace) -> list[Result]:
+def classify(
+    args: argparse.Namespace,
+    transfer_callback: Callable[[Path, int, int, str], None] | None = None,
+) -> list[Result]:
     selected_date = parse_date(args.date)
     cases = discover_cases(args.destination, args.vehicle)
     source_root = resolve_source(args.source)
     sources = discover_sources(source_root, args.extension)
+    _sample_source, video_duration = read_card_duration(sources)
     before = timedelta(minutes=args.before_minutes)
     after = timedelta(minutes=args.after_minutes)
-    offset = timedelta(minutes=args.offset_minutes)
     results: list[Result] = []
 
     for source in sources:
         try:
-            source_time = datetime.fromtimestamp(source.stat().st_mtime)
+            source_stat = source.stat()
+            source_time = datetime.fromtimestamp(source_stat.st_mtime)
         except OSError as exc:
             results.append(
                 Result(
@@ -482,12 +603,13 @@ def classify(args: argparse.Namespace) -> list[Result]:
                 )
             )
             continue
-        adjusted_time = source_time + offset
-        if selected_date and adjusted_time.date() != selected_date:
+        video_end = source_time
+        video_start = video_end - video_duration
+        if selected_date and video_end.date() != selected_date:
             continue
         case = choose_case(
-            adjusted_time,
-            adjusted_time,
+            video_start,
+            video_end,
             cases,
             before,
             after,
@@ -496,50 +618,125 @@ def classify(args: argparse.Namespace) -> list[Result]:
         )
         if case is None:
             results.append(
-                Result(source, source_time, adjusted_time, None, None, "待確認", "沒有符合時間區間的案件")
+                Result(
+                    source,
+                    source_time,
+                    video_end,
+                    None,
+                    None,
+                    "待確認",
+                    "沒有符合時間區間的案件",
+                    video_start,
+                    video_duration,
+                )
             )
             continue
 
         destination = case.path / "車" / source.name
         note = ""
+        source_size = source_stat.st_size
         if destination.exists():
             if same_file_metadata(source, destination):
                 status = "已完成"
             elif args.apply and args.repair_mismatch:
                 try:
-                    copy_preserving_time(source, destination)
+                    if transfer_callback is not None:
+                        transfer_callback(source, 0, source_size, "傳輸中")
+                    copy_preserving_time(
+                        source,
+                        destination,
+                        lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
+                        if transfer_callback is not None
+                        else None,
+                    )
                     status = "已修復"
                 except OSError as exc:
                     status = "錯誤"
+                    if transfer_callback is not None:
+                        transfer_callback(source, 0, source_size, "傳輸失敗")
                     results.append(
-                        Result(source, source_time, adjusted_time, case, destination, status, str(exc))
+                        Result(
+                            source,
+                            source_time,
+                            video_end,
+                            case,
+                            destination,
+                            status,
+                            str(exc),
+                            video_start,
+                            video_duration,
+                        )
                     )
                     continue
             else:
                 status = "目的地不一致"
         elif args.apply:
             try:
-                copy_preserving_time(source, destination)
+                if transfer_callback is not None:
+                    transfer_callback(source, 0, source_size, "傳輸中")
+                copy_preserving_time(
+                    source,
+                    destination,
+                    lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
+                    if transfer_callback is not None
+                    else None,
+                )
                 status = "已複製"
             except OSError as exc:
                 status = "錯誤"
+                if transfer_callback is not None:
+                    transfer_callback(source, 0, source_size, "傳輸失敗")
                 results.append(
-                    Result(source, source_time, adjusted_time, case, destination, status, str(exc))
+                    Result(
+                        source,
+                        source_time,
+                        video_end,
+                        case,
+                        destination,
+                        status,
+                        str(exc),
+                        video_start,
+                        video_duration,
+                    )
                 )
                 continue
         else:
             status = "預計複製"
+        if args.apply and transfer_callback is not None:
+            transfer_callback(source, source_size, source_size, "驗證中")
         status, note = finalize_source_cleanup(
             source,
             destination,
             status,
             getattr(args, "delete_source", False),
         )
-        results.append(Result(source, source_time, adjusted_time, case, destination, status, note))
+        if args.apply and transfer_callback is not None:
+            transfer_callback(
+                source,
+                source_size,
+                source_size,
+                "驗證完成" if status != "來源刪除失敗" else "驗證完成，來源未刪除",
+            )
+        results.append(
+            Result(
+                source,
+                source_time,
+                video_end,
+                case,
+                destination,
+                status,
+                note,
+                video_start,
+                video_duration,
+            )
+        )
     return results
 
 
-def classify_with_work_logs(args: argparse.Namespace) -> list[Result]:
+def classify_with_work_logs(
+    args: argparse.Namespace,
+    transfer_callback: Callable[[Path, int, int, str], None] | None = None,
+) -> list[Result]:
     """Classify by video interval against actual work and return times."""
     selected_date = parse_date(args.date)
     cases = discover_cases(args.destination, args.vehicle)
@@ -551,33 +748,46 @@ def classify_with_work_logs(args: argparse.Namespace) -> list[Result]:
     )
     source_root = resolve_source(args.source)
     sources = discover_sources(source_root, args.extension)
+    _sample_source, video_duration = read_card_duration(sources)
     before = timedelta(minutes=args.before_minutes)
     after = timedelta(minutes=args.after_minutes)
     work_before = timedelta(minutes=args.work_before_minutes)
     return_grace = timedelta(minutes=args.return_grace_minutes)
-    segment = timedelta(minutes=args.segment_minutes)
-    offset = timedelta(minutes=args.offset_minutes)
     results: list[Result] = []
 
     for source in sources:
         try:
-            source_time = datetime.fromtimestamp(source.stat().st_mtime)
+            source_stat = source.stat()
+            source_time = datetime.fromtimestamp(source_stat.st_mtime)
         except OSError as exc:
             results.append(Result(source, datetime.min, datetime.min, None, None, "無法讀取", str(exc)))
             continue
 
-        video_end = source_time + offset
-        video_start = video_end - segment
+        video_end = source_time
+        video_start = video_end - video_duration
         if selected_date and video_end.date() != selected_date:
             continue
 
         case = choose_case(video_start, video_end, cases, before, after, work_before, return_grace)
         if case is None:
-            results.append(Result(source, source_time, video_end, None, None, "待確認", "沒有符合工作／返隊時間的案件"))
+            results.append(
+                Result(
+                    source,
+                    source_time,
+                    video_end,
+                    None,
+                    None,
+                    "待確認",
+                    "沒有符合工作／返隊時間的案件",
+                    video_start,
+                    video_duration,
+                )
+            )
             continue
 
         destination = case.path / "車" / source.name
         work_note = ""
+        source_size = source_stat.st_size
         if case.work_start:
             work_note = f"案件工作={case.work_start:%Y-%m-%d %H:%M}; 返隊={case.return_time:%Y-%m-%d %H:%M:%S}" if case.return_time else f"案件工作={case.work_start:%Y-%m-%d %H:%M}; 無返隊時間"
 
@@ -586,31 +796,72 @@ def classify_with_work_logs(args: argparse.Namespace) -> list[Result]:
                 status = "已完成"
             elif args.apply and args.repair_mismatch:
                 try:
-                    copy_preserving_time(source, destination)
+                    if transfer_callback is not None:
+                        transfer_callback(source, 0, source_size, "傳輸中")
+                    copy_preserving_time(
+                        source,
+                        destination,
+                        lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
+                        if transfer_callback is not None
+                        else None,
+                    )
                     status = "已修復"
                 except OSError as exc:
                     status = "錯誤"
+                    if transfer_callback is not None:
+                        transfer_callback(source, 0, source_size, "傳輸失敗")
                     work_note = f"{work_note}; {exc}"
             else:
                 status = "目的地不一致"
         elif args.apply:
             try:
-                copy_preserving_time(source, destination)
+                if transfer_callback is not None:
+                    transfer_callback(source, 0, source_size, "傳輸中")
+                copy_preserving_time(
+                    source,
+                    destination,
+                    lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
+                    if transfer_callback is not None
+                    else None,
+                )
                 status = "已複製"
             except OSError as exc:
                 status = "錯誤"
+                if transfer_callback is not None:
+                    transfer_callback(source, 0, source_size, "傳輸失敗")
                 work_note = f"{work_note}; {exc}"
         else:
             status = "預計複製"
+        if args.apply and transfer_callback is not None:
+            transfer_callback(source, source_size, source_size, "驗證中")
         status, cleanup_note = finalize_source_cleanup(
             source,
             destination,
             status,
             getattr(args, "delete_source", False),
         )
+        if args.apply and transfer_callback is not None:
+            transfer_callback(
+                source,
+                source_size,
+                source_size,
+                "驗證完成" if status != "來源刪除失敗" else "驗證完成，來源未刪除",
+            )
         if cleanup_note:
             work_note = f"{work_note}; {cleanup_note}" if work_note else cleanup_note
-        results.append(Result(source, source_time, video_end, case, destination, status, work_note))
+        results.append(
+            Result(
+                source,
+                source_time,
+                video_end,
+                case,
+                destination,
+                status,
+                work_note,
+                video_start,
+                video_duration,
+            )
+        )
     return results
 
 
@@ -622,7 +873,9 @@ def write_report(results: list[Result], report: Path) -> None:
             [
                 "來源檔案",
                 "來源修改時間",
-                "校正後時間",
+                "影片開始時間",
+                "影片結束時間",
+                "影片長度（秒）",
                 "案件資料夾",
                 "目的地",
                 "狀態",
@@ -634,7 +887,9 @@ def write_report(results: list[Result], report: Path) -> None:
                 [
                     str(result.source),
                     result.source_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    result.video_start.strftime("%Y-%m-%d %H:%M:%S") if result.video_start else "",
                     result.adjusted_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    f"{result.video_duration.total_seconds():.3f}" if result.video_duration else "",
                     result.case.name if result.case else "",
                     str(result.destination) if result.destination else "",
                     result.status,
@@ -654,8 +909,13 @@ def print_summary(results: list[Result], apply: bool) -> None:
     print("\n分類明細：")
     for result in results:
         case_name = result.case.name if result.case else "待確認"
+        video_time = (
+            f"{result.video_start:%m/%d %H:%M:%S}–{result.adjusted_time:%H:%M:%S}"
+            if result.video_start
+            else result.adjusted_time.strftime("%m/%d %H:%M:%S")
+        )
         print(
-            f"  {result.source.name}  {result.adjusted_time:%m/%d %H:%M:%S}"
+            f"  {result.source.name}  {video_time}"
             f" -> {case_name} [{result.status}]"
         )
 

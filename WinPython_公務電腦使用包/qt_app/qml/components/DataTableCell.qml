@@ -11,6 +11,7 @@ Label {
                                        : column === "time" ? Design.dataTimeWidth
                                        : column === "case" ? Design.dataCaseWidth
                                        : column === "status" ? Design.dataStatusWidth
+                                       : column === "transfer" ? Design.dataTransferWidth
                                        : column === "destination" ? Design.dataDestinationWidth
                                        : Design.dataNoteWidth
     Layout.preferredWidth: columnWidth

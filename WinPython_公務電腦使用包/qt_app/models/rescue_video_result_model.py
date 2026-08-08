@@ -16,6 +16,8 @@ class RescueVideoResultModel(QAbstractListModel):
     DestinationTextRole = Qt.UserRole + 5
     NoteTextRole = Qt.UserRole + 6
     ToneRole = Qt.UserRole + 7
+    TransferPercentRole = Qt.UserRole + 8
+    TransferTextRole = Qt.UserRole + 9
 
     _ROLE_NAMES = {
         SourceTextRole: QByteArray(b"sourceText"),
@@ -25,6 +27,8 @@ class RescueVideoResultModel(QAbstractListModel):
         DestinationTextRole: QByteArray(b"destinationText"),
         NoteTextRole: QByteArray(b"noteText"),
         ToneRole: QByteArray(b"tone"),
+        TransferPercentRole: QByteArray(b"transferPercent"),
+        TransferTextRole: QByteArray(b"transferText"),
     }
     _ROLE_KEYS = {
         SourceTextRole: "sourceText",
@@ -34,6 +38,8 @@ class RescueVideoResultModel(QAbstractListModel):
         DestinationTextRole: "destinationText",
         NoteTextRole: "noteText",
         ToneRole: "tone",
+        TransferPercentRole: "transferPercent",
+        TransferTextRole: "transferText",
     }
 
     def __init__(self, parent=None) -> None:
@@ -56,3 +62,36 @@ class RescueVideoResultModel(QAbstractListModel):
         self.beginResetModel()
         self._rows = [dict(row) for row in rows]
         self.endResetModel()
+
+    def prepare_transfer(self) -> None:
+        for row in self._rows:
+            if row.get("statusText") == "預計複製":
+                row["transferPercent"] = 0
+                row["transferText"] = "等待傳輸"
+            elif str(row.get("statusText") or "").startswith("已完成"):
+                row["transferPercent"] = 100
+                row["transferText"] = "等待驗證"
+            else:
+                row["transferPercent"] = 0
+                row["transferText"] = "不需傳輸"
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._rows) - 1, 0),
+                [self.TransferPercentRole, self.TransferTextRole],
+            )
+
+    def update_transfer(self, source_path: str, copied: int, total: int, state: str) -> None:
+        for row_number, row in enumerate(self._rows):
+            if str(row.get("sourcePath") or "") != source_path:
+                continue
+            percent = 100 if total <= 0 else max(0, min(100, round(copied * 100 / total)))
+            row["transferPercent"] = percent
+            row["transferText"] = state
+            index = self.index(row_number, 0)
+            self.dataChanged.emit(
+                index,
+                index,
+                [self.TransferPercentRole, self.TransferTextRole],
+            )
+            return

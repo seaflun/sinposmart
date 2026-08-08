@@ -111,34 +111,33 @@ def evaluate_preflight(values: Mapping[str, object]) -> PreflightState:
     else:
         checks["report"] = PreflightCheck("report", "error", "找不到或無法寫入固定報告根目錄")
 
-    readable = 0
+    videos: list[Path] = []
     if source is not None and source.is_dir():
-        for video in classifier.discover_sources(source, ".TS"):
-            try:
-                with video.open("rb"):
-                    pass
-            except OSError:
-                continue
-            readable += 1
-    if readable:
-        checks["videos"] = PreflightCheck("videos", "ok", f"可讀取影片：{readable} 部")
+        videos = classifier.discover_sources(source, ".TS")
+    if videos:
+        try:
+            sample, duration = classifier.read_card_duration(videos)
+        except (OSError, ValueError) as exc:
+            checks["videos"] = PreflightCheck(
+                "videos",
+                "error",
+                f"無法讀取範例影片 {sample.name} 的實際長度：{exc}",
+            )
+        else:
+            checks["videos"] = PreflightCheck(
+                "videos",
+                "ok",
+                f"已檢查 {sample.name}：{duration.total_seconds():.3f} 秒（同卡影片共用）。",
+            )
     else:
-        checks["videos"] = PreflightCheck("videos", "error", "找不到可讀取的 .TS 影片")
+        checks["videos"] = PreflightCheck("videos", "error", "找不到可判定實際長度的 .TS 影片")
 
     return PreflightState(checks=checks, vehicles=vehicles)
 
 
-def choose_runtime_offset(args: argparse.Namespace) -> int:
-    scores: dict[int, int] = {}
-    for offset_minutes in (5, 6, 7):
-        trial_values = vars(args).copy()
-        trial_values.update(offset_minutes=offset_minutes, apply=False, delete_source=False)
-        trial = argparse.Namespace(**trial_values)
-        results = classifier.classify_with_work_logs(trial)
-        scores[offset_minutes] = sum(
-            getattr(getattr(result, "case", None), "work_start", None) is not None for result in results
-        )
-    return classifier.choose_offset_minutes(scores)
+def choose_runtime_offset(_args: argparse.Namespace) -> int:
+    """Use the file end time and each TS file's measured duration without an offset."""
+    return 0
 
 
 def run_preflight(values: Mapping[str, object]) -> list[PreflightCheck]:
@@ -344,10 +343,11 @@ def format_summary(summary: Mapping[str, int]) -> str:
 def run_classification(
     args: argparse.Namespace,
     stage_callback: Callable[[str], None] | None = None,
+    transfer_callback: Callable[[Path, int, int, str], None] | None = None,
 ) -> list[classifier.Result]:
     if stage_callback is not None:
         stage_callback("classification")
-    results = classifier.classify_with_work_logs(args)
+    results = classifier.classify_with_work_logs(args, transfer_callback=transfer_callback)
     if stage_callback is not None:
         stage_callback("report_write")
     classifier.write_report(results, args.report)

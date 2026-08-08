@@ -39,7 +39,7 @@ class RescueVideoDefaults:
     repair_mismatch: bool = False
     check_text: str = ""
     is_ready: bool = True
-    status_text: str = "自動檢查通過"
+    status_text: str = "檢查結果通過"
     check_cards: tuple["RescueVideoCheckCard", ...] = ()
 
 
@@ -142,7 +142,7 @@ class RescueVideoService:
             "destination": str(destination),
             "date": date_text,
             "vehicle": str(vehicle or "").strip(),
-            "offset_minutes": "6",
+            "offset_minutes": "0",
             "work_log_root": str(core.DEFAULT_WORK_LOG_ROOT),
             "report": str(core.DEFAULT_REPORT),
             "repair_mismatch": False,
@@ -159,7 +159,7 @@ class RescueVideoService:
         if selected_vehicle:
             values["report"] = str(core.build_public_duty_report_path(date_text, selected_vehicle))
 
-        offset_text = ""
+        offset_text = "0"
         is_ready = False
         check_state = None
         check_lines: list[str] = [manual_source_error] if manual_source_error else []
@@ -167,12 +167,10 @@ class RescueVideoService:
             check_state = core.evaluate_preflight(values)
             check_lines.extend(str(check.detail) for check in check_state.checks.values())
             if check_state.ready:
-                args = core.build_args(values, "preview")
-                offset_text = str(core.choose_runtime_offset(args))
-                check_lines.append(f"自動採用記憶卡偏移：{offset_text} 分鐘")
+                check_lines.append("影片時間會採用同張記憶卡範例影片的實際長度自動判定。")
                 is_ready = True
         except (OSError, ValueError, SystemExit) as exc:
-            check_lines.append(f"無法判定記憶卡偏移：{exc}")
+            check_lines.append(f"無法檢查記憶卡影片長度：{exc}")
 
         card_titles = (
             ("source", "記憶卡來源"),
@@ -202,7 +200,7 @@ class RescueVideoService:
             offset_text=offset_text,
             check_text="\n".join(check_lines),
             is_ready=is_ready,
-            status_text="自動檢查通過" if is_ready else "等待必要資料",
+            status_text="檢查結果通過" if is_ready else "等待必要資料",
             check_cards=tuple(check_cards),
         )
 
@@ -246,7 +244,7 @@ class RescueVideoService:
     def confirmation_summary(self, request: RescueVideoRequest) -> str:
         normalized, warnings, _values = self.validate(request)
         if normalized.mode == "delete":
-            return "只有複製並完成內容驗證的 .TS 檔案會刪除。\n確定要繼續嗎？"
+            return "複製完成後，會將確定完成內容驗證後的影片檔案刪除，確定要繼續嗎？"
         warning_text = f"\n注意：{'；'.join(warnings)}" if warnings else ""
         action_text = (
             "確認後會複製影片並核對目的地，不會刪除來源影片。"
@@ -266,6 +264,7 @@ class RescueVideoService:
         *,
         status_callback: Callable[[str], None] | None = None,
         stage_callback: Callable[[str], None] | None = None,
+        transfer_callback: Callable[[str, int, int, str], None] | None = None,
     ) -> RescueVideoRunResult:
         stage = "preflight"
 
@@ -275,26 +274,38 @@ class RescueVideoService:
             if stage_callback is not None:
                 stage_callback(value)
 
+        def report_transfer(source: Path, copied: int, total: int, state: str) -> None:
+            if transfer_callback is not None:
+                transfer_callback(str(source), copied, total, state)
+
         report_stage(stage)
         report_stage("module_load")
         core = self.module_loader(self.package_root)
         normalized, warnings, values = self.validate(request)
         try:
             args = core.build_args(values, normalized.mode)
-            if not normalized.offset_text:
-                report_stage("offset_detection")
-                if status_callback:
-                    status_callback("正在自動判定記憶卡時間偏移…")
-                args.offset_minutes = core.choose_runtime_offset(args)
             if status_callback:
-                status_callback("正在預覽影片分類…" if normalized.mode == "preview" else "正在分類並核對來源影片…")
+                status_callback(
+                    "正在套用記憶卡影片長度並預覽分類…"
+                    if normalized.mode == "preview"
+                    else "正在套用記憶卡影片長度、分類並核對來源影片…"
+                )
             report_stage("classification")
             try:
-                results = core.run_classification(args, stage_callback=report_stage)
+                results = core.run_classification(
+                    args,
+                    stage_callback=report_stage,
+                    transfer_callback=report_transfer,
+                )
             except TypeError as exc:
-                if "stage_callback" not in str(exc):
+                if "unexpected keyword argument" not in str(exc):
                     raise
-                results = core.run_classification(args)
+                try:
+                    results = core.run_classification(args, stage_callback=report_stage)
+                except TypeError as fallback_exc:
+                    if "unexpected keyword argument" not in str(fallback_exc):
+                        raise
+                    results = core.run_classification(args)
         except (OSError, ValueError) as exc:
             raise RescueVideoExecutionError(str(exc) or "救護影片分類失敗。") from exc
 
@@ -308,17 +319,26 @@ class RescueVideoService:
         )
 
     @staticmethod
-    def _result_row(core: ModuleType, result) -> dict[str, str]:
+    def _result_row(core: ModuleType, result) -> dict[str, object]:
         case = getattr(result, "case", None)
         destination = getattr(result, "destination", None)
         adjusted_time = getattr(result, "adjusted_time", None)
+        video_start = getattr(result, "video_start", None)
         status = str(getattr(result, "status", "") or "")
+        time_text = adjusted_time.strftime("%m/%d %H:%M:%S") if adjusted_time else ""
+        if video_start and adjusted_time:
+            time_text = f"{video_start:%m/%d %H:%M:%S}–{adjusted_time:%H:%M:%S}"
+        transfer_complete = status.startswith(("已完成", "已修復", "已複製")) or status == "來源刪除失敗"
+        transfer_text = "驗證完成，來源未刪除" if status == "來源刪除失敗" else "已完成"
         return {
+            "sourcePath": str(getattr(result, "source", "")),
             "sourceText": Path(getattr(result, "source", "")).name,
-            "timeText": adjusted_time.strftime("%m/%d %H:%M:%S") if adjusted_time else "",
+            "timeText": time_text,
             "caseText": str(getattr(case, "name", "") or "待確認"),
             "statusText": status,
             "destinationText": str(destination or ""),
             "noteText": str(getattr(result, "note", "") or ""),
             "tone": str(core.status_tag(status) or "normal"),
+            "transferPercent": 100 if transfer_complete else 0,
+            "transferText": transfer_text if transfer_complete else "尚未傳輸",
         }

@@ -24,6 +24,8 @@ Window {
     flags: Qt.Window | Qt.FramelessWindowHint
     modality: Qt.NonModal
     readonly property bool usesCustomTitleBar: true
+    readonly property bool interactionsLocked: rescueVideoWindow.controller.isRunning
+                                               || rescueVideoWindow.controller.isAwaitingConfirmation
 
     function positionBesideHost() {
         if (!rescueVideoWindow.screen)
@@ -61,7 +63,7 @@ Window {
     }
 
     onClosing: function(close) {
-        if (rescueVideoWindow.controller.isRunning)
+        if (rescueVideoWindow.interactionsLocked)
             close.accepted = false
     }
 
@@ -80,7 +82,7 @@ Window {
     FolderDialog {
         id: rescueVideoSourceDialog
         title: "選擇記憶卡 DCIM\\100CAREC 資料夾"
-        onAccepted: rescueVideoWindow.controller.refreshAutomaticState(
+        onAccepted: rescueVideoWindow.controller.updateInputs(
             rescueVideoWindow.controller.localPath(selectedFolder),
             rescueVideoDateField.text,
             rescueVideoVehicleCombo.currentText
@@ -96,9 +98,10 @@ Window {
         dateText: rescueVideoDateField.text
         dateFormat: "iso"
         enabled: !rescueVideoWindow.controller.isRunning
+                 && !rescueVideoWindow.controller.isAwaitingConfirmation
         onDateSelected: function(value) {
             rescueVideoDateField.text = value
-            rescueVideoWindow.controller.refreshAutomaticState(
+            rescueVideoWindow.controller.updateInputs(
                 rescueVideoWindow.controller.sourcePath,
                 value,
                 rescueVideoVehicleCombo.currentText
@@ -162,6 +165,7 @@ Window {
                 showFocusRing: false
                 focusPolicy: Qt.NoFocus
                 scale: 1
+                enabled: !rescueVideoWindow.interactionsLocked
                 Accessible.name: "縮小行車紀錄器"
                 onClicked: rescueVideoWindow.showMinimized()
             }
@@ -185,6 +189,7 @@ Window {
                 showFocusRing: false
                 focusPolicy: Qt.NoFocus
                 scale: 1
+                enabled: !rescueVideoWindow.interactionsLocked
                 Accessible.name: rescueVideoWindow.visibility === Window.Maximized ? "還原行車紀錄器" : "最大化行車紀錄器"
                 onClicked: {
                     if (rescueVideoWindow.visibility === Window.Maximized)
@@ -212,6 +217,7 @@ Window {
                 showFocusRing: false
                 focusPolicy: Qt.NoFocus
                 scale: 1
+                enabled: !rescueVideoWindow.interactionsLocked
                 Accessible.name: "關閉行車紀錄器"
                 onClicked: rescueVideoWindow.close()
             }
@@ -220,6 +226,7 @@ Window {
         DragHandler {
             target: null
             enabled: rescueVideoWindow.visibility !== Window.Maximized
+                     && !rescueVideoWindow.interactionsLocked
             onActiveChanged: {
                 if (active)
                     rescueVideoWindow.startSystemMove()
@@ -233,6 +240,7 @@ Window {
         anchors.bottom: parent.bottom
         width: Design.appResizeHandleWidth
         enabled: rescueVideoWindow.visibility !== Window.Maximized
+                 && !rescueVideoWindow.interactionsLocked
         cursorShape: Qt.SizeHorCursor
         z: 3
         onPressed: rescueVideoWindow.startSystemResize(Qt.LeftEdge)
@@ -244,6 +252,7 @@ Window {
         anchors.bottom: parent.bottom
         width: Design.appResizeHandleWidth
         enabled: rescueVideoWindow.visibility !== Window.Maximized
+                 && !rescueVideoWindow.interactionsLocked
         cursorShape: Qt.SizeHorCursor
         z: 3
         onPressed: rescueVideoWindow.startSystemResize(Qt.RightEdge)
@@ -255,6 +264,7 @@ Window {
         anchors.bottom: parent.bottom
         height: Design.appResizeHandleWidth
         enabled: rescueVideoWindow.visibility !== Window.Maximized
+                 && !rescueVideoWindow.interactionsLocked
         cursorShape: Qt.SizeVerCursor
         z: 3
         onPressed: rescueVideoWindow.startSystemResize(Qt.BottomEdge)
@@ -310,8 +320,10 @@ Window {
                         Layout.preferredWidth: Design.rescueVehicleWidth
                         model: rescueVideoWindow.controller.vehicleOptions
                         currentIndex: model.indexOf(rescueVideoWindow.controller.selectedVehicle)
-                        enabled: model.length > 0 && !rescueVideoWindow.controller.isRunning
-                        onActivated: rescueVideoWindow.controller.refreshAutomaticState(
+                        enabled: model.length > 0
+                                 && !rescueVideoWindow.controller.isRunning
+                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
+                        onActivated: rescueVideoWindow.controller.updateInputs(
                             rescueVideoWindow.controller.sourcePath,
                             rescueVideoDateField.text,
                             currentText
@@ -324,7 +336,8 @@ Window {
                         Layout.preferredWidth: Design.rescueDateWidth
                         text: rescueVideoWindow.controller.targetDate
                         enabled: !rescueVideoWindow.controller.isRunning
-                        onEditingFinished: rescueVideoWindow.controller.refreshAutomaticState(
+                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
+                        onEditingFinished: rescueVideoWindow.controller.updateInputs(
                             rescueVideoWindow.controller.sourcePath,
                             text,
                             rescueVideoVehicleCombo.currentText
@@ -333,11 +346,26 @@ Window {
                             rescueVideoDateCalendar.openForCurrentDate()
                         }
                     }
+                    AppleButton {
+                        objectName: "rescueVideoCheckButton"
+                        text: "檢查"
+                        tone: "neutralStrong"
+                        enabled: !rescueVideoWindow.controller.isRunning
+                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
+                        onClicked: rescueVideoWindow.controller.refreshAutomaticState(
+                            rescueVideoWindow.controller.sourcePath,
+                            rescueVideoDateField.text,
+                            rescueVideoVehicleCombo.currentText
+                        )
+                    }
                     Label {
+                        objectName: "rescueVideoSummaryText"
                         Layout.fillWidth: true
-                        text: "車號由當日案件資料夾自動取得；工作紀錄、報告位置與時間偏移均自動處理。"
+                        text: rescueVideoWindow.controller.summaryText
                         color: Design.secondaryText
                         wrapMode: Text.Wrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
                     }
                 }
             }
@@ -348,7 +376,7 @@ Window {
                     spacing: 8
 
                     DataSectionTitle {
-                        text: "自動檢查"
+                        text: "檢查結果"
                     }
 
                     RowLayout {
@@ -432,6 +460,7 @@ Window {
                                         text: "選擇資料夾"
                                         tone: "neutralStrong"
                                         enabled: !rescueVideoWindow.controller.isRunning
+                                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
                                         onClicked: rescueVideoSourceDialog.open()
                                     }
                                 }
@@ -445,10 +474,11 @@ Window {
                 Layout.fillWidth: true
                 AppleButton {
                     objectName: "rescueVideoPreviewButton"
-                    text: "預覽分類"
-                    tone: "primary"
+                    text: "預覽分類結果（不複製）"
+                    tone: "neutralStrong"
                     enabled: rescueVideoWindow.controller.isReady
                              && !rescueVideoWindow.controller.isRunning
+                             && !rescueVideoWindow.controller.isAwaitingConfirmation
                     onClicked: rescueVideoWindow.controller.preparePreview(
                         rescueVideoWindow.controller.sourcePath,
                         rescueVideoWindow.controller.destinationPath,
@@ -457,26 +487,6 @@ Window {
                         rescueVideoWindow.controller.offsetText,
                         false
                     )
-                }
-                AppleButton {
-                    objectName: "rescueVideoDeleteButton"
-                    text: "複製後刪除已驗證來源"
-                    tone: "dangerFilled"
-                    enabled: rescueVideoWindow.controller.isReady
-                             && !rescueVideoWindow.controller.isRunning
-                    onClicked: rescueVideoWindow.controller.prepareDelete(
-                        rescueVideoWindow.controller.sourcePath,
-                        rescueVideoWindow.controller.destinationPath,
-                        rescueVideoDateField.text,
-                        rescueVideoVehicleCombo.currentText,
-                        rescueVideoWindow.controller.offsetText,
-                        false
-                    )
-                }
-                Item { Layout.fillWidth: true }
-                BusyIndicator {
-                    running: rescueVideoWindow.controller.isRunning
-                    visible: running
                 }
             }
 
@@ -500,9 +510,10 @@ Window {
                             anchors.rightMargin: 8
                             spacing: 8
                             DataTableCell { column: "source"; heading: true; text: "來源檔案" }
-                            DataTableCell { column: "time"; heading: true; text: "校正後時間" }
+                            DataTableCell { column: "time"; heading: true; text: "影片時間區間" }
                             DataTableCell { column: "case"; heading: true; text: "案件資料夾" }
                             DataTableCell { column: "status"; heading: true; text: "狀態" }
+                            DataTableCell { column: "transfer"; heading: true; text: "傳輸進度" }
                             DataTableCell { column: "destination"; heading: true; text: "目的地" }
                             DataTableCell { column: "note"; heading: true; text: "備註" }
                         }
@@ -524,6 +535,8 @@ Window {
                             required property string destinationText
                             required property string noteText
                             required property string tone
+                            required property int transferPercent
+                            required property string transferText
                             width: rescueVideoResultList.width
                             height: Design.rescueResultRowHeight
                             color: Design.panel
@@ -542,6 +555,39 @@ Window {
                                     text: rescueVideoResultRow.statusText
                                     tone: rescueVideoResultRow.tone
                                 }
+                                Item {
+                                    Layout.preferredWidth: Design.dataTransferWidth
+                                    Layout.preferredHeight: 22
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: height / 2
+                                        color: Design.softAction
+                                        border.width: Design.borderWidth
+                                        border.color: Design.divider
+                                    }
+                                    Rectangle {
+                                        width: parent.width * rescueVideoResultRow.transferPercent / 100
+                                        height: parent.height
+                                        radius: height / 2
+                                        color: rescueVideoResultRow.transferText === "傳輸失敗"
+                                               ? Design.dangerFill
+                                               : rescueVideoResultRow.transferPercent === 100
+                                                 ? Design.successAction
+                                                 : Design.blue
+                                    }
+                                    Label {
+                                        anchors.fill: parent
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                        text: rescueVideoResultRow.transferText
+                                              + " " + rescueVideoResultRow.transferPercent + "%"
+                                        color: Design.text
+                                        font.pixelSize: Design.captionSize
+                                        font.bold: true
+                                        elide: Text.ElideRight
+                                    }
+                                }
                                 DataTableCell {
                                     column: "destination"
                                     text: rescueVideoResultRow.destinationText
@@ -552,12 +598,31 @@ Window {
                     }
                 }
             }
-            Label {
-                objectName: "rescueVideoSummaryText"
+            RowLayout {
                 Layout.fillWidth: true
-                text: rescueVideoWindow.controller.summaryText
-                color: Design.secondaryText
-                wrapMode: Text.Wrap
+                AppleButton {
+                    objectName: "rescueVideoCopyStartButton"
+                    text: "複製啟動"
+                    tone: "primary"
+                    emphasizedBorder: true
+                    enabled: rescueVideoWindow.controller.isReady
+                             && rescueVideoWindow.controller.hasPreview
+                             && !rescueVideoWindow.controller.isRunning
+                             && !rescueVideoWindow.controller.isAwaitingConfirmation
+                    onClicked: rescueVideoWindow.controller.prepareDelete(
+                        rescueVideoWindow.controller.sourcePath,
+                        rescueVideoWindow.controller.destinationPath,
+                        rescueVideoDateField.text,
+                        rescueVideoVehicleCombo.currentText,
+                        rescueVideoWindow.controller.offsetText,
+                        false
+                    )
+                }
+                BusyIndicator {
+                    running: rescueVideoWindow.controller.isRunning
+                    visible: running
+                }
+                Item { Layout.fillWidth: true }
             }
         }
     }
@@ -568,9 +633,10 @@ Window {
         anchors.centerIn: parent
         width: Math.min(rescueVideoWindow.width - 72, 500)
         modal: true
-        title: "確認刪除記憶卡來源"
+        title: "即將開始複製記憶卡至行車記錄器資料夾"
         standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "刪除來源"
+        acceptText: "確定"
+        rejectText: "取消"
         acceptTone: "dangerFilled"
         onAccepted: rescueVideoWindow.controller.confirmDelete()
         onRejected: rescueVideoWindow.controller.cancelDelete()

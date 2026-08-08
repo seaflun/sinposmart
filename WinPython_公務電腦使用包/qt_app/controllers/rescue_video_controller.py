@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
 
 from app_core.rescue_video_service import (
@@ -43,11 +45,14 @@ class RescueVideoController(QObject):
         self._selected_vehicle = ""
         self._offset_text = ""
         self._repair_mismatch = False
-        self._check_text = "正在檢查記憶卡、Z 槽與工作紀錄。"
+        self._check_text = "尚未檢查。請先確認車號與日期，再按「檢查」。"
         self._check_cards: list[dict[str, str]] = []
         self._is_ready = False
-        self._status_text = "自動檢查中"
-        self._summary_text = "等待自動檢查完成。"
+        self._has_preview = False
+        self._awaiting_confirmation = False
+        self._check_requested = False
+        self._status_text = "尚未檢查"
+        self._summary_text = "流程：1. 按「檢查」確認資料；2. 預覽分類結果；3. 確認無誤後才可按「複製啟動」。"
         self._report_path = ""
         self._confirmation_summary = ""
         self._pending_request: RescueVideoRequest | None = None
@@ -97,6 +102,14 @@ class RescueVideoController(QObject):
     def isReady(self) -> bool:
         return self._is_ready
 
+    @Property(bool, notify=stateChanged)
+    def hasPreview(self) -> bool:
+        return self._has_preview
+
+    @Property(bool, notify=stateChanged)
+    def isAwaitingConfirmation(self) -> bool:
+        return self._awaiting_confirmation
+
     @Property(str, notify=stateChanged)
     def statusText(self) -> str:
         return self._status_text
@@ -130,8 +143,11 @@ class RescueVideoController(QObject):
         if self._workers:
             return
         self._is_ready = False
-        self._status_text = "自動檢查中"
-        self._check_text = "正在檢查記憶卡、Z 槽與工作紀錄。"
+        self._has_preview = False
+        self._awaiting_confirmation = False
+        self._check_requested = False
+        self._status_text = "讀取工具設定中"
+        self._check_text = "尚未檢查。請先確認車號與日期，再按「檢查」。"
         self.stateChanged.emit()
         self._start_worker("defaults")
 
@@ -140,7 +156,11 @@ class RescueVideoController(QObject):
         if self._workers:
             return
         self._is_ready = False
-        self._status_text = "自動檢查中"
+        self._has_preview = False
+        self._awaiting_confirmation = False
+        self._check_requested = True
+        self._status_text = "檢查中"
+        self._summary_text = "正在檢查資料；檢查完成後才能預覽分類結果。"
         self.stateChanged.emit()
         self._start_worker(
             "defaults",
@@ -148,6 +168,22 @@ class RescueVideoController(QObject):
             defaults_date=target_date,
             defaults_vehicle=vehicle,
         )
+
+    @Slot(str, str, str)
+    def updateInputs(self, source_path: str, target_date: str, vehicle: str) -> None:
+        if self._workers or self._awaiting_confirmation:
+            return
+        self._source_path = source_path
+        self._target_date = target_date
+        self._selected_vehicle = vehicle
+        self._is_ready = False
+        self._has_preview = False
+        self._check_requested = False
+        self._status_text = "尚未檢查"
+        self._check_text = "資料已變更，請按「檢查」重新確認。"
+        self._summary_text = "資料已變更。請先按「檢查」，通過後再預覽分類結果。"
+        self._result_model.replace_rows(())
+        self.stateChanged.emit()
 
     @Slot(QUrl, result=str)
     def localPath(self, url: QUrl) -> str:
@@ -163,6 +199,10 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if not self._is_ready or self._awaiting_confirmation:
+            self._set_error("請先按「檢查」並確認結果通過，才能預覽分類。")
+            return
+        self._has_preview = False
         request = self._request(
             source_path,
             destination_path,
@@ -185,6 +225,9 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if not self._is_ready or not self._has_preview or self._awaiting_confirmation:
+            self._set_error("請先完成預覽分類並確認結果，才能啟動複製。")
+            return
         request = self._request(
             source_path,
             destination_path,
@@ -209,6 +252,9 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if not self._is_ready or not self._has_preview or self._awaiting_confirmation:
+            self._set_error("請先完成預覽分類並確認結果，才能啟動複製。")
+            return
         request = self._request(
             source_path,
             destination_path,
@@ -220,7 +266,7 @@ class RescueVideoController(QObject):
         )
         if request is None:
             return
-        if self._prepare_confirmation(request, "自動檢查通過"):
+        if self._prepare_confirmation(request, "等待確認複製啟動"):
             self.deleteConfirmationRequested.emit()
 
     @Slot()
@@ -231,7 +277,8 @@ class RescueVideoController(QObject):
     def cancelCopy(self) -> None:
         self._pending_request = None
         self._confirmation_summary = ""
-        self._status_text = "已取消影片複製。"
+        self._awaiting_confirmation = False
+        self._status_text = "已完成預覽，等待複製啟動。"
         self.stateChanged.emit()
 
     @Slot()
@@ -241,13 +288,17 @@ class RescueVideoController(QObject):
         request = self._pending_request
         self._pending_request = None
         self._confirmation_summary = ""
+        self._awaiting_confirmation = False
+        self._has_preview = False
+        self._result_model.prepare_transfer()
         self._start_worker("execute", request)
 
     @Slot()
     def cancelDelete(self) -> None:
         self._pending_request = None
         self._confirmation_summary = ""
-        self._status_text = "自動檢查通過" if self._is_ready else "等待必要資料"
+        self._awaiting_confirmation = False
+        self._status_text = "已完成預覽，等待複製啟動。" if self._has_preview else "等待必要資料"
         self.stateChanged.emit()
 
     def _prepare_confirmation(self, request: RescueVideoRequest, status_text: str) -> bool:
@@ -258,6 +309,7 @@ class RescueVideoController(QObject):
             return False
         self._pending_request = request
         self._confirmation_summary = summary
+        self._awaiting_confirmation = True
         self._status_text = status_text
         self.stateChanged.emit()
         return True
@@ -320,6 +372,7 @@ class RescueVideoController(QObject):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._progress)
+        worker.transferProgress.connect(self._transfer_progress)
         worker.defaultsLoaded.connect(self._defaults_loaded)
         worker.runSucceeded.connect(self._run_succeeded)
         worker.failed.connect(self._failed)
@@ -340,6 +393,21 @@ class RescueVideoController(QObject):
         if request_id == self._request_id:
             self._status_text = message
             self.stateChanged.emit()
+
+    @Slot(int, str, int, int, str)
+    def _transfer_progress(
+        self,
+        request_id: int,
+        source_path: str,
+        copied: int,
+        total: int,
+        state: str,
+    ) -> None:
+        if request_id != self._request_id:
+            return
+        self._result_model.update_transfer(source_path, copied, total, state)
+        self._status_text = f"{Path(source_path).name}：{state}"
+        self.stateChanged.emit()
 
     @Slot(int, object)
     def _defaults_loaded(self, request_id: int, defaults: RescueVideoDefaults) -> None:
@@ -362,13 +430,26 @@ class RescueVideoController(QObject):
             }
             for card in defaults.check_cards
         ]
-        self._is_ready = defaults.is_ready
-        self._status_text = defaults.status_text
-        self._summary_text = (
-            "可以預覽分類，或複製後刪除已驗證來源。"
-            if defaults.is_ready
-            else "請插入記憶卡並確認 Z 槽與工作紀錄可用。"
-        )
+        self._is_ready = self._check_requested and defaults.is_ready
+        self._has_preview = False
+        self._awaiting_confirmation = False
+        if self._is_ready:
+            self._status_text = "檢查完成"
+            self._summary_text = "檢查完成。下一步：按「預覽分類結果（不複製）」。"
+        elif self._check_requested:
+            failed_titles = [
+                card.title for card in defaults.check_cards if card.level == "error"
+            ]
+            if failed_titles == ["車號與日期"]:
+                self._status_text = "尚未選擇車號或日期"
+                self._summary_text = "請先選擇車號與日期，再按「檢查」。"
+            else:
+                failed_text = "、".join(failed_titles) or "必要資料"
+                self._status_text = f"檢查未通過：{failed_text}"
+                self._summary_text = f"請先處理：{failed_text}，再按「檢查」。"
+        else:
+            self._status_text = "尚未檢查"
+            self._summary_text = "流程：1. 按「檢查」確認資料；2. 預覽分類結果；3. 確認無誤後才可按「複製啟動」。"
         self.stateChanged.emit()
 
     @Slot(int, object)
@@ -376,9 +457,16 @@ class RescueVideoController(QObject):
         if request_id != self._request_id:
             return
         self._result_model.replace_rows(result.rows)
-        self._summary_text = result.summary_text
         self._report_path = result.report_path
-        self._status_text = result.warning_text or "完成"
+        mode = self._worker_modes.get(request_id, "")
+        if mode == "preview":
+            self._has_preview = True
+            self._status_text = result.warning_text or "預覽完成"
+            self._summary_text = f"{result.summary_text}。下一步：確認分類結果，無誤後按「複製啟動」。"
+        else:
+            self._has_preview = False
+            self._status_text = result.warning_text or "複製與驗證完成"
+            self._summary_text = result.summary_text
         self.stateChanged.emit()
         self.runSucceeded.emit(result.summary_text)
 
@@ -386,6 +474,8 @@ class RescueVideoController(QObject):
     def _failed(self, request_id: int, message: str) -> None:
         if request_id == self._request_id:
             self._is_ready = False
+            self._has_preview = False
+            self._awaiting_confirmation = False
             worker_pair = self._workers.get(request_id)
             worker = worker_pair[1] if worker_pair is not None else None
             self._failure_stage = str(getattr(worker, "failure_stage", "unknown") or "unknown")

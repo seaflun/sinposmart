@@ -160,6 +160,28 @@ ColumnLayout {
     }
 
     RowLayout {
+        id: auditRefreshStatusArea
+        Layout.fillWidth: true
+        visible: auditRefreshStatusText.text.length > 0
+        Layout.preferredHeight: visible ? auditRefreshStatusText.implicitHeight : 0
+        Layout.minimumHeight: Layout.preferredHeight
+        Layout.maximumHeight: Layout.preferredHeight
+
+        Label {
+            id: auditRefreshStatusText
+            objectName: "auditRefreshStatusText"
+            Layout.preferredWidth: 360
+            Layout.maximumWidth: 360
+            text: auditFilterPanel.backend.dutyController.scheduleStatus
+            color: /(失敗|錯誤|逾時|登入)/.test(text) ? Design.dangerStrong : Design.muted
+            font.pixelSize: Design.captionSize
+            horizontalAlignment: Text.AlignLeft
+            elide: Text.ElideRight
+            wrapMode: Text.NoWrap
+        }
+    }
+
+    RowLayout {
         Layout.fillWidth: true
         spacing: 6
 
@@ -186,32 +208,6 @@ ColumnLayout {
             Layout.fillWidth: true
             summaryText: "已登打 " + auditFilterPanel.backend.dutyController.auditDoneCount
             tone: "done"
-        }
-    }
-
-    RowLayout {
-        id: auditRefreshStatusArea
-        Layout.fillWidth: true
-        visible: auditRefreshStatusText.text.length > 0
-        Layout.preferredHeight: visible ? auditRefreshStatusText.implicitHeight : 0
-        Layout.minimumHeight: Layout.preferredHeight
-        Layout.maximumHeight: Layout.preferredHeight
-
-        Item {
-            Layout.fillWidth: true
-        }
-
-        Label {
-            id: auditRefreshStatusText
-            objectName: "auditRefreshStatusText"
-            Layout.preferredWidth: 360
-            Layout.maximumWidth: 360
-            text: auditFilterPanel.backend.dutyController.scheduleStatus
-            color: /(失敗|錯誤|逾時|登入)/.test(text) ? Design.dangerStrong : Design.muted
-            font.pixelSize: Design.captionSize
-            horizontalAlignment: Text.AlignRight
-            elide: Text.ElideRight
-            wrapMode: Text.NoWrap
         }
     }
 }

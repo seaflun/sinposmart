@@ -195,6 +195,7 @@ QtObject {
     readonly property int dataTimeWidth: 120
     readonly property int dataCaseWidth: 145
     readonly property int dataStatusWidth: 110
+    readonly property int dataTransferWidth: 130
     readonly property int dataDestinationWidth: 210
     readonly property int dataNoteWidth: 180
 }

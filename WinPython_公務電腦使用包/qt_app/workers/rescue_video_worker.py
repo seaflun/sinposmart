@@ -15,6 +15,7 @@ from app_core.rescue_video_service import (
 
 class RescueVideoWorker(QObject):
     progress = Signal(int, str)
+    transferProgress = Signal(int, str, int, int, str)
     defaultsLoaded = Signal(int, object)
     runSucceeded = Signal(int, object)
     failed = Signal(int, str)
@@ -64,14 +65,30 @@ class RescueVideoWorker(QObject):
                         self.request,
                         status_callback=lambda message: self.progress.emit(self.request_id, message),
                         stage_callback=update_stage,
+                        transfer_callback=lambda source, copied, total, state: self.transferProgress.emit(
+                            self.request_id,
+                            source,
+                            copied,
+                            total,
+                            state,
+                        ),
                     )
                 except TypeError as exc:
-                    if "stage_callback" not in str(exc):
+                    if "unexpected keyword argument" not in str(exc):
                         raise
-                    result = self.service.execute(
-                        self.request,
-                        status_callback=lambda message: self.progress.emit(self.request_id, message),
-                    )
+                    try:
+                        result = self.service.execute(
+                            self.request,
+                            status_callback=lambda message: self.progress.emit(self.request_id, message),
+                            stage_callback=update_stage,
+                        )
+                    except TypeError as fallback_exc:
+                        if "unexpected keyword argument" not in str(fallback_exc):
+                            raise
+                        result = self.service.execute(
+                            self.request,
+                            status_callback=lambda message: self.progress.emit(self.request_id, message),
+                        )
                 self.runSucceeded.emit(self.request_id, result)
             else:
                 raise RescueVideoExecutionError("救護影片背景工作參數不正確。")
