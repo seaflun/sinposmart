@@ -335,7 +335,10 @@ class DutySheetService:
                 errors[-1] if errors else "勤務表登打未完成。",
                 failure_stage=stage,
             )
-        return successes[-1] if successes else f"勤務表登打完成：{request.target_date}"
+        legacy_result = successes[-1] if successes else ""
+        notification_warning = "勤務表截圖或 LINE 通知失敗" in legacy_result
+        suffix = "（截圖通知失敗）" if notification_warning else ""
+        return f"勤務表已登打完成：{target_date}{suffix}"
 
     def _resolve_workbook(self, value: str) -> Path | None:
         value = str(value or "").strip()

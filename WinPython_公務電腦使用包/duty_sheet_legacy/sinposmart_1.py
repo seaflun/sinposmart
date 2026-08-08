@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from selenium.common.exceptions import NoAlertPresentException, NoSuchFrameException, TimeoutException, UnexpectedAlertPresentException
@@ -763,6 +764,15 @@ def preview_excel_capture(excel_path, target_date):
     }
 
 
+def capture_duty_sheet_images(excel_path, target_date):
+    """Capture both duty-sheet images without blocking website submission."""
+
+    return (
+        preview_excel_capture(excel_path, target_date),
+        preview_night_excel_capture(excel_path, target_date),
+    )
+
+
 # ==========================================
 # [區塊三] 演算法大腦 (Core Logic Algorithm)
 # 專注於救災任務編組的分配邏輯
@@ -1228,6 +1238,8 @@ def start_automation(
     _runtime_status_callback = status_callback
     # 紀錄流程開始的時間
     start_time = time.time()
+    capture_executor = None
+    capture_future = None
     # ---------------- 1. 解析 Excel ----------------
     report_stage("source_load")
     day_int = int(target_date[-2:])
@@ -1281,6 +1293,9 @@ def start_automation(
         _runtime_status_callback = previous_status_callback
         return False
     log_status("✅ 勤務表檢查通過，未發現重複或漏排")
+    capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sinposmart-duty-capture")
+    capture_future = capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)
+    log_status("勤務表截圖與網站登打同步進行...")
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     report_stage("browser_start")
@@ -1466,11 +1481,13 @@ def start_automation(
             notification_status = ""
             notification_config = load_config().get("notification", {})
             try:
-                log_status("開始擷取勤務表截圖...")
-                daily_preview = preview_excel_capture(excel_path, target_date)
+                log_status("等待勤務表截圖完成...")
+                if capture_future is None:
+                    daily_preview, night_preview = capture_duty_sheet_images(excel_path, target_date)
+                else:
+                    daily_preview, night_preview = capture_future.result()
                 image_path = daily_preview["image_path"]
                 log_status(f"勤務表截圖完成：{daily_preview['capture_range']}")
-                night_preview = preview_night_excel_capture(excel_path, target_date)
                 log_status(f"夜間勤務截圖完成：{night_preview['capture_range']}")
                 if notification_config.get("enabled"):
                     log_status("開始上傳截圖並發送 LINE 通知...")
@@ -1518,6 +1535,11 @@ def start_automation(
         return False
     finally:
         wb.close()
+        if capture_executor is not None:
+            capture_executor.shutdown(
+                wait=bool(capture_future is not None and capture_future.done()),
+                cancel_futures=True,
+            )
         if close_driver:
             try:
                 quit_driver(driver)

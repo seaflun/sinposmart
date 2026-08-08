@@ -965,9 +965,13 @@ class DutySheetServiceTests(unittest.TestCase):
             (project_dir / "sinposmart_1.py").write_text("# placeholder\n", encoding="utf-8")
             saved: list[dict] = []
 
+            success_message = ["完成"]
+
             def start_automation(_uid, _pwd, _target, _excel, _cars, **kwargs):
-                kwargs["status_callback"]("執行中")
-                kwargs["success_callback"]("完成")
+                status_callback = kwargs.get("status_callback")
+                if status_callback is not None:
+                    status_callback("執行中")
+                kwargs["success_callback"](success_message[0])
                 return True
 
             legacy = SimpleNamespace(
@@ -991,7 +995,10 @@ class DutySheetServiceTests(unittest.TestCase):
 
             result = service.execute(request, status_callback=progress.append)
 
-            self.assertEqual(result, "完成")
+            self.assertEqual(result, "勤務表已登打完成：1150730")
+            success_message[0] = "已登打並存檔完畢！\n勤務表截圖或 LINE 通知失敗：測試訊息"
+            warning_result = service.execute(request)
+            self.assertEqual(warning_result, "勤務表已登打完成：1150730（截圖通知失敗）")
             self.assertEqual(progress, ["執行中"])
             self.assertEqual(saved[0]["login_settings"]["user_pwd"], "preserved")
             self.assertNotIn("session-secret", repr(saved))

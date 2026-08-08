@@ -467,6 +467,24 @@ class PackageSmokeTests(unittest.TestCase):
             ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
         )
 
+    def test_duty_sheet_captures_images_while_website_submission_runs(self) -> None:
+        module = legacy_duty_sheet_module()
+        daily_capture = {"image_path": "daily.png", "capture_range": "B3:AM36"}
+        night_capture = {"image_path": "night.png", "capture_range": "B24:AM33"}
+
+        with mock.patch.object(module, "preview_excel_capture", return_value=daily_capture), mock.patch.object(
+            module, "preview_night_excel_capture", return_value=night_capture
+        ):
+            captures = module.capture_duty_sheet_images("duty.xlsm", "1150809")
+
+        self.assertEqual(captures, (daily_capture, night_capture))
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
+        self.assertIn("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)", source)
+        self.assertLess(
+            source.index("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)"),
+            source.index("driver = build_driver(headless=False)"),
+        )
+
     def test_duty_sheet_truncates_external_duty_names_to_24_display_units(self) -> None:
         module = legacy_duty_sheet_module()
 
