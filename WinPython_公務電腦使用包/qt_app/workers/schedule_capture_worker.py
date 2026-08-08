@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 from PySide6.QtCore import QObject, Signal, Slot
 
 from app_core.schedule_capture_service import (
@@ -63,34 +61,29 @@ class ScheduleCaptureWorker(QObject):
             combine_capture = getattr(self.service, "combine_capture", None)
             if all(callable(value) for value in (capture_schedule, capture_comparisons, combine_capture)):
                 callback = lambda message: self.progress.emit(self.request_id, message)
-                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sinposmart-qt-live") as executor:
-                    schedule_future = executor.submit(
-                        capture_schedule,
+                schedule_snapshot = capture_schedule(
+                    self.request,
+                    status_callback=callback,
+                )
+                self.scheduleReady.emit(self.request_id, actor_no, schedule_snapshot)
+                try:
+                    comparison_data = capture_comparisons(
                         self.request,
                         status_callback=callback,
                     )
-                    comparison_future = executor.submit(
-                        capture_comparisons,
-                        self.request,
-                        status_callback=callback,
+                except ScheduleCaptureError as exc:
+                    message = (
+                        "已登打資料比對逾時，勤務資料仍可使用。"
+                        if exc.error_code == "timeout"
+                        else "已登打資料比對失敗，勤務資料仍可使用。"
                     )
-                    schedule_snapshot = schedule_future.result()
-                    self.scheduleReady.emit(self.request_id, actor_no, schedule_snapshot)
-                    try:
-                        comparison_data = comparison_future.result()
-                    except ScheduleCaptureError as exc:
-                        message = (
-                            "已登打資料比對逾時，勤務資料仍可使用。"
-                            if exc.error_code == "timeout"
-                            else "已登打資料比對失敗，勤務資料仍可使用。"
-                        )
-                        self.failed.emit(
-                            self.request_id,
-                            actor_no,
-                            message,
-                            f"comparison_{exc.error_code}",
-                        )
-                        return
+                    self.failed.emit(
+                        self.request_id,
+                        actor_no,
+                        message,
+                        f"comparison_{exc.error_code}",
+                    )
+                    return
                 snapshot = combine_capture(schedule_snapshot, comparison_data)
             else:
                 snapshot = self.service.capture(

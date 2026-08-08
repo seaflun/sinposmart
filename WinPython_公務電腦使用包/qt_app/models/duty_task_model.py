@@ -23,6 +23,7 @@ class DutyTaskListModel(QAbstractListModel):
     ComparisonTextRole = Qt.UserRole + 12
     GroupRole = Qt.UserRole + 13
     FullDetailTextRole = Qt.UserRole + 14
+    ErrorTextRole = Qt.UserRole + 15
 
     _ROLE_NAMES = {
         TaskIndexRole: QByteArray(b"taskIndex"),
@@ -39,6 +40,7 @@ class DutyTaskListModel(QAbstractListModel):
         ComparisonTextRole: QByteArray(b"comparisonText"),
         GroupRole: QByteArray(b"group"),
         FullDetailTextRole: QByteArray(b"fullDetailText"),
+        ErrorTextRole: QByteArray(b"errorText"),
     }
     _ROLE_KEYS = {
         TaskIndexRole: "taskIndex",
@@ -55,6 +57,7 @@ class DutyTaskListModel(QAbstractListModel):
         ComparisonTextRole: "comparisonText",
         GroupRole: "group",
         FullDetailTextRole: "fullDetailText",
+        ErrorTextRole: "errorText",
     }
 
     def __init__(self, parent=None) -> None:

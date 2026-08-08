@@ -185,6 +185,9 @@ class DutySheetController(QObject):
         if session is None or not session.verified:
             self._set_error("請先完成勤務系統登入。")
             return
+        if not str(session.actor_no or "").strip():
+            self._set_error("登入身分尚未完成番號確認，請稍候勤務表查詢完成。")
+            return
         request = DutySheetRequest(
             session.user_id,
             session.password,

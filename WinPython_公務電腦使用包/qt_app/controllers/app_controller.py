@@ -133,6 +133,7 @@ class AppController(QObject):
         self._rescue_video_controller = RescueVideoController(
             rescue_video_service or RescueVideoService(package_root),
             self,
+            session_state=self._session_state,
         )
         self._duty_execution_controller = DutyExecutionController(
             duty_submission_service or DutySubmissionService(package_root),
@@ -188,10 +189,14 @@ class AppController(QObject):
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
+        self._duty_controller.externalReturnQueueManualSubmissionRequested.connect(
+            self._enqueue_queued_external_return_manual_submission
+        )
+        self._duty_controller.externalReturnRecoveryDue.connect(
+            self._enqueue_external_return_recovery
+        )
+        self._duty_controller.unreturnedReturnEvent.connect(self._publish_unreturned_return_event)
         self._work_log_settings_controller.settingsSaved.connect(self._refresh_after_settings_save)
-        self._duty_execution_controller.actionStarted.connect(self._duty_controller.mark_submission_enqueued)
-        self._duty_execution_controller.actionFinished.connect(self._duty_controller.handle_submission_result)
-        self._duty_execution_controller.actionFailed.connect(self._duty_controller.handle_submission_failure)
         self._duty_execution_controller.allLanesUnavailable.connect(self._handle_execution_unavailable)
         self._duty_sheet_controller.runStarted.connect(
             lambda: self._tool_run_started("duty_sheet", "勤務表登打")
@@ -233,9 +238,6 @@ class AppController(QObject):
                 message,
                 mode=mode,
             )
-        )
-        self._duty_execution_controller.actionStarted.connect(
-            self._notify_duty_action_started
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
@@ -378,17 +380,20 @@ class AppController(QObject):
         """Refresh the selected audit date without publishing a NAS event."""
 
         if self._read_only_acceptance:
+            self._duty_controller.set_refresh_status("測試驗收模式不會執行即時勤務查詢。")
             return False
         session = self._session_state.session
         if session is None or not session.verified:
+            self._duty_controller.set_refresh_status("請先完成勤務系統登入驗證後再重新查詢。")
             return False
         try:
             target_roc_date = clamp_audit_roc_date(
                 self._duty_controller.targetDateText or business_roc_date()
             )
         except ValueError:
+            self._duty_controller.set_refresh_status("審核日期格式錯誤，請重新選擇日期。")
             return False
-        return self._duty_controller.refresh_live_schedule(
+        accepted = self._duty_controller.refresh_live_schedule(
             session.user_id,
             session.password,
             session.actor_no,
@@ -397,6 +402,12 @@ class AppController(QObject):
             publish_events=False,
             allow_auto_execution=False,
         )
+        if not accepted:
+            if self._duty_controller.isRefreshing:
+                self._duty_controller.set_refresh_status("勤務資料正在更新，請稍候再重新查詢。")
+            else:
+                self._duty_controller.set_refresh_status("登入資料不完整，請重新登入後再重新查詢。")
+        return accepted
 
     @Slot()
     def returnToDutySchedule(self) -> None:
@@ -415,6 +426,8 @@ class AppController(QObject):
         user_id = self._session_controller.userId if logged_in else ""
         if actor_no == self._synced_actor_no and user_id == self._synced_user_id:
             return
+        if previous_actor_no or previous_user_id:
+            self._duty_execution_controller.close_entry_session()
         self._synced_actor_no = actor_no
         self._synced_user_id = user_id
         if logged_in and self._session_controller.displayName:
@@ -820,6 +833,42 @@ class AppController(QObject):
         return {}
 
     @staticmethod
+    def _external_return_queue_id(request: DutySubmissionRequest) -> str:
+        return str(request.schedule_data.get("_unreturned_return_queue_id", "") or "").strip()
+
+    @Slot(object)
+    def _publish_unreturned_return_event(self, event: Mapping) -> None:
+        record = event.get("record", {}) if isinstance(event, Mapping) else {}
+        action = record.get("action", {}) if isinstance(record, Mapping) else {}
+        if not isinstance(action, Mapping):
+            return
+        context = record.get("schedule_context", {}) if isinstance(record, Mapping) else {}
+        staff = operational_staff_from_schedule(context) if isinstance(context, Mapping) else {}
+        snapshot = {
+            key: str(record.get(key) or "")
+            for key in (
+                "queue_id",
+                "completion_key",
+                "source_target_date",
+                "origin_actor_no",
+                "last_owner_actor_no",
+                "first_paused_at",
+                "last_attempt_at",
+                "next_retry_at",
+                "expires_at",
+            )
+        }
+        snapshot["retry_interval_minutes"] = int(record.get("retry_interval_minutes") or 0)
+        self._send_operational_event(
+            "unreturned_return",
+            status=str(event.get("status") or "pending"),
+            trigger_type=str(event.get("trigger_type") or "recovery"),
+            action=dict(action),
+            target=target_short_label(action, staff or self._operational_staff),
+            snapshot=snapshot,
+        )
+
+    @staticmethod
     def _format_duty_notification(
         action: Mapping,
         staff: Mapping[str, Mapping],
@@ -848,6 +897,10 @@ class AppController(QObject):
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
+        self._tray_controller.notify(
+            "SinpoSmart",
+            self._format_duty_notification(action, self._operational_staff, "準備登打"),
+        )
         self._send_operational_event(
             "action_queued",
             status="pending_write_automation",
@@ -865,6 +918,37 @@ class AppController(QObject):
         request: DutySubmissionRequest,
         result: DutySubmissionResult,
     ) -> None:
+        queue_id = self._external_return_queue_id(request)
+        if self._duty_controller.is_handoff_preflight_request(request):
+            if result.status == "paused_external":
+                self._duty_controller.handle_handoff_preflight_paused(request)
+            elif result.status == "handoff_preflight_ready":
+                if self._duty_controller.handle_handoff_preflight_ready(request):
+                    self._enqueue_handoff_group_after_preflight(request)
+            else:
+                self._duty_controller.handle_handoff_preflight_failure(
+                    request,
+                    result.message,
+                    "preflight_incomplete",
+                )
+        elif queue_id:
+            action = self._submission_action(request, result)
+            component_key = str(
+                request.schedule_data.get("_unreturned_return_component_key", "") or ""
+            )
+            self._duty_controller.handle_external_return_queue_result(
+                queue_id,
+                action,
+                result.status,
+                component_key,
+            )
+        else:
+            self._duty_controller.handle_submission_result(
+                result.action_index,
+                result.status,
+                result.message,
+                str(result.result_path),
+            )
         action = self._submission_action(request, result)
         self._send_operational_event(
             "action_result",
@@ -891,7 +975,28 @@ class AppController(QObject):
         error_code: str,
         result_path: str,
     ) -> None:
+        queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
+        if self._duty_controller.is_handoff_preflight_request(request):
+            self._duty_controller.handle_handoff_preflight_failure(request, message, error_code)
+            if error_code == "login_failed":
+                self._duty_controller.disable_auto_execution()
+                self._force_logout(message)
+        elif queue_id:
+            component_key = str(
+                request.schedule_data.get("_unreturned_return_component_key", "") or ""
+            )
+            self._duty_controller.handle_external_return_queue_failure(
+                queue_id,
+                action,
+                message,
+                component_key,
+            )
+            if error_code == "login_failed":
+                self._duty_controller.disable_auto_execution()
+                self._force_logout(message)
+        else:
+            self._duty_controller.handle_submission_failure(request.action_index, message, error_code)
         self._send_operational_event(
             "action_result",
             status="failed",
@@ -1204,7 +1309,64 @@ class AppController(QObject):
             list(indices),
         ):
             if self._duty_execution_controller.enqueue(request):
-                self._duty_controller.mark_submission_enqueued(request.action_index)
+                if not self._external_return_queue_id(request):
+                    self._duty_controller.mark_submission_enqueued(request.action_index)
+
+    @Slot(str)
+    def _enqueue_queued_external_return_manual_submission(self, queue_id: str) -> None:
+        if self._read_only_acceptance:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        requests = self._duty_controller.queued_external_return_manual_submission_requests(
+            session.user_id,
+            session.password,
+            queue_id,
+        )
+        for request in requests:
+            self._duty_execution_controller.enqueue(request)
+
+    @Slot(object)
+    def _enqueue_external_return_recovery(self, record: Mapping) -> None:
+        queue_id = str(record.get("queue_id") or "") if isinstance(record, Mapping) else ""
+        if self._read_only_acceptance:
+            self._duty_controller.release_external_return_recovery(queue_id)
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            self._duty_controller.release_external_return_recovery(queue_id)
+            return
+        requests = self._duty_controller.recovery_submission_requests(
+            session.user_id,
+            session.password,
+            record,
+        )
+        if not requests:
+            self._duty_controller.handle_external_return_queue_failure(queue_id)
+            return
+        for request in requests:
+            self._duty_execution_controller.enqueue(request)
+
+    def _enqueue_handoff_group_after_preflight(self, request: DutySubmissionRequest) -> None:
+        session = self._session_state.session
+        if session is None or not session.verified:
+            self._duty_controller.handle_handoff_preflight_failure(
+                request,
+                "登入狀態已失效，未執行值班交接登打。",
+                "login_failed",
+            )
+            return
+        group_requests = self._duty_controller.handoff_group_submission_requests(
+            session.user_id,
+            session.password,
+            request,
+        )
+        for group_request in group_requests:
+            if self._duty_execution_controller.enqueue(group_request):
+                if not self._external_return_queue_id(group_request):
+                    self._duty_controller.mark_submission_enqueued(group_request.action_index)
+        self._duty_controller.finish_handoff_preflight_group(request)
 
     @Slot(str)
     def _auto_logout(self, actor_no: str) -> None:

@@ -338,20 +338,37 @@ def js_click(driver: webdriver.Chrome, element_id: str) -> bool:
     )
 
 
-def js_set(driver: webdriver.Chrome, element_id: str, value: str) -> bool:
+def js_set(
+    driver: webdriver.Chrome,
+    element_id: str,
+    value: str,
+    *,
+    dispatch_change: bool = True,
+) -> bool:
     return bool(
         driver.execute_script(
             """
             const el = document.getElementById(arguments[0]);
             if (!el) return false;
             el.value = arguments[1];
-            el.dispatchEvent(new Event('change', {bubbles: true}));
+            if (arguments[2]) el.dispatchEvent(new Event('change', {bubbles: true}));
             return true;
             """,
             element_id,
             value,
+            dispatch_change,
         )
     )
+
+
+def native_click(driver: webdriver.Chrome, element_id: str) -> bool:
+    """Click with a genuine browser event for legacy pages that read window.event."""
+
+    try:
+        driver.find_element(By.ID, element_id).click()
+    except (AttributeError, NoSuchElementException, WebDriverException):
+        return False
+    return True
 
 
 def suppress_window_open_for_background_query(driver: webdriver.Chrome) -> None:
@@ -1580,12 +1597,45 @@ def query_authenticated_person_name(driver: webdriver.Chrome, user_id: str) -> s
 
 def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutySheet:
     open_ap(driver, DUTY_TABLE_AP)
-    time.sleep(1)
+    try:
+        WebDriverWait(driver, 15, poll_frequency=0.25).until(
+            lambda current_driver: bool(
+                current_driver.execute_script(
+                    """
+                    const dateField = document.getElementById('_txtTaskDate');
+                    const queryButton = document.getElementById('_btnQuery') ||
+                      document.getElementById('_btnSearch');
+                    return Boolean(dateField && queryButton);
+                    """
+                )
+            )
+        )
+    except TimeoutException as exc:
+        raise RuntimeError("勤務表查詢失敗：查詢介面未在 15 秒內完成載入。") from exc
     suppress_window_open_for_background_query(driver)
-    js_set(driver, "_txtTaskDate", target_roc_date)
-    if not js_click(driver, "_btnQuery"):
-        js_click(driver, "_btnSearch")
-    time.sleep(1.5)
+    if not js_set(driver, "_txtTaskDate", target_roc_date):
+        raise RuntimeError("勤務表查詢失敗：找不到查詢日期欄位。")
+    if not js_click(driver, "_btnQuery") and not js_click(driver, "_btnSearch"):
+        raise RuntimeError("勤務表查詢失敗：找不到查詢按鈕。")
+    try:
+        WebDriverWait(driver, 15, poll_frequency=0.25).until(
+            lambda current_driver: bool(
+                current_driver.execute_script(
+                    """
+                    return Array.from(document.querySelectorAll('table')).some(table => {
+                      if (!String(table.className || '').includes('report_list1')) return false;
+                      const slots = Array.from(table.querySelectorAll('tr')).map(row =>
+                        String(row.children[0]?.innerText || '').replace(/\\s+/g, '')
+                      );
+                      return slots.some(slot => /^8[~～-]9$/.test(slot)) &&
+                        slots.some(slot => /^7[~～-]8$/.test(slot));
+                    });
+                    """
+                )
+            )
+        )
+    except TimeoutException as exc:
+        raise RuntimeError("勤務表讀取逾時：等待查詢結果超過 15 秒。") from exc
     data = driver.execute_script(
         """
         function cellText(cell) {
@@ -1722,6 +1772,33 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
     return sheet
 
 
+def wait_for_query_completion(driver: webdriver.Chrome, expected_page: str = "") -> None:
+    """Wait for the duty system to confirm that its asynchronous query finished."""
+
+    expected_page = str(expected_page or "")
+
+    def query_completed(current_driver: webdriver.Chrome) -> bool:
+        state = current_driver.execute_script(
+            r"""
+            const text = document.body?.innerText || '';
+            const pageSelect = document.querySelector("select[name='pageSelect']");
+            return {
+              completed: /QUY-000\s*[:：]\s*查詢完成/.test(text)
+                || /QUY-500\s*[:：]\s*查無資料/.test(text),
+              page: pageSelect?.value || '',
+              hasRows: Array.from(document.querySelectorAll('tr')).some(row => row.children.length >= 3)
+            };
+            """
+        )
+        if not isinstance(state, dict):
+            return False
+        if expected_page:
+            return str(state.get("page", "")) == expected_page and bool(state.get("hasRows"))
+        return bool(state.get("completed"))
+
+    WebDriverWait(driver, 8, poll_frequency=0.25).until(query_completed)
+
+
 def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date: str) -> list[list[str]]:
     open_ap(driver, ap_name)
     time.sleep(1)
@@ -1743,11 +1820,11 @@ def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date:
     js_set(driver, "_selETIMEM", "59")
     js_set(driver, "_selQDept", "033006")
     js_set(driver, "_selDeptno", "033006")
-    js_set(driver, "_txtPageNum", "100")
+    js_set(driver, "_txtPageNum", "200")
     for button_id in ("_btnQuery", "_btnSearch"):
         if js_click(driver, button_id):
             break
-    time.sleep(1.5)
+    wait_for_query_completion(driver)
     raw_rows = driver.execute_script(
         """
         return Array.from(document.querySelectorAll('tr')).map(tr =>
@@ -1777,19 +1854,30 @@ def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date:
     return rows
 
 
-def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
-    open_ap(driver, CASE_QUERY_AP)
-    time.sleep(1)
-    suppress_window_open_for_background_query(driver)
-    js_set(driver, "_hidDeptno", "033006")
-    js_set(driver, "_txtSDATE", target_roc_date)
-    js_set(driver, "_txtEDATE", target_roc_date)
-    js_set(driver, "_selSTIMEH", "00")
-    js_set(driver, "_selSTIMEM", "00")
-    js_set(driver, "_selETIMEH", "23")
-    js_set(driver, "_selETIMEM", "59")
-    js_click(driver, "_btnQuery")
-    time.sleep(1.5)
+def case_query_pages(driver: webdriver.Chrome) -> list[str]:
+    pages = driver.execute_script(
+        """
+        const pageSelect = document.querySelector("select[name='pageSelect']");
+        if (!pageSelect) return [];
+        return Array.from(pageSelect.options || [])
+          .map(option => String(option.value || '').trim())
+          .filter(Boolean);
+        """
+    )
+    return [str(page) for page in pages] if isinstance(pages, list) else []
+
+
+def select_case_query_page(driver: webdriver.Chrome, page: str) -> None:
+    try:
+        page_select = driver.find_element(By.CSS_SELECTOR, "select[name='pageSelect']")
+        option = page_select.find_element(By.CSS_SELECTOR, f"option[value='{page}']")
+        option.click()
+        return
+    except (AttributeError, NoSuchElementException, WebDriverException) as exc:
+        raise RuntimeError(f"案件查詢無法以原生事件切換至第 {page} 頁。") from exc
+
+
+def capture_case_query_table(driver: webdriver.Chrome) -> dict[str, Any]:
     captured_table = driver.execute_script(
         r"""
         const text = (element) => (element.innerText || element.textContent || element.value || '').trim();
@@ -1811,15 +1899,49 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
         return {headers: [], rows: []};
         """
     )
-    headers = captured_table.get("headers", []) if isinstance(captured_table, dict) else []
-    rows = captured_table.get("rows", []) if isinstance(captured_table, dict) else []
-    headers = [str(value or "") for value in headers] if isinstance(headers, list) else []
-    rows = rows if isinstance(rows, list) else []
+    return captured_table if isinstance(captured_table, dict) else {"headers": [], "rows": []}
+
+
+def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
+    open_ap(driver, CASE_QUERY_AP)
+    time.sleep(1)
+    suppress_window_open_for_background_query(driver)
+    for element_id, value in (
+        ("_hidDeptno", "033006"),
+        ("_txtSDATE", target_roc_date),
+        ("_txtEDATE", target_roc_date),
+        ("_selSTIMEH", "00"),
+        ("_selSTIMEM", "00"),
+        ("_selETIMEH", "23"),
+        ("_selETIMEM", "59"),
+    ):
+        if not js_set(driver, element_id, value, dispatch_change=False):
+            raise RuntimeError(f"案件查詢找不到欄位：{element_id}。")
+    if not native_click(driver, "_btnQuery") and not js_click(driver, "_btnQuery"):
+        raise RuntimeError("案件查詢找不到查詢按鈕。")
+    wait_for_query_completion(driver)
+    captured_tables = [capture_case_query_table(driver)]
+    pages = case_query_pages(driver)
+    for page in pages[1:]:
+        select_case_query_page(driver, page)
+        wait_for_query_completion(driver, expected_page=page)
+        captured_tables.append(capture_case_query_table(driver))
+
+    headers: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for captured_table in captured_tables:
+        if not headers:
+            table_headers = captured_table.get("headers", [])
+            if isinstance(table_headers, list):
+                headers = [str(value or "") for value in table_headers]
+        table_rows = captured_table.get("rows", [])
+        if isinstance(table_rows, list):
+            rows.extend(row for row in table_rows if isinstance(row, dict))
     return_column = next(
         (index for index, header in enumerate(headers) if "返隊" in re.sub(r"\s+", "", header)),
         None,
     )
-    if return_column is None:
+    if return_column is None and (headers or rows):
         raise RuntimeError("案件查詢結果缺少返隊時間欄位。")
     cases: list[CaseRecord] = []
     for captured_row in rows:

@@ -5,7 +5,11 @@ Rectangle {
     required property bool dutyMode
     required property bool selectedState
     required property string tone
-    height: dutyMode ? Design.dutyTaskRowHeight : Design.auditTaskRowHeight
+    property string errorText: ""
+    readonly property bool hasTaskError: dutyMode && errorText.length > 0
+    height: dutyMode
+            ? Design.dutyTaskRowHeight + (hasTaskError ? Design.dutyTaskErrorHeight : 0)
+            : Design.auditTaskRowHeight
     radius: Design.radiusSmall
     color: dutyMode ? Design.panel
          : selectedState ? Design.comboButton

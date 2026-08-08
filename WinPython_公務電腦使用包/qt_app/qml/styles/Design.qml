@@ -106,6 +106,7 @@ QtObject {
     readonly property int appContentBottomSpacing: 14
     readonly property int appResizeHandleWidth: 6
     readonly property int dutyTaskRowHeight: 44
+    readonly property int dutyTaskErrorHeight: 28
     readonly property int auditTaskRowHeight: 34
     readonly property int dutyTaskGridInset: 4
     readonly property int dutyTaskTimeWidth: 82
@@ -120,6 +121,7 @@ QtObject {
     readonly property int auditTaskSystemWidth: 70
     readonly property int dutyModeButtonWidth: 112
     readonly property int dutyActionButtonWidth: 104
+    readonly property int externalReturnManualButtonWidth: 184
     readonly property int dutyActionButtonHeight: 38
     readonly property int settingsButtonSize: 34
     readonly property int settingsIconSize: 16

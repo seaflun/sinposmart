@@ -27,12 +27,13 @@ class DutyTaskProjectionState:
     staff: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     comparisons: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     submitting_indices: frozenset[int] = frozenset()
-    manual_paused_indices: frozenset[int] = frozenset()
     comparison_wait_statuses: Mapping[int, str] = field(default_factory=dict)
     paused_indices: frozenset[int] = frozenset()
     executed_indices: frozenset[int] = frozenset()
     manual_completed_indices: frozenset[int] = frozenset()
     selected_indices: frozenset[int] = frozenset()
+    forced_visible_indices: frozenset[int] = frozenset()
+    task_errors: Mapping[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,6 @@ class DueTaskSelectionState:
     comparisons: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     executed_indices: frozenset[int] = frozenset()
     submitting_indices: frozenset[int] = frozenset()
-    manual_paused_indices: frozenset[int] = frozenset()
     blocked_indices: frozenset[int] = frozenset()
     retry_after: Mapping[int, datetime] = field(default_factory=dict)
 
@@ -222,7 +222,12 @@ def duty_task_columns(
 
 def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
     if action.get("kind") == "work_log":
-        return True
+        return action.get("source") in (
+            "值班交接",
+            "在隊訓練",
+            "無線電試話",
+            "無線電測試",
+        )
     if action.get("kind") != "entry_log":
         return False
     fields = action.get("fields", {})
@@ -249,7 +254,7 @@ def select_due_task_indices(
             continue
         if index in state.executed_indices or index in state.submitting_indices:
             continue
-        if index in state.manual_paused_indices or index in state.blocked_indices:
+        if index in state.blocked_indices:
             continue
         retry_at = state.retry_after.get(index)
         if retry_at is not None and current < retry_at:
@@ -315,8 +320,6 @@ def _task_status(
         return "正在登打", "running"
     if comparison.get("group") == "done":
         return _display_status(comparison.get("compare") or "已存在"), "triggered"
-    if index in state.manual_paused_indices:
-        return "人員手動暫停", "manual"
     if index in state.comparison_wait_statuses:
         return state.comparison_wait_statuses[index], "manual"
     if index in state.paused_indices:
@@ -349,7 +352,11 @@ def project_duty_tasks(
     for index, action in enumerate(actions):
         comparison = state.comparisons.get(index, {})
         is_previous_item = _is_previous_duty_item(action, previous_actors)
-        if str(action.get("actor", "") or "") != actor_no and not is_previous_item:
+        if (
+            str(action.get("actor", "") or "") != actor_no
+            and not is_previous_item
+            and index not in state.forced_visible_indices
+        ):
             continue
         if is_previous_item and comparison and comparison.get("group") in ("done", "near", "adjust", "future"):
             continue
@@ -378,6 +385,7 @@ def project_duty_tasks(
                     "statusText": status_text,
                     "statusTone": status_tone,
                     "selected": index in state.selected_indices,
+                    "errorText": str(state.task_errors.get(index, "") or ""),
                 },
             )
         )
@@ -423,7 +431,7 @@ def next_duty_task_text(
         comparison = state.comparisons.get(index, {})
         if index in state.submitting_indices or comparison.get("group") == "done":
             continue
-        if index in state.manual_paused_indices or index in state.comparison_wait_statuses:
+        if index in state.comparison_wait_statuses:
             continue
         if index in state.paused_indices or index in state.executed_indices:
             continue
@@ -525,10 +533,10 @@ def project_audit_tasks(
                     "selected": False,
                     "actorText": person_short_label(action_actor, staff),
                     "targetText": target_short_label(action, staff),
-                    "comparisonText": comparison_text,
-                    "group": group,
-                    "fullDetailText": audit_detail_text(action, comparison),
-                },
+                "comparisonText": comparison_text,
+                "group": group,
+                "fullDetailText": audit_detail_text(action, comparison),
+            },
             )
         )
     rows.sort(key=lambda item: item[0])
@@ -663,10 +671,13 @@ def build_schedule_comparisons(
         work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
         if action.get("kind") == "entry_log":
             reason = fields.get("領用事由及地點", "")
-            if is_future_action(target_date, dict(action)):
-                result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
-            elif reason in ("休息", "休息返隊"):
-                result[index] = _compare_rest_entry(actions, action, action_date, entry_rows, target_date, staff)
+            if reason in ("休息", "休息返隊"):
+                comparison = _compare_rest_entry(actions, action, action_date, entry_rows, target_date, staff)
+                result[index] = (
+                    comparison
+                    if comparison.get("group") == "done" or not is_future_action(target_date, dict(action))
+                    else {"compare": "尚未到點", "group": "future", "matched": []}
+                )
             else:
                 exact = find_entry_matches(entry_rows, action_date, staff, action, allow_near=False)
                 arrival_exists = [] if exact else find_arrival_entry_exists(entry_rows, action_date, staff, action)
@@ -675,6 +686,8 @@ def build_schedule_comparisons(
                     result[index] = {"compare": "已存在", "group": "done", "matched": exact[:1]}
                 elif arrival_exists:
                     result[index] = {"compare": "已存在(時間不同)", "group": "done", "matched": arrival_exists[:1]}
+                elif is_future_action(target_date, dict(action)):
+                    result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
                 elif is_possible_handoff_adjustment(entry_rows, action_date, staff, action):
                     result[index] = {"compare": "可能臨時調整", "group": "adjust", "matched": []}
                 elif near:
@@ -685,19 +698,18 @@ def build_schedule_comparisons(
                     result[index] = {"compare": "人工確認", "group": "review", "matched": []}
                 else:
                     result[index] = {"compare": "未找到", "group": "todo", "matched": []}
-        elif is_future_action(target_date, dict(action)):
-            result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
         else:
             matches = (
                 find_case_work_matches(work_rows, action_date, action)
                 if action.get("source") == "案件工作審核"
                 else find_work_matches(work_rows, action_date, staff, action)
             )
-            result[index] = {
-                "compare": "已存在" if matches else "未找到",
-                "group": "done" if matches else "todo",
-                "matched": matches[:1],
-            }
+            if matches:
+                result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
+            elif is_future_action(target_date, dict(action)):
+                result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
+            else:
+                result[index] = {"compare": "未找到", "group": "todo", "matched": []}
 
     for index, action in enumerate(actions):
         if action.get("kind") != "entry_log" or not str(action.get("source", "")).startswith("外勤"):

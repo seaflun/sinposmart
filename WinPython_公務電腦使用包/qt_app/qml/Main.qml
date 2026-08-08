@@ -98,7 +98,7 @@ ApplicationWindow {
         const normalized = String(message || "").trim()
         if (!window.backend.sessionController.isLoggedIn || normalized.length === 0)
             return
-        window.backend.sessionController.setOperationalStatus(normalized, "warning")
+        window.errorMessage = normalized
     }
 
     function shiftSlashDate(value, days) {
@@ -138,7 +138,7 @@ ApplicationWindow {
         window.maximumWidth = isLoggedIn ? Design.maximumWindowExtent : window.dutyMainWidth
         window.maximumHeight = isLoggedIn ? Design.maximumWindowExtent : 320 + Design.appTitleBarHeight
         window.width = window.activeToolSidePanel ? window.dutyExpandedWidth : window.dutyMainWidth
-        window.height = (isLoggedIn ? 800 : 320) + Design.appTitleBarHeight
+        window.height = (isLoggedIn ? 840 : 320) + Design.appTitleBarHeight
     }
 
     function toggleWindowMaximize() {
@@ -263,6 +263,10 @@ ApplicationWindow {
 
         function onManualSubmissionConfirmationRequested() {
             actionConfirmations.openManualSubmissionConfirmation()
+        }
+
+        function onExternalReturnManualSubmissionConfirmationRequested() {
+            actionConfirmations.openExternalReturnManualSubmissionConfirmation()
         }
 
         function onErrorOccurred(message) {

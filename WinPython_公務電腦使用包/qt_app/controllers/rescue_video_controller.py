@@ -12,6 +12,7 @@ from app_core.rescue_video_service import (
     RescueVideoService,
     RescueVideoValidationError,
 )
+from app_core.session import SessionState
 from qt_app.models.rescue_video_result_model import RescueVideoResultModel
 from qt_app.workers.rescue_video_worker import RescueVideoWorker
 
@@ -25,9 +26,16 @@ class RescueVideoController(QObject):
     runFailed = Signal(str, str)
     errorOccurred = Signal(str)
 
-    def __init__(self, service: RescueVideoService, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        service: RescueVideoService,
+        parent: QObject | None = None,
+        *,
+        session_state: SessionState | None = None,
+    ) -> None:
         super().__init__(parent)
         self._service = service
+        self._session_state = session_state
         self._source_path = ""
         self._destination_path = ""
         self._target_date = ""
@@ -291,6 +299,11 @@ class RescueVideoController(QObject):
         defaults_date: str = "",
         defaults_vehicle: str = "",
     ) -> None:
+        if operation == "execute" and self._session_state is not None:
+            session = self._session_state.session
+            if session is None or not session.verified or not str(session.actor_no or "").strip():
+                self._set_error("登入身分尚未完成番號確認，請稍候勤務表查詢完成。")
+                return
         self._request_id += 1
         request_id = self._request_id
         self._failure_stage = "unknown"

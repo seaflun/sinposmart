@@ -14,6 +14,10 @@ Item {
         manualSubmissionConfirmation.open()
     }
 
+    function openExternalReturnManualSubmissionConfirmation() {
+        externalReturnManualSubmissionConfirmation.open()
+    }
+
     function openCredentialSyncConfirmation() {
         credentialSyncConfirmation.open()
     }
@@ -50,6 +54,26 @@ Item {
         Label {
             width: parent.width
             text: actionConfirmations.backend.dutyController.manualConfirmationSummary
+            color: actionConfirmations.hostWindow.ink
+            wrapMode: Text.Wrap
+        }
+    }
+
+    AppleDialog {
+        id: externalReturnManualSubmissionConfirmation
+        objectName: "externalReturnManualSubmissionConfirmation"
+        anchors.centerIn: parent
+        width: Math.min(actionConfirmations.hostWindow.width - 72, 500)
+        modal: true
+        title: "確認返隊手動登打"
+        standardButtons: Dialog.Yes | Dialog.No
+        acceptText: "確認登打"
+        onAccepted: actionConfirmations.backend.dutyController.confirmExternalReturnManualSubmission()
+        onRejected: actionConfirmations.backend.dutyController.cancelExternalReturnManualSubmission()
+
+        Label {
+            width: parent.width
+            text: actionConfirmations.backend.dutyController.externalReturnConfirmationSummary
             color: actionConfirmations.hostWindow.ink
             wrapMode: Text.Wrap
         }

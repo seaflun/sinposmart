@@ -8,6 +8,7 @@ import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import sleep
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
@@ -55,6 +56,16 @@ class DutySubmissionResult:
     action: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class DutySubmissionBrowserSession:
+    """A logged-in browser that may execute consecutive entry submissions."""
+
+    automation: ModuleType
+    driver: object
+    user_id: str
+    visible: bool
+
+
 def load_automation_module() -> ModuleType:
     return importlib.import_module("duty_rehearsal")
 
@@ -68,6 +79,7 @@ class DutySubmissionService:
         now_factory: Callable[[], datetime] = datetime.now,
         comparison_builder: Callable[..., dict[int, dict[str, Any]]] = build_schedule_comparisons,
         open_assignment_checker: Callable[..., bool] = has_open_external_assignment,
+        sleeper: Callable[[float], None] = sleep,
     ) -> None:
         self.package_root = Path(package_root)
         self.output_dir = self.package_root / "runtime_outputs" / "form_tests"
@@ -75,6 +87,7 @@ class DutySubmissionService:
         self.now_factory = now_factory
         self.comparison_builder = comparison_builder
         self.open_assignment_checker = open_assignment_checker
+        self.sleeper = sleeper
 
     def validate(self, request: DutySubmissionRequest) -> DutySubmissionRequest:
         if not str(request.user_id or "").strip() or not request.password:
@@ -89,9 +102,13 @@ class DutySubmissionService:
         if not isinstance(actions, list) or not 0 <= int(request.action_index) < len(actions):
             raise DutySubmissionValidationError("找不到指定的勤務任務。")
         action = actions[int(request.action_index)]
-        if not isinstance(action, Mapping) or action.get("kind") not in ("work_log", "entry_log"):
+        if not isinstance(action, Mapping) or action.get("kind") not in (
+            "work_log",
+            "entry_log",
+            "handoff_preflight",
+        ):
             raise DutySubmissionValidationError("這筆任務不支援勤務系統登打。")
-        if request.trigger_type not in ("due", "manual"):
+        if request.trigger_type not in ("due", "manual", "recovery"):
             raise DutySubmissionValidationError("登打觸發類型不正確。")
         return DutySubmissionRequest(
             user_id=request.user_id.strip(),
@@ -108,18 +125,21 @@ class DutySubmissionService:
         request: DutySubmissionRequest,
         *,
         status_callback: Callable[[str], None] | None = None,
+        browser_session: DutySubmissionBrowserSession | None = None,
     ) -> DutySubmissionResult:
         request = self.validate(request)
+        if browser_session is not None and (
+            request.user_id != browser_session.user_id
+            or request.visible != browser_session.visible
+        ):
+            raise DutySubmissionValidationError("出入登打瀏覽器登入身分與任務不一致。")
         data = request.schedule_data
         actions = [dict(item) for item in data["actions"]]
         action = dict(actions[request.action_index])
         base_target_date = str(data["target_date"])
         action_date = action_target_roc_date(action, base_target_date)
         result_path = self._create_result_path(request, action)
-        if (
-            request.trigger_type == "due"
-            and base_target_date != business_roc_date(self.now_factory())
-        ):
+        if self.is_stale_due_request(request):
             return self._finish(
                 request,
                 action,
@@ -131,11 +151,20 @@ class DutySubmissionService:
         automation = None
         driver = None
         try:
-            automation = self._load_automation()
+            automation = (
+                browser_session.automation
+                if browser_session is not None
+                else self._load_automation()
+            )
             if status_callback:
                 status_callback("正在登入勤務系統…")
-            driver = automation.build_driver(headless=not request.visible)
-            automation.login(driver, request.user_id, request.password)
+            driver = (
+                browser_session.driver
+                if browser_session is not None
+                else automation.build_driver(headless=not request.visible)
+            )
+            if browser_session is None:
+                automation.login(driver, request.user_id, request.password)
             action = self._refresh_action_before_submit(
                 automation,
                 driver,
@@ -158,6 +187,15 @@ class DutySubmissionService:
                     "paused_external",
                     "人員尚未返隊，已暫停退勤登打。",
                     {"compare": "未返隊，暫停登打", "group": "paused", "matched": []},
+                )
+            if action.get("kind") == "handoff_preflight":
+                return self._finish(
+                    request,
+                    action,
+                    result_path,
+                    "handoff_preflight_ready",
+                    "接班人員已返隊，可登打值退、值班與交接工作。",
+                    {"compare": "接班人員已返隊", "group": "ready", "matched": []},
                 )
             comparison = self._comparison_for_action(
                 comparison_source,
@@ -236,14 +274,22 @@ class DutySubmissionService:
 
             if status_callback:
                 status_callback("正在回查送出結果…")
-            after = self._query_comparison(automation, driver, action, action_date)
-            verified = self._comparison_for_action(
-                comparison_source,
-                actions,
-                request.action_index,
-                action_date,
-                after,
-            )
+            verified = {"group": "todo", "matched": []}
+            for attempt in range(3):
+                after = self._query_comparison(automation, driver, action, action_date)
+                verified = self._comparison_for_action(
+                    comparison_source,
+                    actions,
+                    request.action_index,
+                    action_date,
+                    after,
+                )
+                if verified.get("group") == "done":
+                    break
+                if attempt < 2:
+                    if status_callback:
+                        status_callback(f"登打後資料尚未顯示，正在第 {attempt + 2} 次確認。")
+                    self.sleeper(1.0)
             if verified.get("group") != "done":
                 raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料。")
             verified = {**verified, "form_result": form_result}
@@ -267,11 +313,80 @@ class DutySubmissionService:
             message, error_code = self._safe_error(exc)
             raise DutySubmissionExecutionError(message, error_code, result_path) from exc
         finally:
-            if driver is not None and automation is not None:
+            if browser_session is None and driver is not None and automation is not None:
                 try:
                     automation.quit_driver(driver)
                 except Exception:
                     pass
+
+    def is_stale_due_request(self, request: DutySubmissionRequest) -> bool:
+        request = self.validate(request)
+        return (
+            request.trigger_type == "due"
+            and str(request.schedule_data["target_date"]) != business_roc_date(self.now_factory())
+        )
+
+    def open_browser_session(
+        self,
+        request: DutySubmissionRequest,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> DutySubmissionBrowserSession:
+        """Create one authenticated browser without retaining the password."""
+
+        request = self.validate(request)
+        automation = None
+        driver = None
+        opened = False
+        try:
+            automation = self._load_automation()
+            if status_callback:
+                status_callback("正在建立出入登打瀏覽器連線")
+            driver = automation.build_driver(headless=not request.visible)
+            automation.login(driver, request.user_id, request.password)
+            opened = True
+            return DutySubmissionBrowserSession(
+                automation=automation,
+                driver=driver,
+                user_id=request.user_id,
+                visible=request.visible,
+            )
+        except DutySubmissionValidationError:
+            raise
+        except DutySubmissionExecutionError:
+            raise
+        except Exception as exc:
+            message, error_code = self._safe_error(exc)
+            raise DutySubmissionExecutionError(message, error_code) from exc
+        finally:
+            if not opened and driver is not None and automation is not None:
+                try:
+                    automation.quit_driver(driver)
+                except Exception:
+                    pass
+
+    def close_browser_session(self, session: DutySubmissionBrowserSession | None) -> None:
+        if session is None:
+            return
+        try:
+            session.automation.quit_driver(session.driver)
+        except Exception:
+            pass
+
+    def execute_with_browser_session(
+        self,
+        request: DutySubmissionRequest,
+        session: DutySubmissionBrowserSession,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> DutySubmissionResult:
+        """Execute a request while keeping all pre-checks and verification enabled."""
+
+        return self.execute(
+            request,
+            status_callback=status_callback,
+            browser_session=session,
+        )
 
     def _load_automation(self) -> ModuleType:
         try:
@@ -342,10 +457,16 @@ class DutySubmissionService:
         staff: Mapping[str, Mapping[str, Any]],
         request: DutySubmissionRequest,
     ) -> bool:
-        if request.trigger_type != "due" or action.get("kind") != "entry_log":
+        if request.trigger_type not in ("due", "recovery"):
             return False
         fields = action.get("fields", {})
-        if not isinstance(fields, Mapping) or fields.get("領用事由及地點", "") not in ("退勤", "休息後退勤"):
+        if not isinstance(fields, Mapping):
+            return False
+        if action.get("kind") == "handoff_preflight":
+            pass
+        elif action.get("kind") == "entry_log" and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤"):
+            pass
+        else:
             return False
         now = self.now_factory()
         current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
@@ -409,7 +530,7 @@ class DutySubmissionService:
         action: Mapping[str, Any],
         action_date: str,
     ) -> dict[str, list[Any]]:
-        if action.get("kind") == "entry_log":
+        if action.get("kind") in ("entry_log", "handoff_preflight"):
             rows = automation.query_visible_table(driver, automation.ENTRY_LOG_AP, action_date)
             return {"visible_entry_rows": rows, "visible_work_rows": []}
         rows = automation.query_visible_table(driver, automation.WORK_LOG_AP, action_date)

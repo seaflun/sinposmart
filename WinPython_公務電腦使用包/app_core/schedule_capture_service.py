@@ -158,14 +158,19 @@ class ScheduleCaptureService:
         status_callback: Callable[[str], None] | None = None,
     ) -> ScheduleSnapshot:
         request = self.validate(request)
-        automation = self._load_automation()
+        stage = "load_automation"
+        automation = None
         driver = None
         try:
+            automation = self._load_automation()
             if status_callback:
                 status_callback("正在即時查詢勤務表…")
+            stage = "start_browser"
             driver = automation.build_driver(headless=True)
+            stage = "login"
             automation.login(driver, request.user_id, request.password)
             target = automation.parse_roc_date(request.target_roc_date)
+            stage = "today_duty_sheet"
             today_sheet = automation.query_duty_sheet(driver, automation.roc_date(target))
             authenticated_actor_no, authenticated_actor_name = actor_identity_from_name(
                 today_sheet.staff,
@@ -193,15 +198,20 @@ class ScheduleCaptureService:
                     pass
             yesterday = target - timedelta(days=1)
             tomorrow = target + timedelta(days=1)
+            stage = "yesterday_duty_sheet"
             yesterday_sheet = automation.query_duty_sheet(driver, automation.roc_date(yesterday))
             try:
+                stage = "tomorrow_duty_sheet"
                 tomorrow_sheet = automation.query_duty_sheet(driver, automation.roc_date(tomorrow))
             except Exception:
                 tomorrow_sheet = None
             if status_callback:
                 status_callback("正在查詢未返隊案件…")
+            stage = "yesterday_cases"
             yesterday_cases = automation.query_cases(driver, automation.roc_date(yesterday))
+            stage = "today_cases"
             cases = automation.query_cases(driver, automation.roc_date(target))
+            stage = "planned_actions"
             actions = automation.planned_actions(
                 today_sheet,
                 yesterday_sheet,
@@ -222,6 +232,7 @@ class ScheduleCaptureService:
                 "actions": [asdict(item) for item in actions],
             }
             schedule_path = self.runtime_dir / "schedule" / f"schedule_output_{request.target_roc_date}.json"
+            stage = "write_schedule_snapshot"
             self._write_json(schedule_path, payload)
             stamp = self.now_factory().strftime("%H%M%S")
             self._write_json(
@@ -241,13 +252,15 @@ class ScheduleCaptureService:
                 authenticated_actor_no=str(authenticated_actor_no or "").strip(),
                 authenticated_actor_name=str(authenticated_actor_name or "").strip(),
             )
-        except (ScheduleCaptureValidationError, ScheduleCaptureError):
+        except (ScheduleCaptureValidationError, ScheduleCaptureError) as exc:
+            self._write_capture_failure_diagnostic(stage, request, exc)
             raise
         except Exception as exc:
+            self._write_capture_failure_diagnostic(stage, request, exc)
             message, error_code = self._safe_error(exc)
             raise ScheduleCaptureError(message, error_code) from exc
         finally:
-            if driver is not None:
+            if driver is not None and automation is not None:
                 try:
                     automation.quit_driver(driver)
                 except Exception:
@@ -260,17 +273,21 @@ class ScheduleCaptureService:
         status_callback: Callable[[str], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         request = self.validate(request)
+        stage = "load_automation"
         automation = self._load_automation()
         driver = None
         try:
             if status_callback:
                 status_callback("正在背景比對已登打資料…")
+            stage = "start_browser"
             driver = automation.build_driver(headless=True)
+            stage = "login"
             automation.login(driver, request.user_id, request.password)
             target = automation.parse_roc_date(request.target_roc_date)
             comparison_data: dict[str, dict[str, Any]] = {}
             for action_date in [target + timedelta(days=offset) for offset in (-1, 0, 1)]:
                 target_roc_date = automation.roc_date(action_date)
+                stage = f"work_rows_{target_roc_date}"
                 payload = {
                     "file_type": "comparison",
                     "target_date": target_roc_date,
@@ -280,21 +297,26 @@ class ScheduleCaptureService:
                         automation.WORK_LOG_AP,
                         target_roc_date,
                     ),
-                    "visible_entry_rows": automation.query_visible_table(
-                        driver,
-                        automation.ENTRY_LOG_AP,
-                        target_roc_date,
-                    ),
+                    "visible_entry_rows": [],
                 }
+                stage = f"entry_rows_{target_roc_date}"
+                payload["visible_entry_rows"] = automation.query_visible_table(
+                    driver,
+                    automation.ENTRY_LOG_AP,
+                    target_roc_date,
+                )
                 comparison_data[target_roc_date] = payload
+                stage = f"write_output_{target_roc_date}"
                 self._write_json(
                     self.runtime_dir / "comparison" / f"comparison_output_{target_roc_date}.json",
                     payload,
                 )
             return comparison_data
-        except (ScheduleCaptureValidationError, ScheduleCaptureError):
+        except (ScheduleCaptureValidationError, ScheduleCaptureError) as exc:
+            self._write_capture_failure_diagnostic(f"comparison_{stage}", request, exc)
             raise
         except Exception as exc:
+            self._write_capture_failure_diagnostic(f"comparison_{stage}", request, exc)
             message, error_code = self._safe_error(exc)
             raise ScheduleCaptureError(message, error_code) from exc
         finally:
@@ -350,6 +372,29 @@ class ScheduleCaptureService:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
+
+    def _write_capture_failure_diagnostic(
+        self,
+        stage: str,
+        request: ScheduleCaptureRequest,
+        exc: BaseException,
+    ) -> None:
+        """Keep only the actionable failure point; never persist credentials or page data."""
+
+        message = " ".join(str(exc or "").split())
+        if request.password:
+            message = message.replace(request.password, "[REDACTED]")
+        payload = {
+            "captured_at": self.now_factory().isoformat(timespec="seconds"),
+            "target_roc_date": request.target_roc_date,
+            "stage": str(stage or "unknown"),
+            "exception_type": type(exc).__name__,
+            "message": message[:500],
+        }
+        try:
+            self._write_json(self.runtime_dir / "browser" / "schedule_capture_failure.json", payload)
+        except OSError:
+            return
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:

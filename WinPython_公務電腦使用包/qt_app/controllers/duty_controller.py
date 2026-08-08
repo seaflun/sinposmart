@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 from PySide6.QtCore import QDateTime, QObject, Property, QThread, QTimer, QUrl, Signal, Slot
@@ -22,9 +23,11 @@ from app_core.duty_task_projection import (
     project_audit_tasks,
     project_duty_tasks,
     select_due_task_indices,
+    target_short_label,
 )
 from app_core.schedule_repository import ScheduleRepository, ScheduleSnapshot, business_roc_date
 from app_core.duty_submission_service import DutySubmissionRequest
+from app_core.unreturned_return_queue import UnreturnedReturnQueue
 from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
 from qt_app.models.duty_task_model import DutyTaskListModel
 from qt_app.workers.schedule_load_worker import ScheduleLoadWorker
@@ -38,7 +41,11 @@ class DutyController(QObject):
     autoLogoutRequested = Signal(str)
     reloginRequired = Signal(str)
     manualSubmissionConfirmationRequested = Signal()
+    externalReturnManualSubmissionConfirmationRequested = Signal()
     manualSubmissionRequested = Signal(object)
+    externalReturnQueueManualSubmissionRequested = Signal(str)
+    externalReturnRecoveryDue = Signal(object)
+    unreturnedReturnEvent = Signal(object)
     liveScheduleCaptured = Signal(object)
     liveSnapshotCaptured = Signal(object)
     liveCaptureFailed = Signal(str, str)
@@ -52,11 +59,15 @@ class DutyController(QObject):
         *,
         repository: ScheduleRepository | None = None,
         capture_service: ScheduleCaptureService | None = None,
+        unreturned_return_queue: UnreturnedReturnQueue | None = None,
     ) -> None:
         super().__init__(parent)
         package_root = Path(__file__).resolve().parents[2]
         self._repository = repository or ScheduleRepository(package_root / "runtime_outputs")
         self._capture_service = capture_service or ScheduleCaptureService(package_root)
+        self._unreturned_return_queue = unreturned_return_queue or UnreturnedReturnQueue(
+            package_root / "runtime_outputs"
+        )
         self._current_date_text = ""
         self._current_time_text = ""
         self._observed_fire_day = business_roc_date()
@@ -75,12 +86,16 @@ class DutyController(QObject):
         self._due_task_indices: list[int] = []
         self._executed_indices: set[int] = set()
         self._submitting_indices: set[int] = set()
-        self._manual_paused_indices: set[int] = set()
         self._blocked_indices: set[int] = set()
         self._retry_after: dict[int, datetime] = {}
+        self._task_errors: dict[int, str] = {}
         self._selected_indices: set[int] = set()
         self._pending_manual_indices: list[int] = []
         self._manual_confirmation_summary = ""
+        self._pending_external_return_indices: list[int] = []
+        self._external_return_confirmation_summary = ""
+        self._external_return_queue_ids_by_action_index: dict[int, str] = {}
+        self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
         self._auto_execution_enabled = False
         self._login_started_at: datetime | None = None
         self._auto_logout_actor_no = ""
@@ -143,6 +158,12 @@ class DutyController(QObject):
     def scheduleStatus(self) -> str:
         return self._schedule_status
 
+    def set_refresh_status(self, message: str) -> None:
+        """Expose an immediate query rejection in the existing schedule-status area."""
+
+        self._schedule_status = str(message or "").strip()
+        self.scheduleChanged.emit()
+
     @Property(bool, notify=scheduleChanged)
     def isRefreshing(self) -> bool:
         return bool(self._schedule_workers or self._capture_workers or self._comparison_workers)
@@ -192,12 +213,6 @@ class DutyController(QObject):
         return len(self._selected_indices)
 
     @Property(bool, notify=scheduleChanged)
-    def canAdjustSelectedSchedule(self) -> bool:
-        """Whether every selected task remains eligible for schedule controls."""
-
-        return self._can_adjust_selected_schedule()
-
-    @Property(bool, notify=scheduleChanged)
     def canManualSubmitSelected(self) -> bool:
         """Whether every selected task can be submitted manually."""
 
@@ -206,6 +221,30 @@ class DutyController(QObject):
     @Property(str, notify=scheduleChanged)
     def manualConfirmationSummary(self) -> str:
         return self._manual_confirmation_summary
+
+    @Property(bool, notify=scheduleChanged)
+    def hasExternalReturnPauseSelected(self) -> bool:
+        return any(
+            self._comparisons.get(index, {}).get("group") == "paused"
+            for index in self._selected_indices
+        )
+
+    @Property(bool, notify=scheduleChanged)
+    def canConfirmExternalReturnManualSubmissionSelected(self) -> bool:
+        if not self._selected_indices:
+            return False
+        queue_ids = {
+            self._external_return_queue_ids_by_action_index.get(index, "")
+            for index in self._selected_indices
+        }
+        if "" in queue_ids or len(queue_ids) != 1:
+            return False
+        queue_id = next(iter(queue_ids))
+        return self._selected_indices == self._queue_action_indices(queue_id)
+
+    @Property(str, notify=scheduleChanged)
+    def externalReturnConfirmationSummary(self) -> str:
+        return self._external_return_confirmation_summary
 
     @Property(str, notify=scheduleChanged)
     def automationStatus(self) -> str:
@@ -258,46 +297,21 @@ class DutyController(QObject):
     def toggleTaskSelection(self, action_index: int) -> None:
         if not 0 <= action_index < len(self._actions):
             return
-        if action_index in self._selected_indices:
+        queue_id = self._external_return_queue_ids_by_action_index.get(action_index, "")
+        group_indices = set(
+            self._queue_action_indices(queue_id)
+            if queue_id
+            else self._handoff_group_indices(action_index)
+        )
+        if group_indices:
+            if group_indices.issubset(self._selected_indices):
+                self._selected_indices.difference_update(group_indices)
+            else:
+                self._selected_indices.update(group_indices)
+        elif action_index in self._selected_indices:
             self._selected_indices.remove(action_index)
         else:
             self._selected_indices.add(action_index)
-        self._refresh_projection()
-
-    @Slot()
-    def pauseSelectedTasks(self) -> None:
-        if not self._can_adjust_selected_schedule():
-            return
-        paused = 0
-        for index in tuple(self._selected_indices):
-            if not 0 <= index < len(self._actions):
-                continue
-            action = self._actions[index]
-            comparison = self._comparisons.get(index, {})
-            if (
-                str(action.get("actor", "") or "") == self._actor_no
-                and action.get("kind") in ("work_log", "entry_log")
-                and comparison.get("group") not in ("done", "manual", "near", "adjust", "review")
-                and index not in self._executed_indices
-                and index not in self._submitting_indices
-            ):
-                self._manual_paused_indices.add(index)
-                paused += 1
-        self._selected_indices.clear()
-        self._schedule_status = f"已手動暫停 {paused} 筆任務" if paused else "選取任務無法手動暫停"
-        self._refresh_projection()
-
-    @Slot()
-    def resumeSelectedTasks(self) -> None:
-        if not self._can_adjust_selected_schedule():
-            return
-        resumed = 0
-        for index in tuple(self._selected_indices):
-            if index in self._manual_paused_indices:
-                self._manual_paused_indices.remove(index)
-                resumed += 1
-        self._selected_indices.clear()
-        self._schedule_status = f"已繼續排程 {resumed} 筆任務" if resumed else "選取任務沒有手動暫停狀態"
         self._refresh_projection()
 
     @Slot()
@@ -359,26 +373,44 @@ class DutyController(QObject):
         self._schedule_status = "已取消手動登打"
         self.scheduleChanged.emit()
 
-    def _can_adjust_selected_schedule(self) -> bool:
-        """Keep manual or external-review tasks out of automatic scheduling controls."""
+    @Slot()
+    def prepareExternalReturnManualSubmission(self) -> None:
+        if not self.canConfirmExternalReturnManualSubmissionSelected:
+            self._schedule_status = "請只選取未返隊暫停的退勤項目。"
+            self._refresh_projection()
+            return
+        indices = sorted(self._selected_indices)
+        summaries = "\n".join(
+            f"• {action_summary(self._actions[index])} ｜ {target_short_label(self._actions[index], self._staff)}"
+            for index in indices
+        )
+        self._pending_external_return_indices = indices
+        self._external_return_confirmation_summary = (
+            "請確認人員已返隊。確認後將以目前時間手動登打下列暫停項目：\n"
+            f"{summaries}"
+        )
+        self.scheduleChanged.emit()
+        self.externalReturnManualSubmissionConfirmationRequested.emit()
 
-        if not self._selected_indices:
-            return False
-        for index in self._selected_indices:
-            if not 0 <= index < len(self._actions):
-                return False
-            action = self._actions[index]
-            comparison = self._comparisons.get(index, {})
-            if (
-                str(action.get("actor", "") or "") != self._actor_no
-                or action.get("kind") not in ("work_log", "entry_log")
-                or not is_auto_duty_action(action)
-                or comparison.get("group") in ("done", "manual", "near", "adjust", "review")
-                or index in self._executed_indices
-                or index in self._submitting_indices
-            ):
-                return False
-        return True
+    @Slot()
+    def confirmExternalReturnManualSubmission(self) -> None:
+        if not self._pending_external_return_indices:
+            return
+        indices = list(self._pending_external_return_indices)
+        queue_id = self._external_return_queue_ids_by_action_index.get(indices[0], "")
+        self._pending_external_return_indices.clear()
+        self._external_return_confirmation_summary = ""
+        self._selected_indices.clear()
+        self.scheduleChanged.emit()
+        if queue_id:
+            self.externalReturnQueueManualSubmissionRequested.emit(queue_id)
+
+    @Slot()
+    def cancelExternalReturnManualSubmission(self) -> None:
+        self._pending_external_return_indices.clear()
+        self._external_return_confirmation_summary = ""
+        self._schedule_status = "已取消確認返隊手動登打"
+        self.scheduleChanged.emit()
 
     def _can_manually_submit_selected(self) -> bool:
         """Require all selected tasks to be manually eligible before enabling the action."""
@@ -406,6 +438,13 @@ class DutyController(QObject):
             )
         )
 
+    def _is_external_return_pause(self, index: int) -> bool:
+        return bool(
+            0 <= index < len(self._actions)
+            and index in self._external_return_queue_ids_by_action_index
+            and self._comparisons.get(index, {}).get("group") == "paused"
+        )
+
     def set_actor_no(self, actor_no: str) -> None:
         actor_no = str(actor_no or "").strip()
         if actor_no == self._actor_no:
@@ -417,7 +456,7 @@ class DutyController(QObject):
         if not actor_no:
             self._schedule_status = "尚未登入"
             self._selected_indices.clear()
-            self._manual_paused_indices.clear()
+            self._task_errors.clear()
             self._login_started_at = None
             self._cancel_auto_logout()
         self._refresh_projection()
@@ -523,11 +562,136 @@ class DutyController(QObject):
     ) -> list[DutySubmissionRequest]:
         if not self._auto_execution_enabled or not user_id or not password:
             return []
-        return [
-            DutySubmissionRequest(user_id, password, index, self._schedule_data, trigger_type="due")
-            for index in indices
-            if index in self._due_task_indices and 0 <= index < len(self._actions)
-        ]
+        requests: list[DutySubmissionRequest] = []
+        handled_group_ids: set[str] = set()
+        for index in indices:
+            if index not in self._due_task_indices or not 0 <= index < len(self._actions):
+                continue
+            group_indices = self._handoff_group_indices(index)
+            if not group_indices:
+                requests.append(
+                    DutySubmissionRequest(user_id, password, index, self._schedule_data, trigger_type="due")
+                )
+                continue
+            group_id = self._handoff_group_id(group_indices)
+            if group_id in handled_group_ids or group_id in self._handoff_preflight_groups:
+                continue
+            handled_group_ids.add(group_id)
+            preflight_requests = self._handoff_preflight_requests(
+                user_id,
+                password,
+                [self._actions[group_index] for group_index in group_indices],
+                group_id=group_id,
+                group_indices=group_indices,
+                trigger_type="due",
+            )
+            if preflight_requests:
+                requests.extend(preflight_requests)
+                continue
+            requests.extend(
+                DutySubmissionRequest(user_id, password, group_index, self._schedule_data, trigger_type="due")
+                for group_index in group_indices
+            )
+        return requests
+
+    @staticmethod
+    def is_handoff_preflight_request(request: DutySubmissionRequest) -> bool:
+        return bool(request.schedule_data.get("_handoff_preflight_group_id"))
+
+    def _handoff_group_indices(self, action_index: int) -> tuple[int, ...]:
+        if not 0 <= action_index < len(self._actions):
+            return ()
+        action = self._actions[action_index]
+        if action.get("source") != "值班交接":
+            return ()
+        action_time = action_datetime(action, self._target_date_text)
+        actor = str(action.get("actor", "") or "")
+        return tuple(
+            index
+            for index, candidate in enumerate(self._actions)
+            if candidate.get("source") == "值班交接"
+            and str(candidate.get("actor", "") or "") == actor
+            and action_datetime(candidate, self._target_date_text) == action_time
+        )
+
+    def _handoff_group_id(self, indices: tuple[int, ...]) -> str:
+        return "handoff:" + "|".join(
+            action_completion_key(self._actions[index]) for index in indices
+        )
+
+    @staticmethod
+    def _handoff_incoming_actions(actions: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        incoming: list[dict[str, Any]] = []
+        for action in actions:
+            fields = action.get("fields", {})
+            if (
+                action.get("kind") == "entry_log"
+                and isinstance(fields, Mapping)
+                and fields.get("出或入") == "值班"
+            ):
+                incoming.append(dict(action))
+        return incoming
+
+    def _handoff_preflight_requests(
+        self,
+        user_id: str,
+        password: str,
+        actions: list[Mapping[str, Any]],
+        *,
+        group_id: str,
+        group_indices: tuple[int, ...] = (),
+        trigger_type: str,
+        queue_id: str = "",
+        submit_at: datetime | None = None,
+    ) -> list[DutySubmissionRequest]:
+        incoming_actions = self._handoff_incoming_actions(actions)
+        if not incoming_actions:
+            return []
+        pending_keys = {action_completion_key(action) for action in incoming_actions}
+        self._handoff_preflight_groups[group_id] = {
+            "indices": tuple(group_indices),
+            "actions": [dict(action) for action in actions],
+            "pending_keys": pending_keys,
+            "paused": False,
+            "queue_id": queue_id,
+        }
+        current = submit_at or datetime.now()
+        target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+        requests: list[DutySubmissionRequest] = []
+        for incoming in incoming_actions:
+            preflight = dict(incoming)
+            preflight["kind"] = "handoff_preflight"
+            schedule_data = dict(self._schedule_data if not queue_id else {})
+            if queue_id:
+                record = self._unreturned_return_queue.get(queue_id) or {}
+                schedule_data.update(record.get("schedule_context", {}))
+                schedule_data["target_date"] = target_date
+                schedule_data["actions"] = [preflight]
+                action_index = 0
+            else:
+                schedule_actions = [dict(action) for action in self._actions]
+                action_index = next(
+                    index
+                    for index, action in enumerate(schedule_actions)
+                    if action_completion_key(action) == action_completion_key(incoming)
+                )
+                schedule_actions[action_index] = preflight
+                schedule_data["actions"] = schedule_actions
+            schedule_data["_handoff_preflight_group_id"] = group_id
+            schedule_data["_handoff_preflight_component_key"] = action_completion_key(incoming)
+            schedule_data["_handoff_preflight_source_index"] = action_index if not queue_id else -1
+            if queue_id:
+                schedule_data["_unreturned_return_queue_id"] = queue_id
+            requests.append(
+                DutySubmissionRequest(
+                    user_id,
+                    password,
+                    action_index,
+                    schedule_data,
+                    trigger_type=trigger_type,
+                )
+            )
+        return requests
 
     def manual_submission_requests(
         self,
@@ -540,24 +704,13 @@ class DutyController(QObject):
         if not user_id or not password:
             return []
         current = submit_at or datetime.now()
-        current_time = current.strftime("%H:%M")
-        submit_target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
         requests: list[DutySubmissionRequest] = []
         for index in indices:
             if not 0 <= index < len(self._actions):
                 continue
-            action = dict(self._actions[index])
-            fields = dict(action.get("fields", {}))
-            if action.get("kind") == "work_log":
-                fields["工作時間"] = current_time
-            elif action.get("kind") == "entry_log":
-                fields["登打時間"] = current_time
-                fields["系統寫入時間"] = current_time
-            else:
+            action = self._stamped_submission_action(self._actions[index], current)
+            if action is None:
                 continue
-            action["fields"] = fields
-            action["time"] = current_time
-            action["submit_target_date"] = submit_target_date
             actions = [dict(item) for item in self._actions]
             actions[index] = action
             schedule_data = dict(self._schedule_data)
@@ -573,10 +726,137 @@ class DutyController(QObject):
             )
         return requests
 
+    def queued_external_return_manual_submission_requests(
+        self,
+        user_id: str,
+        password: str,
+        queue_id: str,
+        *,
+        submit_at: datetime | None = None,
+    ) -> list[DutySubmissionRequest]:
+        current = submit_at or datetime.now()
+        record = self._unreturned_return_queue.claim_manual(queue_id, self._actor_no, now=current)
+        if record is None:
+            return []
+        return self._queue_submission_requests(
+            user_id,
+            password,
+            record,
+            trigger_type="manual",
+            submit_at=current,
+        )
+
+    def queued_external_return_manual_submission_request(
+        self,
+        user_id: str,
+        password: str,
+        queue_id: str,
+        *,
+        submit_at: datetime | None = None,
+    ) -> DutySubmissionRequest | None:
+        requests = self.queued_external_return_manual_submission_requests(
+            user_id,
+            password,
+            queue_id,
+            submit_at=submit_at,
+        )
+        return requests[0] if requests else None
+
+    def recovery_submission_requests(
+        self,
+        user_id: str,
+        password: str,
+        record: Mapping[str, Any],
+        *,
+        submit_at: datetime | None = None,
+    ) -> list[DutySubmissionRequest]:
+        current = submit_at or datetime.now()
+        if record.get("record_type") == "handoff_group":
+            actions = self._unreturned_return_queue.incomplete_actions(record)
+            group_id = "queue:" + str(record.get("queue_id") or "")
+            return self._handoff_preflight_requests(
+                user_id,
+                password,
+                actions,
+                group_id=group_id,
+                trigger_type="recovery",
+                queue_id=str(record.get("queue_id") or ""),
+                submit_at=current,
+            )
+        return self._queue_submission_requests(
+            user_id,
+            password,
+            record,
+            trigger_type="recovery",
+            submit_at=current,
+        )
+
+    def recovery_submission_request(
+        self,
+        user_id: str,
+        password: str,
+        record: Mapping[str, Any],
+        *,
+        submit_at: datetime | None = None,
+    ) -> DutySubmissionRequest | None:
+        requests = self.recovery_submission_requests(
+            user_id,
+            password,
+            record,
+            submit_at=submit_at,
+        )
+        return requests[0] if requests else None
+
+    def release_external_return_recovery(self, queue_id: str) -> None:
+        record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
+        if record is not None:
+            self._publish_unreturned_return_event("pending", record, trigger_type="recovery")
+            self.scheduleChanged.emit()
+
+    def handle_external_return_queue_result(
+        self,
+        queue_id: str,
+        action: Mapping[str, Any],
+        status: str,
+        completion_key: str = "",
+    ) -> None:
+        record, resolved = self._unreturned_return_queue.complete_action(
+            queue_id,
+            action,
+            status,
+            completion_key=completion_key,
+        )
+        action_index = self._queue_component_action_index(queue_id, action, completion_key)
+        if action_index is not None and status in ("submitted", "skipped_duplicate"):
+            self._task_errors.pop(action_index, None)
+        if record is not None and resolved:
+            self._publish_unreturned_return_event("resolved", record, trigger_type="recovery")
+        elif record is not None and status not in ("submitted", "skipped_duplicate"):
+            self._publish_unreturned_return_event("pending", record, trigger_type="recovery")
+        self._refresh_queue_action_indices()
+        self._refresh_projection()
+
+    def handle_external_return_queue_failure(
+        self,
+        queue_id: str,
+        action: Mapping[str, Any] | None = None,
+        message: str = "",
+        completion_key: str = "",
+    ) -> None:
+        record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
+        action_index = self._queue_component_action_index(queue_id, action, completion_key)
+        if action_index is not None and message:
+            self._task_errors[action_index] = str(message).strip()
+        if record is not None:
+            self._publish_unreturned_return_event("pending", record, trigger_type="recovery")
+        self._refresh_queue_action_indices()
+        self._refresh_projection()
+
     def mark_submission_enqueued(self, action_index: int) -> None:
         if not 0 <= action_index < len(self._actions):
             return
         self._submitting_indices.add(action_index)
+        self._task_errors.pop(action_index, None)
         self._refresh_projection()
 
     @Slot(int, str, str, str)
@@ -590,6 +870,7 @@ class DutyController(QObject):
         self._submitting_indices.discard(action_index)
         if not 0 <= action_index < len(self._actions):
             return
+        self._task_errors.pop(action_index, None)
         if status in ("submitted", "skipped_duplicate"):
             self._executed_indices.add(action_index)
             self._comparisons[action_index] = {
@@ -603,8 +884,16 @@ class DutyController(QObject):
             self._blocked_indices.add(action_index)
             self._comparisons[action_index] = {"compare": "人工確認", "group": "review", "matched": []}
         elif status == "paused_external":
-            self._retry_after[action_index] = datetime.now() + timedelta(minutes=1)
+            record, created = self._unreturned_return_queue.pause(
+                self._actions[action_index],
+                self._schedule_data,
+                owner_actor_no=self._actor_no,
+            )
+            self._external_return_queue_ids_by_action_index[action_index] = str(record["queue_id"])
+            self._retry_after[action_index] = datetime.now() + timedelta(minutes=5)
             self._comparisons[action_index] = {"compare": "未返隊，暫停登打", "group": "paused", "matched": []}
+            if created:
+                self._publish_unreturned_return_event("pending", record, trigger_type="due")
         else:
             self._retry_after[action_index] = datetime.now() + timedelta(seconds=30)
         self._schedule_status = message
@@ -622,6 +911,7 @@ class DutyController(QObject):
             return
         if 0 <= action_index < len(self._actions):
             self._retry_after[action_index] = datetime.now() + timedelta(minutes=1)
+            self._task_errors[action_index] = str(message).strip()
         self._schedule_status = message
         self._refresh_projection()
         self.errorOccurred.emit(message)
@@ -769,6 +1059,7 @@ class DutyController(QObject):
             if isinstance(info, Mapping)
         }
         self._target_date_text = next_target_date
+        self._append_active_queue_actions()
         incoming_comparisons = {
             int(index): dict(comparison)
             for index, comparison in (comparisons or {}).items()
@@ -818,9 +1109,9 @@ class DutyController(QObject):
         if not same_schedule_date:
             self._executed_indices = carried_completed_indices
             self._submitting_indices.clear()
-            self._manual_paused_indices.clear()
             self._blocked_indices.clear()
             self._retry_after.clear()
+        self._refresh_queue_action_indices()
         self._refresh_projection()
 
     def _projection_state(self) -> DutyTaskProjectionState:
@@ -830,10 +1121,11 @@ class DutyController(QObject):
             staff=self._staff,
             comparisons=self._comparisons,
             submitting_indices=frozenset(self._submitting_indices),
-            manual_paused_indices=frozenset(self._manual_paused_indices),
             paused_indices=frozenset(self._blocked_indices),
             executed_indices=frozenset(self._executed_indices),
             selected_indices=frozenset(self._selected_indices),
+            forced_visible_indices=frozenset(self._external_return_queue_ids_by_action_index),
+            task_errors=self._task_errors,
         )
 
     def _refresh_projection(self) -> None:
@@ -882,18 +1174,338 @@ class DutyController(QObject):
                 comparisons=self._comparisons,
                 executed_indices=frozenset(self._executed_indices),
                 submitting_indices=frozenset(self._submitting_indices),
-                manual_paused_indices=frozenset(self._manual_paused_indices),
-                blocked_indices=frozenset(self._blocked_indices),
+                blocked_indices=frozenset(
+                    set(self._blocked_indices)
+                    | set(self._external_return_queue_ids_by_action_index)
+                    | self._handoff_preflight_blocked_indices()
+                ),
                 retry_after=self._retry_after,
             ),
         )
-        if due == self._due_task_indices and not force_emit:
+        if due != self._due_task_indices or force_emit:
+            self._due_task_indices = due
+            if emit_signal:
+                self.scheduleChanged.emit()
+            if self._auto_execution_enabled and due:
+                self.dueTasksAvailable.emit(list(due))
+        self._refresh_unreturned_return_queue()
+
+    def _refresh_unreturned_return_queue(self) -> None:
+        expired = self._unreturned_return_queue.expire_due()
+        for record in expired:
+            self._mark_expired_unreturned_return(record)
+            self._publish_unreturned_return_event("expired", record, trigger_type="recovery")
+        if expired:
+            self._refresh_queue_action_indices()
+            self._refresh_projection()
+        if not self._auto_execution_enabled or not self._actor_no:
             return
-        self._due_task_indices = due
-        if emit_signal:
-            self.scheduleChanged.emit()
-        if self._auto_execution_enabled and due:
-            self.dueTasksAvailable.emit(list(due))
+        record = self._unreturned_return_queue.claim_due(self._actor_no)
+        if record is None:
+            return
+        self._publish_unreturned_return_event("retrying", record, trigger_type="recovery")
+        self.scheduleChanged.emit()
+        self.externalReturnRecoveryDue.emit(record)
+
+    @staticmethod
+    def _stamped_submission_action(
+        original_action: Mapping[str, Any],
+        submit_at: datetime,
+    ) -> dict[str, Any] | None:
+        action = dict(original_action)
+        fields = dict(action.get("fields", {}))
+        current_time = submit_at.strftime("%H:%M")
+        if action.get("kind") == "work_log":
+            fields["工作時間"] = current_time
+            if action.get("source") == "值班交接":
+                fields["處理情形"] = DutyController._handoff_status_with_actual_end(
+                    fields.get("處理情形", ""),
+                    current_time,
+                )
+        elif action.get("kind") == "entry_log":
+            fields["登打時間"] = current_time
+            fields["系統寫入時間"] = current_time
+        else:
+            return None
+        target_date = f"{submit_at.year - 1911:03d}{submit_at.month:02d}{submit_at.day:02d}"
+        action["fields"] = fields
+        action["time"] = current_time
+        action["date_offset"] = 0
+        action["submit_target_date"] = target_date
+        return action
+
+    @staticmethod
+    def _handoff_status_with_actual_end(value: Any, actual_end: str) -> str:
+        lines = str(value or "").splitlines()
+        if not lines:
+            return str(value or "")
+        matched = re.match(r"^(一、時間:)\s*(.+?)\s*-\s*.*$", lines[0])
+        if matched is None:
+            return str(value or "")
+        start = matched.group(2).strip()
+        if start.isdigit() and len(start) == 2:
+            start = f"{start}:00"
+        elif start.isdigit() and len(start) == 4:
+            start = f"{start[:2]}:{start[2:]}"
+        lines[0] = f"{matched.group(1)}{start}-{actual_end}"
+        return "\n".join(lines)
+
+    def _queue_submission_requests(
+        self,
+        user_id: str,
+        password: str,
+        record: Mapping[str, Any],
+        *,
+        trigger_type: str,
+        submit_at: datetime,
+    ) -> list[DutySubmissionRequest]:
+        queue_id = str(record.get("queue_id") or "")
+        target_date = f"{submit_at.year - 1911:03d}{submit_at.month:02d}{submit_at.day:02d}"
+        requests: list[DutySubmissionRequest] = []
+        for original_action in self._unreturned_return_queue.incomplete_actions(record):
+            action = self._stamped_submission_action(original_action, submit_at)
+            if action is None:
+                continue
+            schedule_data = dict(record.get("schedule_context", {}))
+            schedule_data["target_date"] = target_date
+            schedule_data["actions"] = [action]
+            schedule_data["_unreturned_return_queue_id"] = queue_id
+            schedule_data["_unreturned_return_component_key"] = action_completion_key(original_action)
+            requests.append(
+                DutySubmissionRequest(user_id, password, 0, schedule_data, trigger_type=trigger_type)
+            )
+        return requests
+
+    def handoff_group_submission_requests(
+        self,
+        user_id: str,
+        password: str,
+        preflight_request: DutySubmissionRequest,
+        *,
+        submit_at: datetime | None = None,
+    ) -> list[DutySubmissionRequest]:
+        group_id = str(preflight_request.schedule_data.get("_handoff_preflight_group_id") or "")
+        state = self._handoff_preflight_groups.get(group_id)
+        if state is None or state.get("paused"):
+            return []
+        current = submit_at or datetime.now()
+        queue_id = str(state.get("queue_id") or "")
+        if queue_id:
+            record = self._unreturned_return_queue.get(queue_id)
+            if record is None:
+                return []
+            return self._queue_submission_requests(
+                user_id,
+                password,
+                record,
+                trigger_type=preflight_request.trigger_type,
+                submit_at=current,
+            )
+
+        group_indices = tuple(state.get("indices", ()))
+        actions = [dict(action) for action in self._actions]
+        target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+        for index in group_indices:
+            if not 0 <= index < len(actions):
+                return []
+            action = self._stamped_submission_action(actions[index], current)
+            if action is None:
+                return []
+            actions[index] = action
+        schedule_data = dict(self._schedule_data)
+        schedule_data["target_date"] = target_date
+        schedule_data["actions"] = actions
+        return [
+            DutySubmissionRequest(
+                user_id,
+                password,
+                index,
+                schedule_data,
+                trigger_type=preflight_request.trigger_type,
+            )
+            for index in group_indices
+        ]
+
+    def handle_handoff_preflight_ready(self, request: DutySubmissionRequest) -> bool:
+        group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
+        state = self._handoff_preflight_groups.get(group_id)
+        if state is None or state.get("paused"):
+            return False
+        source_index = int(request.schedule_data.get("_handoff_preflight_source_index", -1) or -1)
+        if source_index >= 0:
+            self._submitting_indices.discard(source_index)
+        pending_keys = set(state.get("pending_keys", set()))
+        pending_keys.discard(str(request.schedule_data.get("_handoff_preflight_component_key") or ""))
+        state["pending_keys"] = pending_keys
+        self._refresh_projection()
+        return not pending_keys
+
+    def finish_handoff_preflight_group(self, request: DutySubmissionRequest) -> None:
+        group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
+        self._handoff_preflight_groups.pop(group_id, None)
+
+    def handle_handoff_preflight_paused(self, request: DutySubmissionRequest) -> None:
+        group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
+        state = self._handoff_preflight_groups.get(group_id)
+        if state is None:
+            return
+        source_index = int(request.schedule_data.get("_handoff_preflight_source_index", -1) or -1)
+        if source_index >= 0:
+            self._submitting_indices.discard(source_index)
+        state["paused"] = True
+        queue_id = str(state.get("queue_id") or "")
+        if queue_id:
+            record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
+        else:
+            record, created = self._unreturned_return_queue.pause_group(
+                state.get("actions", []),
+                self._schedule_data,
+                owner_actor_no=self._actor_no,
+            )
+            queue_id = str(record.get("queue_id") or "")
+            if created:
+                self._publish_unreturned_return_event("pending", record, trigger_type="due")
+        if record is not None:
+            for index in self._queue_action_indices(queue_id) | set(state.get("indices", ())):
+                self._comparisons[index] = {
+                    "compare": "未返隊，暫停登打",
+                    "group": "paused",
+                    "matched": [],
+                }
+            self._schedule_auto_logout_for_handoff_indices(set(state.get("indices", ())))
+        self._refresh_queue_action_indices()
+        self._refresh_projection()
+
+    def handle_handoff_preflight_failure(
+        self,
+        request: DutySubmissionRequest,
+        message: str,
+        error_code: str,
+    ) -> None:
+        group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
+        state = self._handoff_preflight_groups.pop(group_id, None)
+        if state is None:
+            return
+        queue_id = str(state.get("queue_id") or "")
+        if queue_id:
+            self.handle_external_return_queue_failure(queue_id)
+            return
+        for index in state.get("indices", ()):
+            self._submitting_indices.discard(index)
+            self._retry_after[index] = datetime.now() + timedelta(minutes=1)
+        self._schedule_status = message
+        self._refresh_projection()
+        if error_code == "login_failed":
+            self.errorOccurred.emit(message)
+            self.reloginRequired.emit(message)
+
+    def _handoff_preflight_blocked_indices(self) -> set[int]:
+        return {
+            index
+            for state in self._handoff_preflight_groups.values()
+            for index in state.get("indices", ())
+        }
+
+    def _queue_action_indices(self, queue_id: str) -> set[int]:
+        return {
+            index
+            for index, current_queue_id in self._external_return_queue_ids_by_action_index.items()
+            if current_queue_id == queue_id
+        }
+
+    def _queue_component_action_index(
+        self,
+        queue_id: str,
+        action: Mapping[str, Any] | None,
+        completion_key: str = "",
+    ) -> int | None:
+        if not action:
+            return None
+        component_key = str(completion_key or action_completion_key(action))
+        for index in self._queue_action_indices(queue_id):
+            if action_completion_key(self._actions[index]) == component_key:
+                return index
+        return None
+
+    def _append_active_queue_actions(self) -> None:
+        existing_keys = {action_completion_key(action) for action in self._actions}
+        for record in self._unreturned_return_queue.active_records():
+            source_target_date = str(record.get("source_target_date") or "")
+            if source_target_date and source_target_date > self._target_date_text:
+                continue
+            for action in self._unreturned_return_queue.record_actions(record):
+                completion_key = action_completion_key(action)
+                if completion_key in existing_keys:
+                    continue
+                self._actions.append(action)
+                existing_keys.add(completion_key)
+        self._schedule_data["actions"] = self._actions
+
+    def _refresh_queue_action_indices(self) -> None:
+        queue_ids_by_completion_key: dict[str, str] = {}
+        completed_statuses: dict[str, str] = {}
+        for record in self._unreturned_return_queue.active_records():
+            record_completed = {
+                str(key): str(value)
+                for key, value in dict(record.get("completed_statuses", {})).items()
+            }
+            for action in self._unreturned_return_queue.record_actions(record):
+                completion_key = action_completion_key(action)
+                if completion_key in record_completed:
+                    completed_statuses[completion_key] = record_completed[completion_key]
+                else:
+                    queue_ids_by_completion_key[completion_key] = str(record.get("queue_id") or "")
+        self._external_return_queue_ids_by_action_index = {
+            index: queue_ids_by_completion_key[action_completion_key(action)]
+            for index, action in enumerate(self._actions)
+            if action_completion_key(action) in queue_ids_by_completion_key
+        }
+        for index in self._external_return_queue_ids_by_action_index:
+            self._comparisons[index] = {
+                "compare": "未返隊，暫停登打",
+                "group": "paused",
+                "matched": [],
+            }
+        for index, action in enumerate(self._actions):
+            status = completed_statuses.get(action_completion_key(action))
+            if not status:
+                continue
+            self._executed_indices.add(index)
+            self._comparisons[index] = {
+                "compare": "已登打" if status == "submitted" else "已存在",
+                "group": "done",
+                "matched": [],
+            }
+
+    def _mark_expired_unreturned_return(self, record: Mapping[str, Any]) -> None:
+        expired_keys = {
+            action_completion_key(action)
+            for action in self._unreturned_return_queue.record_actions(record)
+        }
+        for index, action in enumerate(self._actions):
+            if action_completion_key(action) not in expired_keys:
+                continue
+            self._blocked_indices.add(index)
+            self._comparisons[index] = {
+                "compare": "未返隊暫停已逾 18 小時，請人工確認",
+                "group": "review",
+                "matched": [],
+            }
+
+    def _publish_unreturned_return_event(
+        self,
+        status: str,
+        record: Mapping[str, Any],
+        *,
+        trigger_type: str,
+    ) -> None:
+        self.unreturnedReturnEvent.emit(
+            {
+                "status": status,
+                "trigger_type": trigger_type,
+                "record": dict(record),
+            }
+        )
 
     def _schedule_auto_logout_if_needed(self, action_index: int) -> None:
         action = self._actions[action_index]
@@ -914,6 +1526,12 @@ class DutyController(QObject):
         delay_ms = max(0, int((self._auto_logout_deadline - datetime.now()).total_seconds() * 1000))
         self._auto_logout_timer.start(delay_ms)
 
+    def _schedule_auto_logout_for_handoff_indices(self, indices: set[int]) -> None:
+        for index in indices:
+            if not 0 <= index < len(self._actions):
+                continue
+            self._schedule_auto_logout_if_needed(index)
+
     @Slot()
     def _check_auto_logout(self) -> None:
         if not self._auto_logout_actor_no or self._auto_logout_handoff_at is None:
@@ -932,9 +1550,13 @@ class DutyController(QObject):
         incomplete = [
             index
             for index in group
-            if index not in self._executed_indices and self._comparisons.get(index, {}).get("group") != "done"
+            if (
+                index not in self._executed_indices
+                and self._comparisons.get(index, {}).get("group") != "done"
+                and not self._is_paused_handoff_group_index(index)
+            )
         ]
-        if self._submitting_indices or self._manual_paused_indices or not group or incomplete:
+        if self._submitting_indices or not group or incomplete:
             self._auto_logout_deadline = datetime.now() + timedelta(minutes=10)
             self._auto_logout_timer.start(10 * 60 * 1000)
             self._schedule_status = f"交接仍有 {len(incomplete)} 筆未完成，10 分鐘後再檢查自動登出"
@@ -943,6 +1565,11 @@ class DutyController(QObject):
         actor_no = self._auto_logout_actor_no
         self._cancel_auto_logout()
         self.autoLogoutRequested.emit(actor_no)
+
+    def _is_paused_handoff_group_index(self, index: int) -> bool:
+        queue_id = self._external_return_queue_ids_by_action_index.get(index, "")
+        record = self._unreturned_return_queue.get(queue_id)
+        return bool(record is not None and record.get("record_type") == "handoff_group")
 
     def _cancel_auto_logout(self) -> None:
         self._auto_logout_timer.stop()

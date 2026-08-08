@@ -158,12 +158,14 @@ Rectangle {
                 required property string comparisonText
                 required property string group
                 required property string fullDetailText
+                required property string errorText
                 required property bool selected
 
                 width: taskList.width
                 dutyMode: dutyTaskArea.modeIndex === 0
                 selectedState: taskRow.selected
                 tone: taskRow.statusTone
+                errorText: taskRow.errorText
 
                 MouseArea {
                     anchors.fill: parent
@@ -178,9 +180,12 @@ Rectangle {
 
                 RowLayout {
                     visible: dutyTaskArea.modeIndex === 0
-                    anchors.fill: parent
+                    anchors.top: parent.top
                     anchors.leftMargin: Design.dutyTaskGridInset
                     anchors.rightMargin: Design.dutyTaskGridInset
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: Design.dutyTaskRowHeight
                     spacing: 0
                     Label {
                         objectName: "dutyTaskTimeCell"
@@ -221,6 +226,23 @@ Rectangle {
                         tone: taskRow.statusTone
                         statusText: taskRow.statusText
                     }
+                }
+
+                Label {
+                    objectName: "dutyTaskErrorText"
+                    visible: dutyTaskArea.modeIndex === 0 && taskRow.errorText.length > 0
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: Design.dutyTaskGridInset
+                    anchors.rightMargin: Design.dutyTaskGridInset
+                    height: visible ? Design.dutyTaskErrorHeight : 0
+                    text: taskRow.errorText
+                    color: Design.dangerStrong
+                    font.pixelSize: Design.captionSize
+                    font.bold: true
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
                 }
 
                 RowLayout {
@@ -332,26 +354,23 @@ Rectangle {
             spacing: 8
 
             DutyActionButton {
-                objectName: "manualPauseButton"
-                text: "手動暫停"
-                tone: "warningStrong"
-                enabled: dutyTaskArea.backend.dutyController.canAdjustSelectedSchedule
-                onClicked: dutyTaskArea.backend.dutyController.pauseSelectedTasks()
-            }
-            DutyActionButton {
-                objectName: "resumeScheduleButton"
-                text: "繼續排程"
-                tone: "success"
-                enabled: dutyTaskArea.backend.dutyController.canAdjustSelectedSchedule
-                onClicked: dutyTaskArea.backend.dutyController.resumeSelectedTasks()
-            }
-            DutyActionButton {
                 objectName: "manualSubmitButton"
                 text: "手動登打"
                 tone: "primary"
                 emphasizedBorder: true
+                visible: !dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected
                 enabled: dutyTaskArea.backend.dutyController.canManualSubmitSelected
                 onClicked: dutyTaskArea.backend.dutyController.prepareManualSubmission()
+            }
+            DutyActionButton {
+                objectName: "confirmExternalReturnManualSubmitButton"
+                text: "確認返隊手動登打"
+                implicitWidth: Design.externalReturnManualButtonWidth
+                tone: "primary"
+                emphasizedBorder: true
+                visible: dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected
+                enabled: dutyTaskArea.backend.dutyController.canConfirmExternalReturnManualSubmissionSelected
+                onClicked: dutyTaskArea.backend.dutyController.prepareExternalReturnManualSubmission()
             }
         }
     }

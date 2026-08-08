@@ -185,6 +185,10 @@ class OperationalSyncService:
         action = fields.get("action") if isinstance(fields.get("action"), Mapping) else {}
         action_fields = action.get("fields") if isinstance(action.get("fields"), Mapping) else {}
         item_kind = "出入" if action.get("kind") == "entry_log" else "工作" if action.get("kind") == "work_log" else str(action.get("kind", ""))
+        target = str(fields.get("target") or action.get("target") or "")
+        item_title = action_summary(action) if action else ""
+        if action_fields.get("領用事由及地點") == "到勤" and target:
+            item_title = f"{item_title} ｜ {target}"
         payload = {
             "event_id": f"sinposmart-{now:%Y%m%d%H%M%S%f}-{uuid4().hex}",
             "occurred_at": now.isoformat(timespec="seconds"),
@@ -200,7 +204,7 @@ class OperationalSyncService:
             "user_id": str(fields.get("user_id") or ""),
             "display_name": str(fields.get("display_name") or ""),
             "item_kind": item_kind,
-            "item_title": action_summary(action) if action else "",
+            "item_title": item_title,
             "content": str(
                 fields.get("content")
                 or action_fields.get("工作內容")
@@ -208,7 +212,7 @@ class OperationalSyncService:
                 or action.get("source")
                 or ""
             )[:2000],
-            "target": str(fields.get("target") or action.get("target") or ""),
+            "target": target,
             "target_time": str(action_fields.get("系統寫入時間") or action_fields.get("登打時間") or action_fields.get("工作時間") or action.get("time") or ""),
         }
         version_path = self.package_root / "VERSION.txt"

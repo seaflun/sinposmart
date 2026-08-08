@@ -210,6 +210,9 @@ class RestMonthlyController(QObject):
         if session is None or not session.verified:
             self._set_error("請先完成勤務系統登入。")
             return None
+        if not str(session.actor_no or "").strip():
+            self._set_error("登入身分尚未完成番號確認，請稍候勤務表查詢完成。")
+            return None
         if not str(session.actor_name or "").strip():
             self._set_error("登入資料缺少人員姓名，無法確認登打對象。")
             return None

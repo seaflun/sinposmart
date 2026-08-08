@@ -2315,6 +2315,8 @@ class PackageSmokeTests(unittest.TestCase):
             module, "suppress_window_open_for_background_query"
         ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
             module.time, "sleep"
+        ), mock.patch.object(
+            module, "wait_for_query_completion"
         ):
             cases = module.query_cases(Driver(), "1150806")
 
@@ -2347,6 +2349,8 @@ class PackageSmokeTests(unittest.TestCase):
             module, "suppress_window_open_for_background_query"
         ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
             module.time, "sleep"
+        ), mock.patch.object(
+            module, "wait_for_query_completion"
         ):
             cases = module.query_cases(Driver(), "1150806")
 
@@ -2379,6 +2383,8 @@ class PackageSmokeTests(unittest.TestCase):
             module, "suppress_window_open_for_background_query"
         ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
             module.time, "sleep"
+        ), mock.patch.object(
+            module, "wait_for_query_completion"
         ):
             cases = module.query_cases(Driver(), "1150806")
 
@@ -2391,6 +2397,167 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertEqual(cases[0].return_time, "21:45:00")
         self.assertEqual(items, [])
+
+    def test_visible_table_waits_for_completion_and_requests_200_rows(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> list[list[str]]:
+                return [["115/08/07 12:00", "新坡分隊", "測試人員", "隊員", "入", "到勤"]]
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set") as set_value, mock.patch.object(
+            module, "js_click", return_value=True
+        ), mock.patch.object(module, "wait_for_query_completion") as wait_for_completion:
+            rows = module.query_visible_table(Driver(), module.ENTRY_LOG_AP, "1150807")
+
+        set_value.assert_any_call(mock.ANY, "_txtPageNum", "200")
+        wait_for_completion.assert_called_once_with(mock.ANY)
+        self.assertEqual(len(rows), 1)
+
+    def test_case_query_uses_silent_field_updates_and_native_query_click(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[object]]:
+                return {"headers": ["返隊時間"], "rows": []}
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module.time, "sleep"), mock.patch.object(
+            module, "js_set", return_value=True
+        ) as set_value, mock.patch.object(
+            module, "native_click", return_value=True
+        ) as native_query, mock.patch.object(module, "wait_for_query_completion"):
+            cases = module.query_cases(Driver(), "1150808")
+
+        self.assertEqual(cases, [])
+        self.assertEqual(set_value.call_count, 7)
+        self.assertTrue(all(call.kwargs == {"dispatch_change": False} for call in set_value.call_args_list))
+        native_query.assert_called_once_with(mock.ANY, "_btnQuery")
+
+    def test_case_query_treats_an_empty_result_as_no_cases(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[object]]:
+                return {"headers": [], "rows": []}
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module.time, "sleep"), mock.patch.object(
+            module, "js_set", return_value=True
+        ), mock.patch.object(module, "native_click", return_value=True), mock.patch.object(
+            module, "wait_for_query_completion"
+        ):
+            cases = module.query_cases(Driver(), "1150809")
+
+        self.assertEqual(cases, [])
+
+    def test_page_completion_accepts_loaded_second_page_without_query_banner(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, object]:
+                return {"completed": False, "page": "2", "hasRows": True}
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency) -> None:
+                self.driver = driver
+
+            def until(self, condition) -> bool:
+                return condition(self.driver)
+
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(Driver(), expected_page="2")
+
+    def test_query_completion_treats_no_records_as_a_finished_query(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            scripts: list[str] = []
+
+            def execute_script(self, script: str) -> dict[str, object]:
+                self.scripts.append(script)
+                return {"completed": True, "page": "", "hasRows": False}
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency) -> None:
+                self.driver = driver
+
+            def until(self, condition) -> bool:
+                return condition(self.driver)
+
+        driver = Driver()
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(driver)
+
+        self.assertIn("QUY-500", driver.scripts[0])
+
+    def test_case_query_reads_all_pages(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            page = "1"
+
+            class Option:
+                def __init__(self, owner) -> None:
+                    self.owner = owner
+
+                def click(self) -> None:
+                    self.owner.page = "2"
+
+            class PageSelect:
+                def __init__(self, owner) -> None:
+                    self.owner = owner
+
+                def find_element(self, _by, selector: str):
+                    if selector == "option[value='2']":
+                        return Driver.Option(self.owner)
+                    raise module.NoSuchElementException()
+
+            def find_element(self, _by, selector: str):
+                if selector == "select[name='pageSelect']":
+                    return Driver.PageSelect(self)
+                raise module.NoSuchElementException()
+
+            def execute_script(self, script: str, *args: str) -> object:
+                if "Array.from(pageSelect.options" in script:
+                    return ["1", "2"]
+                if self.page == "1":
+                    return {
+                        "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
+                        "rows": [{
+                            "cells": ["緊急救護", "21:01:00", "21:03:00", "0001/01/01 00:00:00"],
+                            "personnel_source": "",
+                        }],
+                    }
+                return {
+                    "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
+                    "rows": [{
+                        "cells": ["火災", "22:01:00", "22:03:00", "0001/01/01 00:00:00"],
+                        "personnel_source": "",
+                    }],
+                }
+
+        driver = Driver()
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(
+            module, "js_click"
+        ), mock.patch.object(module, "wait_for_query_completion") as wait_for_completion:
+            cases = module.query_cases(driver, "1150807")
+
+        self.assertEqual([case.report_time for case in cases], ["21:01:00", "22:01:00"])
+        self.assertEqual(
+            wait_for_completion.call_args_list,
+            [mock.call(driver), mock.call(driver, expected_page="2")],
+        )
 
     def test_0800_handoff_uses_yesterday_2200_duty_when_today_0608_row_absent(self) -> None:
         module = duty_rehearsal_module()

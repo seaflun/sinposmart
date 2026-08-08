@@ -410,6 +410,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
                 "time": "09:00",
                 "actor": "10",
                 "target": "10",
+                "source": "值班交接",
                 "fields": {"工作時間": "09:00", "勤務項目": "巡邏", "服勤人員": ["10"]},
             },
             {
@@ -479,6 +480,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
                 "time": "09:00",
                 "actor": "10",
                 "target": "10",
+                "source": "值班交接",
                 "fields": {"工作時間": "09:00", "勤務項目": "巡邏"},
             },
             {
@@ -535,6 +537,33 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(comparisons[0]["group"], "done")
         self.assertEqual(comparisons[0]["compare"], "已存在")
 
+    def test_comparison_prefers_existing_scheduled_checkout_over_future_time(self) -> None:
+        from unittest.mock import patch
+
+        from app_core.duty_task_projection import build_schedule_comparisons
+
+        action = {
+            "kind": "entry_log",
+            "time": "08:05",
+            "actor": "10",
+            "target": "10",
+            "fields": {"出或入": "值退", "系統寫入時間": "08:05"},
+        }
+        data = {
+            "target_date": "1150807",
+            "today": {"staff": {"10": {"name": "測試員"}}},
+            "actions": [action],
+        }
+        comparison_data = {
+            "1150807": {"visible_entry_rows": [["115/08/07", "08:05", "-", "測試員", "值退"]]}
+        }
+
+        with patch("app_core.duty_task_projection.is_future_action", return_value=True):
+            comparisons = build_schedule_comparisons(data, [action], comparison_data)
+
+        self.assertEqual(comparisons[0]["group"], "done")
+        self.assertEqual(comparisons[0]["compare"], "已存在")
+
     def test_audit_projection_includes_existing_rows_and_raw_action_detail(self) -> None:
         from app_core.duty_task_projection import project_audit_tasks
 
@@ -571,22 +600,21 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
         now = datetime(2026, 7, 29, 9, 0)
         actions = [
-            {"kind": "work_log", "time": "08:00", "actor": "10"},
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "在隊訓練"},
             {"kind": "entry_log", "time": "08:10", "actor": "10", "fields": {"出或入": "值班"}},
-            {"kind": "work_log", "time": "08:20", "actor": "10"},
-            {"kind": "work_log", "time": "08:30", "actor": "10"},
-            {"kind": "work_log", "time": "09:30", "actor": "10"},
-            {"kind": "work_log", "time": "08:40", "actor": "11"},
+            {"kind": "work_log", "time": "08:20", "actor": "10", "source": "在隊訓練"},
+            {"kind": "work_log", "time": "08:30", "actor": "10", "source": "在隊訓練"},
+            {"kind": "work_log", "time": "09:30", "actor": "10", "source": "在隊訓練"},
+            {"kind": "work_log", "time": "08:40", "actor": "11", "source": "在隊訓練"},
         ]
         state = DueTaskSelectionState(
             actor_no="10",
             target_roc_date="1150729",
             comparisons={1: {"group": "done"}},
-            manual_paused_indices=frozenset({2}),
             retry_after={3: now + timedelta(minutes=1)},
         )
 
-        self.assertEqual(select_due_task_indices(actions, state, now=now), [0])
+        self.assertEqual(select_due_task_indices(actions, state, now=now), [0, 2])
 
     def test_due_selection_starts_0805_checkout_at_0800(self) -> None:
         from datetime import datetime
@@ -611,6 +639,26 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 7, 59)), [])
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 8, 0)), [0])
+
+    def test_only_known_work_tasks_can_auto_submit_without_generic_pause_controls(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        actions = [
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "在隊訓練"},
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "無線電試話"},
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "值班交接"},
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "未分類工作"},
+        ]
+
+        due = select_due_task_indices(
+            actions,
+            DueTaskSelectionState(actor_no="10", target_roc_date="1150807"),
+            now=datetime(2026, 8, 7, 8, 0),
+        )
+
+        self.assertEqual(due, [0, 1, 2])
 
     def test_1800_handoff_keeps_outgoing_incoming_and_work_for_outgoing_actor(self) -> None:
         from datetime import datetime
@@ -1064,6 +1112,57 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertNotIn("session-secret", repr(request))
             self.assertNotIn("session-secret", result.result_path.read_text(encoding="utf-8"))
 
+    def test_submit_retries_post_submit_verification_before_failing(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waits: list[float] = []
+            comparisons = iter(
+                [
+                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
+                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
+                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
+                    {0: {"compare": "已存在", "group": "done", "matched": ["saved"]}},
+                ]
+            )
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=lambda *_args: [],
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                sleeper=waits.append,
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(waits, [1.0, 1.0])
+
     def test_duplicate_result_skips_form_submission(self) -> None:
         from datetime import datetime
 
@@ -1209,6 +1308,255 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "paused_external")
             self.assertEqual(checked_minutes, [555])
             self.assertEqual(fills, [])
+
+    def test_entry_browser_session_reuses_login_and_keeps_each_action_verification(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            driver = object()
+            build_calls: list[bool] = []
+            login_calls: list[tuple[str, str]] = []
+            quit_calls: list[object] = []
+            fill_calls: list[int] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _action_date):
+                nonlocal query_count
+                query_count += 1
+                return [] if query_count % 2 else [{"verified": True}]
+
+            def comparison_builder(_data, actions, comparison_by_date):
+                comparison = next(iter(comparison_by_date.values()))
+                group = "done" if comparison["visible_entry_rows"] else "todo"
+                return {
+                    index: {"group": group, "matched": []}
+                    for index, _action in enumerate(actions)
+                }
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda headless: build_calls.append(headless) or driver,
+                login=lambda _driver, user_id, password: login_calls.append((user_id, password)),
+                query_visible_table=query_visible_table,
+                fill_entry_log_form_for_test=lambda _driver, action, *_args, **_kwargs: fill_calls.append(
+                    int(action["index"])
+                ),
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: None,
+                quit_driver=lambda current_driver: quit_calls.append(current_driver),
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                comparison_builder=comparison_builder,
+            )
+            data = {
+                "target_date": "1150807",
+                "actions": [
+                    {"kind": "entry_log", "index": 0, "time": "08:00", "actor": "10", "fields": {}},
+                    {"kind": "entry_log", "index": 1, "time": "08:05", "actor": "10", "fields": {}},
+                ],
+            }
+            first_request = DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
+            second_request = DutySubmissionRequest("user10", "secret", 1, data, trigger_type="manual")
+
+            session = service.open_browser_session(first_request)
+            first_result = service.execute_with_browser_session(first_request, session)
+            second_result = service.execute_with_browser_session(second_request, session)
+            service.close_browser_session(session)
+
+        self.assertEqual(first_result.status, "submitted")
+        self.assertEqual(second_result.status, "submitted")
+        self.assertEqual(build_calls, [True])
+        self.assertEqual(login_calls, [("user10", "secret")])
+        self.assertEqual(fill_calls, [0, 1])
+        self.assertEqual(quit_calls, [driver])
+
+    def test_recovery_off_duty_action_still_checks_open_external_assignment(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[bool] = []
+            checked_minutes: list[int | None] = []
+
+            def open_assignment_checker(_rows, _date, _staff, _action, *, current_minute=None):
+                checked_minutes.append(current_minute)
+                return True
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda headless: object(),
+                login=lambda *_args: None,
+                query_visible_table=lambda *_args: [["外勤未返隊"]],
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 9, 15),
+                open_assignment_checker=open_assignment_checker,
+            )
+            data = {
+                "target_date": "1150729",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "09:15",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+                    }
+                ],
+            }
+
+            result = service.execute(
+                DutySubmissionRequest("user10", "secret", 0, data, trigger_type="recovery")
+            )
+
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(checked_minutes, [555])
+            self.assertEqual(fills, [])
+
+    def test_handoff_preflight_checks_incoming_staff_without_writing_a_form(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[bool] = []
+            checked_actions: list[dict] = []
+
+            def open_assignment_checker(_rows, _date, _staff, action, *, current_minute=None):
+                checked_actions.append(dict(action))
+                return True
+
+            automation = SimpleNamespace(
+                ENTRY_LOG_AP="entry",
+                WORK_LOG_AP="work",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=lambda *_args: [],
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 18, 0),
+                open_assignment_checker=open_assignment_checker,
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"11": {"name": "接班"}}},
+                "actions": [
+                    {
+                        "kind": "handoff_preflight",
+                        "time": "18:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(checked_actions[0]["target"], "11")
+            self.assertEqual(fills, [])
+
+    def test_unreturned_return_queue_keeps_fixed_expiry_and_changes_handoff_interval(self) -> None:
+        from datetime import datetime
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            action = {
+                "kind": "entry_log",
+                "time": "08:05",
+                "actor": "10",
+                "target": "10",
+                "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+            }
+            schedule = {
+                "target_date": "1150729",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+            }
+            started_at = datetime(2026, 7, 29, 8, 0)
+            queue = UnreturnedReturnQueue(Path(temp_dir), now_factory=lambda: started_at)
+
+            record, created = queue.pause(action, schedule, owner_actor_no="10", now=started_at)
+
+            self.assertTrue(created)
+            self.assertEqual(record["next_retry_at"], "2026-07-29T08:05:00")
+            self.assertEqual(record["expires_at"], "2026-07-30T02:00:00")
+            self.assertTrue((Path(temp_dir) / "unreturned_return_queue.json").is_file())
+            restarted = UnreturnedReturnQueue(Path(temp_dir), now_factory=lambda: started_at)
+            self.assertEqual(len(restarted.active_records()), 1)
+
+            current_shift = restarted.claim_due("10", now=datetime(2026, 7, 29, 8, 5))
+            self.assertEqual(current_shift["retry_interval_minutes"], 5)
+            self.assertEqual(current_shift["next_retry_at"], "2026-07-29T08:10:00")
+            restarted.defer(record["queue_id"], "10", now=datetime(2026, 7, 29, 8, 5))
+            handoff = restarted.claim_due("11", now=datetime(2026, 7, 29, 8, 10))
+            self.assertEqual(handoff["retry_interval_minutes"], 10)
+            self.assertEqual(handoff["next_retry_at"], "2026-07-29T08:20:00")
+            self.assertEqual(
+                [item["queue_id"] for item in restarted.expire_due(now=datetime(2026, 7, 30, 2, 0))],
+                [record["queue_id"]],
+            )
+
+    def test_handoff_group_queue_resolves_only_after_every_component_succeeds(self) -> None:
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = UnreturnedReturnQueue(Path(temp_dir))
+            actions = [
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "10",
+                    "target": "10",
+                    "duplicate_key": "entry:out",
+                    "fields": {"出或入": "值退"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "10",
+                    "target": "11",
+                    "duplicate_key": "entry:in",
+                    "fields": {"出或入": "值班"},
+                },
+                {
+                    "kind": "work_log",
+                    "time": "18:00",
+                    "actor": "10",
+                    "target": "10",
+                    "duplicate_key": "work:handoff",
+                    "fields": {"工作時間": "18:00"},
+                },
+            ]
+            record, created = queue.pause_group(actions, {"target_date": "1150807"}, owner_actor_no="10")
+
+            self.assertTrue(created)
+            queue.claim_manual(record["queue_id"], "10")
+            partial, resolved = queue.complete_action(record["queue_id"], actions[0], "submitted")
+            self.assertFalse(resolved)
+            self.assertEqual(partial["completed_keys"], ["entry:out"])
+            queue.complete_action(record["queue_id"], actions[1], "skipped_duplicate")
+            completed, resolved = queue.complete_action(record["queue_id"], actions[2], "submitted")
+
+            self.assertTrue(resolved)
+            self.assertEqual(completed["queue_id"], record["queue_id"])
+            self.assertEqual(queue.active_records(), [])
 
     def test_due_checkout_starts_at_0800_and_writes_0805(self) -> None:
         from datetime import datetime
@@ -2302,6 +2650,122 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         self.assertEqual(events.count("driver:True"), 2)
         self.assertEqual(events.count("quit"), 2)
 
+    def test_duty_sheet_query_waits_for_asynchronous_result_rows(self) -> None:
+        import duty_rehearsal
+
+        class Driver:
+            def __init__(self) -> None:
+                self.wait_checks = 0
+
+            def get(self, _url: str) -> None:
+                return None
+
+            def execute_script(self, script: str, *_args):
+                if "const dateField" in script:
+                    return True
+                if "return Array.from(document.querySelectorAll('table')).some" in script:
+                    self.wait_checks += 1
+                    return self.wait_checks >= 2
+                if "function cellText(cell)" in script:
+                    return {
+                        "unit": "新坡分隊",
+                        "rows": [{"slot": "8-9", "columns": {"值班": "10"}}],
+                        "summary": {},
+                        "staff": {"10": {"role": "隊員", "name": "測試員"}},
+                        "checkNums": [],
+                    }
+                return True
+
+        test_case = self
+
+        class ImmediateWait:
+            def __init__(self, _driver, _timeout, *, poll_frequency) -> None:
+                self.driver = _driver
+                self.poll_frequency = poll_frequency
+
+            def until(self, condition):
+                first_result = condition(self.driver)
+                if self.driver.wait_checks:
+                    test_case.assertFalse(first_result)
+                    return condition(self.driver)
+                return first_result
+
+        driver = Driver()
+        with (
+            patch("duty_rehearsal.time.sleep"),
+            patch("duty_rehearsal.WebDriverWait", ImmediateWait),
+        ):
+            sheet = duty_rehearsal.query_duty_sheet(driver, "1150808")
+
+        self.assertEqual(driver.wait_checks, 2)
+        self.assertEqual(sheet.roc_date, "1150808")
+        self.assertEqual(sheet.rows[0].columns["值班"], ["10"])
+    def test_capture_persists_redacted_failure_stage(self) -> None:
+        from app_core.schedule_capture_service import (
+            ScheduleCaptureError,
+            ScheduleCaptureRequest,
+            ScheduleCaptureService,
+        )
+
+        automation = SimpleNamespace(
+            build_driver=lambda headless: object(),
+            login=lambda *_args: (_ for _ in ()).throw(RuntimeError("login failed: session-secret")),
+            quit_driver=lambda _driver: None,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ScheduleCaptureService(Path(temp_dir), module_loader=lambda: automation)
+            request = ScheduleCaptureRequest("user10", "session-secret", "10", "1150808")
+
+            with self.assertRaises(ScheduleCaptureError):
+                service.capture_schedule(request)
+
+            diagnostic_path = Path(temp_dir) / "runtime_outputs" / "browser" / "schedule_capture_failure.json"
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(diagnostic["stage"], "login")
+        self.assertEqual(diagnostic["exception_type"], "RuntimeError")
+        self.assertIn("[REDACTED]", diagnostic["message"])
+        self.assertNotIn("session-secret", diagnostic["message"])
+
+    def test_capture_comparisons_persists_precise_redacted_failure_stage(self) -> None:
+        from datetime import date
+
+        from app_core.schedule_capture_service import (
+            ScheduleCaptureError,
+            ScheduleCaptureRequest,
+            ScheduleCaptureService,
+        )
+
+        def query_visible_table(_driver, ap_name, _target_roc_date):
+            if ap_name == "entry":
+                raise RuntimeError("entry query failed: session-secret")
+            return []
+
+        automation = SimpleNamespace(
+            WORK_LOG_AP="work",
+            ENTRY_LOG_AP="entry",
+            build_driver=lambda headless: object(),
+            login=lambda *_args: None,
+            parse_roc_date=lambda _value: date(2026, 8, 8),
+            roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+            query_visible_table=query_visible_table,
+            quit_driver=lambda _driver: None,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ScheduleCaptureService(Path(temp_dir), module_loader=lambda: automation)
+            request = ScheduleCaptureRequest("user10", "session-secret", "10", "1150808")
+
+            with self.assertRaises(ScheduleCaptureError):
+                service.capture_comparisons(request)
+
+            diagnostic_path = Path(temp_dir) / "runtime_outputs" / "browser" / "schedule_capture_failure.json"
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(diagnostic["stage"], "comparison_entry_rows_1150807")
+        self.assertEqual(diagnostic["exception_type"], "RuntimeError")
+        self.assertIn("[REDACTED]", diagnostic["message"])
+        self.assertNotIn("session-secret", diagnostic["message"])
+
 
 class WorkLogSettingsServiceTests(unittest.TestCase):
     def test_save_preserves_case_overrides_and_validates_numbers(self) -> None:
@@ -2560,6 +3024,64 @@ class WorkLogSettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.save())
         self.assertEqual(saved_spy.count(), 0)
         self.assertEqual(error_spy.at(0)[0], "工作紀錄預設內容無法儲存。")
+
+
+class ScheduleCaptureWorkerTests(unittest.TestCase):
+    def test_worker_finishes_schedule_before_starting_same_account_comparisons(self) -> None:
+        from app_core.schedule_capture_service import ScheduleCaptureRequest
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
+
+        class FakeCaptureService:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.schedule_active = threading.Event()
+                self.comparison_started = threading.Event()
+
+            def capture_schedule(self, request, *, status_callback=None):
+                self.calls.append("schedule")
+                self.schedule_active.set()
+                self.comparison_started.wait(0.1)
+                self.schedule_active.clear()
+                return ScheduleSnapshot(
+                    Path(f"schedule_output_{request.target_roc_date}.json"),
+                    {"target_date": request.target_roc_date, "actions": []},
+                    request.target_roc_date,
+                )
+
+            def capture_comparisons(self, request, *, status_callback=None):
+                self.calls.append("comparisons")
+                self.comparison_started.set()
+                if self.schedule_active.is_set():
+                    raise AssertionError("勤務表與比對不得同時登入同一個勤務系統帳號")
+                return {request.target_roc_date: {}}
+
+            @staticmethod
+            def combine_capture(snapshot, comparison_data):
+                return ScheduleSnapshot(
+                    snapshot.path,
+                    snapshot.data,
+                    snapshot.target_roc_date,
+                    {},
+                    comparison_data=comparison_data,
+                )
+
+        service = FakeCaptureService()
+        worker = ScheduleCaptureWorker(
+            1,
+            service,
+            ScheduleCaptureRequest("user10", "secret", "10", "1150808"),
+        )
+        succeeded: list[object] = []
+        failed: list[object] = []
+        worker.succeeded.connect(lambda *_args: succeeded.append(True))
+        worker.failed.connect(lambda *_args: failed.append(True))
+
+        worker.run()
+
+        self.assertEqual(service.calls, ["schedule", "comparisons"])
+        self.assertEqual(succeeded, [True])
+        self.assertEqual(failed, [])
 
 
 class ScheduledFolderServiceTests(unittest.TestCase):
@@ -3159,6 +3681,30 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(payload["content"], "交接完成")
         self.assertEqual(payload["target"], "10番 測試員（隊員）")
         self.assertEqual(payload["target_time"], "08:00")
+
+    def test_arrival_event_payload_appends_target_person_to_item_title(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payload = OperationalSyncService(Path(temp_dir)).build_event_payload(
+                "action_result",
+                status="submitted",
+                trigger_type="due",
+                target="10番 測試員",
+                action={
+                    "kind": "entry_log",
+                    "target": "10",
+                    "time": "07:55",
+                    "fields": {
+                        "登打時間": "07:55",
+                        "出或入": "入",
+                        "領用事由及地點": "到勤",
+                    },
+                },
+            )
+
+        self.assertEqual(payload["item_title"], "入 / 到勤 ｜ 10番 測試員")
+        self.assertEqual(payload["target"], "10番 測試員")
 
     def test_immediate_event_is_persisted_and_acknowledged_before_return(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
@@ -4002,8 +4548,9 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("taskRow.fullDetailText", source)
         self.assertNotIn("actorResolutionCard", source)
         self.assertNotIn("resolveSessionActor", source)
-        self.assertIn('objectName: "manualPauseButton"', source)
-        self.assertIn('objectName: "resumeScheduleButton"', source)
+        self.assertNotIn('objectName: "manualPauseButton"', source)
+        self.assertNotIn('objectName: "resumeScheduleButton"', source)
+        self.assertNotIn('objectName: "unreturnedReturnQueuePanel"', source)
         self.assertIn('objectName: "manualSubmitButton"', source)
         self.assertIn('objectName: "manualSubmissionConfirmation"', source)
         self.assertIn('objectName: "dutyTaskHeader"', source)
@@ -4111,7 +4658,8 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('text: auditFilterPanel.backend.dutyController.isRefreshing ? "更新中…" : "重新查詢"', source)
         self.assertIn("function showAppError(message)", source)
         self.assertIn("function showDutyStatusError(message)", source)
-        self.assertIn('setOperationalStatus(normalized, "warning")', source)
+        self.assertIn("window.errorMessage = normalized", source)
+        self.assertNotIn('setOperationalStatus(normalized, "warning")', source)
         self.assertIn("Design.auditRefreshButtonWidth", source)
         self.assertIn("Design.monthlySourceOpenButtonWidth", source)
         self.assertNotIn('objectName: "auditPreviewCard"', source)
@@ -4319,6 +4867,9 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("AppleButton {", (components_path / "DutyActionButton.qml").read_text(encoding="utf-8"))
         self.assertLess(source.index("DutyOperationBar {"), source.index("DutyTaskArea {"))
         self.assertIn("DutyTaskStatusPill {", task_delegate)
+        self.assertIn("errorText: taskRow.errorText", task_delegate)
+        self.assertIn('objectName: "dutyTaskErrorText"', task_area)
+        self.assertIn("implicitWidth: Design.externalReturnManualButtonWidth", action_row)
         self.assertIn(
             'color: taskRow.comparisonText === "尚未到點" ? Design.blueHover',
             task_area,
@@ -4328,18 +4879,22 @@ class QtShellTests(unittest.TestCase):
             2,
         )
         self.assertIn("selectedTaskCount > 0", action_row)
-        self.assertEqual(
-            action_row.count(
-                "enabled: dutyTaskArea.backend.dutyController.canAdjustSelectedSchedule"
-            ),
-            2,
-        )
+        self.assertNotIn("canAdjustSelectedSchedule", action_row)
         self.assertIn(
             "enabled: dutyTaskArea.backend.dutyController.canManualSubmitSelected",
             action_row,
         )
+        self.assertIn('text: "確認返隊手動登打"', action_row)
+        self.assertIn(
+            "enabled: dutyTaskArea.backend.dutyController.canConfirmExternalReturnManualSubmissionSelected",
+            action_row,
+        )
+        self.assertEqual(
+            action_row.count("visible: !dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected"),
+            1,
+        )
         self.assertIn("emphasizedBorder: true", action_row)
-        self.assertEqual(action_row.count("DutyActionButton {"), 3)
+        self.assertEqual(action_row.count("DutyActionButton {"), 2)
 
     def test_qml_duty_sheet_panel_preserves_finalized_legacy_text_and_order(self) -> None:
         source = (
@@ -5670,6 +6225,7 @@ if return_code != 0 or loaded:
                 "comparisonText",
                 "group",
                 "fullDetailText",
+                "errorText",
             },
         )
         self.assertEqual(model.rowCount(), 0)
@@ -5703,6 +6259,7 @@ if return_code != 0 or loaded:
                         "time": "09:00",
                         "actor": "10",
                         "target": "10",
+                        "source": "值班交接",
                         "fields": {"工作時間": "09:00", "勤務項目": "巡邏"},
                     }
                 ],
@@ -6281,7 +6838,20 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
-    def test_duty_controller_selection_pause_and_resume_updates_due_tasks(self) -> None:
+    def test_app_controller_reports_why_audit_refresh_cannot_start(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        try:
+            self.assertFalse(controller.refreshAuditLiveData())
+            self.assertEqual(
+                controller.dutyController.scheduleStatus,
+                "請先完成勤務系統登入驗證後再重新查詢。",
+            )
+        finally:
+            controller.shutdown()
+
+    def test_duty_controller_has_no_generic_pause_or_resume_controls(self) -> None:
         from qt_app.controllers.duty_controller import DutyController
 
         controller = DutyController()
@@ -6296,6 +6866,7 @@ if return_code != 0 or loaded:
                         "time": "00:00",
                         "actor": "10",
                         "target": "10",
+                        "source": "在隊訓練",
                         "fields": {"勤務項目": "巡邏"},
                     }
                 ],
@@ -6305,17 +6876,9 @@ if return_code != 0 or loaded:
 
         controller.toggleTaskSelection(0)
         self.assertEqual(controller.selectedTaskCount, 1)
-        controller.pauseSelectedTasks()
-
-        self.assertEqual(controller.selectedTaskCount, 0)
-        self.assertEqual(controller.dueTaskCount, 0)
-        self.assertIn("已手動暫停", controller.scheduleStatus)
-
-        controller.toggleTaskSelection(0)
-        controller.resumeSelectedTasks()
-
         self.assertEqual(controller.dueTaskCount, 1)
-        self.assertIn("已繼續排程", controller.scheduleStatus)
+        self.assertFalse(hasattr(controller, "pauseSelectedTasks"))
+        self.assertFalse(hasattr(controller, "resumeSelectedTasks"))
 
     def test_duty_controller_locks_auto_execution_when_fire_day_changes(self) -> None:
         from unittest.mock import patch
@@ -6339,28 +6902,6 @@ if return_code != 0 or loaded:
             self.assertFalse(controller._auto_execution_enabled)
         finally:
             controller.shutdown()
-
-    def test_duty_controller_locks_schedule_controls_for_manual_or_review_tasks(self) -> None:
-        from qt_app.controllers.duty_controller import DutyController
-
-        controller = DutyController()
-        controller.set_actor_no("10")
-        controller._actions = [
-            {"kind": "work_log", "actor": "10", "fields": {}},
-            {"kind": "entry_log", "actor": "10", "fields": {}},
-        ]
-        controller._comparisons = {
-            0: {"group": "review"},
-            1: {"group": "manual"},
-        }
-
-        for index in (0, 1):
-            controller.toggleTaskSelection(index)
-            self.assertFalse(controller.canAdjustSelectedSchedule)
-            controller.pauseSelectedTasks()
-            self.assertEqual(controller.selectedTaskCount, 1)
-            self.assertNotIn(index, controller._manual_paused_indices)
-            controller.toggleTaskSelection(index)
 
     def test_duty_sheet_controller_adds_and_removes_vehicle_options(self) -> None:
         from app_core.duty_sheet_service import DutySheetDefaults
@@ -6608,6 +7149,61 @@ if return_code != 0 or loaded:
         self.assertEqual(success_spy.count(), 1)
         self.assertFalse(controller._workers)
 
+    def test_daily_vehicle_controller_requires_resolved_actor_no(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.daily_vehicle_service import DailyVehicleDefaults
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.daily_vehicle_controller import DailyVehicleController
+
+        class FakeService:
+            def load_defaults(self):
+                return DailyVehicleDefaults("2026/07/29", ())
+
+            def validate(self, request):
+                return request
+
+            def confirmation_summary(self, request):
+                return "should not be called"
+
+        state = SessionState()
+        attempt_id = state.begin_login()
+        state.complete_login(
+            attempt_id,
+            LoginSession("", "user10", "secret", verified=True, actor_name="測試員"),
+        )
+        controller = DailyVehicleController(state, FakeService())
+        errors = QSignalSpy(controller.errorOccurred)
+
+        controller.prepareRun()
+
+        self.assertEqual(errors.count(), 1)
+        self.assertIn("番號確認", errors.at(0)[0])
+
+    def test_rescue_video_controller_requires_resolved_actor_no_before_running(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.rescue_video_service import RescueVideoRequest
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        state = SessionState()
+        attempt_id = state.begin_login()
+        state.complete_login(
+            attempt_id,
+            LoginSession("", "user10", "secret", verified=True, actor_name="測試員"),
+        )
+        controller = RescueVideoController(object(), session_state=state)
+        errors = QSignalSpy(controller.errorOccurred)
+
+        controller._start_worker(
+            "execute",
+            RescueVideoRequest("source", "destination", "1150808", "92", "", False, "preview"),
+        )
+
+        self.assertEqual(errors.count(), 1)
+        self.assertFalse(controller._workers)
+
     def test_rescue_video_controller_runs_preview_and_confirms_delete(self) -> None:
         from dataclasses import replace
 
@@ -6687,7 +7283,7 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.confirmationSummary, "")
         self.assertEqual(controller.statusText, "自動檢查通過")
 
-    def test_duty_execution_controller_runs_two_entry_lanes_and_work_lane_and_deduplicates_queue(self) -> None:
+    def test_duty_execution_controller_runs_single_entry_lane_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
         from app_core.duty_submission_service import (
@@ -6696,7 +7292,7 @@ if return_code != 0 or loaded:
         )
         from qt_app.controllers.duty_execution_controller import DutyExecutionController
 
-        barrier = threading.Barrier(3)
+        barrier = threading.Barrier(1)
 
         class FakeService:
             def validate(self, request):
@@ -6740,6 +7336,282 @@ if return_code != 0 or loaded:
         self.assertEqual(finished_spy.count(), 3)
         self.assertFalse(controller.isBusy)
         self.assertEqual({finished_spy.at(index)[0] for index in range(finished_spy.count())}, {0, 1, 2})
+        controller.shutdown()
+
+    def test_duty_execution_controller_reuses_one_browser_for_serial_entry_queue(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        first_entry_started = threading.Event()
+        release_first_entry = threading.Event()
+        work_started = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.entry_sessions: list[object] = []
+                self.entry_calls: list[int] = []
+                self.entry_trigger_types: list[str] = []
+                self.work_calls: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                session = SimpleNamespace(user_id=request.user_id, visible=request.visible)
+                self.entry_sessions.append(session)
+                if status_callback:
+                    status_callback("browser ready")
+                return session
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.entry_calls.append(request.action_index)
+                self.entry_trigger_types.append(request.trigger_type)
+                if request.action_index == 0:
+                    first_entry_started.set()
+                    release_first_entry.wait(timeout=2)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "entry submitted",
+                    Path(f"entry-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+            def execute(self, request, *, status_callback=None):
+                self.work_calls.append(request.action_index)
+                work_started.set()
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "work submitted",
+                    Path(f"work-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+        data = {
+            "target_date": "1150807",
+            "actions": [
+                {"kind": "entry_log", "time": "08:00", "actor": "10"},
+                {"kind": "entry_log", "time": "08:05", "actor": "10"},
+                {"kind": "work_log", "time": "08:00", "actor": "10"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 0, data)))
+        self.assertTrue(first_entry_started.wait(timeout=2))
+        self.assertTrue(
+            controller.enqueue(DutySubmissionRequest("user10", "secret", 1, data, trigger_type="recovery"))
+        )
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 2, data)))
+        self.assertTrue(work_started.wait(timeout=2))
+        release_first_entry.set()
+        for _ in range(30):
+            if finished_spy.count() == 3 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(service.entry_calls, [0, 1])
+        self.assertEqual(service.entry_trigger_types, ["due", "recovery"])
+        self.assertEqual(len(service.entry_sessions), 1)
+        self.assertEqual(service.work_calls, [2])
+        self.assertFalse(controller.isBusy)
+        controller.shutdown()
+
+    def test_duty_execution_controller_runs_manual_entry_next_without_interrupting_active_one(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        first_entry_started = threading.Event()
+        release_first_entry = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.calls.append(request.action_index)
+                if request.action_index == 0:
+                    first_entry_started.set()
+                    release_first_entry.wait(timeout=2)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "submitted",
+                    Path(f"manual-priority-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150807",
+            "actions": [
+                {"kind": "entry_log", "time": "08:00", "actor": "10"},
+                {"kind": "entry_log", "time": "08:05", "actor": "10"},
+                {"kind": "entry_log", "time": "08:10", "actor": "10"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 0, data)))
+        self.assertTrue(first_entry_started.wait(timeout=2))
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 1, data)))
+        self.assertTrue(
+            controller.enqueue(DutySubmissionRequest("user10", "secret", 2, data, trigger_type="manual"))
+        )
+        release_first_entry.set()
+        for _ in range(30):
+            if finished_spy.count() == 3 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(service.calls, [0, 2, 1])
+        self.assertFalse(controller.isBusy)
+        controller.shutdown()
+
+    def test_duty_execution_controller_keeps_stale_entry_precheck_before_browser_start(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.browser_started = False
+                self.executed: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def is_stale_due_request(self, _request):
+                return True
+
+            def open_browser_session(self, *_args, **_kwargs):
+                self.browser_started = True
+                raise AssertionError("stale entry must not start a browser")
+
+            def execute_with_browser_session(self, *_args, **_kwargs):
+                raise AssertionError("stale entry must not reuse a browser")
+
+            def close_browser_session(self, _session):
+                return None
+
+            def execute(self, request, *, status_callback=None):
+                self.executed.append(request.action_index)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "skipped_stale_schedule",
+                    "stale",
+                    Path("stale.json"),
+                    {"group": "stale"},
+                )
+
+        data = {
+            "target_date": "1150806",
+            "actions": [{"kind": "entry_log", "time": "08:00", "actor": "10"}],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 0, data)))
+        for _ in range(20):
+            if finished_spy.count() == 1 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(service.executed, [0])
+        self.assertFalse(service.browser_started)
+        controller.shutdown()
+
+    def test_duty_execution_controller_reopens_expired_entry_session_once(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError,
+            DutySubmissionRequest,
+            DutySubmissionResult,
+        )
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opens = 0
+                self.calls: list[tuple[int, int]] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                session = SimpleNamespace(
+                    user_id=request.user_id,
+                    visible=request.visible,
+                    generation=self.opens,
+                )
+                self.opens += 1
+                return session
+
+            def execute_with_browser_session(self, request, session, *, status_callback=None):
+                self.calls.append((request.action_index, session.generation))
+                if request.action_index == 1 and session.generation == 0:
+                    raise DutySubmissionExecutionError("login expired", "login_failed")
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "submitted",
+                    Path(f"relogin-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150807",
+            "actions": [
+                {"kind": "entry_log", "time": "08:00", "actor": "10"},
+                {"kind": "entry_log", "time": "08:05", "actor": "10"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        failed_spy = QSignalSpy(controller.actionFailed)
+
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 0, data)))
+        self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 1, data)))
+        for _ in range(30):
+            if finished_spy.count() == 2 and not controller.isBusy:
+                break
+            finished_spy.wait(250)
+            QTest.qWait(10)
+
+        self.assertEqual(service.opens, 2)
+        self.assertEqual(service.calls, [(0, 0), (1, 0), (1, 1)])
+        self.assertEqual(failed_spy.count(), 0)
+        controller.shutdown()
 
     def test_duty_notification_identifies_the_completed_action_and_target(self) -> None:
         from qt_app.controllers.app_controller import AppController
@@ -6756,7 +7628,7 @@ if return_code != 0 or loaded:
 
         self.assertEqual(message, "出入｜值班 / 值班 08 曾彥綸｜登打完成")
 
-    def test_duty_execution_controller_falls_back_work_startup_failure_to_entry_lane(self) -> None:
+    def test_duty_execution_controller_retries_work_browser_without_using_entry_channel(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
         from app_core.duty_submission_service import (
@@ -6803,6 +7675,7 @@ if return_code != 0 or loaded:
         service = FakeService()
         controller = DutyExecutionController(service)
         finished_spy = QSignalSpy(controller.actionFinished)
+        failed_spy = QSignalSpy(controller.actionFailed)
 
         self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", 0, data)))
         self.assertTrue(first_work_started.wait(timeout=2))
@@ -6817,12 +7690,12 @@ if return_code != 0 or loaded:
 
         self.assertEqual(service.calls.count(0), 2)
         self.assertEqual(set(service.calls), {0, 1, 2})
-        self.assertLess(max(index for index, value in enumerate(service.calls) if value == 0), service.calls.index(1))
-        self.assertEqual(controller._disabled_lanes, {"work"})
         self.assertEqual({finished_spy.at(index)[0] for index in range(finished_spy.count())}, {0, 1, 2})
+        self.assertEqual(failed_spy.count(), 0)
         self.assertFalse(controller.isBusy)
         controller.reset_parallel_lanes()
         self.assertEqual(controller._disabled_lanes, set())
+        controller.shutdown()
 
     def test_duty_execution_controller_blocks_manual_duplicate_while_due_task_is_running(self) -> None:
         from PySide6.QtTest import QTest
@@ -6865,6 +7738,7 @@ if return_code != 0 or loaded:
                 break
             QTest.qWait(50)
         self.assertFalse(controller.isBusy)
+        controller.shutdown()
 
     def test_duty_execution_controller_keeps_all_three_1800_handoff_actions(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -6915,6 +7789,7 @@ if return_code != 0 or loaded:
         self.assertEqual([index for index in service.executed if index in (0, 1)], [0, 1])
         self.assertEqual(finished_spy.count(), 3)
         self.assertFalse(controller.isBusy)
+        controller.shutdown()
 
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -6939,6 +7814,7 @@ if return_code != 0 or loaded:
                             "time": "00:00",
                             "actor": "10",
                             "target": "10",
+                            "source": "在隊訓練",
                             "fields": {"勤務項目": "巡邏"},
                         }
                     ],
@@ -7805,6 +8681,292 @@ if return_code != 0 or loaded:
         self.assertEqual(confirmation_spy.count(), 1)
         self.assertEqual(controller._pending_manual_indices, [0])
 
+    def test_external_return_pause_uses_dedicated_manual_confirmation(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        controller = DutyController(
+            unreturned_return_queue=UnreturnedReturnQueue(Path(temporary_queue_dir.name))
+        )
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"8": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "9",
+                        "target": "8",
+                        "source": "昨日在勤且今日未在勤",
+                        "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+                    }
+                ],
+            },
+            comparisons={0: {"compare": "未返隊，暫停登打", "group": "paused", "matched": []}},
+        )
+        confirmation_spy = QSignalSpy(controller.externalReturnManualSubmissionConfirmationRequested)
+        requested_spy = QSignalSpy(controller.externalReturnQueueManualSubmissionRequested)
+        controller.handle_submission_result(0, "paused_external", "人員尚未返隊", "")
+        controller.toggleTaskSelection(0)
+
+        self.assertTrue(controller.hasExternalReturnPauseSelected)
+        self.assertTrue(controller.canConfirmExternalReturnManualSubmissionSelected)
+        controller.prepareExternalReturnManualSubmission()
+
+        self.assertEqual(confirmation_spy.count(), 1)
+        self.assertEqual(controller._pending_external_return_indices, [0])
+        self.assertIn("確認人員已返隊", controller.externalReturnConfirmationSummary)
+        self.assertIn("08 測試員", controller.externalReturnConfirmationSummary)
+        controller.confirmExternalReturnManualSubmission()
+
+        self.assertEqual(requested_spy.count(), 1)
+        self.assertEqual(
+            requested_spy.at(0),
+            [controller._external_return_queue_ids_by_action_index[0]],
+        )
+        self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_external_return_pause_mixed_selection_disables_confirmation(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "9",
+                        "target": "8",
+                        "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"勤務項目": "一般勤務"},
+                    },
+                ],
+            },
+            comparisons={0: {"compare": "未返隊，暫停登打", "group": "paused", "matched": []}},
+        )
+        controller.toggleTaskSelection(0)
+        controller.toggleTaskSelection(1)
+
+        self.assertTrue(controller.hasExternalReturnPauseSelected)
+        self.assertFalse(controller.canConfirmExternalReturnManualSubmissionSelected)
+
+    def test_persisted_external_return_queue_uses_special_confirmation_and_current_time(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = UnreturnedReturnQueue(Path(temp_dir))
+            action = {
+                "kind": "entry_log",
+                "time": "08:05",
+                "actor": "10",
+                "target": "8",
+                "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+            }
+            queue.pause(
+                action,
+                {
+                    "target_date": "1150807",
+                    "today": {"staff": {"8": {"name": "測試員"}}},
+                },
+                owner_actor_no="10",
+            )
+            controller = DutyController(unreturned_return_queue=queue)
+            controller.set_actor_no("11")
+            controller.replace_schedule_data(
+                {
+                    "target_date": "1150807",
+                    "today": {"staff": {"8": {"name": "測試員"}}},
+                    "actions": [action],
+                }
+            )
+            queue_id = controller._external_return_queue_ids_by_action_index[0]
+            confirmation_spy = QSignalSpy(controller.externalReturnManualSubmissionConfirmationRequested)
+            requested_spy = QSignalSpy(controller.externalReturnQueueManualSubmissionRequested)
+
+            controller.toggleTaskSelection(0)
+            self.assertTrue(controller.canConfirmExternalReturnManualSubmissionSelected)
+            controller.prepareExternalReturnManualSubmission()
+
+            self.assertEqual(confirmation_spy.count(), 1)
+            self.assertIn("確認人員已返隊", controller.externalReturnConfirmationSummary)
+            controller.confirmExternalReturnManualSubmission()
+            self.assertEqual(requested_spy.at(0), [queue_id])
+            request = controller.queued_external_return_manual_submission_request(
+                "user11",
+                "secret",
+                queue_id,
+                submit_at=datetime(2026, 8, 7, 1, 2),
+            )
+            self.assertIsNotNone(request)
+            queued_action = request.schedule_data["actions"][0]
+            self.assertEqual(request.trigger_type, "manual")
+            self.assertEqual(queued_action["time"], "01:02")
+            self.assertEqual(queued_action["fields"]["登打時間"], "01:02")
+            self.assertEqual(queued_action["fields"]["系統寫入時間"], "01:02")
+            self.assertEqual(queued_action["submit_target_date"], "1150807")
+
+    def test_handoff_external_pause_groups_three_items_and_manual_uses_actual_time(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        controller = DutyController(
+            unreturned_return_queue=UnreturnedReturnQueue(Path(temporary_queue_dir.name))
+        )
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {
+                    "staff": {
+                        "10": {"name": "原值班"},
+                        "11": {"name": "接班"},
+                    }
+                },
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "00:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "duplicate_key": "entry:1150807:00:值退:10",
+                        "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "00:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "值班交接",
+                        "duplicate_key": "entry:1150807:00:值班:11",
+                        "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "00:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "duplicate_key": "work:1150807:00:值班交接:10",
+                        "fields": {
+                            "工作時間": "00:00",
+                            "處理情形": "一、時間:16-18\n二、交接完成",
+                        },
+                    },
+                ],
+            }
+        )
+        controller._due_task_indices = [0, 1, 2]
+        controller.enable_auto_execution()
+
+        preflight_requests = controller.due_submission_requests("user10", "secret", [0, 1, 2])
+
+        self.assertEqual(len(preflight_requests), 1)
+        self.assertEqual(
+            preflight_requests[0].schedule_data["actions"][preflight_requests[0].action_index]["kind"],
+            "handoff_preflight",
+        )
+        controller.mark_submission_enqueued(preflight_requests[0].action_index)
+        controller.handle_handoff_preflight_paused(preflight_requests[0])
+
+        records = controller._unreturned_return_queue.active_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["record_type"], "handoff_group")
+        self.assertEqual(len(records[0]["actions"]), 3)
+        self.assertEqual(set(controller._external_return_queue_ids_by_action_index), {0, 1, 2})
+
+        controller.toggleTaskSelection(1)
+        self.assertEqual(controller.selectedTaskCount, 3)
+        self.assertTrue(controller.canConfirmExternalReturnManualSubmissionSelected)
+        confirmation_spy = QSignalSpy(controller.externalReturnManualSubmissionConfirmationRequested)
+        controller.prepareExternalReturnManualSubmission()
+        self.assertEqual(confirmation_spy.count(), 1)
+
+        queue_id = controller._external_return_queue_ids_by_action_index[1]
+        requests = controller.queued_external_return_manual_submission_requests(
+            "user10",
+            "secret",
+            queue_id,
+            submit_at=datetime(2026, 8, 7, 18, 25),
+        )
+
+        self.assertEqual(len(requests), 3)
+        stamped_actions = [request.schedule_data["actions"][0] for request in requests]
+        self.assertEqual(
+            [action["kind"] for action in stamped_actions],
+            ["entry_log", "entry_log", "work_log"],
+        )
+        self.assertTrue(
+            all(action["time"] == "18:25" for action in stamped_actions)
+        )
+        work_action = stamped_actions[2]
+        self.assertEqual(work_action["fields"]["工作時間"], "18:25")
+        self.assertEqual(work_action["fields"]["處理情形"].splitlines()[0], "一、時間:16:00-18:25")
+
+    def test_handoff_selection_groups_checkout_on_duty_and_work(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "\u503c\u73ed\u4ea4\u63a5",
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "\u503c\u73ed\u4ea4\u63a5",
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "\u503c\u73ed\u4ea4\u63a5",
+                    },
+                ],
+            }
+        )
+
+        controller.toggleTaskSelection(1)
+        self.assertEqual(controller.selectedTaskCount, 3)
+        controller.toggleTaskSelection(0)
+        self.assertEqual(controller.selectedTaskCount, 0)
+
     def test_manual_submission_includes_adjust_group_task(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
@@ -7909,7 +9071,9 @@ if return_code != 0 or loaded:
         controller.replace_schedule_data(
             {
                 "target_date": "1150729",
-                "actions": [{"kind": "work_log", "time": "00:00", "actor": "10"}],
+                "actions": [
+                    {"kind": "work_log", "time": "00:00", "actor": "10", "source": "在隊訓練"}
+                ],
             }
         )
         controller.mark_submission_enqueued(0)
@@ -8353,7 +9517,7 @@ if return_code != 0 or loaded:
                 self.assertFalse(controller.dutyController.isRefreshing)
                 self.assertFalse(controller.sessionController._login_workers)
                 self.assertFalse(controller.dutyController._capture_workers)
-                self.assertEqual((root.width(), root.height()), (550, 832))
+                self.assertEqual((root.width(), root.height()), (550, 872))
             finally:
                 root.close()
                 controller.shutdown()
@@ -8631,7 +9795,7 @@ if return_code != 0 or loaded:
             engine = create_engine(controller)
             root = engine.rootObjects()[0]
             QTest.qWait(100)
-            self.assertEqual((root.width(), root.height()), (550, 832))
+            self.assertEqual((root.width(), root.height()), (550, 872))
 
             def find_visual(name):
                 stack = [root.contentItem()]
@@ -8692,15 +9856,17 @@ if return_code != 0 or loaded:
                     "已登入：分隊長 驗收人員，今日值班時段：08:00-10:00。",
                 )
                 self.assertEqual(root.property("errorMessage"), "驗收錯誤訊息")
+                previous_login_status = wait_for("loggedInStatusLabel").property("text")
+                previous_login_tone = controller.sessionController.loginStatusTone
                 controller.dutyController.errorOccurred.emit("勤務資料讀取失敗")
                 QTest.qWait(50)
                 self.assertEqual(
                     wait_for("loggedInStatusLabel").property("text"),
-                    "勤務資料讀取失敗",
+                    previous_login_status,
                 )
                 self.assertEqual(
                     controller.sessionController.loginStatusTone,
-                    "warning",
+                    previous_login_tone,
                 )
                 controller.sessionController.sessionChanged.disconnect(controller._sync_session_actor)
                 try:
@@ -8717,8 +9883,6 @@ if return_code != 0 or loaded:
                 duty_task_header = wait_for("dutyTaskHeader")
                 audit_task_header = wait_for("auditTaskHeader")
                 mode_menu_button = wait_for("modeMenuButton")
-                manual_pause_button = wait_for("manualPauseButton")
-                resume_schedule_button = wait_for("resumeScheduleButton")
                 manual_submit_button = wait_for("manualSubmitButton")
                 selected_task_actions = wait_for("selectedTaskActions")
                 duty_task_row = wait_for_visible("dutyTaskRow")
@@ -8842,11 +10006,7 @@ if return_code != 0 or loaded:
                     mode_menu_button.mapToScene(QPointF(0, 0)).y(),
                     duty_task_header.mapToScene(QPointF(0, 0)).y(),
                 )
-                for task_button in (
-                    manual_pause_button,
-                    resume_schedule_button,
-                    manual_submit_button,
-                ):
+                for task_button in (manual_submit_button,):
                     self.assertEqual((task_button.width(), task_button.height()), (104, 38))
                 self.assertEqual(duty_task_row.height(), 44)
                 self.assertEqual(duty_task_row.property("color").name().upper(), "#FFFFFF")
@@ -8864,11 +10024,11 @@ if return_code != 0 or loaded:
                 self.assertEqual(controller.dutyController.selectedTaskCount, 1)
                 self.assertTrue(selected_task_actions.property("visible"))
                 self.assertGreaterEqual(
-                    manual_pause_button.mapToScene(QPointF(0, 0)).x(),
+                    manual_submit_button.mapToScene(QPointF(0, 0)).x(),
                     duty_task_area.mapToScene(QPointF(0, 0)).x(),
                 )
                 self.assertGreaterEqual(
-                    manual_pause_button.mapToScene(QPointF(0, 0)).y(),
+                    manual_submit_button.mapToScene(QPointF(0, 0)).y(),
                     duty_task_area.mapToScene(QPointF(0, 0)).y(),
                 )
                 self.assertLessEqual(
@@ -8877,19 +10037,6 @@ if return_code != 0 or loaded:
                     ).y(),
                     duty_task_area.mapToScene(QPointF(0, duty_task_area.height())).y(),
                 )
-                duty_task_row = wait_for_visible("dutyTaskRow")
-                self.assertEqual(duty_task_row.property("color").name().upper(), "#FFFFFF")
-                click(wait_for("manualPauseButton"))
-                self.assertIn(0, controller.dutyController._manual_paused_indices)
-                self.assertEqual(controller.dutyController.selectedTaskCount, 0)
-                self.assertEqual(controller.dutyController.taskModel.rowCount(), 1)
-
-                click(wait_for_visible("dutyTaskRow"))
-                self.assertEqual(controller.dutyController.selectedTaskCount, 1)
-                click(wait_for("resumeScheduleButton"))
-                self.assertNotIn(0, controller.dutyController._manual_paused_indices)
-
-                click(wait_for_visible("dutyTaskRow"))
                 click(wait_for("manualSubmitButton"))
                 manual_dialog = root.findChild(QObject, "manualSubmissionConfirmation")
                 self.assertIsNotNone(manual_dialog)
@@ -9018,7 +10165,7 @@ if return_code != 0 or loaded:
 
                 click(wait_for("modeMenuButton"))
                 click(wait_for_visible("dutyModeTab"))
-                self.assertEqual((root.width(), root.height()), (550, 832))
+                self.assertEqual((root.width(), root.height()), (550, 872))
                 self.assertEqual(root.title(), "值班模式")
                 self.assertTrue(duty_task_header.property("visible"))
                 self.assertFalse(audit_task_header.property("visible"))
@@ -9052,7 +10199,7 @@ if return_code != 0 or loaded:
                     self.assertEqual(root.width(), 964)
                     self.assertEqual(
                         (panel.x(), panel.y(), panel.width(), panel.height()),
-                    (550, 34, 400, 784),
+                    (550, 34, 400, 824),
                     )
                     self.assertEqual(main_content_host.width(), duty_main_width)
                     self.assertTrue(QMetaObject.invokeMethod(panel, "close", Qt.DirectConnection))
