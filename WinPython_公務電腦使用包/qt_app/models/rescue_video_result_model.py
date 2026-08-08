@@ -68,6 +68,7 @@ class RescueVideoResultModel(QAbstractListModel):
             if row.get("statusText") == "預計複製":
                 row["transferPercent"] = 0
                 row["transferText"] = "等待傳輸"
+                row["statusText"] = "等待傳輸"
             elif str(row.get("statusText") or "").startswith("已完成"):
                 row["transferPercent"] = 100
                 row["transferText"] = "等待驗證"
@@ -78,7 +79,7 @@ class RescueVideoResultModel(QAbstractListModel):
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._rows) - 1, 0),
-                [self.TransferPercentRole, self.TransferTextRole],
+                [self.StatusTextRole, self.TransferPercentRole, self.TransferTextRole],
             )
 
     def update_transfer(self, source_path: str, copied: int, total: int, state: str) -> None:
@@ -88,10 +89,11 @@ class RescueVideoResultModel(QAbstractListModel):
             percent = 100 if total <= 0 else max(0, min(100, round(copied * 100 / total)))
             row["transferPercent"] = percent
             row["transferText"] = state
+            row["statusText"] = state
             index = self.index(row_number, 0)
             self.dataChanged.emit(
                 index,
                 index,
-                [self.TransferPercentRole, self.TransferTextRole],
+                [self.StatusTextRole, self.TransferPercentRole, self.TransferTextRole],
             )
             return

@@ -145,6 +145,34 @@ class RescueVideoController(QObject):
         return self._result_model
 
     @Slot()
+    def resetForNextSession(self) -> None:
+        if self._workers:
+            return
+        self._source_path = ""
+        self._destination_path = ""
+        self._target_date = ""
+        self._vehicle_options = []
+        self._selected_vehicle = ""
+        self._offset_text = ""
+        self._repair_mismatch = False
+        self._check_text = "尚未檢查，請選擇日期及車號後按「檢查及預覽分類」。"
+        self._check_cards = []
+        self._is_ready = False
+        self._has_preview = False
+        self._awaiting_confirmation = False
+        self._check_requested = False
+        self._preview_after_check = False
+        self._status_text = "尚未檢查"
+        self._summary_text = "流程：1. 選擇日期，系統自動帶入車號；2. 按「檢查及預覽分類」；3. 檢查通過後會自動顯示分類結果，可按「複製啟動」。"
+        self._report_path = ""
+        self._confirmation_summary = ""
+        self._pending_request = None
+        self._failure_stage = "unknown"
+        self._last_completed_mode = ""
+        self._result_model.replace_rows(())
+        self.stateChanged.emit()
+
+    @Slot()
     def loadDefaults(self) -> None:
         if self._workers:
             return
@@ -155,6 +183,7 @@ class RescueVideoController(QObject):
         self._preview_after_check = False
         self._status_text = "讀取工具設定中"
         self._check_text = "尚未檢查。選擇日期後會自動帶入車號，再按「檢查及預覽分類」。"
+        self._set_check_cards_pending()
         self.stateChanged.emit()
         self._start_worker("defaults")
 
@@ -205,6 +234,7 @@ class RescueVideoController(QObject):
         self._status_text = "正在依日期尋找車號"
         self._check_text = "日期已變更，正在更新可用車號。"
         self._summary_text = "已依日期重新尋找案件車號；請按「檢查及預覽分類」開始。"
+        self._set_check_cards_pending()
         self._result_model.replace_rows(())
         self.stateChanged.emit()
         self._start_worker(
@@ -228,6 +258,7 @@ class RescueVideoController(QObject):
         self._status_text = "尚未檢查"
         self._check_text = "資料已變更，請按「檢查及預覽分類」重新確認。"
         self._summary_text = "資料已變更。請按「檢查及預覽分類」重新確認。"
+        self._set_check_cards_pending()
         self._result_model.replace_rows(())
         self.stateChanged.emit()
 
@@ -467,7 +498,7 @@ class RescueVideoController(QObject):
         self._offset_text = defaults.offset_text
         self._repair_mismatch = defaults.repair_mismatch
         self._check_text = defaults.check_text
-        self._check_cards = [
+        check_cards = [
             {
                 "key": card.key,
                 "title": card.title,
@@ -476,6 +507,10 @@ class RescueVideoController(QObject):
             }
             for card in defaults.check_cards
         ]
+        if self._check_requested:
+            self._check_cards = check_cards
+        else:
+            self._set_check_cards_pending(check_cards)
         self._is_ready = self._check_requested and defaults.is_ready
         self._has_preview = False
         self._awaiting_confirmation = False
@@ -502,6 +537,18 @@ class RescueVideoController(QObject):
             self._status_text = "尚未檢查"
             self._summary_text = "選擇日期後會自動帶入車號；按「檢查及預覽分類」開始。"
         self.stateChanged.emit()
+
+    def _set_check_cards_pending(self, cards: list[dict[str, str]] | None = None) -> None:
+        current_cards = self._check_cards if cards is None else cards
+        self._check_cards = [
+            {
+                "key": card["key"],
+                "title": card["title"],
+                "detail": "資料已變更，請按「檢查及預覽分類」重新檢查。",
+                "level": "pending",
+            }
+            for card in current_cards
+        ]
 
     @Slot(int, object)
     def _run_succeeded(self, request_id: int, result: RescueVideoRunResult) -> None:

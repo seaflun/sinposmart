@@ -87,11 +87,36 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("controller.checkAndPreview(", source)
         self.assertNotIn('objectName: "rescueVideoPreviewButton"', source)
         self.assertIn('text: "矯正影片時間"', source)
+        self.assertIn('text: rescueVideoResultRow.transferPercent + "%"', source)
+        self.assertNotIn('text: rescueVideoResultRow.transferText', source)
+        self.assertIn("component ResultColumnResizeHandle", source)
+        self.assertIn("resizeResultColumns(", source)
+        self.assertIn("columnWidthOverride: rescueVideoWindow.resultColumnWidth", source)
+        self.assertIn("status: 160", source)
+        self.assertIn('column === "status" ? 150', source)
+        self.assertIn('modelData.level === "pending"', source)
+        self.assertIn("onClosing: function(closeEvent)", source)
+        self.assertIn("controller.resetForNextSession()", source)
 
         controller_source = (PACKAGE_ROOT / "qt_app" / "controllers" / "rescue_video_controller.py").read_text(encoding="utf-8")
         self.assertIn("檢查通過後會自動顯示分類結果", controller_source)
         self.assertNotIn("請先完成預覽分類", controller_source)
         self.assertIn('objectName: "rescueVideoCloseButton"', source)
+
+    def test_window_keeps_minimize_and_maximize_available_during_copy(self) -> None:
+        source = (
+            PACKAGE_ROOT / "qt_app" / "qml" / "dialogs" / "RescueVideoWindow.qml"
+        ).read_text(encoding="utf-8")
+        minimize_start = source.index('objectName: "rescueVideoTitleMinimizeButton"')
+        maximize_start = source.index('objectName: "rescueVideoTitleMaximizeButton"')
+        close_start = source.index('objectName: "rescueVideoTitleCloseButton"')
+
+        self.assertIn("enabled: true", source[minimize_start:maximize_start])
+        self.assertIn("enabled: true", source[maximize_start:close_start])
+        self.assertIn(
+            "enabled: !rescueVideoWindow.interactionsLocked",
+            source[close_start:],
+        )
 
     def test_daily_tools_include_rescue_video_as_third_action(self) -> None:
         source = (
@@ -213,6 +238,74 @@ class RescueVideoPackageTests(unittest.TestCase):
         )
 
         self.assertEqual(row["timeText"], "08/08 23:57:00")
+
+    def test_transfer_status_moves_to_the_status_column(self) -> None:
+        from qt_app.models.rescue_video_result_model import RescueVideoResultModel
+
+        model = RescueVideoResultModel()
+        model.replace_rows(
+            (
+                {
+                    "sourcePath": "X:/DCIM/V0000001.TS",
+                    "statusText": "預計複製",
+                    "transferPercent": 0,
+                    "transferText": "尚未傳輸",
+                },
+            )
+        )
+        index = model.index(0, 0)
+
+        model.prepare_transfer()
+        self.assertEqual(model.data(index, model.StatusTextRole), "等待傳輸")
+        self.assertEqual(model.data(index, model.TransferPercentRole), 0)
+
+        model.update_transfer("X:/DCIM/V0000001.TS", 51, 100, "傳輸中")
+        self.assertEqual(model.data(index, model.StatusTextRole), "傳輸中")
+        self.assertEqual(model.data(index, model.TransferPercentRole), 51)
+
+    def test_date_or_vehicle_change_marks_check_cards_pending(self) -> None:
+        if str(PACKAGE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PACKAGE_ROOT))
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._check_cards = [
+            {"key": "source", "title": "記憶卡來源", "detail": "來源可用", "level": "ok"},
+            {"key": "vehicle_date", "title": "車號與日期", "detail": "案件可用", "level": "ok"},
+        ]
+
+        controller.updateInputs("F:/DCIM/100CAREC", "2026-08-08", "93")
+
+        self.assertEqual([card["level"] for card in controller.checkCards], ["pending", "pending"])
+        self.assertTrue(all("重新檢查" in card["detail"] for card in controller.checkCards))
+
+    def test_closing_rescue_video_clears_prior_session(self) -> None:
+        if str(PACKAGE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PACKAGE_ROOT))
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._source_path = "F:/DCIM/100CAREC"
+        controller._target_date = "2026-08-08"
+        controller._selected_vehicle = "93"
+        controller._check_cards = [
+            {"key": "source", "title": "記憶卡來源", "detail": "可用", "level": "ok"},
+        ]
+        controller._is_ready = True
+        controller._has_preview = True
+        controller._result_model.replace_rows(
+            ({"sourcePath": "F:/DCIM/100CAREC/V0000001.TS", "statusText": "已完成"},)
+        )
+
+        controller.resetForNextSession()
+
+        self.assertEqual(controller.sourcePath, "")
+        self.assertEqual(controller.targetDate, "")
+        self.assertEqual(controller.selectedVehicle, "")
+        self.assertEqual(controller.checkCards, [])
+        self.assertFalse(controller.hasPreview)
+        self.assertEqual(controller.statusText, "尚未檢查")
+        self.assertEqual(controller.resultModel.rowCount(), 0)
 
     def test_windows_notification_is_limited_to_completed_rescue_video_copy(self) -> None:
         source = (PACKAGE_ROOT / "qt_app" / "controllers" / "app_controller.py").read_text(

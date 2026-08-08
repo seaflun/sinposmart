@@ -26,6 +26,79 @@ Window {
     readonly property bool usesCustomTitleBar: true
     readonly property bool interactionsLocked: rescueVideoWindow.controller.isRunning
                                                || rescueVideoWindow.controller.isAwaitingConfirmation
+    property var resultColumnWidths: ({
+        source: Design.dataSourceWidth,
+        time: Design.dataTimeWidth,
+        case: Design.dataCaseWidth,
+        status: 160,
+        transfer: Design.dataTransferWidth,
+        destination: Design.dataDestinationWidth,
+        note: Design.dataNoteWidth
+    })
+
+    function resultColumnWidth(column) {
+        return resultColumnWidths[column]
+    }
+
+    function resultColumnMinimumWidth(column) {
+        return column === "source" ? 80
+             : column === "time" ? 110
+             : column === "case" ? 100
+             : column === "status" ? 150
+             : column === "transfer" ? 80
+             : column === "destination" ? 160
+             : 180
+    }
+
+    function resizeResultColumns(leftColumn, rightColumn, preferredLeftWidth) {
+        const leftWidth = resultColumnWidth(leftColumn)
+        const rightWidth = resultColumnWidth(rightColumn)
+        const pairWidth = leftWidth + rightWidth
+        const minimumLeft = resultColumnMinimumWidth(leftColumn)
+        const minimumRight = resultColumnMinimumWidth(rightColumn)
+        const nextLeft = Math.max(minimumLeft, Math.min(preferredLeftWidth, pairWidth - minimumRight))
+        const widths = Object.assign({}, resultColumnWidths)
+        widths[leftColumn] = Math.round(nextLeft)
+        widths[rightColumn] = Math.round(pairWidth - nextLeft)
+        resultColumnWidths = widths
+    }
+
+    component ResultColumnResizeHandle: MouseArea {
+        required property string leftColumn
+        required property string rightColumn
+        property real pressHeaderX: 0
+        property real initialLeftWidth: 0
+
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        width: 12
+        height: parent.height
+        z: 1
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeHorCursor
+        onPressed: function(mouse) {
+            initialLeftWidth = rescueVideoWindow.resultColumnWidth(leftColumn)
+            pressHeaderX = mapToItem(rescueVideoResultHeader, mouse.x, mouse.y).x
+        }
+        onPositionChanged: function(mouse) {
+            if (!pressed)
+                return
+            const currentHeaderX = mapToItem(rescueVideoResultHeader, mouse.x, mouse.y).x
+            rescueVideoWindow.resizeResultColumns(
+                leftColumn,
+                rightColumn,
+                initialLeftWidth + currentHeaderX - pressHeaderX
+            )
+        }
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: 1
+            height: parent.height - 10
+            color: parent.containsMouse || parent.pressed ? Design.blue : Design.divider
+        }
+    }
 
     function positionBesideHost() {
         if (!rescueVideoWindow.screen)
@@ -64,9 +137,12 @@ Window {
             nativeTitleBarConfigurator()
     }
 
-    onClosing: function(close) {
-        if (rescueVideoWindow.interactionsLocked)
-            close.accepted = false
+    onClosing: function(closeEvent) {
+        if (rescueVideoWindow.interactionsLocked) {
+            closeEvent.accepted = false
+            return
+        }
+        rescueVideoWindow.controller.resetForNextSession()
     }
 
     Connections {
@@ -166,7 +242,7 @@ Window {
                 showFocusRing: false
                 focusPolicy: Qt.NoFocus
                 scale: 1
-                enabled: !rescueVideoWindow.interactionsLocked
+                enabled: true
                 Accessible.name: "縮小行車紀錄器"
                 onClicked: rescueVideoWindow.showMinimized()
             }
@@ -190,7 +266,7 @@ Window {
                 showFocusRing: false
                 focusPolicy: Qt.NoFocus
                 scale: 1
-                enabled: !rescueVideoWindow.interactionsLocked
+                enabled: true
                 Accessible.name: rescueVideoWindow.visibility === Window.Maximized ? "還原行車紀錄器" : "最大化行車紀錄器"
                 onClicked: {
                     if (rescueVideoWindow.visibility === Window.Maximized)
@@ -402,6 +478,8 @@ Window {
                                     border.width: Design.borderWidth
                                     border.color: rescueVideoCheckCard.modelData.level === "ok"
                                                   ? Design.successBorder
+                                                  : rescueVideoCheckCard.modelData.level === "pending"
+                                                    ? Design.warningBorder
                                                   : Design.dangerBorder
                                 }
 
@@ -418,6 +496,8 @@ Window {
                                             radius: Design.rescueCheckMarkerRadius
                                             color: rescueVideoCheckCard.modelData.level === "ok"
                                                    ? Design.successAction
+                                                   : rescueVideoCheckCard.modelData.level === "pending"
+                                                     ? Design.warningStrong
                                                    : Design.dangerFill
                                         }
 
@@ -432,9 +512,13 @@ Window {
                                     }
 
                                     Label {
-                                        text: rescueVideoCheckCard.modelData.level === "ok" ? "可用" : "需處理"
+                                        text: rescueVideoCheckCard.modelData.level === "ok" ? "可用"
+                                              : rescueVideoCheckCard.modelData.level === "pending" ? "待重新檢查"
+                                              : "需處理"
                                         color: rescueVideoCheckCard.modelData.level === "ok"
                                                ? Design.successText
+                                               : rescueVideoCheckCard.modelData.level === "pending"
+                                                 ? Design.warningText
                                                : Design.dangerStrong
                                         font.pixelSize: Design.captionSize
                                         font.bold: true
@@ -485,17 +569,45 @@ Window {
                         implicitHeight: Design.toolSmallButtonHeight
                         color: Design.softAction
                         RowLayout {
+                            id: rescueVideoResultHeader
                             anchors.fill: parent
                             anchors.leftMargin: 8
                             anchors.rightMargin: 8
                             spacing: 8
-                            DataTableCell { column: "source"; heading: true; text: "來源檔案" }
-                            DataTableCell { column: "time"; heading: true; text: "矯正影片時間" }
-                            DataTableCell { column: "case"; heading: true; text: "案件資料夾" }
-                            DataTableCell { column: "status"; heading: true; text: "狀態" }
-                            DataTableCell { column: "transfer"; heading: true; text: "傳輸進度" }
-                            DataTableCell { column: "destination"; heading: true; text: "目的地" }
-                            DataTableCell { column: "note"; heading: true; text: "備註" }
+                            DataTableCell {
+                                column: "source"; heading: true; text: "來源檔案"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("source")
+                                ResultColumnResizeHandle { leftColumn: "source"; rightColumn: "time" }
+                            }
+                            DataTableCell {
+                                column: "time"; heading: true; text: "矯正影片時間"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("time")
+                                ResultColumnResizeHandle { leftColumn: "time"; rightColumn: "case" }
+                            }
+                            DataTableCell {
+                                column: "case"; heading: true; text: "案件資料夾"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("case")
+                                ResultColumnResizeHandle { leftColumn: "case"; rightColumn: "status" }
+                            }
+                            DataTableCell {
+                                column: "status"; heading: true; text: "狀態"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("status")
+                                ResultColumnResizeHandle { leftColumn: "status"; rightColumn: "transfer" }
+                            }
+                            DataTableCell {
+                                column: "transfer"; heading: true; text: "傳輸進度"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("transfer")
+                                ResultColumnResizeHandle { leftColumn: "transfer"; rightColumn: "destination" }
+                            }
+                            DataTableCell {
+                                column: "destination"; heading: true; text: "目的地"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("destination")
+                                ResultColumnResizeHandle { leftColumn: "destination"; rightColumn: "note" }
+                            }
+                            DataTableCell {
+                                column: "note"; heading: true; text: "備註"
+                                columnWidthOverride: rescueVideoWindow.resultColumnWidth("note")
+                            }
                         }
                     }
                     ListView {
@@ -527,16 +639,26 @@ Window {
                                 anchors.leftMargin: 8
                                 anchors.rightMargin: 8
                                 spacing: 8
-                                DataTableCell { column: "source"; text: rescueVideoResultRow.sourceText }
-                                DataTableCell { column: "time"; text: rescueVideoResultRow.timeText }
-                                DataTableCell { column: "case"; text: rescueVideoResultRow.caseText }
+                                DataTableCell {
+                                    column: "source"; text: rescueVideoResultRow.sourceText
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("source")
+                                }
+                                DataTableCell {
+                                    column: "time"; text: rescueVideoResultRow.timeText
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("time")
+                                }
+                                DataTableCell {
+                                    column: "case"; text: rescueVideoResultRow.caseText
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("case")
+                                }
                                 DataTableCell {
                                     column: "status"
                                     text: rescueVideoResultRow.statusText
                                     tone: rescueVideoResultRow.tone
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("status")
                                 }
                                 Item {
-                                    Layout.preferredWidth: Design.dataTransferWidth
+                                    Layout.preferredWidth: rescueVideoWindow.resultColumnWidth("transfer")
                                     Layout.preferredHeight: 22
 
                                     Rectangle {
@@ -560,8 +682,7 @@ Window {
                                         anchors.fill: parent
                                         horizontalAlignment: Text.AlignHCenter
                                         verticalAlignment: Text.AlignVCenter
-                                        text: rescueVideoResultRow.transferText
-                                              + " " + rescueVideoResultRow.transferPercent + "%"
+                                        text: rescueVideoResultRow.transferPercent + "%"
                                         color: Design.text
                                         font.pixelSize: Design.captionSize
                                         font.bold: true
@@ -571,8 +692,13 @@ Window {
                                 DataTableCell {
                                     column: "destination"
                                     text: rescueVideoResultRow.destinationText
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("destination")
                                 }
-                                DataTableCell { column: "note"; text: rescueVideoResultRow.noteText }
+                                DataTableCell {
+                                    column: "note"
+                                    text: rescueVideoResultRow.noteText
+                                    columnWidthOverride: rescueVideoWindow.resultColumnWidth("note")
+                                }
                             }
                         }
                     }

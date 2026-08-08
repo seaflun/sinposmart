@@ -7,15 +7,20 @@ Label {
     property string column: ""
     property bool heading: false
     property string tone: ""
-    readonly property int columnWidth: column === "source" ? Design.dataSourceWidth
-                                       : column === "time" ? Design.dataTimeWidth
-                                       : column === "case" ? Design.dataCaseWidth
-                                       : column === "status" ? Design.dataStatusWidth
-                                       : column === "transfer" ? Design.dataTransferWidth
-                                       : column === "destination" ? Design.dataDestinationWidth
-                                       : Design.dataNoteWidth
+    property int columnWidthOverride: -1
+    readonly property int defaultColumnWidth: column === "source" ? Design.dataSourceWidth
+                                              : column === "time" ? Design.dataTimeWidth
+                                              : column === "case" ? Design.dataCaseWidth
+                                              : column === "status" ? Design.dataStatusWidth
+                                              : column === "transfer" ? Design.dataTransferWidth
+                                              : column === "destination" ? Design.dataDestinationWidth
+                                              : Design.dataNoteWidth
+    readonly property int columnWidth: columnWidthOverride > 0
+                                     ? columnWidthOverride
+                                     : defaultColumnWidth
     Layout.preferredWidth: columnWidth
-    Layout.fillWidth: column === "destination" || column === "note"
+    Layout.fillWidth: columnWidthOverride <= 0
+                      && (column === "destination" || column === "note")
     color: heading ? Design.secondaryText
                    : tone === "ok" || tone === "deleted" ? Design.success
                    : tone === "warning" ? Design.warningStrong
