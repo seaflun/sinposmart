@@ -182,20 +182,20 @@ QtObject {
     readonly property int buttonFeedbackDuration: 100
     readonly property int buttonColorTransitionDuration: 120
     readonly property int sidePanelTransitionDuration: 140
-    readonly property int rescueWindowWidth: 1100
+    readonly property int rescueWindowWidth: 1320
     readonly property int rescueWindowHeight: 720
-    readonly property int rescueWindowMinimumWidth: 980
+    readonly property int rescueWindowMinimumWidth: 1160
     readonly property int rescueWindowMinimumHeight: 560
     readonly property int rescueHeaderHeight: 58
-    readonly property int rescueVehicleWidth: 140
-    readonly property int rescueDateWidth: 150
+    readonly property int rescueVehicleWidth: 112
+    readonly property int rescueDateWidth: 140
     readonly property int rescueCheckMarkerRadius: 2
     readonly property int rescueResultRowHeight: 38
-    readonly property int dataSourceWidth: 145
-    readonly property int dataTimeWidth: 120
-    readonly property int dataCaseWidth: 145
-    readonly property int dataStatusWidth: 110
-    readonly property int dataTransferWidth: 130
-    readonly property int dataDestinationWidth: 210
-    readonly property int dataNoteWidth: 180
+    readonly property int dataSourceWidth: 115
+    readonly property int dataTimeWidth: 130
+    readonly property int dataCaseWidth: 115
+    readonly property int dataStatusWidth: 88
+    readonly property int dataTransferWidth: 118
+    readonly property int dataDestinationWidth: 300
+    readonly property int dataNoteWidth: 250
 }

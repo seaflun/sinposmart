@@ -325,9 +325,8 @@ class RescueVideoService:
         adjusted_time = getattr(result, "adjusted_time", None)
         video_start = getattr(result, "video_start", None)
         status = str(getattr(result, "status", "") or "")
-        time_text = adjusted_time.strftime("%m/%d %H:%M:%S") if adjusted_time else ""
-        if video_start and adjusted_time:
-            time_text = f"{video_start:%m/%d %H:%M:%S}–{adjusted_time:%H:%M:%S}"
+        corrected_video_time = video_start or adjusted_time
+        time_text = corrected_video_time.strftime("%m/%d %H:%M:%S") if corrected_video_time else ""
         transfer_complete = status.startswith(("已完成", "已修復", "已複製")) or status == "來源刪除失敗"
         transfer_text = "驗證完成，來源未刪除" if status == "來源刪除失敗" else "已完成"
         return {

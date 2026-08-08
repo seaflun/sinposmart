@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -20,6 +21,14 @@ class RescueVideoPackageTests(unittest.TestCase):
         import classify_rescue_video
 
         return classify_rescue_video
+
+    @staticmethod
+    def _service_module():
+        if str(PACKAGE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PACKAGE_ROOT))
+        from app_core import rescue_video_service
+
+        return rescue_video_service
 
     @staticmethod
     def _ts_packet(pid: int, pts: int) -> bytes:
@@ -66,6 +75,23 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("width: Design.rescueWindowWidth", panel)
         self.assertNotIn("ToolSidePanel {", panel)
         self.assertNotIn("CTkToplevel", panel)
+
+    def test_rescue_video_qml_combines_date_vehicle_check_and_preview_flow(self) -> None:
+        source = (
+            PACKAGE_ROOT / "qt_app" / "qml" / "dialogs" / "RescueVideoWindow.qml"
+        ).read_text(encoding="utf-8")
+
+        self.assertLess(source.index('FormFieldTitle { text: "日期" }'), source.index('FormFieldTitle { text: "車號" }'))
+        self.assertIn("refreshVehicleOptions(", source)
+        self.assertIn('text: "檢查及預覽分類"', source)
+        self.assertIn("controller.checkAndPreview(", source)
+        self.assertNotIn('objectName: "rescueVideoPreviewButton"', source)
+        self.assertIn('text: "矯正影片時間"', source)
+
+        controller_source = (PACKAGE_ROOT / "qt_app" / "controllers" / "rescue_video_controller.py").read_text(encoding="utf-8")
+        self.assertIn("檢查通過後會自動顯示分類結果", controller_source)
+        self.assertNotIn("請先完成預覽分類", controller_source)
+        self.assertIn('objectName: "rescueVideoCloseButton"', source)
 
     def test_daily_tools_include_rescue_video_as_third_action(self) -> None:
         source = (
@@ -149,6 +175,52 @@ class RescueVideoPackageTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"0123456789")
 
         self.assertEqual(updates, [(4, 10), (8, 10), (10, 10)])
+
+    def test_cross_day_video_interval_matches_both_dates(self) -> None:
+        classifier = self._classifier_module()
+        video_start = datetime(2026, 8, 8, 23, 57)
+        video_end = datetime(2026, 8, 9, 0, 3)
+
+        self.assertTrue(classifier.video_overlaps_selected_date(video_start, video_end, date(2026, 8, 8)))
+        self.assertTrue(classifier.video_overlaps_selected_date(video_start, video_end, date(2026, 8, 9)))
+        self.assertFalse(classifier.video_overlaps_selected_date(video_start, video_end, date(2026, 8, 10)))
+
+    def test_vehicle_lookup_includes_previous_day_for_cross_day_case(self) -> None:
+        classifier = self._classifier_module()
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir)
+            (destination / "2026" / "8月" / "08082350-93").mkdir(parents=True)
+
+            vehicles = classifier.discover_vehicles(destination, date(2026, 8, 9))
+
+        self.assertEqual(vehicles, ["93"])
+
+    def test_result_table_displays_only_corrected_video_start_time(self) -> None:
+        service = self._service_module()
+        result = SimpleNamespace(
+            source=Path("V0000001.TS"),
+            adjusted_time=datetime(2026, 8, 9, 0, 3),
+            video_start=datetime(2026, 8, 8, 23, 57),
+            case=None,
+            destination=None,
+            status="預計複製",
+            note="",
+        )
+
+        row = service.RescueVideoService._result_row(
+            SimpleNamespace(status_tag=lambda _status: "normal"),
+            result,
+        )
+
+        self.assertEqual(row["timeText"], "08/08 23:57:00")
+
+    def test_windows_notification_is_limited_to_completed_rescue_video_copy(self) -> None:
+        source = (PACKAGE_ROOT / "qt_app" / "controllers" / "app_controller.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('lastCompletedMode in {"copy", "delete"}', source)
+        self.assertIn('mode=mode,\n                notify=False,', source)
 
 
 if __name__ == "__main__":

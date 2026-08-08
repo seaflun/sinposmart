@@ -39,6 +39,8 @@ Window {
         const rightX = hostWindow.x + hostWindow.width + margin
         const rightEdge = availableX + availableWidth
         const bottomEdge = availableY + availableHeight
+        const maximumWidth = Math.max(1, availableWidth - margin * 2)
+        rescueVideoWindow.width = Math.min(Design.rescueWindowWidth, maximumWidth)
         const centeredX = availableX + Math.round((availableWidth - rescueVideoWindow.width) / 2)
         rescueVideoWindow.x = rightX + rescueVideoWindow.width <= rightEdge - margin
                 ? rightX
@@ -101,10 +103,9 @@ Window {
                  && !rescueVideoWindow.controller.isAwaitingConfirmation
         onDateSelected: function(value) {
             rescueVideoDateField.text = value
-            rescueVideoWindow.controller.updateInputs(
+            rescueVideoWindow.controller.refreshVehicleOptions(
                 rescueVideoWindow.controller.sourcePath,
-                value,
-                rescueVideoVehicleCombo.currentText
+                value
             )
         }
     }
@@ -313,6 +314,22 @@ Window {
                 Layout.fillWidth: true
                 contentItem: RowLayout {
                     spacing: 8
+                    FormFieldTitle { text: "日期" }
+                    AppleTextField {
+                        id: rescueVideoDateField
+                        objectName: "rescueVideoDateField"
+                        Layout.preferredWidth: Design.rescueDateWidth
+                        text: rescueVideoWindow.controller.targetDate
+                        enabled: !rescueVideoWindow.controller.isRunning
+                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
+                        onEditingFinished: rescueVideoWindow.controller.refreshVehicleOptions(
+                            rescueVideoWindow.controller.sourcePath,
+                            text
+                        )
+                        clickAction: function() {
+                            rescueVideoDateCalendar.openForCurrentDate()
+                        }
+                    }
                     FormFieldTitle { text: "車號" }
                     AppleComboBox {
                         id: rescueVideoVehicleCombo
@@ -329,30 +346,13 @@ Window {
                             currentText
                         )
                     }
-                    FormFieldTitle { text: "日期" }
-                    AppleTextField {
-                        id: rescueVideoDateField
-                        objectName: "rescueVideoDateField"
-                        Layout.preferredWidth: Design.rescueDateWidth
-                        text: rescueVideoWindow.controller.targetDate
-                        enabled: !rescueVideoWindow.controller.isRunning
-                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
-                        onEditingFinished: rescueVideoWindow.controller.updateInputs(
-                            rescueVideoWindow.controller.sourcePath,
-                            text,
-                            rescueVideoVehicleCombo.currentText
-                        )
-                        clickAction: function() {
-                            rescueVideoDateCalendar.openForCurrentDate()
-                        }
-                    }
                     AppleButton {
                         objectName: "rescueVideoCheckButton"
-                        text: "檢查"
+                        text: "檢查及預覽分類"
                         tone: "neutralStrong"
                         enabled: !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
-                        onClicked: rescueVideoWindow.controller.refreshAutomaticState(
+                        onClicked: rescueVideoWindow.controller.checkAndPreview(
                             rescueVideoWindow.controller.sourcePath,
                             rescueVideoDateField.text,
                             rescueVideoVehicleCombo.currentText
@@ -470,26 +470,6 @@ Window {
                 }
             }
 
-            RowLayout {
-                Layout.fillWidth: true
-                AppleButton {
-                    objectName: "rescueVideoPreviewButton"
-                    text: "預覽分類結果（不複製）"
-                    tone: "neutralStrong"
-                    enabled: rescueVideoWindow.controller.isReady
-                             && !rescueVideoWindow.controller.isRunning
-                             && !rescueVideoWindow.controller.isAwaitingConfirmation
-                    onClicked: rescueVideoWindow.controller.preparePreview(
-                        rescueVideoWindow.controller.sourcePath,
-                        rescueVideoWindow.controller.destinationPath,
-                        rescueVideoDateField.text,
-                        rescueVideoVehicleCombo.currentText,
-                        rescueVideoWindow.controller.offsetText,
-                        false
-                    )
-                }
-            }
-
             ToolFormCard {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -510,7 +490,7 @@ Window {
                             anchors.rightMargin: 8
                             spacing: 8
                             DataTableCell { column: "source"; heading: true; text: "來源檔案" }
-                            DataTableCell { column: "time"; heading: true; text: "影片時間區間" }
+                            DataTableCell { column: "time"; heading: true; text: "矯正影片時間" }
                             DataTableCell { column: "case"; heading: true; text: "案件資料夾" }
                             DataTableCell { column: "status"; heading: true; text: "狀態" }
                             DataTableCell { column: "transfer"; heading: true; text: "傳輸進度" }
@@ -623,6 +603,13 @@ Window {
                     visible: running
                 }
                 Item { Layout.fillWidth: true }
+                AppleButton {
+                    objectName: "rescueVideoCloseButton"
+                    text: "關閉"
+                    tone: "neutralStrong"
+                    enabled: !rescueVideoWindow.interactionsLocked
+                    onClicked: rescueVideoWindow.close()
+                }
             }
         }
     }

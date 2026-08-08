@@ -2404,7 +2404,7 @@ class RescueVideoServiceTests(unittest.TestCase):
 
     def test_preview_reuses_existing_classifier_and_projects_results(self) -> None:
         import argparse
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         from app_core.rescue_video_service import RescueVideoRequest, RescueVideoService
 
@@ -2415,6 +2415,8 @@ class RescueVideoServiceTests(unittest.TestCase):
             case=SimpleNamespace(name="07290900-92"),
             destination=Path("case") / "車" / "video001.TS",
             status="預計複製",
+            video_start=datetime(2026, 7, 29, 9, 24),
+            video_duration=timedelta(minutes=6),
             note="dry-run",
         )
 
@@ -2432,7 +2434,6 @@ class RescueVideoServiceTests(unittest.TestCase):
             DEFAULT_WORK_LOG_ROOT=Path("work_logs"),
             validate_form=lambda _values, _mode: ([], ["測試警告"]),
             build_args=build_args,
-            choose_runtime_offset=lambda _args: 6,
             run_classification=lambda args: captured_args.append(args) or [result_row],
             summarize_results=lambda _results: {"預計複製": 1},
             format_summary=lambda _summary: "預計複製: 1",
@@ -2455,14 +2456,15 @@ class RescueVideoServiceTests(unittest.TestCase):
 
         self.assertFalse(captured_args[0].apply)
         self.assertFalse(captured_args[0].delete_source)
-        self.assertEqual(captured_args[0].offset_minutes, 6)
+        self.assertEqual(captured_args[0].offset_minutes, 0)
         self.assertEqual(result.summary_text, "預計複製: 1")
         self.assertEqual(result.rows[0]["sourceText"], "video001.TS")
+        self.assertEqual(result.rows[0]["timeText"], "07/29 09:24:00")
         self.assertEqual(result.rows[0]["caseText"], "07290900-92")
         self.assertIn("測試警告", result.warning_text)
         self.assertTrue(progress)
 
-    def test_public_defaults_run_the_legacy_automatic_preflight_contract(self) -> None:
+    def test_public_defaults_use_measured_video_durations_without_time_offset(self) -> None:
         import argparse
         from datetime import date
 
@@ -2485,7 +2487,6 @@ class RescueVideoServiceTests(unittest.TestCase):
             evaluate_preflight=lambda _values: state,
             build_public_duty_report_path=lambda _date, _vehicle: Path("report.csv"),
             build_args=lambda values, _mode: argparse.Namespace(**values),
-            choose_runtime_offset=lambda _args: 6,
         )
         service = RescueVideoService(PACKAGE_ROOT, module_loader=lambda _root: core)
 
@@ -2494,11 +2495,11 @@ class RescueVideoServiceTests(unittest.TestCase):
         self.assertEqual(defaults.target_date, "2026-07-29")
         self.assertEqual(defaults.vehicle_options, ("92", "93"))
         self.assertEqual(defaults.selected_vehicle, "93")
-        self.assertEqual(defaults.offset_text, "6")
+        self.assertEqual(defaults.offset_text, "0")
         self.assertTrue(defaults.is_ready)
-        self.assertEqual(defaults.status_text, "自動檢查通過")
+        self.assertEqual(defaults.status_text, "檢查結果通過")
         self.assertIn("工作／返隊紀錄可存取", defaults.check_text)
-        self.assertIn("自動採用記憶卡偏移：6 分鐘", defaults.check_text)
+        self.assertIn("影片時間會採用同張記憶卡範例影片的實際長度自動判定。", defaults.check_text)
         self.assertEqual(
             [card.key for card in defaults.check_cards],
             ["source", "destination", "work_log", "vehicle_date", "report", "videos"],
@@ -2557,7 +2558,17 @@ class RescueVideoServiceTests(unittest.TestCase):
         roles = {bytes(value).decode("utf-8") for value in model.roleNames().values()}
         self.assertEqual(
             roles,
-            {"sourceText", "timeText", "caseText", "statusText", "destinationText", "noteText", "tone"},
+            {
+                "sourceText",
+                "timeText",
+                "caseText",
+                "statusText",
+                "destinationText",
+                "noteText",
+                "tone",
+                "transferPercent",
+                "transferText",
+            },
         )
         model.replace_rows([{"sourceText": "video001.TS", "statusText": "預計複製"}])
         self.assertEqual(model.rowCount(), 1)
@@ -4581,10 +4592,12 @@ class QtShellTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(quick_tools.count("Layout.preferredWidth: 1"), 5)
         self.assertNotIn("Item { Layout.fillWidth: true }", quick_tools)
-        self.assertNotIn('objectName: "rescueVideoCopyButton"', rescue_video)
-        self.assertIn('text: "預覽分類"', rescue_video)
-        self.assertNotIn('text: "執行複製"', rescue_video)
-        self.assertIn('text: "複製後刪除已驗證來源"', rescue_video)
+        self.assertIn('objectName: "rescueVideoCheckButton"', rescue_video)
+        self.assertIn('text: "檢查結果"', rescue_video)
+        self.assertIn('text: "檢查及預覽分類"', rescue_video)
+        self.assertIn('objectName: "rescueVideoCopyStartButton"', rescue_video)
+        self.assertIn('text: "複製啟動"', rescue_video)
+        self.assertIn('title: "即將開始複製記憶卡至行車記錄器資料夾"', rescue_video)
         self.assertIn("id: updateConfirmation", source)
         self.assertIn("function onUpdateReady(_latestVersion)", source)
         self.assertIn("actionConfirmations.openUpdateConfirmation()", source)
@@ -5090,26 +5103,39 @@ class QtShellTests(unittest.TestCase):
             'text: "救護行車影片分類"',
             'text: "車號"',
             'text: "日期"',
-            'text: "車號由當日案件資料夾自動取得；工作紀錄、報告位置與時間偏移均自動處理。"',
-            'text: "自動檢查"',
+            'objectName: "rescueVideoSummaryText"',
+            "text: rescueVideoWindow.controller.summaryText",
+            'text: "檢查結果"',
             'model: rescueVideoWindow.controller.checkCards',
             'objectName: "rescueVideoCheckCard_" + rescueVideoCheckCard.modelData.key',
             'text: "選擇資料夾"',
             'objectName: "rescueVideoVehicleCombo"',
             'objectName: "rescueVideoDateField"',
+            'objectName: "rescueVideoCheckButton"',
             'objectName: "rescueVideoDateCalendarButton"',
             'dateFormat: "iso"',
-            'objectName: "rescueVideoPreviewButton"',
-            'text: "預覽分類"',
-            'objectName: "rescueVideoDeleteButton"',
-            'text: "複製後刪除已驗證來源"',
+            'text: "檢查及預覽分類"',
+            "rescueVideoWindow.controller.checkAndPreview(",
+            'objectName: "rescueVideoCopyStartButton"',
+            'objectName: "rescueVideoCloseButton"',
+            'text: "複製啟動"',
+            "emphasizedBorder: true",
+            "readonly property bool interactionsLocked",
+            "if (rescueVideoWindow.interactionsLocked)",
+            "enabled: !rescueVideoWindow.interactionsLocked",
             'text: "分類結果"',
             'text: "來源檔案"',
-            'text: "校正後時間"',
+            'text: "矯正影片時間"',
             'text: "案件資料夾"',
+            'text: "傳輸進度"',
             'text: "狀態"',
             'text: "目的地"',
             'text: "備註"',
+            "rescueVideoWindow.controller.hasPreview",
+            "rescueVideoWindow.controller.isAwaitingConfirmation",
+            "rescueVideoWindow.controller.updateInputs(",
+            "required property int transferPercent",
+            "required property string transferText",
             "rescueVideoWindow.controller.isReady",
         ):
             self.assertIn(expected, panel)
@@ -5122,12 +5148,12 @@ class QtShellTests(unittest.TestCase):
             'text: "執行複製"',
             'text: "複製並刪除已驗證來源"',
             'text: "修正案件時間不一致"',
-            'text: "關閉"',
             '"報表："',
             '"先執行預覽',
             "ToolUsageCard {",
         ):
             self.assertNotIn(unauthorized, panel)
+        self.assertNotIn('text: "操作流程：1. 檢查  2. 預覽分類  3. 複製啟動。按檢查確認來源、工作紀錄與記憶卡中最大範例影片的長度。"', panel)
         self.assertNotIn("rescueTitleSize", source)
         self.assertNotIn("ToolUsageHistory {", panel)
         self.assertNotIn('toolId: "rescue_video"', panel)
@@ -5169,7 +5195,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("DataSectionTitle {", panel)
         self.assertNotIn("section: true", panel)
         self.assertIn('title: "選擇記憶卡 DCIM\\\\100CAREC 資料夾"', source)
-        self.assertIn('title: "確認刪除記憶卡來源"', source)
+        self.assertIn('title: "即將開始複製記憶卡至行車記錄器資料夾"', source)
 
     def test_qml_rest_time_panel_preserves_finalized_legacy_contract(self) -> None:
         source = (PACKAGE_ROOT / "qt_app" / "qml" / "Main.qml").read_text(encoding="utf-8")
@@ -7334,6 +7360,75 @@ if return_code != 0 or loaded:
 
         self.assertEqual(errors.count(), 1)
         self.assertFalse(controller._workers)
+    def test_rescue_video_result_model_tracks_each_video_transfer_progress(self) -> None:
+        from qt_app.models.rescue_video_result_model import RescueVideoResultModel
+
+        model = RescueVideoResultModel()
+        model.replace_rows(
+            (
+                {
+                    "sourcePath": "X:/DCIM/V0000001.TS",
+                    "sourceText": "V0000001.TS",
+                    "statusText": "預計複製",
+                    "transferPercent": 0,
+                    "transferText": "尚未傳輸",
+                },
+            )
+        )
+
+        model.prepare_transfer()
+        index = model.index(0, 0)
+        self.assertEqual(model.data(index, model.TransferPercentRole), 0)
+        self.assertEqual(model.data(index, model.TransferTextRole), "等待傳輸")
+
+        model.update_transfer("X:/DCIM/V0000001.TS", 48, 96, "傳輸中")
+        self.assertEqual(model.data(index, model.TransferPercentRole), 50)
+        self.assertEqual(model.data(index, model.TransferTextRole), "傳輸中")
+
+    def test_rescue_video_controller_names_the_failed_check_items(self) -> None:
+        from app_core.rescue_video_service import RescueVideoCheckCard, RescueVideoDefaults
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._check_requested = True
+        controller._defaults_loaded(
+            0,
+            RescueVideoDefaults(
+                "source",
+                "destination",
+                "2026-08-08",
+                ("92",),
+                "92",
+                check_cards=(
+                    RescueVideoCheckCard("source", "記憶卡來源", "來源不可用", "error"),
+                    RescueVideoCheckCard("vehicle_date", "車號與日期", "日期不可用", "error"),
+                ),
+                is_ready=False,
+            ),
+        )
+        self.assertEqual(controller.statusText, "檢查未通過：記憶卡來源、車號與日期")
+        self.assertEqual(
+            controller.summaryText,
+            "請先處理：記憶卡來源、車號與日期，再按「檢查及預覽分類」。",
+        )
+
+        controller._defaults_loaded(
+            0,
+            RescueVideoDefaults(
+                "source",
+                "destination",
+                "2026-08-08",
+                (),
+                "",
+                check_cards=(
+                    RescueVideoCheckCard("vehicle_date", "車號與日期", "日期不可用", "error"),
+                ),
+                is_ready=False,
+            ),
+        )
+        self.assertEqual(controller.statusText, "尚未選擇車號或日期")
+        self.assertEqual(controller.summaryText, "請先選擇日期與車號，再按「檢查及預覽分類」。")
+
 
     def test_rescue_video_controller_runs_preview_and_confirms_delete(self) -> None:
         from dataclasses import replace
@@ -7348,18 +7443,18 @@ if return_code != 0 or loaded:
         from qt_app.controllers.rescue_video_controller import RescueVideoController
 
         class FakeService:
-            def load_defaults(self):
+            def load_defaults(self, *_args, **_kwargs):
                 defaults = RescueVideoDefaults(
                     "source",
                     "destination",
                     "2026-07-29",
                     ("92", "93"),
                     "92",
-                    "6",
+                    "0",
                     False,
-                    "來源可用\n自動採用記憶卡偏移：6 分鐘",
+                    "來源可用\n影片時間會採用同張記憶卡範例影片的實際長度自動判定。",
                     True,
-                    "自動檢查通過",
+                    "檢查結果通過",
                 )
                 return replace(
                     defaults,
@@ -7385,6 +7480,7 @@ if return_code != 0 or loaded:
 
         controller = RescueVideoController(FakeService())
         success_spy = QSignalSpy(controller.runSucceeded)
+        error_spy = QSignalSpy(controller.errorOccurred)
         delete_spy = QSignalSpy(controller.deleteConfirmationRequested)
 
         controller.loadDefaults()
@@ -7393,26 +7489,36 @@ if return_code != 0 or loaded:
                 break
             QTest.qWait(50)
         self.assertEqual(controller.vehicleOptions, ["92", "93"])
-        self.assertTrue(controller.isReady)
-        self.assertIn("自動採用記憶卡偏移", controller.checkText)
+        self.assertFalse(controller.isReady)
+        self.assertFalse(controller.hasPreview)
+        self.assertIn("影片時間會採用同張記憶卡範例影片的實際長度自動判定。", controller.checkText)
         self.assertEqual(controller.checkCards[0]["key"], "source")
 
+        self.assertEqual(error_spy.count(), 1)
+        self.assertFalse(controller._workers)
+
+        controller.checkAndPreview("source", "2026-07-29", "92")
         controller.preparePreview("source", "destination", "2026-07-29", "92", "", False)
         for _ in range(20):
             if success_spy.count() and not controller._workers:
                 break
             success_spy.wait(250)
+        self.assertTrue(controller.isReady)
             QTest.qWait(10)
         self.assertEqual(success_spy.count(), 1)
         self.assertEqual(controller.resultModel.rowCount(), 1)
+        self.assertTrue(controller.hasPreview)
+        self.assertIn("複製啟動", controller.summaryText)
         self.assertEqual(controller.reportPath, "report.csv")
 
         controller.prepareDelete("source", "destination", "2026-07-29", "92", "", False)
+        self.assertTrue(controller.isAwaitingConfirmation)
         self.assertEqual(delete_spy.count(), 1)
         self.assertIn("確認刪除 92", controller.confirmationSummary)
         controller.cancelDelete()
         self.assertEqual(controller.confirmationSummary, "")
-        self.assertEqual(controller.statusText, "自動檢查通過")
+        self.assertFalse(controller.isAwaitingConfirmation)
+        self.assertEqual(controller.statusText, "已完成預覽，等待複製啟動。")
 
     def test_duty_execution_controller_runs_single_entry_lane_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -9850,6 +9956,8 @@ if return_code != 0 or loaded:
 
         class FakeRescueVideoService:
             def __init__(self):
+                self.copy_started = threading.Event()
+                self.release_copy = threading.Event()
                 self.requests = []
 
             def load_defaults(self, *_args, **_kwargs):
@@ -9859,11 +9967,11 @@ if return_code != 0 or loaded:
                     "2026-07-29",
                     ("92", "93"),
                     "92",
-                    "6",
+                    "0",
                     False,
-                    "來源可用\n案件目的地可存取\n工作／返隊紀錄可存取\n自動採用記憶卡偏移：6 分鐘",
+                    "來源可用\n案件目的地可存取\n工作／返隊紀錄可存取\n影片時間會採用同張記憶卡範例影片的實際長度自動判定。",
                     True,
-                    "自動檢查通過",
+                    "檢查結果通過",
                 )
                 return replace(
                     defaults,
@@ -9882,18 +9990,31 @@ if return_code != 0 or loaded:
 
             def confirmation_summary(self, request):
                 if request.mode == "delete":
-                    return "只有複製並完成內容驗證的 .TS 檔案會刪除。\n確定要繼續嗎？"
+                    return "複製完成後，會將確定完成內容驗證後的影片檔案刪除，確定要繼續嗎？"
                 return f"確認救護影片 {request.mode}"
 
-            def execute(self, request, *, status_callback=None):
+            def execute(
+                self,
+                request,
+                *,
+                status_callback=None,
+                stage_callback=None,
+                transfer_callback=None,
+            ):
                 self.requests.append(request)
                 if status_callback is not None:
+                if request.mode == "delete" and transfer_callback is not None:
+                    transfer_callback("X:/DCIM/clip.mp4", 50, 100, "傳輸中")
+                    self.copy_started.set()
+                    self.release_copy.wait(timeout=5)
+                    transfer_callback("X:/DCIM/clip.mp4", 100, 100, "驗證完成")
                     status_callback("救護影片測試執行中")
                 return RescueVideoRunResult(
-                    summary_text="預覽完成",
+                    summary_text="預覽完成" if request.mode == "preview" else "複製完成",
                     warning_text="",
                     report_path="report.csv",
                     rows=(
+                            "sourcePath": "X:/DCIM/clip.mp4",
                         {
                             "sourceText": "clip.mp4",
                             "timeText": "09:30",
@@ -9901,6 +10022,8 @@ if return_code != 0 or loaded:
                             "statusText": "已配對",
                             "destinationText": "case/clip.mp4",
                             "noteText": "",
+                            "transferPercent": 0 if request.mode == "preview" else 100,
+                            "transferText": "尚未傳輸" if request.mode == "preview" else "驗證完成",
                             "tone": "ok",
                         },
                     ),
@@ -10646,43 +10769,105 @@ if return_code != 0 or loaded:
                 rescue_result_title = wait_for("rescueVideoResultTitle")
                 rescue_source_card = find_rescue_visual("rescueVideoCheckCard_source")
                 rescue_videos_card = find_rescue_visual("rescueVideoCheckCard_videos")
-                rescue_preview_button = wait_for("rescueVideoPreviewButton")
-                rescue_delete_button = wait_for("rescueVideoDeleteButton")
+                rescue_check_button = wait_for("rescueVideoCheckButton")
+                rescue_summary_text = wait_for("rescueVideoSummaryText")
+                rescue_copy_button = wait_for("rescueVideoCopyStartButton")
+                rescue_minimize_button = wait_for("rescueVideoTitleMinimizeButton")
+                rescue_maximize_button = wait_for("rescueVideoTitleMaximizeButton")
+                rescue_title_close_button = wait_for("rescueVideoTitleCloseButton")
+                rescue_bottom_close_button = wait_for("rescueVideoCloseButton")
                 self.assertIsNotNone(rescue_source_card)
                 self.assertIsNotNone(rescue_videos_card)
-                self.assertEqual((rescue_window.width(), rescue_window.height()), (1100, 752))
-                self.assertEqual(rescue_vehicle_combo.width(), 140)
-                self.assertEqual(rescue_date_field.width(), 150)
+                self.assertGreater(rescue_window.width(), 0)
+                self.assertLessEqual(rescue_window.width(), 1320)
+                self.assertEqual(rescue_window.height(), 752)
+                self.assertEqual(rescue_vehicle_combo.width(), 112)
+                self.assertEqual(rescue_date_field.width(), 140)
                 self.assertEqual(rescue_title_label.property("font").pixelSize(), 24)
                 self.assertEqual(rescue_window_title.property("text"), "SinpoSmart - 行車紀錄器")
                 self.assertEqual(rescue_result_title.property("font").pixelSize(), 16)
                 self.assertGreater(rescue_source_card.width(), 0)
                 self.assertGreater(rescue_videos_card.width(), 0)
                 self.assertTrue(rescue_date_field.property("enabled"))
-                self.assertEqual(rescue_preview_button.property("text"), "預覽分類")
-                self.assertEqual(rescue_delete_button.property("text"), "複製後刪除已驗證來源")
-                self.assertGreater(rescue_preview_button.property("contentItem").width(), 0)
-                self.assertGreater(rescue_delete_button.property("contentItem").width(), 0)
-                self.assertLess(rescue_preview_button.x(), rescue_delete_button.x())
-                self.assertTrue(rescue_preview_button.property("enabled"))
-                self.assertIn("自動檢查通過", wait_for("rescueVideoStatusBadge").property("text"))
-                click(rescue_preview_button, rescue_window)
+                self.assertEqual(rescue_check_button.property("text"), "檢查及預覽分類")
+                self.assertEqual(rescue_bottom_close_button.property("text"), "關閉")
+                self.assertEqual(rescue_copy_button.property("text"), "複製啟動")
+                self.assertTrue(rescue_copy_button.property("emphasizedBorder"))
+                self.assertGreater(rescue_copy_button.property("contentItem").width(), 0)
+                self.assertGreater(
+                    rescue_copy_button.mapToScene(QPointF(0, 0)).y(),
+                    rescue_check_button.mapToScene(QPointF(0, 0)).y(),
+                )
+                self.assertLess(
+                    rescue_summary_text.mapToScene(QPointF(0, 0)).y(),
+                    rescue_copy_button.mapToScene(QPointF(0, 0)).y(),
+                )
+                self.assertFalse(rescue_copy_button.property("enabled"))
+                self.assertIn("尚未檢查", wait_for("rescueVideoStatusBadge").property("text"))
+                click(rescue_check_button, rescue_window)
                 wait_until(
                     lambda: len(rescue_video_service.requests) == 1
                     and not controller.rescueVideoController._workers,
-                    "救護影片 QML 預覽鍵未完成 worker 呼叫",
+                    "救護影片檢查及預覽鍵未完成 worker 呼叫",
                 )
                 self.assertEqual(controller.rescueVideoController.resultModel.rowCount(), 1)
-                click(wait_for("rescueVideoDeleteButton"), rescue_window)
+                rescue_result_model = controller.rescueVideoController.resultModel
+                rescue_result_index = rescue_result_model.index(0, 0)
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_index,
+                        rescue_result_model.TransferPercentRole,
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_index,
+                        rescue_result_model.TransferTextRole,
+                    ),
+                    "尚未傳輸",
+                )
+                self.assertTrue(rescue_copy_button.property("enabled"))
+                click(wait_for("rescueVideoCopyStartButton"), rescue_window)
                 rescue_delete_confirmation = root.findChild(QObject, "rescueVideoDeleteConfirmation")
                 self.assertIsNotNone(rescue_delete_confirmation)
+                for control in (
+                    rescue_vehicle_combo,
+                    rescue_date_field,
+                    rescue_check_button,
+                    rescue_copy_button,
+                    rescue_minimize_button,
+                    rescue_maximize_button,
+                    rescue_title_close_button,
+                    rescue_bottom_close_button,
+                ):
+                    self.assertFalse(control.property("enabled"))
+                self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
+                self.assertTrue(rescue_window.property("visible"))
                 self.assertTrue(rescue_delete_confirmation.property("visible"))
                 self.assertEqual(
                     controller.rescueVideoController.confirmationSummary,
-                    "只有複製並完成內容驗證的 .TS 檔案會刪除。\n確定要繼續嗎？",
+                    "複製完成後，會將確定完成內容驗證後的影片檔案刪除，確定要繼續嗎？",
                 )
                 self.assertTrue(
                     QMetaObject.invokeMethod(rescue_delete_confirmation, "accept", Qt.DirectConnection)
+                self.assertTrue(rescue_video_service.copy_started.wait(timeout=2))
+                QTest.qWait(50)
+                self.assertTrue(controller.rescueVideoController.isRunning)
+                for control in (
+                    rescue_vehicle_combo,
+                    rescue_date_field,
+                    rescue_check_button,
+                    rescue_copy_button,
+                    rescue_minimize_button,
+                    rescue_maximize_button,
+                    rescue_title_close_button,
+                    rescue_bottom_close_button,
+                ):
+                    self.assertFalse(control.property("enabled"))
+                self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
+                self.assertTrue(rescue_window.property("visible"))
+                rescue_video_service.release_copy.set()
                 )
                 wait_until(
                     lambda: len(rescue_video_service.requests) == 2
@@ -10692,6 +10877,20 @@ if return_code != 0 or loaded:
                 self.assertEqual(
                     [request.mode for request in rescue_video_service.requests],
                     ["preview", "delete"],
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_model.index(0, 0),
+                        rescue_result_model.TransferPercentRole,
+                    ),
+                    100,
+                )
+                self.assertEqual(
+                    rescue_result_model.data(
+                        rescue_result_model.index(0, 0),
+                        rescue_result_model.TransferTextRole,
+                    ),
+                    "驗證完成",
+                )
                 )
                 rescue_dialog = root.findChild(QObject, "rescueVideoDialog")
                 self.assertTrue(QMetaObject.invokeMethod(rescue_dialog, "close", Qt.DirectConnection))

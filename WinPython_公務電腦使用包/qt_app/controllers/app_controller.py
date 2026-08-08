@@ -229,7 +229,12 @@ class AppController(QObject):
             lambda mode: self._tool_run_started("rescue_video", "行車紀錄器（BETA）", mode=mode)
         )
         self._rescue_video_controller.runSucceeded.connect(
-            lambda message: self._tool_run_finished("rescue_video", "行車紀錄器（BETA）", message)
+            lambda message: self._tool_run_finished(
+                "rescue_video",
+                "行車紀錄器（BETA）",
+                message,
+                notify=self._rescue_video_controller.lastCompletedMode in {"copy", "delete"},
+            )
         )
         self._rescue_video_controller.runFailed.connect(
             lambda mode, message: self._tool_run_failed(
@@ -237,6 +242,7 @@ class AppController(QObject):
                 "行車紀錄器（BETA）",
                 message,
                 mode=mode,
+                notify=False,
             )
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
@@ -1068,7 +1074,14 @@ class AppController(QObject):
             snapshot=snapshot,
         )
 
-    def _tool_run_finished(self, tool_name: str, tool_label: str, message: str) -> None:
+    def _tool_run_finished(
+        self,
+        tool_name: str,
+        tool_label: str,
+        message: str,
+        *,
+        notify: bool = True,
+    ) -> None:
         self._tool_controller.record_finished(tool_name, "completed", message)
         self._send_operational_event(
             "tool_action_finished",
@@ -1077,7 +1090,8 @@ class AppController(QObject):
             content=message,
             snapshot={"tool_name": tool_name, "tool_label": tool_label},
         )
-        self._tray_controller.notify("SinpoSmart", message)
+        if notify:
+            self._tray_controller.notify("SinpoSmart", message)
 
     def _tool_run_failed(
         self,
@@ -1086,6 +1100,7 @@ class AppController(QObject):
         message: str,
         *,
         mode: str = "",
+        notify: bool = True,
     ) -> None:
         self._tool_controller.record_finished(tool_name, "failed", message)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
@@ -1104,7 +1119,8 @@ class AppController(QObject):
             error=message,
             snapshot=snapshot,
         )
-        self._tray_controller.notify("SinpoSmart", message)
+        if notify:
+            self._tray_controller.notify("SinpoSmart", message)
 
     def _failure_stage_for_tool(self, tool_name: str) -> str:
         controllers = {

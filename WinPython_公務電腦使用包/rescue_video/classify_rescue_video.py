@@ -216,20 +216,35 @@ def discover_vehicles(destination: Path, selected_date: date) -> list[str]:
         return []
 
     vehicles: set[str] = set()
-    date_prefix = selected_date.strftime("%m%d")
+    case_dates = {
+        (str(candidate.year), candidate.month, candidate.strftime("%m%d"))
+        for candidate in (selected_date, selected_date - timedelta(days=1))
+    }
     for year_dir in destination.iterdir():
-        if not year_dir.is_dir() or year_dir.name != str(selected_date.year):
+        if not year_dir.is_dir() or not YEAR_RE.match(year_dir.name):
             continue
         for month_dir in year_dir.iterdir():
-            if not month_dir.is_dir() or month_from_name(month_dir.name) != selected_date.month:
+            folder_month = month_from_name(month_dir.name)
+            if not month_dir.is_dir() or folder_month is None:
                 continue
             for case_dir in month_dir.iterdir():
                 if not case_dir.is_dir():
                     continue
                 match = CASE_RE.match(case_dir.name)
-                if match and match.group("md") == date_prefix:
+                if match and (year_dir.name, folder_month, match.group("md")) in case_dates:
                     vehicles.add(match.group("vehicle"))
     return sorted(vehicles, key=lambda vehicle: (int(vehicle), vehicle))
+
+
+def video_overlaps_selected_date(
+    video_start: datetime,
+    video_end: datetime,
+    selected_date: date,
+) -> bool:
+    """Keep recordings that overlap the selected day, including midnight spans."""
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    return video_end >= day_start and video_start < day_end
 
 
 def choose_offset_minutes(_scores: Mapping[int, int]) -> int:
@@ -605,7 +620,7 @@ def classify(
             continue
         video_end = source_time
         video_start = video_end - video_duration
-        if selected_date and video_end.date() != selected_date:
+        if selected_date and not video_overlaps_selected_date(video_start, video_end, selected_date):
             continue
         case = choose_case(
             video_start,
@@ -765,7 +780,7 @@ def classify_with_work_logs(
 
         video_end = source_time
         video_start = video_end - video_duration
-        if selected_date and video_end.date() != selected_date:
+        if selected_date and not video_overlaps_selected_date(video_start, video_end, selected_date):
             continue
 
         case = choose_case(video_start, video_end, cases, before, after, work_before, return_grace)
