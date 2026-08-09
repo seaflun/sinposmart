@@ -12,7 +12,11 @@ from time import sleep
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
-from app_core.duty_task_projection import action_target_roc_date, build_schedule_comparisons
+from app_core.duty_task_projection import (
+    action_target_roc_date,
+    build_schedule_comparisons,
+    compare_submission_action,
+)
 from app_core.schedule_repository import business_roc_date
 from compare_rehearsal_records import flatten_rows, has_open_external_assignment
 
@@ -204,6 +208,13 @@ class DutySubmissionService:
                 action_date,
                 before,
             )
+            submission_comparison = self._submission_comparison_for_action(
+                comparison_source,
+                actions,
+                request.action_index,
+                action_date,
+                before,
+            )
             group = str(comparison.get("group", "") or "")
             allows_manual_submission = request.trigger_type == "manual" and (
                 group in ("manual", "adjust")
@@ -212,14 +223,14 @@ class DutySubmissionService:
                     and str(action.get("source", "") or "").startswith("外勤")
                 )
             )
-            if group == "done":
+            if submission_comparison.get("group") == "done":
                 return self._finish(
                     request,
                     action,
                     result_path,
                     "skipped_duplicate",
                     "已存在相同紀錄，已略過重複登打。",
-                    comparison,
+                    submission_comparison,
                 )
             if group in ("near", "adjust", "review", "manual") and not allows_manual_submission:
                 return self._finish(
@@ -277,7 +288,7 @@ class DutySubmissionService:
             verified = {"group": "todo", "matched": []}
             for attempt in range(3):
                 after = self._query_comparison(automation, driver, action, action_date)
-                verified = self._comparison_for_action(
+                verified = self._submission_comparison_for_action(
                     comparison_source,
                     actions,
                     request.action_index,
@@ -546,6 +557,21 @@ class DutySubmissionService:
     ) -> Mapping[str, Any]:
         comparisons = self.comparison_builder(data, actions, {action_date: comparison_data})
         return comparisons.get(index, {"compare": "未找到", "group": "todo", "matched": []})
+
+    def _submission_comparison_for_action(
+        self,
+        data: Mapping[str, Any],
+        actions: list[Mapping[str, Any]],
+        index: int,
+        action_date: str,
+        comparison_data: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not 0 <= index < len(actions):
+            return {"compare": "未找到", "group": "todo", "matched": []}
+        action = actions[index]
+        if action.get("kind") in ("entry_log", "work_log"):
+            return compare_submission_action(data, action, action_date, comparison_data)
+        return self._comparison_for_action(data, actions, index, action_date, comparison_data)
 
     @staticmethod
     def _staff(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

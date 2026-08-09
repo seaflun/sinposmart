@@ -567,6 +567,7 @@ class DutyController(QObject):
         requests: list[DutySubmissionRequest] = []
         handled_group_ids: set[str] = set()
         current = datetime.now()
+        handoff_priority_times = self._due_handoff_priority_times(indices, current)
         for index in indices:
             if index not in self._due_task_indices or not 0 <= index < len(self._actions):
                 continue
@@ -574,6 +575,12 @@ class DutyController(QObject):
                 continue
             group_indices = self._handoff_group_indices(index)
             if not group_indices:
+                if self._is_handoff_priority_checkout(
+                    self._actions[index],
+                    current,
+                    handoff_priority_times,
+                ):
+                    continue
                 requests.append(
                     DutySubmissionRequest(user_id, password, index, self._schedule_data, trigger_type="due")
                 )
@@ -602,6 +609,81 @@ class DutyController(QObject):
     @staticmethod
     def is_handoff_preflight_request(request: DutySubmissionRequest) -> bool:
         return bool(request.schedule_data.get("_handoff_preflight_group_id"))
+
+    def _due_handoff_priority_times(
+        self,
+        indices: list[int],
+        current: datetime,
+    ) -> set[datetime]:
+        times: set[datetime] = set()
+        for state in self._handoff_preflight_groups.values():
+            if state.get("paused"):
+                continue
+            for action in state.get("actions", []):
+                if not isinstance(action, Mapping):
+                    continue
+                action_at = action_datetime(
+                    action,
+                    self._target_date_text,
+                    fallback_date=current.date(),
+                )
+                if action_at <= current:
+                    times.add(action_at.replace(second=0, microsecond=0))
+                    break
+        for index in indices:
+            if index not in self._due_task_indices or not 0 <= index < len(self._actions):
+                continue
+            group_indices = self._handoff_group_indices(index)
+            if not group_indices:
+                continue
+            group_id = self._handoff_group_id(group_indices)
+            state = self._handoff_preflight_groups.get(group_id)
+            if state is not None and state.get("paused"):
+                continue
+            action_at = action_datetime(
+                self._actions[index],
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if action_at <= current:
+                times.add(action_at.replace(second=0, microsecond=0))
+        return times
+
+    def _is_handoff_priority_checkout(
+        self,
+        action: Mapping[str, Any],
+        current: datetime,
+        handoff_priority_times: set[datetime],
+    ) -> bool:
+        if not handoff_priority_times or action.get("kind") != "entry_log":
+            return False
+        fields = action.get("fields", {})
+        if not isinstance(fields, Mapping) or fields.get("領用事由及地點", "") != "退勤":
+            return False
+        start_minutes = self._clock_minutes(fields.get("登打時間") or action.get("time", ""))
+        write_minutes = self._clock_minutes(fields.get("系統寫入時間"))
+        if (
+            start_minutes is None
+            or write_minutes is None
+            or not start_minutes < write_minutes <= start_minutes + 5
+        ):
+            return False
+        action_at = action_datetime(
+            action,
+            self._target_date_text,
+            fallback_date=current.date(),
+        ).replace(second=0, microsecond=0)
+        return action_at in handoff_priority_times
+
+    @staticmethod
+    def _clock_minutes(value: Any) -> int | None:
+        try:
+            hour, minute = [int(part) for part in str(value or "").split(":", 1)]
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= hour < 24 or not 0 <= minute < 60:
+            return None
+        return hour * 60 + minute
 
     def _handoff_group_indices(self, action_index: int) -> tuple[int, ...]:
         if not 0 <= action_index < len(self._actions):
@@ -1365,7 +1447,8 @@ class DutyController(QObject):
 
     def finish_handoff_preflight_group(self, request: DutySubmissionRequest) -> None:
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
-        self._handoff_preflight_groups.pop(group_id, None)
+        if self._handoff_preflight_groups.pop(group_id, None) is not None:
+            self._refresh_due_tasks(force_emit=True)
 
     def handle_handoff_preflight_paused(self, request: DutySubmissionRequest) -> None:
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
@@ -1398,6 +1481,7 @@ class DutyController(QObject):
             self._schedule_auto_logout_for_handoff_indices(set(state.get("indices", ())))
         self._refresh_queue_action_indices()
         self._refresh_projection()
+        self._refresh_due_tasks(force_emit=True)
 
     def handle_handoff_preflight_failure(
         self,
@@ -1418,6 +1502,7 @@ class DutyController(QObject):
             self._retry_after[index] = datetime.now() + timedelta(minutes=1)
         self._schedule_status = message
         self._refresh_projection()
+        self._refresh_due_tasks(force_emit=True)
         if error_code == "login_failed":
             self.errorOccurred.emit(message)
             self.reloginRequired.emit(message)

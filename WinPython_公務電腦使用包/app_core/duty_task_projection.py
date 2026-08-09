@@ -616,6 +616,7 @@ def _rest_entry_matches(
     action: Mapping[str, Any],
     *,
     allow_near: bool,
+    near_minutes: int = 120,
     staff: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
     fields = action.get("fields", {})
@@ -638,7 +639,7 @@ def _rest_entry_matches(
         if (not target_name or target_name in row)
         and (not direction or direction in row)
         and (not reason or any(value in row for value in acceptable_reasons))
-        and row_has_time(row, action_date, system_time, allow_near=allow_near, near_minutes=120)
+        and row_has_time(row, action_date, system_time, allow_near=allow_near, near_minutes=near_minutes)
     ]
 
 
@@ -684,6 +685,67 @@ def _compare_rest_entry(
         return {"compare": "已存在", "group": "done", "matched": exact[:1]}
     if near:
         return {"compare": "時間近似", "group": "near", "matched": near[:1]}
+    return {"compare": "未找到", "group": "todo", "matched": []}
+
+
+def compare_submission_action(
+    data: Mapping[str, Any],
+    action: Mapping[str, Any],
+    action_date: str,
+    comparison_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Match only the action being submitted, with a short write-time tolerance."""
+
+    today = data.get("today", {})
+    yesterday = data.get("yesterday", {})
+    today_staff = today.get("staff", {}) if isinstance(today, Mapping) else {}
+    yesterday_staff = yesterday.get("staff", {}) if isinstance(yesterday, Mapping) else {}
+    staff = {**yesterday_staff, **today_staff}
+    current_action = dict(action)
+
+    if current_action.get("kind") == "entry_log":
+        entry_source = comparison_data.get("visible_entry_rows", [])
+        entry_rows = flatten_rows(entry_source or [], action_date)
+        fields = current_action.get("fields", {})
+        reason = fields.get("領用事由及地點", "") if isinstance(fields, Mapping) else ""
+        if reason in ("休息", "休息返隊"):
+            matches = _rest_entry_matches(
+                entry_rows,
+                action_date,
+                current_action,
+                allow_near=True,
+                near_minutes=2,
+                staff=staff,
+            )
+        else:
+            matches = find_entry_matches(
+                entry_rows,
+                action_date,
+                staff,
+                current_action,
+                allow_near=True,
+                near_minutes=2,
+            )
+    elif current_action.get("kind") == "work_log":
+        work_source = comparison_data.get("visible_work_rows", [])
+        work_rows = flatten_rows(work_source or [], action_date)
+        matches = (
+            find_case_work_matches(work_rows, action_date, current_action, near_minutes=2)
+            if current_action.get("source") == "案件工作審核"
+            else find_work_matches(
+                work_rows,
+                action_date,
+                staff,
+                current_action,
+                allow_near=True,
+                near_minutes=2,
+            )
+        )
+    else:
+        matches = []
+
+    if matches:
+        return {"compare": "已存在", "group": "done", "matched": matches[:1]}
     return {"compare": "未找到", "group": "todo", "matched": []}
 
 

@@ -206,6 +206,7 @@ def find_entry_matches(
     staff: dict[str, dict[str, str]],
     action: dict[str, Any],
     allow_near: bool = False,
+    near_minutes: int = 120,
 ) -> list[str]:
     fields = action["fields"]
     target_number = str(action["target"])
@@ -216,7 +217,6 @@ def find_entry_matches(
     strict_time = outin in ("值班", "值退")
     external_entry = str(action.get("source", "")).startswith("外勤")
     rest_entry = reason in ("休息", "休息返隊", "休息後退勤") or "休息" in str(action.get("source", ""))
-    near_minutes = 120
     matches = []
     for row in rows:
         if target_name:
@@ -232,7 +232,7 @@ def find_entry_matches(
             if not row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
                 continue
         if external_entry:
-            if row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=120):
+            if row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
                 matches.append(row)
             continue
         if not row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
@@ -274,6 +274,8 @@ def find_work_matches(
     target_date: str,
     staff: dict[str, dict[str, str]],
     action: dict[str, Any],
+    allow_near: bool = False,
+    near_minutes: int = 2,
 ) -> list[str]:
     fields = action["fields"]
     time_value = fields.get("工作時間", action["time"])
@@ -283,7 +285,13 @@ def find_work_matches(
     matches = []
     for row in rows:
         c = clean(row)
-        if not row_has_time(row, target_date, time_value):
+        if not row_has_time(
+            row,
+            target_date,
+            time_value,
+            allow_near=allow_near,
+            near_minutes=near_minutes,
+        ):
             continue
         if item and item not in row:
             continue
@@ -345,7 +353,12 @@ def case_keywords(category: str) -> list[str]:
     return ordered
 
 
-def find_case_work_matches(rows: list[str], target_date: str, action: dict[str, Any]) -> list[str]:
+def find_case_work_matches(
+    rows: list[str],
+    target_date: str,
+    action: dict[str, Any],
+    near_minutes: int = 180,
+) -> list[str]:
     fields = action.get("fields", {})
     report_time = fields.get("工作時間", action.get("time", ""))
     report_minute = action_minutes(action)
@@ -355,11 +368,11 @@ def find_case_work_matches(rows: list[str], target_date: str, action: dict[str, 
     matches = []
     for row in rows:
         row_minute = row_minutes(row, target_date)
-        if row_minute is None or abs(row_minute - report_minute) > 180:
+        if row_minute is None or abs(row_minute - report_minute) > near_minutes:
             continue
         if any(routine in row for routine in ("值班(宿)", "在隊訓練", "無線電試話", "環境整理")):
             continue
-        if not row_has_time(row, target_date, report_time, allow_near=True, near_minutes=180):
+        if not row_has_time(row, target_date, report_time, allow_near=True, near_minutes=near_minutes):
             continue
         if keywords and not any(keyword in row for keyword in keywords):
             continue

@@ -96,6 +96,8 @@ class AppController(QObject):
         self._operational_sync_workers: dict[int, tuple[QThread, OperationalSyncWorker]] = {}
         self._operational_sync_queue: deque[tuple[int, str, str, dict, dict]] = deque()
         self._operational_sync_shutting_down = False
+        self._active_tool_runs: dict[str, tuple[str, str]] = {}
+        self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
             self,
@@ -870,7 +872,10 @@ class AppController(QObject):
             status=str(event.get("status") or "pending"),
             trigger_type=str(event.get("trigger_type") or "recovery"),
             action=dict(action),
-            target=target_short_label(action, staff or self._operational_staff),
+            target=operational_person_label(
+                str(action.get("target") or ""),
+                staff or self._operational_staff,
+            ),
             snapshot=snapshot,
         )
 
@@ -975,7 +980,12 @@ class AppController(QObject):
             },
         )
         if not is_handoff_preflight:
-            outcome = "登打完成" if result.status == "submitted" else "已有資料，略過"
+            if result.status == "submitted":
+                outcome = "登打完成"
+            elif result.status == "skipped_duplicate":
+                outcome = "已有資料，略過"
+            else:
+                outcome = str(result.message or "登打未完成").strip()
             self._tray_controller.notify(
                 "SinpoSmart",
                 self._format_duty_notification(action, self._operational_staff, outcome),
@@ -1055,6 +1065,8 @@ class AppController(QObject):
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
+        self._active_tool_runs[tool_name] = (tool_label, mode)
+        self._shutdown_terminal_tool_runs.discard(tool_name)
         session = self._session_state.session
         actor_no = self._session_controller.actorNo
         actor_name = str(session.actor_name or "").strip() if session is not None else ""
@@ -1091,7 +1103,13 @@ class AppController(QObject):
         message: str,
         *,
         notify: bool = True,
+        allow_during_shutdown: bool = False,
     ) -> None:
+        if self._operational_sync_shutting_down and not allow_during_shutdown:
+            return
+        if tool_name in self._shutdown_terminal_tool_runs:
+            return
+        self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "completed", message)
         self._send_operational_event(
             "tool_action_finished",
@@ -1111,7 +1129,14 @@ class AppController(QObject):
         *,
         mode: str = "",
         notify: bool = True,
+        force: bool = False,
+        allow_during_shutdown: bool = False,
     ) -> None:
+        if self._operational_sync_shutting_down and not allow_during_shutdown:
+            return
+        if tool_name in self._shutdown_terminal_tool_runs and not force:
+            return
+        self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "failed", message)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         failure_stage = self._failure_stage_for_tool(tool_name)
@@ -1131,6 +1156,19 @@ class AppController(QObject):
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
+
+    def _finalize_active_tool_runs_for_shutdown(self) -> None:
+        for tool_name, (tool_label, mode) in tuple(self._active_tool_runs.items()):
+            self._shutdown_terminal_tool_runs.add(tool_name)
+            self._tool_run_failed(
+                tool_name,
+                tool_label,
+                "主程式關閉，未取得工具完成結果。",
+                mode=mode,
+                notify=False,
+                force=True,
+                allow_during_shutdown=True,
+            )
 
     def _failure_stage_for_tool(self, tool_name: str) -> str:
         controllers = {
@@ -1488,6 +1526,7 @@ class AppController(QObject):
             if thread.wait(60_000):
                 self._operational_sync_workers.pop(request_id, None)
                 thread.deleteLater()
+        self._finalize_active_tool_runs_for_shutdown()
         self._drain_queued_operational_sync()
         self._tray_controller.shutdown()
         self._update_controller.shutdown()
@@ -1603,15 +1642,15 @@ def operational_staff_from_schedule(schedule_data: Mapping) -> dict[str, dict]:
 
 
 def operational_person_label(number: str, staff: Mapping[str, Mapping]) -> str:
-    """Match the legacy backend event target label without exposing UI widgets."""
-    number = str(number or "").strip()
-    if not number:
-        return ""
-    info = staff.get(number, {}) if isinstance(staff, Mapping) else {}
-    name = str(info.get("name", "") or "").strip() if isinstance(info, Mapping) else ""
-    role = str(info.get("role", "") or "").strip() if isinstance(info, Mapping) else ""
-    if name and role:
-        return f"{number}番 {name}（{role}）"
-    if name:
-        return f"{number}番 {name}"
-    return f"{number}番"
+    """Build NAS target labels as number-plus-name without role titles."""
+    targets = [
+        target.strip()
+        for target in str(number or "").replace("，", ",").split(",")
+        if target.strip()
+    ]
+    labels = []
+    for target in targets:
+        info = staff.get(target, {}) if isinstance(staff, Mapping) else {}
+        name = str(info.get("name", "") or "").strip() if isinstance(info, Mapping) else ""
+        labels.append(f"{target}番 {name}" if name else f"{target}番")
+    return "、".join(labels)

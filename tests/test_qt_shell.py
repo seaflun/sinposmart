@@ -1202,7 +1202,7 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 nonlocal query_count
                 query_count += 1
                 events.append(f"query:{ap_name}")
-                return [["submitted"]] if query_count > 1 else []
+                return [["115/07/29", "08:01", "巡邏"]] if query_count > 1 else []
 
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
@@ -1214,22 +1214,26 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
                 quit_driver=lambda _driver: events.append("quit"),
             )
-            comparisons = iter(
-                [
-                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["submitted"]}},
-                ]
-            )
             service = DutySubmissionService(
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 9, 0),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150729",
                 "today": {"staff": {"10": {"name": "測試員"}}},
-                "actions": [{"kind": "work_log", "time": "08:00", "actor": "10"}],
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+                    }
+                ],
             }
             request = DutySubmissionRequest("user10", "session-secret", 0, data)
             progress: list[str] = []
@@ -1250,20 +1254,19 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             waits: list[float] = []
-            comparisons = iter(
-                [
-                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
-                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
-                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["saved"]}},
-                ]
-            )
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/08/07", "08:00", "巡邏"]] if query_count >= 4 else []
+
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda *_args, **_kwargs: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [],
+                query_visible_table=query_visible_table,
                 fill_work_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
                 fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
                 quit_driver=lambda *_args: None,
@@ -1272,7 +1275,9 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 8, 7, 8, 0),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
                 sleeper=waits.append,
             )
             data = {
@@ -1293,6 +1298,7 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "submitted")
         self.assertEqual(waits, [1.0, 1.0])
+        self.assertEqual(query_count, 4)
 
     def test_duplicate_result_skips_form_submission(self) -> None:
         from datetime import datetime
@@ -1306,7 +1312,9 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda headless: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [["existing"]],
+                query_visible_table=lambda *_args: [
+                    ["115/07/29", "08:00", "-", "測試員", "入", "到勤"]
+                ],
                 fill_work_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
                 fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
                 quit_driver=lambda _driver: None,
@@ -1316,18 +1324,235 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 8, 1),
                 comparison_builder=lambda *_args, **_kwargs: {
-                    0: {"compare": "已存在", "group": "done", "matched": ["existing"]}
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
                 },
             )
             data = {
                 "target_date": "1150729",
-                "actions": [{"kind": "entry_log", "time": "08:00", "actor": "10"}],
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {
+                            "系統寫入時間": "08:00",
+                            "出或入": "入",
+                            "領用事由及地點": "到勤",
+                        },
+                    }
+                ],
             }
 
             result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
 
             self.assertEqual(result.status, "skipped_duplicate")
             self.assertEqual(fills, [])
+
+    def test_submit_verifies_rest_return_without_checkout_within_two_minutes(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for submitted_time in ("17:58", "18:02"):
+            with self.subTest(submitted_time=submitted_time), tempfile.TemporaryDirectory() as temp_dir:
+                fills: list[bool] = []
+                query_count = 0
+
+                def query_visible_table(_driver, _ap_name, _target_date):
+                    nonlocal query_count
+                    query_count += 1
+                    return (
+                        [["115/08/07", submitted_time, "王小明", "入", "返隊"]]
+                        if query_count > 1
+                        else []
+                    )
+
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work",
+                    ENTRY_LOG_AP="entry",
+                    build_driver=lambda *_args, **_kwargs: object(),
+                    login=lambda *_args: None,
+                    query_visible_table=query_visible_table,
+                    fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
+                    fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True) or {},
+                    quit_driver=lambda *_args: None,
+                )
+                service = DutySubmissionService(
+                    Path(temp_dir),
+                    module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 8, 7, 18, 0),
+                    comparison_builder=lambda *_args, **_kwargs: {
+                        0: {"compare": "未找到", "group": "todo", "matched": []}
+                    },
+                )
+                data = {
+                    "target_date": "1150807",
+                    "today": {"staff": {"10": {"name": "王小明"}}},
+                    "actions": [
+                        {
+                            "kind": "entry_log",
+                            "time": "18:00",
+                            "actor": "10",
+                            "target": "10",
+                            "source": "休息結束",
+                            "fields": {
+                                "登打時間": "18:00",
+                                "系統寫入時間": "18:00",
+                                "出或入": "入",
+                                "領用事由及地點": "休息返隊",
+                            },
+                        }
+                    ],
+                }
+
+                result = service.execute(
+                    DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
+                )
+
+                self.assertEqual(result.status, "submitted")
+                self.assertEqual(fills, [True])
+                self.assertIn(submitted_time, result.comparison["matched"][0])
+
+    def test_submit_rejects_post_submit_rows_outside_two_minutes_or_for_other_person(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError,
+            DutySubmissionRequest,
+            DutySubmissionService,
+        )
+
+        cases = {
+            "three_minutes_late": ["115/08/07", "18:03", "王小明", "入", "返隊"],
+            "other_person": ["115/08/07", "18:01", "王小華", "入", "返隊"],
+        }
+        for name, row in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                fills: list[bool] = []
+                waits: list[float] = []
+                query_count = 0
+
+                def query_visible_table(_driver, _ap_name, _target_date):
+                    nonlocal query_count
+                    query_count += 1
+                    return [row] if query_count > 1 else []
+
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work",
+                    ENTRY_LOG_AP="entry",
+                    build_driver=lambda *_args, **_kwargs: object(),
+                    login=lambda *_args: None,
+                    query_visible_table=query_visible_table,
+                    fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
+                    fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True) or {},
+                    quit_driver=lambda *_args: None,
+                )
+                service = DutySubmissionService(
+                    Path(temp_dir),
+                    module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 8, 7, 18, 0),
+                    comparison_builder=lambda *_args, **_kwargs: {
+                        0: {"compare": "未找到", "group": "todo", "matched": []}
+                    },
+                    sleeper=waits.append,
+                )
+                data = {
+                    "target_date": "1150807",
+                    "today": {"staff": {"10": {"name": "王小明"}}},
+                    "actions": [
+                        {
+                            "kind": "entry_log",
+                            "time": "18:00",
+                            "actor": "10",
+                            "target": "10",
+                            "source": "休息結束",
+                            "fields": {
+                                "系統寫入時間": "18:00",
+                                "出或入": "入",
+                                "領用事由及地點": "休息返隊",
+                            },
+                        }
+                    ],
+                }
+
+                with self.assertRaisesRegex(DutySubmissionExecutionError, "未在勤務系統查到已送出資料"):
+                    service.execute(
+                        DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
+                    )
+
+                self.assertEqual(fills, [True])
+                self.assertEqual(waits, [1.0, 1.0])
+
+    def test_submit_verifies_current_work_log_within_two_minutes(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[str] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return (
+                    [
+                        ["115/08/07", "08:02", "巡邏"],
+                        ["115/08/07", "08:02", "車輛清點"],
+                    ]
+                    if query_count > 1
+                    else []
+                )
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda _driver, action, *_args, **_kwargs: fills.append(
+                    action["fields"]["勤務項目"]
+                )
+                or {},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {},
+                quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"10": {"name": "王小明"}}},
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "車輛清點"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+                    },
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(fills, ["車輛清點"])
+        self.assertIn("車輛清點", result.comparison["matched"][0])
 
     def test_handoff_action_is_refreshed_before_form_fill(self) -> None:
         from datetime import date, datetime
@@ -1336,12 +1561,19 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             filled_descriptions: list[str] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:00", "完成"]] if query_count > 1 else []
+
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda headless: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [],
+                query_visible_table=query_visible_table,
                 fill_work_log_form_for_test=lambda _driver, action, _staff, _date, save: filled_descriptions.append(action["fields"]["工作概述"]) or {},
                 fill_entry_log_form_for_test=lambda *_args, **_kwargs: {},
                 quit_driver=lambda _driver: None,
@@ -1360,17 +1592,13 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     }
                 ],
             )
-            comparisons = iter(
-                [
-                    {0: {"compare": "未找到", "group": "todo", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["saved"]}},
-                ]
-            )
             service = DutySubmissionService(
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 8, 1),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150729",
@@ -1454,7 +1682,11 @@ class DutySubmissionServiceTests(unittest.TestCase):
             def query_visible_table(_driver, _ap_name, _action_date):
                 nonlocal query_count
                 query_count += 1
-                return [] if query_count % 2 else [{"verified": True}]
+                post_submit_rows = {
+                    2: [["115/08/07", "08:00", "-", "測試員", "出", "勤務"]],
+                    4: [["115/08/07", "08:05", "-", "測試員", "出", "勤務"]],
+                }
+                return post_submit_rows.get(query_count, [])
 
             def comparison_builder(_data, actions, comparison_by_date):
                 comparison = next(iter(comparison_by_date.values()))
@@ -1483,9 +1715,24 @@ class DutySubmissionServiceTests(unittest.TestCase):
             )
             data = {
                 "target_date": "1150807",
+                "today": {"staff": {"10": {"name": "測試員"}}},
                 "actions": [
-                    {"kind": "entry_log", "index": 0, "time": "08:00", "actor": "10", "fields": {}},
-                    {"kind": "entry_log", "index": 1, "time": "08:05", "actor": "10", "fields": {}},
+                    {
+                        "kind": "entry_log",
+                        "index": 0,
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"出或入": "出", "領用事由及地點": "勤務"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "index": 1,
+                        "time": "08:05",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"出或入": "出", "領用事由及地點": "勤務"},
+                    },
                 ],
             }
             first_request = DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
@@ -1603,6 +1850,60 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(checked_actions[0]["target"], "11")
             self.assertEqual(fills, [])
 
+    def test_handoff_preflight_ready_does_not_enter_actual_submission_verification(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queries: list[str] = []
+            fills: list[str] = []
+
+            def query_visible_table(_driver, ap_name, _target_date):
+                queries.append(ap_name)
+                return []
+
+            def unexpected_comparison(*_args, **_kwargs):
+                raise AssertionError("handoff preflight must not use actual submission verification")
+
+            automation = SimpleNamespace(
+                ENTRY_LOG_AP="entry",
+                WORK_LOG_AP="work",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append("entry"),
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: fills.append("work"),
+                quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 18, 0),
+                comparison_builder=unexpected_comparison,
+                open_assignment_checker=lambda *_args, **_kwargs: False,
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"11": {"name": "接班"}}},
+                "actions": [
+                    {
+                        "kind": "handoff_preflight",
+                        "time": "18:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(result.status, "handoff_preflight_ready")
+        self.assertEqual(queries, ["entry"])
+        self.assertEqual(fills, [])
+
     def test_unreturned_return_queue_keeps_fixed_expiry_and_changes_handoff_interval(self) -> None:
         from datetime import datetime
 
@@ -1696,29 +1997,32 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             events: list[str] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/08/07", "08:05", "-", "測試員", "出", "退勤"]] if query_count > 1 else []
+
             automation = SimpleNamespace(
                 ENTRY_LOG_AP="entry",
                 WORK_LOG_AP="work",
                 build_driver=lambda headless: events.append(f"driver:{headless}") or object(),
                 login=lambda _driver, _user_id, _password: events.append("login"),
-                query_visible_table=lambda _driver, _ap_name, _date: [],
+                query_visible_table=query_visible_table,
                 fill_entry_log_form_for_test=lambda _driver, action, _staff, _date, save: events.append(
                     f"fill:{action['fields']['系統寫入時間']}:{save}"
                 )
                 or {"ok": True},
                 quit_driver=lambda _driver: events.append("quit"),
             )
-            comparisons = iter(
-                [
-                    {0: {"compare": "尚未到點", "group": "future", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["saved"]}},
-                ]
-            )
             service = DutySubmissionService(
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 8, 7, 8, 0),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "尚未到點", "group": "future", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150807",
@@ -1752,18 +2056,19 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             fills: list[str] = []
-            comparisons = iter(
-                [
-                    {0: {"compare": "外勤確認", "group": "review", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["submitted"]}},
-                ]
-            )
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:01", "-", "測試員", "出", "外勤"]] if query_count > 1 else []
+
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda headless: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [],
+                query_visible_table=query_visible_table,
                 fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
                 fill_entry_log_form_for_test=lambda _driver, action, *_args, **_kwargs: fills.append(
                     action["source"]
@@ -1774,10 +2079,13 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 8, 1),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "外勤確認", "group": "review", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150729",
+                "today": {"staff": {"10": {"name": "測試員"}}},
                 "actions": [
                     {
                         "kind": "entry_log",
@@ -1804,18 +2112,19 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             fills: list[str] = []
-            comparisons = iter(
-                [
-                    {0: {"compare": "手動登打", "group": "manual", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["submitted"]}},
-                ]
-            )
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:01", "工作紀錄"]] if query_count > 1 else []
+
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda headless: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [],
+                query_visible_table=query_visible_table,
                 fill_work_log_form_for_test=lambda _driver, action, *_args, **_kwargs: fills.append(
                     action["source"]
                 ) or {},
@@ -1826,7 +2135,9 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 8, 1),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "手動登打", "group": "manual", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150729",
@@ -1855,18 +2166,19 @@ class DutySubmissionServiceTests(unittest.TestCase):
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            comparisons = iter(
-                [
-                    {0: {"compare": "可能臨時調整", "group": "adjust", "matched": []}},
-                    {0: {"compare": "已存在", "group": "done", "matched": ["submitted"]}},
-                ]
-            )
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:01", "工作紀錄"]] if query_count > 1 else []
+
             automation = SimpleNamespace(
                 WORK_LOG_AP="work",
                 ENTRY_LOG_AP="entry",
                 build_driver=lambda headless: object(),
                 login=lambda *_args: None,
-                query_visible_table=lambda *_args: [],
+                query_visible_table=query_visible_table,
                 fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
                 fill_entry_log_form_for_test=lambda *_args, **_kwargs: {},
                 quit_driver=lambda _driver: None,
@@ -1875,7 +2187,9 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 Path(temp_dir),
                 module_loader=lambda: automation,
                 now_factory=lambda: datetime(2026, 7, 29, 8, 1),
-                comparison_builder=lambda *_args, **_kwargs: next(comparisons),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "可能臨時調整", "group": "adjust", "matched": []}
+                },
             )
             data = {
                 "target_date": "1150729",
@@ -8023,6 +8337,37 @@ if return_code != 0 or loaded:
             )
 
             notifications.clear()
+            controller._submission_finished(
+                actual_request,
+                DutySubmissionResult(
+                    0,
+                    "skipped_duplicate",
+                    "已存在相同紀錄，已略過重複登打。",
+                    Path("duplicate.json"),
+                    {},
+                    actual_action,
+                ),
+            )
+            self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜已有資料，略過")])
+
+            notifications.clear()
+            controller._submission_finished(
+                actual_request,
+                DutySubmissionResult(
+                    0,
+                    "review_required",
+                    "查到時間近似或需人工確認的紀錄，未自動送出。",
+                    Path("review.json"),
+                    {},
+                    actual_action,
+                ),
+            )
+            self.assertEqual(
+                notifications,
+                [("SinpoSmart", "出入｜值班 / 值班 08｜查到時間近似或需人工確認的紀錄，未自動送出。")],
+            )
+
+            notifications.clear()
             controller._submission_queued(preflight_request)
             controller._submission_finished(
                 preflight_request,
@@ -8157,7 +8502,9 @@ if return_code != 0 or loaded:
         self.assertFalse(controller.isBusy)
         controller.shutdown()
 
-    def test_duty_execution_controller_keeps_all_three_1800_handoff_actions(self) -> None:
+    def test_duty_execution_controller_serializes_handoff_before_early_checkout(self) -> None:
+        from types import SimpleNamespace
+
         from PySide6.QtTest import QSignalSpy, QTest
 
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
@@ -8165,13 +8512,19 @@ if return_code != 0 or loaded:
 
         class FakeService:
             def __init__(self) -> None:
-                self.executed: list[int] = []
+                self.opened_sessions = 0
+                self.serialized_actions: list[int] = []
+                self.parallel_actions: list[int] = []
 
             def validate(self, request):
                 return request
 
-            def execute(self, request, *, status_callback=None):
-                self.executed.append(request.action_index)
+            def open_browser_session(self, request, *, status_callback=None):
+                self.opened_sessions += 1
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.serialized_actions.append(request.action_index)
                 if status_callback:
                     status_callback(f"執行 {request.action_index}")
                 return DutySubmissionResult(
@@ -8182,31 +8535,59 @@ if return_code != 0 or loaded:
                     {"group": "done"},
                 )
 
+            def close_browser_session(self, _session):
+                return None
+
+            def execute(self, request, *, status_callback=None):
+                self.parallel_actions.append(request.action_index)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    f"完成 {request.action_index}",
+                    Path(f"parallel-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
         data = {
             "target_date": "1150806",
             "actions": [
                 {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
                 {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5", "source": "值班交接"},
-                {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17"},
+                {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "17",
+                    "target": "17",
+                    "source": "昨日在勤且今日未在勤",
+                    "fields": {
+                        "登打時間": "18:00",
+                        "系統寫入時間": "18:05",
+                        "出或入": "出",
+                        "領用事由及地點": "退勤",
+                    },
+                },
             ],
         }
         service = FakeService()
         controller = DutyExecutionController(service)
         finished_spy = QSignalSpy(controller.actionFinished)
+        try:
+            for index in (0, 1, 2, 3):
+                self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", index, data)))
+            for _ in range(30):
+                if finished_spy.count() == 4 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
 
-        for index in (0, 1, 2):
-            self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", index, data)))
-        for _ in range(30):
-            if finished_spy.count() == 3 and not controller.isBusy:
-                break
-            finished_spy.wait(250)
-            QTest.qWait(10)
-
-        self.assertEqual(set(service.executed), {0, 1, 2})
-        self.assertEqual([index for index in service.executed if index in (0, 1)], [0, 1])
-        self.assertEqual(finished_spy.count(), 3)
-        self.assertFalse(controller.isBusy)
-        controller.shutdown()
+            self.assertEqual(service.opened_sessions, 1)
+            self.assertEqual(service.serialized_actions, [0, 1, 2, 3])
+            self.assertEqual(service.parallel_actions, [])
+            self.assertEqual(finished_spy.count(), 4)
+            self.assertFalse(controller.isBusy)
+        finally:
+            controller.shutdown()
 
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -8224,7 +8605,7 @@ if return_code != 0 or loaded:
             def load_current(self):
                 payload = {
                     "target_date": target_roc_date,
-                    "today": {"staff": {"10": {"name": "本班"}}},
+                    "today": {"staff": {"10": {"name": "本班", "role": "隊員"}}},
                     "actions": [
                         {
                             "kind": "work_log",
@@ -8372,6 +8753,55 @@ if return_code != 0 or loaded:
                 controller.workLogSettingsController._schedule_data.get("target_date"),
                 target_roc_date,
             )
+
+    def test_operational_person_label_omits_roles_for_multiple_targets(self) -> None:
+        from qt_app.controllers.app_controller import operational_person_label
+
+        label = operational_person_label(
+            "10, 12，13",
+            {
+                "10": {"name": "測試甲", "role": "隊員"},
+                "12": {"name": "測試乙", "role": "小隊長"},
+                "13": {"name": "測試丙", "role": "分隊長"},
+            },
+        )
+
+        self.assertEqual(label, "10番 測試甲、12番 測試乙、13番 測試丙")
+
+    def test_unreturned_return_event_uses_operational_target_label(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeController:
+            _operational_staff = {}
+
+            def __init__(self) -> None:
+                self.events = []
+
+            def _send_operational_event(self, record_type: str, **fields) -> None:
+                self.events.append((record_type, fields))
+
+        controller = FakeController()
+        AppController._publish_unreturned_return_event(
+            controller,
+            {
+                "status": "pending",
+                "trigger_type": "recovery",
+                "record": {
+                    "action": {"kind": "entry_log", "target": "10,12"},
+                    "schedule_context": {
+                        "today": {
+                            "staff": {
+                                "10": {"name": "測試甲", "role": "隊員"},
+                                "12": {"name": "測試乙", "role": "小隊長"},
+                            }
+                        }
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(controller.events[0][0], "unreturned_return")
+        self.assertEqual(controller.events[0][1]["target"], "10番 測試甲、12番 測試乙")
 
     def test_app_controller_preserves_update_logout_identity_and_legacy_event_contract(self) -> None:
         from app_core.credential_repository import CredentialRepository
@@ -8600,6 +9030,101 @@ if return_code != 0 or loaded:
 
         self.assertTrue(finished.is_set())
         self.assertFalse(controller._operational_sync_workers)
+
+    def test_app_controller_shutdown_records_daily_vehicle_terminal_event(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.credential_repository import CredentialRepository
+        from app_core.daily_vehicle_service import DailyVehicleDefaults
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        class FakeDailyVehicleService:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def load_defaults(self):
+                return DailyVehicleDefaults("2026/08/09", ("車輛保養檢查",))
+
+            def validate(self, request):
+                return request
+
+            def confirmation_summary(self, _request):
+                return "確認執行車輛保養清點"
+
+            def execute(self, _request, *, status_callback=None, stage_callback=None):
+                if stage_callback is not None:
+                    stage_callback("submit")
+                if status_callback is not None:
+                    status_callback("車輛保養清點執行中")
+                self.started.set()
+                self.release.wait(2)
+                return "車輛保養清點已完成。"
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+            def sync_board_async(self, _schedule_data):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daily_vehicle_service = FakeDailyVehicleService()
+            operational_sync = FakeOperationalSyncService()
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                daily_vehicle_service=daily_vehicle_service,
+                operational_sync_service=operational_sync,
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            release_timer = None
+            shutdown_called = False
+            try:
+                attempt_id = controller._session_state.begin_login()
+                controller._session_state.complete_login(
+                    attempt_id,
+                    LoginSession("10", "user10", "secret", verified=True, actor_name="測試員"),
+                )
+                controller.dailyVehicleController.loadDefaults()
+                controller.dailyVehicleController.prepareRun()
+                controller.dailyVehicleController.confirmRun()
+                self.assertTrue(daily_vehicle_service.started.wait(1))
+
+                release_timer = threading.Timer(0.05, daily_vehicle_service.release.set)
+                release_timer.start()
+                controller.shutdown()
+                shutdown_called = True
+                release_timer.join()
+                for _ in range(20):
+                    QTest.qWait(10)
+            finally:
+                daily_vehicle_service.release.set()
+                if release_timer is not None:
+                    release_timer.join()
+                if not shutdown_called:
+                    controller.shutdown()
+
+        tool_events = [
+            (record_type, fields)
+            for record_type, fields in operational_sync.events
+            if fields.get("snapshot", {}).get("tool_name") == "daily_vehicle"
+        ]
+        terminal_events = [
+            fields
+            for record_type, fields in tool_events
+            if record_type == "tool_action_finished"
+        ]
+        self.assertEqual([record_type for record_type, _fields in tool_events], ["tool_action_started", "tool_action_finished"])
+        self.assertEqual(len(terminal_events), 1)
+        self.assertEqual(terminal_events[0]["status"], "failed")
+        self.assertEqual(terminal_events[0]["trigger_type"], "tool_finish")
+        self.assertEqual(terminal_events[0]["error"], "主程式關閉，未取得工具完成結果。")
 
     def test_app_controller_reports_submission_validation_failure_as_legacy_action_result(self) -> None:
         from app_core.credential_repository import CredentialRepository
@@ -9345,6 +9870,120 @@ if return_code != 0 or loaded:
         work_action = stamped_actions[2]
         self.assertEqual(work_action["fields"]["工作時間"], "18:25")
         self.assertEqual(work_action["fields"]["處理情形"].splitlines()[0], "一、時間:16:00-18:25")
+
+    def test_handoff_preflight_defers_early_checkout_until_group_is_queued(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        fixed_now = RealDateTime(2026, 8, 9, 8, 0)
+
+        class FixedDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 8, 0, tzinfo=tz)
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "10",
+                "source": "昨日在勤且今日未在勤",
+                "fields": {
+                    "登打時間": "08:00",
+                    "系統寫入時間": "08:05",
+                    "出或入": "出",
+                    "領用事由及地點": "退勤",
+                },
+            },
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "10",
+                "source": "值班交接",
+                "fields": {
+                    "登打時間": "08:00",
+                    "系統寫入時間": "08:00",
+                    "出或入": "值退",
+                    "領用事由及地點": "值退",
+                },
+            },
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "11",
+                "source": "值班交接",
+                "fields": {
+                    "登打時間": "08:00",
+                    "系統寫入時間": "08:00",
+                    "出或入": "值班",
+                    "領用事由及地點": "值班",
+                },
+            },
+            {
+                "kind": "work_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "10",
+                "source": "值班交接",
+                "fields": {"工作時間": "08:00", "勤務項目": "值班(宿)"},
+            },
+        ]
+        with (
+            patch("qt_app.controllers.duty_controller.datetime", FixedDateTime),
+            patch("app_core.duty_task_projection.datetime", FixedDateTime),
+        ):
+            controller = DutyController()
+            try:
+                controller.set_actor_no("10")
+                controller.replace_schedule_data({"target_date": "1150809", "actions": actions})
+                controller._due_task_indices = [0, 1, 2, 3]
+                controller._auto_execution_enabled = True
+
+                preflight_requests = controller.due_submission_requests(
+                    "user10",
+                    "secret",
+                    [0, 1, 2, 3],
+                )
+
+                self.assertEqual(len(preflight_requests), 1)
+                self.assertEqual(preflight_requests[0].action_index, 2)
+                self.assertEqual(
+                    preflight_requests[0].schedule_data["actions"][2]["kind"],
+                    "handoff_preflight",
+                )
+                controller.mark_submission_enqueued(preflight_requests[0].action_index)
+                self.assertTrue(controller.handle_handoff_preflight_ready(preflight_requests[0]))
+
+                group_requests = controller.handoff_group_submission_requests(
+                    "user10",
+                    "secret",
+                    preflight_requests[0],
+                    submit_at=fixed_now,
+                )
+
+                self.assertEqual([request.action_index for request in group_requests], [1, 2, 3])
+                for request in group_requests:
+                    controller.mark_submission_enqueued(request.action_index)
+                released_spy = QSignalSpy(controller.dueTasksAvailable)
+                controller.finish_handoff_preflight_group(preflight_requests[0])
+
+                self.assertGreaterEqual(released_spy.count(), 1)
+                self.assertEqual(released_spy.at(released_spy.count() - 1)[0], [0])
+                released_requests = controller.due_submission_requests(
+                    "user10",
+                    "secret",
+                    list(released_spy.at(released_spy.count() - 1)[0]),
+                )
+                self.assertEqual([request.action_index for request in released_requests], [0])
+            finally:
+                controller.shutdown()
 
     def test_handoff_selection_groups_checkout_on_duty_and_work(self) -> None:
         from qt_app.controllers.duty_controller import DutyController

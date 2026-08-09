@@ -116,7 +116,11 @@ class DutyExecutionController(QObject):
     def _queue_name(request: DutySubmissionRequest) -> str:
         actions = request.schedule_data.get("actions", [])
         action = actions[request.action_index]
-        return "work" if action.get("kind") == "work_log" else "entry"
+        return (
+            "work"
+            if action.get("kind") == "work_log" and action.get("source") != "值班交接"
+            else "entry"
+        )
 
     @staticmethod
     def _request_key(request: DutySubmissionRequest) -> tuple[str, int, str]:
