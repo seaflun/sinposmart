@@ -367,7 +367,13 @@ class RestMonthlyService:
 
     @staticmethod
     def _format_error(legacy: ModuleType, exc: Exception, fallback: str) -> str:
-        if RestMonthlyService._failure_detail(exc) == "browser_startup":
+        failure_detail = RestMonthlyService._failure_detail(exc)
+        if failure_detail == "browser_session_open":
+            return (
+                "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"
+                "若仍失敗，請重新登入後再試或匯出問題包。"
+            )
+        if failure_detail == "browser_startup":
             return (
                 "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
                 "一般 Chrome 不需關閉；若仍失敗，請先在 NAS 值班後台查看工具卡片的錯誤詳情。"
@@ -381,7 +387,10 @@ class RestMonthlyService:
 
     @staticmethod
     def _failure_detail(exc: Exception) -> str:
-        return "browser_startup" if getattr(exc, "diagnostic_category", "") else ""
+        category = str(getattr(exc, "diagnostic_category", "") or "")
+        if category == "browser_session_open":
+            return category
+        return "browser_startup" if category else ""
 
     @staticmethod
     def _validate_identity(user_id: str, password: str, actor_no: str, actor_name: str = "") -> None:

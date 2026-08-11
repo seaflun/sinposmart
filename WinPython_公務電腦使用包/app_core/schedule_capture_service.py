@@ -165,10 +165,18 @@ class ScheduleCaptureService:
             automation = self._load_automation()
             if status_callback:
                 status_callback("正在即時查詢勤務表…")
+            def initialize_browser(candidate: Any) -> None:
+                nonlocal stage
+                stage = "login"
+                automation.login(candidate, request.user_id, request.password)
+
             stage = "start_browser"
-            driver = automation.build_driver(headless=True)
-            stage = "login"
-            automation.login(driver, request.user_id, request.password)
+            session_builder = getattr(automation, "build_initialized_driver", None)
+            if callable(session_builder):
+                driver = session_builder(headless=True, initialize=initialize_browser)
+            else:
+                driver = automation.build_driver(headless=True)
+                initialize_browser(driver)
             target = automation.parse_roc_date(request.target_roc_date)
             stage = "today_duty_sheet"
             today_sheet = automation.query_duty_sheet(driver, automation.roc_date(target))
@@ -279,10 +287,18 @@ class ScheduleCaptureService:
         try:
             if status_callback:
                 status_callback("正在背景比對已登打資料…")
+            def initialize_browser(candidate: Any) -> None:
+                nonlocal stage
+                stage = "login"
+                automation.login(candidate, request.user_id, request.password)
+
             stage = "start_browser"
-            driver = automation.build_driver(headless=True)
-            stage = "login"
-            automation.login(driver, request.user_id, request.password)
+            session_builder = getattr(automation, "build_initialized_driver", None)
+            if callable(session_builder):
+                driver = session_builder(headless=True, initialize=initialize_browser)
+            else:
+                driver = automation.build_driver(headless=True)
+                initialize_browser(driver)
             target = automation.parse_roc_date(request.target_roc_date)
             comparison_data: dict[str, dict[str, Any]] = {}
             for action_date in [target + timedelta(days=offset) for offset in (-1, 0, 1)]:
@@ -398,7 +414,14 @@ class ScheduleCaptureService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
-        if getattr(exc, "diagnostic_category", ""):
+        category = str(getattr(exc, "diagnostic_category", "") or "")
+        if category == "browser_session_open":
+            return (
+                "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"
+                "若仍失敗，請重新登入後再試或匯出問題包。",
+                "browser_session_open",
+            )
+        if category:
             return (
                 "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
                 "一般 Chrome 不需關閉；若仍失敗請通知管理人員。",

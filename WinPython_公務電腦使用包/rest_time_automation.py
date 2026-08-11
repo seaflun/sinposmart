@@ -25,7 +25,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from duty_rehearsal import build_driver, js_click, login, open_ap, quit_driver
+from duty_rehearsal import build_initialized_driver, js_click, login, open_ap, quit_driver
 
 UI_FONT = "Microsoft JhengHei UI"
 UI_BG = "#f5f7fb"
@@ -73,6 +73,7 @@ FRONTEND_ERROR_MESSAGES = {
     "timeout": "網頁等待逾時：勤務系統可能登入失敗、網頁變慢，或頁面結構已變更。",
     "no_such_element": "找不到網頁元素：可能勤務系統頁面改版，或尚未成功登入。",
     "browser_error": "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
+    "browser_session_open": "瀏覽器在登入或開啟勤務頁面時中斷：已自動使用新的工作階段重試，仍失敗請重新登入後再試。",
     "monthly_base_source_failed": "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
     "unknown_error": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
 }
@@ -146,6 +147,8 @@ class MonthlyBasePlan:
 def format_automation_error(exc: Exception) -> str:
     text = str(exc).strip()
     lowered = text.lower()
+    if getattr(exc, "diagnostic_category", "") == "browser_session_open":
+        return FRONTEND_ERROR_MESSAGES["browser_session_open"]
     if any(marker in lowered or marker in text for marker in LOGIN_FAILURE_MARKERS):
         return FRONTEND_ERROR_MESSAGES["login_failed"]
     if "timeoutexception" in lowered or "timeout" in lowered or "timed out" in lowered or "逾時" in text:
@@ -660,19 +663,21 @@ def submit_rest_entries(
         validate_workbook_year_month(workbook_path, expected_roc_year, expected_month)
     actor_name = str(actor_name or "").strip()
     target_name = actor_name or workbook_person_name(workbook_path, actor_no)
-    report_stage("browser_start")
-    driver = build_driver(headless=headless)
-    inserted = 0
-    skipped = 0
-    deleted_duplicates = 0
-    success = False
-    try:
+    def initialize_browser(driver) -> None:
         report_stage("login")
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
         report_stage("form_open")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
+
+    report_stage("browser_start")
+    driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
+    inserted = 0
+    skipped = 0
+    deleted_duplicates = 0
+    success = False
+    try:
         if expected_roc_year is not None and expected_month is not None:
             status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
             select_base_month(driver, expected_roc_year, expected_month)
@@ -730,16 +735,18 @@ def submit_monthly_base_entries(
     plan = fetch_monthly_base_plan(actor_no, actor_name=actor_name)
     if expected_roc_year is not None and expected_month is not None:
         validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
-    report_stage("browser_start")
-    driver = build_driver(headless=headless)
-    success = False
-    try:
+    def initialize_browser(driver) -> None:
         report_stage("login")
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
         report_stage("form_open")
         open_ap(driver, DUTY_BASE_AP)
         wait_for_main_table(driver)
+
+    report_stage("browser_start")
+    driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
+    success = False
+    try:
         status(f"切換到 {plan.roc_year}年{plan.month:02d}月並查詢...")
         select_base_month(driver, plan.roc_year, plan.month)
         wait_for_person_name_row(driver, plan.name)

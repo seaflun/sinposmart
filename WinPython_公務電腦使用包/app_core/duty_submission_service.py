@@ -181,13 +181,21 @@ class DutySubmissionService:
             )
             if status_callback:
                 status_callback("正在登入勤務系統…")
-            driver = (
-                browser_session.driver
-                if browser_session is not None
-                else automation.build_driver(headless=not request.visible)
-            )
-            if browser_session is None:
-                automation.login(driver, request.user_id, request.password)
+            if browser_session is not None:
+                driver = browser_session.driver
+            else:
+                def initialize_browser(candidate: Any) -> None:
+                    automation.login(candidate, request.user_id, request.password)
+
+                session_builder = getattr(automation, "build_initialized_driver", None)
+                if callable(session_builder):
+                    driver = session_builder(
+                        headless=not request.visible,
+                        initialize=initialize_browser,
+                    )
+                else:
+                    driver = automation.build_driver(headless=not request.visible)
+                    initialize_browser(driver)
             action = self._refresh_action_before_submit(
                 automation,
                 driver,
@@ -372,8 +380,18 @@ class DutySubmissionService:
             automation = self._load_automation()
             if status_callback:
                 status_callback("正在建立出入登打瀏覽器連線")
-            driver = automation.build_driver(headless=not request.visible)
-            automation.login(driver, request.user_id, request.password)
+            def initialize_browser(candidate: Any) -> None:
+                automation.login(candidate, request.user_id, request.password)
+
+            session_builder = getattr(automation, "build_initialized_driver", None)
+            if callable(session_builder):
+                driver = session_builder(
+                    headless=not request.visible,
+                    initialize=initialize_browser,
+                )
+            else:
+                driver = automation.build_driver(headless=not request.visible)
+                initialize_browser(driver)
             opened = True
             return DutySubmissionBrowserSession(
                 automation=automation,
@@ -676,7 +694,14 @@ class DutySubmissionService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
-        if getattr(exc, "diagnostic_category", ""):
+        category = str(getattr(exc, "diagnostic_category", "") or "")
+        if category == "browser_session_open":
+            return (
+                "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"
+                "若仍失敗，請重新登入後再試或匯出問題包。",
+                "browser_session_open",
+            )
+        if category:
             return (
                 "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
                 "一般 Chrome 不需關閉；若仍失敗請通知管理人員。",

@@ -27,7 +27,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from selenium import webdriver
@@ -2880,6 +2880,10 @@ _DUTY_BROWSER_STARTUP_MESSAGE = (
     "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
     "一般 Chrome 不需關閉；若仍失敗請匯出問題包。"
 )
+_DUTY_BROWSER_SESSION_OPEN_MESSAGE = (
+    "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"
+    "若仍失敗，請重新登入後再試或匯出問題包。"
+)
 
 
 class DutyBrowserStartupError(WebDriverException):
@@ -2890,6 +2894,15 @@ class DutyBrowserStartupError(WebDriverException):
         self.diagnostic_category = category
         self.attempts = attempts
         self.profiles_pruned = profiles_pruned
+
+
+class DutyBrowserSessionOpenError(WebDriverException):
+    """Safe pre-write browser-session failure after one fresh-session retry."""
+
+    def __init__(self, *, attempts: int) -> None:
+        super().__init__(_DUTY_BROWSER_SESSION_OPEN_MESSAGE)
+        self.diagnostic_category = "browser_session_open"
+        self.attempts = attempts
 
 
 def duty_browser_profile_root() -> Path:
@@ -3100,6 +3113,90 @@ def _browser_startup_failure_category(error: BaseException) -> str:
     if isinstance(error, OSError):
         return "os_startup"
     return "webdriver_startup"
+
+
+def _can_retry_duty_browser_session_open(error: BaseException) -> bool:
+    """Keep page/load and page-structure errors distinct from a lost browser session."""
+
+    return isinstance(error, WebDriverException) and not isinstance(
+        error,
+        (TimeoutException, NoSuchElementException, DutyBrowserStartupError),
+    )
+
+
+def retry_duty_browser_session_open(
+    create_driver: Callable[[], webdriver.Chrome],
+    initialize: Callable[[webdriver.Chrome], None],
+    *,
+    cleanup: Callable[[webdriver.Chrome], None] = quit_driver,
+    attempts: int = 2,
+) -> webdriver.Chrome:
+    """Create, log in, and open a read-only page with one fresh-session retry.
+
+    ``initialize`` is deliberately restricted to login, navigation, and reads.
+    Callers must not fill, delete, save, or submit from it: that makes replacing
+    the private browser session safe when Chrome disconnects before any write.
+    """
+
+    session_attempts = max(1, min(int(attempts), 2))
+    last_error: WebDriverException | None = None
+    for attempt in range(1, session_attempts + 1):
+        driver = create_driver()
+        try:
+            initialize(driver)
+        except WebDriverException as exc:
+            with suppress(Exception):
+                cleanup(driver)
+            if not _can_retry_duty_browser_session_open(exc):
+                raise
+            last_error = exc
+            if attempt < session_attempts:
+                _write_duty_browser_startup_diagnostic(
+                    "session_open_retry",
+                    category="browser_session_open",
+                    attempts=attempt,
+                    profiles_pruned=0,
+                )
+                continue
+            _write_duty_browser_startup_diagnostic(
+                "session_open_failed",
+                category="browser_session_open",
+                attempts=session_attempts,
+                profiles_pruned=0,
+            )
+            raise DutyBrowserSessionOpenError(attempts=session_attempts) from exc
+        except BaseException:
+            with suppress(Exception):
+                cleanup(driver)
+            raise
+        if attempt > 1:
+            _write_duty_browser_startup_diagnostic(
+                "session_open_recovered",
+                category="browser_session_open",
+                attempts=attempt,
+                profiles_pruned=0,
+            )
+        return driver
+    raise DutyBrowserSessionOpenError(attempts=session_attempts) from last_error
+
+
+def build_initialized_driver(
+    headless: bool,
+    initialize: Callable[[webdriver.Chrome], None],
+    *,
+    option_arguments: tuple[str, ...] = (),
+    page_load_strategy: str = "",
+) -> webdriver.Chrome:
+    """Build a private Driver and safely retry only its pre-write initialization."""
+
+    return retry_duty_browser_session_open(
+        lambda: build_driver(
+            headless=headless,
+            option_arguments=option_arguments,
+            page_load_strategy=page_load_strategy,
+        ),
+        initialize,
+    )
 
 
 def position_duty_browser_at_top_right(driver: webdriver.Chrome) -> None:

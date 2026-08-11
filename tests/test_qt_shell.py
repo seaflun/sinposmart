@@ -2608,6 +2608,25 @@ class RestMonthlyServiceTests(unittest.TestCase):
         self.assertIn("專用瀏覽器啟動失敗", str(raised.exception))
         self.assertNotIn("原始瀏覽器錯誤", str(raised.exception))
 
+    def test_monthly_browser_session_open_failure_keeps_its_own_detail(self) -> None:
+        from app_core.rest_monthly_service import RestMonthlyService
+
+        class BrowserSessionOpenError(RuntimeError):
+            diagnostic_category = "browser_session_open"
+
+        legacy = SimpleNamespace(
+            format_automation_error=lambda _exc: "不應顯示原始瀏覽器錯誤",
+        )
+
+        self.assertEqual(
+            RestMonthlyService._failure_detail(BrowserSessionOpenError()),
+            "browser_session_open",
+        )
+        self.assertIn(
+            "登入或開啟勤務頁面時中斷",
+            RestMonthlyService._format_error(legacy, BrowserSessionOpenError(), "fallback"),
+        )
+
 
 class DailyVehicleServiceTests(unittest.TestCase):
     def test_execute_uses_existing_script_with_ephemeral_credentials_and_cleanup(self) -> None:

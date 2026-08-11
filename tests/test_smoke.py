@@ -442,6 +442,11 @@ class PackageSmokeTests(unittest.TestCase):
             module.format_automation_error(WebDriverException("driver startup failed")),
             "瀏覽器啟動或連線失敗：請關閉卡住的 Chrome 後重試。",
         )
+        session_error = duty_rehearsal_module().DutyBrowserSessionOpenError(attempts=2)
+        self.assertEqual(
+            module.format_automation_error(session_error),
+            "瀏覽器在登入或開啟勤務頁面時中斷：已自動使用新的工作階段重試，仍失敗請重新登入後再試。",
+        )
         self.assertEqual(
             module.format_automation_error(RuntimeError("讀取固定 Google 試算表失敗：HTTP 503")),
             "勤務基準表登打失敗：輪休基準表無法讀取，請確認網路與 Google 試算表後重試。",
@@ -505,7 +510,7 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)", source)
         self.assertLess(
             source.index("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)"),
-            source.index("driver = build_driver(headless=False)"),
+            source.index("driver = retry_duty_browser_session_open("),
         )
 
     def test_external_duty_followed_by_rest_returns_before_rest_starts(self) -> None:
@@ -1874,6 +1879,58 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertNotEqual(profiles[0], profiles[1])
         self.assertEqual(getattr(driver, "_sinposmart_duty_browser_profile"), str(profiles[1]))
 
+    def test_prewrite_session_open_retries_with_a_fresh_driver_only(self) -> None:
+        module = duty_rehearsal_module()
+        first_driver = object()
+        second_driver = object()
+        cleaned: list[object] = []
+        diagnostics: list[tuple[str, str, int]] = []
+
+        def initialize(driver: object) -> None:
+            if driver is first_driver:
+                raise module.WebDriverException("invalid session id")
+
+        with mock.patch.object(
+            module,
+            "_write_duty_browser_startup_diagnostic",
+            side_effect=lambda event, **payload: diagnostics.append(
+                (event, payload["category"], payload["attempts"])
+            ),
+        ):
+            result = module.retry_duty_browser_session_open(
+                mock.Mock(side_effect=[first_driver, second_driver]),
+                initialize,
+                cleanup=cleaned.append,
+            )
+
+        self.assertIs(result, second_driver)
+        self.assertEqual(cleaned, [first_driver])
+        self.assertEqual(
+            diagnostics,
+            [
+                ("session_open_retry", "browser_session_open", 1),
+                ("session_open_recovered", "browser_session_open", 2),
+            ],
+        )
+
+    def test_prewrite_session_open_does_not_retry_page_timeout(self) -> None:
+        module = duty_rehearsal_module()
+        from selenium.common.exceptions import TimeoutException
+
+        driver = object()
+        factory = mock.Mock(return_value=driver)
+        cleanup = mock.Mock()
+
+        with self.assertRaises(TimeoutException):
+            module.retry_duty_browser_session_open(
+                factory,
+                lambda _driver: (_ for _ in ()).throw(TimeoutException("page timed out")),
+                cleanup=cleanup,
+            )
+
+        factory.assert_called_once_with()
+        cleanup.assert_called_once_with(driver)
+
     def test_visible_driver_is_positioned_at_top_right_without_explicit_position(self) -> None:
         module = duty_rehearsal_module()
         driver = mock.Mock()
@@ -2014,15 +2071,24 @@ class PackageSmokeTests(unittest.TestCase):
         root = package_dir()
         duty_sheet_source = (root / "duty_sheet_legacy" / "sinposmart_1.py").read_text(encoding="utf-8-sig")
         vehicle_source = (root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py").read_text(encoding="utf-8-sig")
+        rest_source = (root / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+        schedule_source = (root / "app_core" / "schedule_capture_service.py").read_text(encoding="utf-8-sig")
+        submission_source = (root / "app_core" / "duty_submission_service.py").read_text(encoding="utf-8-sig")
+        login_source = (root / "app_core" / "login_verifier.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("from duty_rehearsal import build_driver", duty_sheet_source)
         self.assertIn("quit_driver(driver)", duty_sheet_source)
-        self.assertIn("driver = build_driver(headless=False)", duty_sheet_source)
+        self.assertIn("retry_duty_browser_session_open", duty_sheet_source)
         self.assertIn("from duty_rehearsal import build_driver", vehicle_source)
         self.assertIn("quit_driver(driver)", vehicle_source)
-        self.assertIn("driver = build_driver(", vehicle_source)
+        self.assertIn("retry_duty_browser_session_open", vehicle_source)
+        self.assertIn("return build_driver(", vehicle_source)
         self.assertIn('page_load_strategy="none"', vehicle_source)
-        self.assertIn("driver = webdriver.Remote(command_executor=remote_url, options=options)", vehicle_source)
+        self.assertIn("return webdriver.Remote(command_executor=remote_url, options=options)", vehicle_source)
+        self.assertIn("build_initialized_driver", rest_source)
+        self.assertIn("build_initialized_driver", schedule_source)
+        self.assertIn("build_initialized_driver", submission_source)
+        self.assertIn("retry_duty_browser_session_open", login_source)
 
     def test_next_morning_0600_rest_includes_manual_return_at_0800(self) -> None:
         module = duty_rehearsal_module()

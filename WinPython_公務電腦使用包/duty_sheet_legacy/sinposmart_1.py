@@ -25,7 +25,7 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from duty_rehearsal import build_driver, quit_driver
+from duty_rehearsal import build_driver, quit_driver, retry_duty_browser_session_open
 
 # ==========================================
 # [區塊一] 模組導入與全域設定 (Imports & Config)
@@ -1240,6 +1240,7 @@ def start_automation(
     start_time = time.time()
     capture_executor = None
     capture_future = None
+    driver = None
     # ---------------- 1. 解析 Excel ----------------
     report_stage("source_load")
     day_int = int(target_date[-2:])
@@ -1299,23 +1300,27 @@ def start_automation(
     
     # ---------------- 2. 瀏覽器自動化 ----------------
     report_stage("browser_start")
-    driver = build_driver(headless=False)
-    try:
-        driver.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
-    except Exception:
-        pass
-    try:
-        driver.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
-    except Exception:
-        pass
-    wait = WebDriverWait(driver, 20)
+    def initialize_browser(candidate: webdriver.Chrome) -> None:
+        try:
+            candidate.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
+        except Exception:
+            pass
+        try:
+            candidate.set_script_timeout(max(10, int(os.environ.get("SELENIUM_SCRIPT_TIMEOUT_SECONDS", "45"))))
+        except Exception:
+            pass
+        report_stage("login")
+        step_login(candidate, user_id, user_pwd)
+        report_stage("duty_form_open")
+        step_navigate_menu(candidate, WebDriverWait(candidate, 20))
 
     try:
-        report_stage("login")
-        step_login(driver, user_id, user_pwd)
-        report_stage("duty_form_open")
-        step_navigate_menu(driver, wait)
-        
+        driver = retry_duty_browser_session_open(
+            lambda: build_driver(headless=False),
+            initialize_browser,
+            cleanup=quit_driver,
+        )
+        wait = WebDriverWait(driver, 20)
         if step_prepare_content(driver, wait):
             super_js_execute(driver, "_txtTaskDate", "set", target_date)
             super_js_execute(driver, "_btnQuery", "click")

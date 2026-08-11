@@ -275,9 +275,17 @@ class LoginVerifier:
     ) -> LoginResult:
         driver = None
         try:
-            driver = self.driver_factory(self.options_factory())
-            self.configure_driver(driver)
-            self.login_function(driver, user_id, password)
+            from duty_rehearsal import retry_duty_browser_session_open
+
+            def initialize_browser(candidate: Any) -> None:
+                self.configure_driver(candidate)
+                self.login_function(candidate, user_id, password)
+
+            driver = retry_duty_browser_session_open(
+                lambda: self.driver_factory(self.options_factory()),
+                initialize_browser,
+                cleanup=self.driver_cleanup,
+            )
             try:
                 detected_actor_no, actor_name = identify_logged_in_actor(driver, actor_no_from_name, staff)
             except Exception:

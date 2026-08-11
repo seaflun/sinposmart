@@ -28,7 +28,7 @@ PACKAGE_DIR = Path(__file__).resolve().parents[2]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from duty_rehearsal import build_driver, quit_driver
+from duty_rehearsal import build_driver, quit_driver, retry_duty_browser_session_open
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -431,14 +431,14 @@ def main(argv: list[str] | None = None) -> None:
 
     remote_url = str(config["selenium_remote_url"])
     print("[sinposmart-stage] browser_start", flush=True)
-    if remote_url:
-        print(f"[driver] using remote selenium: {remote_url}")
-        wait_for_remote_selenium(remote_url, int(config["selenium_remote_ready_timeout_seconds"]))
-        wait_for_login_site(LOGIN_URL, int(config["selenium_remote_ready_timeout_seconds"]))
-        driver = webdriver.Remote(command_executor=remote_url, options=options)
-    else:
+    def create_driver() -> webdriver.Chrome:
+        if remote_url:
+            print(f"[driver] using remote selenium: {remote_url}")
+            wait_for_remote_selenium(remote_url, int(config["selenium_remote_ready_timeout_seconds"]))
+            wait_for_login_site(LOGIN_URL, int(config["selenium_remote_ready_timeout_seconds"]))
+            return webdriver.Remote(command_executor=remote_url, options=options)
         print("[driver] using local chrome")
-        driver = build_driver(
+        return build_driver(
             headless=bool(config["headless"]),
             option_arguments=(
                 "--window-size=1440,1200",
@@ -451,21 +451,27 @@ def main(argv: list[str] | None = None) -> None:
             page_load_strategy="none",
         )
 
-    wait = WebDriverWait(driver, int(config["timeout_seconds"]))
-    driver.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
-    driver.set_script_timeout(max(15, int(config["timeout_seconds"])))
+    def initialize_browser(candidate: webdriver.Chrome) -> None:
+        candidate.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
+        candidate.set_script_timeout(max(15, int(config["timeout_seconds"])))
+        login(
+            candidate,
+            WebDriverWait(candidate, int(config["timeout_seconds"])),
+            str(config["username"]),
+            str(config["password"]),
+        )
 
     today = dt.datetime.now()
     today_strings = build_today_strings(today)
 
-    print("=" * 50)
-    print(f"date: {today.strftime('%Y/%m/%d')}")
-    print(f"headless: {config['headless']}")
-    print("=" * 50)
-
     try:
         print("[sinposmart-stage] login", flush=True)
-        login(driver, wait, str(config["username"]), str(config["password"]))
+        driver = retry_duty_browser_session_open(create_driver, initialize_browser, cleanup=quit_driver)
+        wait = WebDriverWait(driver, int(config["timeout_seconds"]))
+        print("=" * 50)
+        print(f"date: {today.strftime('%Y/%m/%d')}")
+        print(f"headless: {config['headless']}")
+        print("=" * 50)
         print("[sinposmart-stage] maintenance_check", flush=True)
         process_maintain_checks(driver, wait, today_strings, today)
         print("[sinposmart-stage] equipment_check", flush=True)
