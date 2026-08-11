@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 from app_core.credential_repository import CredentialRepository
@@ -156,11 +156,18 @@ class AppController(QObject):
             self._scheduled_folder_timer.start()
         self._synced_actor_no = ""
         self._synced_user_id = ""
+        self._synced_session_generation = -1
         self._last_login_actor_no = ""
         self._last_login_user_id = ""
         self._last_login_display_name = ""
         self._provisional_actor_no = ""
         self._actor_identity_pending = False
+        self._logout_pending = False
+        self._pending_logout_message = ""
+        self._update_shutdown_prepared = False
+        self._worker_admissions_closed = False
+        self._allow_shutdown_operational_sync = False
+        self._pending_live_refresh_generation: int | None = None
         self._pending_fire_day_refresh = ""
         self._operational_staff: dict[str, dict] = {}
         self._last_hourly_refresh_key = ""
@@ -175,6 +182,7 @@ class AppController(QObject):
         self._board_retry_timer.start()
         self._tomorrow_schedule_request_id = 0
         self._tomorrow_schedule_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
+        self._tomorrow_schedule_contexts: dict[int, tuple[int, str, str, str]] = {}
         self._tomorrow_schedule_timer = QTimer(self)
         self._tomorrow_schedule_timer.setInterval(30_000)
         self._tomorrow_schedule_timer.timeout.connect(self._capture_evening_tomorrow_schedule)
@@ -198,6 +206,7 @@ class AppController(QObject):
             self._enqueue_external_return_recovery
         )
         self._duty_controller.unreturnedReturnEvent.connect(self._publish_unreturned_return_event)
+        self._duty_controller.scheduleChanged.connect(self._retry_pending_live_refresh)
         self._work_log_settings_controller.settingsSaved.connect(self._refresh_after_settings_save)
         self._duty_execution_controller.allLanesUnavailable.connect(self._handle_execution_unavailable)
         self._duty_sheet_controller.runStarted.connect(
@@ -248,8 +257,13 @@ class AppController(QObject):
             )
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
+        self._duty_execution_controller.submissionStarted.connect(self._submission_started)
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
         self._duty_execution_controller.submissionFailed.connect(self._submission_failed)
+        self._duty_execution_controller.submissionCancelled.connect(self._submission_cancelled)
+        self._duty_execution_controller.stateChanged.connect(self._finish_pending_logout)
+        self._tray_controller.setStopGuard(self._stop_block_reason)
+        self._update_controller.setStopGuard(self._stop_block_reason)
 
     @Property(QObject, constant=True)
     def sessionController(self) -> SessionController:
@@ -333,6 +347,8 @@ class AppController(QObject):
 
     @Slot(result=bool)
     def recordUpdateLogout(self) -> bool:
+        """Durably queue the update logout before the updater may stop this process."""
+
         session = self._session_state.session
         actor_no = (
             str(session.actor_no or "").strip()
@@ -359,9 +375,89 @@ class AppController(QObject):
             user_id=user_id,
             display_name=self._operational_display_name(actor_no, display_name),
             content="更新前登出",
-            immediate=True,
+            durable_only=True,
         )
         return True
+
+    @Slot(result=str)
+    def prepareUpdateShutdown(self) -> str:
+        """Return the updater handshake result without risking an in-flight task."""
+
+        if self._update_shutdown_prepared:
+            return "ready"
+        block_reason = self._stop_block_reason()
+        if block_reason:
+            self._tray_controller.notify("SinpoSmart", f"更新已延後：{block_reason}")
+            return "busy"
+        session = self._session_state.session
+        has_identity = bool(
+            (session is not None and session.verified)
+            or self._last_login_actor_no
+            or self._last_login_user_id
+        )
+        if has_identity:
+            try:
+                if not self.recordUpdateLogout():
+                    return "failed"
+            except Exception:
+                return "failed"
+        self._pending_live_refresh_generation = None
+        if not self._close_worker_admissions():
+            return "busy"
+        self._update_shutdown_prepared = True
+        return "ready"
+
+    def _close_worker_admissions(self) -> bool:
+        """Stop every timer and controller entry point before process exit."""
+
+        self._worker_admissions_closed = True
+        self._hourly_refresh_timer.stop()
+        self._board_retry_timer.stop()
+        self._tomorrow_schedule_timer.stop()
+        if self._scheduled_folder_timer is not None:
+            self._scheduled_folder_timer.stop()
+        for controller in (
+            self._session_controller,
+            self._update_controller,
+            self._duty_sheet_controller,
+            self._rest_monthly_controller,
+            self._daily_vehicle_controller,
+            self._rescue_video_controller,
+        ):
+            prepare = getattr(controller, "prepare_shutdown_admission", None)
+            if callable(prepare):
+                prepare()
+        duty_ready = self._duty_controller.prepare_session_end()
+        execution_ready = self._duty_execution_controller.prepare_session_end()
+        return duty_ready and execution_ready
+
+    def _stop_block_reason(self) -> str:
+        """Describe the first activity that makes quit or update unsafe."""
+
+        if self._update_shutdown_prepared or self._worker_admissions_closed:
+            return "程式正在關閉"
+        if self._duty_execution_controller.isBusy or self._logout_pending:
+            return "勤務登打尚未完成"
+        if self._session_controller.isBusy or self._session_controller.hasRunningWorkers:
+            return "登入驗證尚未完成"
+        if self._duty_controller.isRefreshing or self._tomorrow_schedule_workers:
+            return "勤務資料正在更新"
+        running_tools = (
+            (self._duty_sheet_controller.isRunning, "勤務表登打"),
+            (self._rest_monthly_controller.isRunning, "休息時間或勤務基準表登打"),
+            (self._daily_vehicle_controller.isRunning, "車輛保養清點"),
+            (self._rescue_video_controller.isRunning, "行車紀錄器處理"),
+        )
+        for is_running, label in running_tools:
+            if is_running:
+                return f"{label}尚未完成"
+        if self._scheduled_folder_workers:
+            return "排程資料夾作業尚未完成"
+        if self._operational_sync_workers or self._operational_sync_queue:
+            return "後台狀態正在同步"
+        if self._update_controller.isChecking:
+            return "更新檢查尚未完成"
+        return ""
 
     @Slot(int)
     def shiftAuditDate(self, days: int) -> None:
@@ -370,6 +466,7 @@ class AppController(QObject):
 
     @Slot()
     def openAuditMode(self) -> None:
+        self._duty_controller.disable_auto_execution()
         self._duty_mode_active = False
         self._duty_controller.setAuditStatusFilter("需處理")
         self._duty_controller.setAuditKindFilter("全部")
@@ -420,24 +517,84 @@ class AppController(QObject):
     @Slot()
     def returnToDutySchedule(self) -> None:
         self._duty_mode_active = True
-        if (
-            self._duty_controller.isPreviewLoaded
-            or self._duty_controller.targetDateText != business_roc_date()
-        ):
+        self._duty_controller.disable_auto_execution()
+        if self._read_only_acceptance:
             self.refreshAuditDate(business_roc_date())
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            self._duty_controller.set_refresh_status("請先完成登入驗證。")
+            return
+        accepted = self._duty_controller.refresh_live_schedule(
+            session.user_id,
+            session.password,
+            session.actor_no,
+            target_roc_date=business_roc_date(),
+            actor_name=session.actor_name,
+        )
+        if not accepted:
+            self._duty_controller.set_refresh_status("勤務資料正在更新，完成後才會恢復自動登打。")
+
+    @Slot()
+    def requestLogout(self) -> None:
+        """Cancel queued work and wait for an irreversible active request."""
+
+        self._begin_session_logout("")
+
+    def _begin_session_logout(self, message: str) -> None:
+        if self._logout_pending:
+            return
+        self._pending_live_refresh_generation = None
+        self._duty_controller.prepare_session_end()
+        if self._duty_execution_controller.prepare_session_end():
+            if message:
+                self._session_controller.systemLogout(message)
+            else:
+                self._session_controller.logout()
+            return
+        self._logout_pending = True
+        self._pending_logout_message = str(message or "")
+        self._session_controller.setOperationalStatus(
+            "正在完成目前登打，完成後會自動登出。",
+            "warning",
+        )
+
+    @Slot()
+    def _finish_pending_logout(self) -> None:
+        if not self._logout_pending or self._duty_execution_controller.isBusy:
+            return
+        message = self._pending_logout_message
+        self._logout_pending = False
+        self._pending_logout_message = ""
+        if message:
+            self._session_controller.systemLogout(message)
+        else:
+            self._session_controller.logout()
 
     def _sync_session_actor(self) -> None:
         previous_actor_no = self._synced_actor_no
         previous_user_id = self._synced_user_id
+        previous_generation = self._synced_session_generation
+        session_generation = self._session_state.generation
         logged_in = self._session_controller.isLoggedIn
         actor_no = self._session_controller.actorNo if logged_in else ""
         user_id = self._session_controller.userId if logged_in else ""
-        if actor_no == self._synced_actor_no and user_id == self._synced_user_id:
+        if (
+            actor_no == self._synced_actor_no
+            and user_id == self._synced_user_id
+            and session_generation == self._synced_session_generation
+        ):
             return
         if previous_actor_no or previous_user_id:
             self._duty_execution_controller.close_entry_session()
+        self._duty_controller.disable_auto_execution()
         self._synced_actor_no = actor_no
         self._synced_user_id = user_id
+        self._synced_session_generation = session_generation
+        if session_generation != previous_generation:
+            self._actor_identity_pending = False
+        self._duty_execution_controller.set_session_generation(session_generation)
+        self._duty_controller.set_session_context(session_generation, user_id)
         if logged_in and self._session_controller.displayName:
             self._last_login_display_name = self._session_controller.displayName
         if logged_in and user_id:
@@ -460,13 +617,17 @@ class AppController(QObject):
             if actor_no and not self._actor_identity_pending:
                 self._send_operational_event("login", status="ok", trigger_type="login")
             self._duty_controller.load_current_schedule()
-            self._duty_controller.refresh_live_schedule(
+            accepted = self._duty_controller.refresh_live_schedule(
                 session.user_id,
                 session.password,
                 provisional_actor_no,
                 actor_name=session.actor_name,
             )
+            self._pending_live_refresh_generation = (
+                None if accepted else session_generation
+            )
         elif previous_actor_no:
+            self._pending_live_refresh_generation = None
             self._send_operational_event(
                 "logout",
                 status="ok",
@@ -476,9 +637,34 @@ class AppController(QObject):
                 display_name=self._last_login_display_name,
             )
 
+    @Slot()
+    def _retry_pending_live_refresh(self) -> None:
+        generation = self._pending_live_refresh_generation
+        if generation is None or self._duty_controller.isRefreshing:
+            return
+        session = self._session_state.session
+        if (
+            session is None
+            or not session.verified
+            or generation != self._session_state.generation
+        ):
+            self._pending_live_refresh_generation = None
+            return
+        self._pending_live_refresh_generation = None
+        accepted = self._duty_controller.refresh_live_schedule(
+            session.user_id,
+            session.password,
+            self._provisional_actor_no,
+            actor_name=session.actor_name,
+        )
+        if not accepted and generation == self._session_state.generation:
+            self._pending_live_refresh_generation = generation
+
     @Slot(bool)
     def setDutyModeActive(self, active: bool) -> None:
         self._duty_mode_active = bool(active)
+        if not self._duty_mode_active:
+            self._duty_controller.disable_auto_execution()
 
     @Slot(object)
     def _cached_schedule_loaded(self, schedule_data: dict) -> None:
@@ -714,7 +900,7 @@ class AppController(QObject):
 
     @Slot()
     def _refresh_hourly_live_schedule(self) -> None:
-        if self._read_only_acceptance:
+        if self._read_only_acceptance or self._worker_admissions_closed:
             return
         now = datetime.now()
         session = self._session_state.session
@@ -745,7 +931,11 @@ class AppController(QObject):
     def _capture_evening_tomorrow_schedule(self) -> None:
         """Match the legacy 18:00-24:00 missing-tomorrow snapshot prefetch."""
 
-        if self._read_only_acceptance or self._tomorrow_schedule_workers:
+        if (
+            self._read_only_acceptance
+            or self._worker_admissions_closed
+            or self._tomorrow_schedule_workers
+        ):
             return
         now = datetime.now()
         session = self._session_state.session
@@ -766,6 +956,9 @@ class AppController(QObject):
             return
         self._tomorrow_schedule_request_id += 1
         request_id = self._tomorrow_schedule_request_id
+        lane_owner = f"tomorrow-schedule:{request_id}"
+        if not self._duty_controller.claim_capture_lane(lane_owner):
+            return
         request = ScheduleCaptureRequest(
             session.user_id,
             session.password,
@@ -785,13 +978,34 @@ class AppController(QObject):
         worker.succeeded.connect(self._tomorrow_schedule_succeeded)
         worker.failed.connect(self._tomorrow_schedule_failed)
         worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(self._tomorrow_schedule_worker_finished)
+        worker.finished.connect(
+            self._tomorrow_schedule_worker_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._tomorrow_schedule_workers[request_id] = (thread, worker)
+        self._tomorrow_schedule_contexts[request_id] = (
+            self._session_state.generation,
+            session.user_id,
+            session.actor_no,
+            lane_owner,
+        )
         thread.start()
+
+    def _tomorrow_schedule_request_is_current(self, request_id: int) -> bool:
+        context = self._tomorrow_schedule_contexts.get(request_id)
+        session = self._session_state.session
+        if context is None or session is None or not session.verified:
+            return False
+        generation, user_id, actor_no, _lane_owner = context
+        return (
+            generation == self._session_state.generation
+            and user_id == session.user_id
+            and actor_no == session.actor_no
+        )
 
     @Slot(int, str, object)
     def _tomorrow_schedule_succeeded(self, request_id: int, _actor_no: str, snapshot) -> None:
-        if request_id not in self._tomorrow_schedule_workers:
+        if not self._tomorrow_schedule_request_is_current(request_id):
             return
         # NAS schedule-snapshot events remain on hold until the backend update is approved.
         del snapshot
@@ -804,7 +1018,7 @@ class AppController(QObject):
         message: str,
         error_code: str,
     ) -> None:
-        if request_id not in self._tomorrow_schedule_workers:
+        if not self._tomorrow_schedule_request_is_current(request_id):
             return
         if error_code == "login_failed":
             self._force_logout(message)
@@ -816,10 +1030,30 @@ class AppController(QObject):
             return
         thread, _worker = worker_pair
         thread.quit()
-        if not thread.wait(5_000):
+        self._poll_tomorrow_schedule_thread(request_id)
+
+    def _poll_tomorrow_schedule_thread(self, request_id: int) -> None:
+        worker_pair = self._tomorrow_schedule_workers.get(request_id)
+        if worker_pair is None:
             return
-        self._tomorrow_schedule_workers.pop(request_id, None)
+        if worker_pair[0].isFinished():
+            self._tomorrow_schedule_thread_finished(request_id)
+            return
+        QTimer.singleShot(
+            10,
+            lambda request_id=request_id: self._poll_tomorrow_schedule_thread(request_id),
+        )
+
+    @Slot(int)
+    def _tomorrow_schedule_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._tomorrow_schedule_workers.pop(request_id, None)
+        context = self._tomorrow_schedule_contexts.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         thread.deleteLater()
+        if context is not None:
+            self._duty_controller.release_capture_lane(context[3])
 
     @staticmethod
     def _tool_label(tool_id: str) -> str:
@@ -839,6 +1073,25 @@ class AppController(QObject):
         if 0 <= request.action_index < len(actions) and isinstance(actions[request.action_index], Mapping):
             return dict(actions[request.action_index])
         return {}
+
+    @staticmethod
+    def _submission_staff(request: DutySubmissionRequest) -> dict[str, dict]:
+        return operational_staff_from_schedule(request.schedule_data)
+
+    def _submission_event_fields(
+        self,
+        request: DutySubmissionRequest,
+        action: Mapping,
+    ) -> dict[str, str]:
+        actor_no = str(request.session_actor_no or "").strip()
+        staff = self._submission_staff(request)
+        actor_name = str(staff.get(actor_no, {}).get("name", "") or "").strip()
+        return {
+            "actor_no": actor_no,
+            "user_id": str(request.user_id or "").strip(),
+            "display_name": self._operational_display_name(actor_no, actor_name),
+            "target": operational_person_label(str(action.get("target") or ""), staff),
+        }
 
     @staticmethod
     def _external_return_queue_id(request: DutySubmissionRequest) -> str:
@@ -898,35 +1151,64 @@ class AppController(QObject):
         target_text = f" {target}" if target and target != "-" else ""
         return f"{kind}｜{summary}{target_text}｜{outcome}"
 
-    @Slot(int)
-    def _notify_duty_action_started(self, action_index: int) -> None:
-        actions = self._duty_controller._actions
-        if not 0 <= action_index < len(actions):
+    @Slot(object)
+    def _submission_started(self, request: DutySubmissionRequest) -> None:
+        if self._duty_controller.is_handoff_preflight_request(request):
             return
-        message = self._format_duty_notification(
-            actions[action_index],
-            self._operational_staff,
-            "開始登打",
+        action = self._submission_action(request)
+        self._tray_controller.notify(
+            "SinpoSmart",
+            self._format_duty_notification(
+                action,
+                self._submission_staff(request),
+                "開始登打",
+            ),
         )
-        self._tray_controller.notify("SinpoSmart", message)
 
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
-        if not self._duty_controller.is_handoff_preflight_request(request):
+        staff = self._submission_staff(request)
+        is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
+        if not is_handoff_preflight:
             self._tray_controller.notify(
                 "SinpoSmart",
-                self._format_duty_notification(action, self._operational_staff, "準備登打"),
+                self._format_duty_notification(action, staff, "準備登打"),
             )
+            self._send_operational_event(
+                "action_queued",
+                status="pending_write_automation",
+                trigger_type=request.trigger_type,
+                action=action,
+                snapshot={
+                    "action_index": request.action_index,
+                    "completion_key": request.action_key or action_completion_key(action),
+                },
+                **self._submission_event_fields(request, action),
+            )
+
+    @Slot(object, str, str)
+    def _submission_cancelled(
+        self,
+        request: DutySubmissionRequest,
+        message: str,
+        error_code: str,
+    ) -> None:
+        if self._duty_controller.is_handoff_preflight_request(request):
+            return
+        action = self._submission_action(request)
         self._send_operational_event(
-            "action_queued",
-            status="pending_write_automation",
+            "action_result",
+            status="cancelled",
             trigger_type=request.trigger_type,
             action=action,
+            error=message,
             snapshot={
                 "action_index": request.action_index,
-                "completion_key": action_completion_key(action),
+                "completion_key": request.action_key or action_completion_key(action),
+                "error_code": error_code,
             },
+            **self._submission_event_fields(request, action),
         )
 
     @Slot(object, object)
@@ -937,7 +1219,8 @@ class AppController(QObject):
     ) -> None:
         queue_id = self._external_return_queue_id(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
-        if is_handoff_preflight:
+        request_is_current = self._duty_controller.request_matches_current_session(request)
+        if is_handoff_preflight and request_is_current:
             if result.status == "paused_external":
                 self._duty_controller.handle_handoff_preflight_paused(request)
             elif result.status == "handoff_preflight_ready":
@@ -949,7 +1232,7 @@ class AppController(QObject):
                     result.message,
                     "preflight_incomplete",
                 )
-        elif queue_id:
+        elif queue_id and request_is_current:
             action = self._submission_action(request, result)
             component_key = str(
                 request.schedule_data.get("_unreturned_return_component_key", "") or ""
@@ -960,26 +1243,27 @@ class AppController(QObject):
                 result.status,
                 component_key,
             )
-        else:
-            self._duty_controller.handle_submission_result(
-                result.action_index,
+        elif not is_handoff_preflight and not queue_id:
+            self._duty_controller.handle_submission_request_result(
+                request,
                 result.status,
                 result.message,
                 str(result.result_path),
             )
         action = self._submission_action(request, result)
-        self._send_operational_event(
-            "action_result",
-            status=result.status,
-            trigger_type=request.trigger_type,
-            action=action,
-            result_ref=Path(result.result_path).name,
-            snapshot={
-                "action_index": request.action_index,
-                "completion_key": action_completion_key(action),
-            },
-        )
         if not is_handoff_preflight:
+            self._send_operational_event(
+                "action_result",
+                status=result.status,
+                trigger_type=request.trigger_type,
+                action=action,
+                result_ref=Path(result.result_path).name,
+                snapshot={
+                    "action_index": request.action_index,
+                    "completion_key": request.action_key or action_completion_key(action),
+                },
+                **self._submission_event_fields(request, action),
+            )
             if result.status == "submitted":
                 outcome = "登打完成"
             elif result.status == "skipped_duplicate":
@@ -988,7 +1272,7 @@ class AppController(QObject):
                 outcome = str(result.message or "登打未完成").strip()
             self._tray_controller.notify(
                 "SinpoSmart",
-                self._format_duty_notification(action, self._operational_staff, outcome),
+                self._format_duty_notification(action, self._submission_staff(request), outcome),
             )
 
     @Slot(object, str, str, str)
@@ -1002,12 +1286,10 @@ class AppController(QObject):
         queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
-        if is_handoff_preflight:
+        request_is_current = self._duty_controller.request_matches_current_session(request)
+        if is_handoff_preflight and request_is_current:
             self._duty_controller.handle_handoff_preflight_failure(request, message, error_code)
-            if error_code == "login_failed":
-                self._duty_controller.disable_auto_execution()
-                self._force_logout(message)
-        elif queue_id:
+        elif queue_id and request_is_current:
             component_key = str(
                 request.schedule_data.get("_unreturned_return_component_key", "") or ""
             )
@@ -1020,28 +1302,36 @@ class AppController(QObject):
             if error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()
                 self._force_logout(message)
-        else:
-            self._duty_controller.handle_submission_failure(request.action_index, message, error_code)
-        self._send_operational_event(
-            "action_result",
-            status="failed",
-            trigger_type=request.trigger_type,
-            action=action,
-            error=message,
-            result_ref=Path(result_path).name if result_path else "",
-            snapshot={
-                "action_index": request.action_index,
-                "completion_key": action_completion_key(action),
-                "error_code": error_code,
-            },
-        )
+        elif not is_handoff_preflight and not queue_id:
+            failure_applied = self._duty_controller.handle_submission_request_failure(
+                request,
+                message,
+                error_code,
+            )
+            if not failure_applied and request_is_current and error_code == "login_failed":
+                self._duty_controller.disable_auto_execution()
+                self._force_logout(message)
         if not is_handoff_preflight:
+            self._send_operational_event(
+                "action_result",
+                status="failed",
+                trigger_type=request.trigger_type,
+                action=action,
+                error=message,
+                result_ref=Path(result_path).name if result_path else "",
+                snapshot={
+                    "action_index": request.action_index,
+                    "completion_key": request.action_key or action_completion_key(action),
+                    "error_code": error_code,
+                },
+                **self._submission_event_fields(request, action),
+            )
             detail = str(message or "登打失敗").strip()
             self._tray_controller.notify(
                 "SinpoSmart",
                 self._format_duty_notification(
                     action,
-                    self._operational_staff,
+                    self._submission_staff(request),
                     f"登打失敗：{detail}",
                 ),
             )
@@ -1053,15 +1343,16 @@ class AppController(QObject):
                     login_status=self._session_controller.loginStatus,
                     duty_status=message,
                     target_date=str(request.schedule_data.get("target_date", "")),
-                    session_actor=self._session_controller.actorNo,
-                    session_verified=self._session_controller.isLoggedIn,
+                    session_actor=request.session_actor_no,
+                    session_verified=request_is_current,
                 )
             )
         except DiagnosticExportError as exc:
             self._diagnostics_status = str(exc)
         else:
             self._diagnostics_status = f"問題包已匯出：{package_path.name}"
-            self._tray_controller.notify("SinpoSmart", self._diagnostics_status)
+            if not is_handoff_preflight:
+                self._tray_controller.notify("SinpoSmart", self._diagnostics_status)
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
@@ -1252,6 +1543,8 @@ class AppController(QObject):
         fields: dict | None = None,
         schedule_data: dict | None = None,
     ) -> None:
+        if self._worker_admissions_closed and not self._allow_shutdown_operational_sync:
+            return
         self._operational_sync_request_id += 1
         request_id = self._operational_sync_request_id
         request = (
@@ -1261,19 +1554,13 @@ class AppController(QObject):
             dict(fields or {}),
             dict(schedule_data or {}),
         )
-        if operation != "event":
-            self._launch_operational_sync(request)
-            return
         self._operational_sync_queue.append(request)
         self._start_next_operational_sync()
 
     def _start_next_operational_sync(self) -> None:
         if (
             self._operational_sync_shutting_down
-            or any(
-                worker.operation == "event"
-                for _thread, worker in self._operational_sync_workers.values()
-            )
+            or self._operational_sync_workers
             or not self._operational_sync_queue
         ):
             return
@@ -1308,10 +1595,31 @@ class AppController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_operational_sync_thread_finished(request_id)
             return
-        self._operational_sync_workers.pop(request_id, None)
+        self._operational_sync_thread_finished(request_id)
         thread.deleteLater()
-        self._start_next_operational_sync()
+
+    def _poll_operational_sync_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._operational_sync_workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(
+                50,
+                lambda: self._poll_operational_sync_thread_finished(request_id),
+            )
+            return
+        self._operational_sync_thread_finished(request_id)
+        thread.deleteLater()
+
+    @Slot(int)
+    def _operational_sync_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._operational_sync_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        QTimer.singleShot(0, self._start_next_operational_sync)
 
     def _drain_queued_operational_sync(self) -> None:
         while self._operational_sync_queue:
@@ -1342,7 +1650,7 @@ class AppController(QObject):
 
     @Slot(object)
     def _enqueue_due_tasks(self, indices: list[int]) -> None:
-        if self._read_only_acceptance:
+        if self._read_only_acceptance or not self._duty_mode_active:
             return
         session = self._session_state.session
         if session is None or not session.verified:
@@ -1438,7 +1746,7 @@ class AppController(QObject):
         if session is None or str(session.actor_no) != str(actor_no):
             return
         self._tray_controller.notify("SinpoSmart", f"{actor_no} 值班交接已完成，自動登出")
-        self._session_controller.systemLogout("系統已自動登出")
+        self._begin_session_logout("系統已自動登出")
 
     @Slot(str)
     def _force_logout(self, message: str) -> None:
@@ -1452,11 +1760,11 @@ class AppController(QObject):
             error=message,
         )
         self._tray_controller.notify("SinpoSmart", message)
-        self._session_controller.systemLogout(message)
+        self._begin_session_logout(message)
 
     @Slot()
     def _refresh_after_settings_save(self) -> None:
-        if self._read_only_acceptance:
+        if self._read_only_acceptance or self._worker_admissions_closed:
             return
         session = self._session_state.session
         if session is not None and session.verified:
@@ -1469,7 +1777,7 @@ class AppController(QObject):
 
     @Slot()
     def _check_scheduled_folders(self) -> None:
-        if self._scheduled_folder_service is None:
+        if self._worker_admissions_closed or self._scheduled_folder_service is None:
             return
         folder = self._scheduled_folder_service.claim_due_folder(datetime.now())
         if folder is None:
@@ -1497,46 +1805,68 @@ class AppController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_scheduled_folder_thread_finished(request_id)
             return
-        self._scheduled_folder_workers.pop(request_id, None)
+        self._scheduled_folder_thread_finished(request_id)
         thread.deleteLater()
+
+    def _poll_scheduled_folder_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._scheduled_folder_workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(
+                50,
+                lambda: self._poll_scheduled_folder_thread_finished(request_id),
+            )
+            return
+        self._scheduled_folder_thread_finished(request_id)
+        thread.deleteLater()
+
+    @Slot(int)
+    def _scheduled_folder_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._scheduled_folder_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
 
     @Slot()
     def shutdown(self) -> None:
-        self._hourly_refresh_timer.stop()
-        self._board_retry_timer.stop()
-        self._tomorrow_schedule_timer.stop()
-        self._operational_sync_shutting_down = True
-        if self._scheduled_folder_timer is not None:
-            self._scheduled_folder_timer.stop()
+        self._close_worker_admissions()
         for request_id, (thread, _worker) in tuple(self._scheduled_folder_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(10_000):
-                self._scheduled_folder_workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(10_000):
+                thread.wait()
+            self._scheduled_folder_thread_finished(request_id)
+            thread.deleteLater()
         for request_id, (thread, _worker) in tuple(self._tomorrow_schedule_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(10_000):
-                self._tomorrow_schedule_workers.pop(request_id, None)
-                thread.deleteLater()
-        for request_id, (thread, _worker) in tuple(self._operational_sync_workers.items()):
-            thread.quit()
-            if thread.wait(60_000):
-                self._operational_sync_workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(10_000):
+                thread.wait()
+            self._tomorrow_schedule_thread_finished(request_id)
+            thread.deleteLater()
+        self._allow_shutdown_operational_sync = True
         self._finalize_active_tool_runs_for_shutdown()
-        self._drain_queued_operational_sync()
-        self._tray_controller.shutdown()
-        self._update_controller.shutdown()
+        self._allow_shutdown_operational_sync = False
+        self._duty_execution_controller.shutdown()
+        self._duty_controller.shutdown()
         self._duty_sheet_controller.shutdown()
         self._rest_monthly_controller.shutdown()
         self._daily_vehicle_controller.shutdown()
         self._rescue_video_controller.shutdown()
-        self._duty_execution_controller.shutdown()
-        self._duty_controller.shutdown()
         self._session_controller.shutdown()
+        self._update_controller.shutdown()
+        self._operational_sync_shutting_down = True
+        for request_id, (thread, _worker) in tuple(self._operational_sync_workers.items()):
+            thread.quit()
+            if not thread.wait(60_000):
+                thread.wait()
+            self._operational_sync_thread_finished(request_id)
+            thread.deleteLater()
+        self._drain_queued_operational_sync()
+        self._tray_controller.shutdown()
 
 
 def shift_roc_date(target_roc_date: str, days: int) -> str:

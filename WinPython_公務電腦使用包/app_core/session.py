@@ -25,6 +25,7 @@ class SessionState:
         self._session: LoginSession | None = None
         self._login_running = False
         self._attempt_id = 0
+        self._generation = 0
 
     @property
     def session(self) -> LoginSession | None:
@@ -32,7 +33,10 @@ class SessionState:
 
     @session.setter
     def session(self, value: LoginSession | None) -> None:
+        if value is self._session:
+            return
         self._session = value
+        self._generation += 1
 
     @property
     def login_running(self) -> bool:
@@ -50,6 +54,12 @@ class SessionState:
     def attempt_id(self, value: int) -> None:
         self._attempt_id = int(value)
 
+    @property
+    def generation(self) -> int:
+        """Monotonic identity token used to reject work from older sessions."""
+
+        return self._generation
+
     def begin_login(self) -> int | None:
         """Start one login attempt, returning None while another is active."""
 
@@ -66,6 +76,7 @@ class SessionState:
             return False
         self._login_running = False
         self._session = session
+        self._generation += 1
         return True
 
     def fail_login(self, attempt_id: int) -> bool:
@@ -74,6 +85,8 @@ class SessionState:
         if attempt_id != self._attempt_id:
             return False
         self._login_running = False
+        if self._session is not None:
+            self._generation += 1
         self._session = None
         return True
 
@@ -84,6 +97,8 @@ class SessionState:
             return False
         self._login_running = False
         self._attempt_id += 1
+        if self._session is not None:
+            self._generation += 1
         self._session = None
         return True
 
@@ -92,4 +107,6 @@ class SessionState:
 
         previous = self._session
         self._session = None
+        if previous is not None:
+            self._generation += 1
         return previous

@@ -13,6 +13,7 @@ from types import ModuleType
 from typing import Any, Callable, Mapping
 
 from app_core.duty_task_projection import (
+    action_completion_key,
     action_target_roc_date,
     build_schedule_comparisons,
     compare_submission_action,
@@ -48,6 +49,10 @@ class DutySubmissionRequest:
     trigger_type: str = "due"
     save: bool = True
     visible: bool = False
+    session_generation: int = 0
+    schedule_generation: int = 0
+    action_key: str = ""
+    session_actor_no: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,13 @@ class DutySubmissionService:
             raise DutySubmissionValidationError("這筆任務不支援勤務系統登打。")
         if request.trigger_type not in ("due", "manual", "recovery"):
             raise DutySubmissionValidationError("登打觸發類型不正確。")
+        try:
+            session_generation = int(request.session_generation)
+            schedule_generation = int(request.schedule_generation)
+        except (TypeError, ValueError) as exc:
+            raise DutySubmissionValidationError("登打工作階段識別不正確。") from exc
+        if session_generation < 0 or schedule_generation < 0:
+            raise DutySubmissionValidationError("登打工作階段識別不正確。")
         return DutySubmissionRequest(
             user_id=request.user_id.strip(),
             password=request.password,
@@ -122,6 +134,13 @@ class DutySubmissionService:
             trigger_type=request.trigger_type,
             save=bool(request.save),
             visible=bool(request.visible),
+            session_generation=session_generation,
+            schedule_generation=schedule_generation,
+            action_key=(
+                str(request.action_key or "").strip()
+                or action_completion_key(action)
+            ),
+            session_actor_no=str(request.session_actor_no or "").strip(),
         )
 
     def execute(

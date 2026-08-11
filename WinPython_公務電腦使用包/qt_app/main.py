@@ -88,9 +88,23 @@ def show_existing_window_requests(server: QLocalServer, controller: AppControlle
     while server.hasPendingConnections():
         connection = server.nextPendingConnection()
         if connection is not None:
+            quit_after_response = False
             connection.waitForReadyRead(100)
             command = bytes(connection.readAll()).decode("utf-8", errors="ignore").strip()
-            if command == "update_logout":
+            if command == "update_prepare":
+                prepare = getattr(controller, "prepareUpdateShutdown", None)
+                if not callable(prepare):
+                    result = "failed"
+                else:
+                    try:
+                        result = str(prepare() or "failed").strip().lower()
+                    except Exception:
+                        result = "failed"
+                if result not in {"ready", "busy", "failed"}:
+                    result = "failed"
+                response = f"{result}\n".encode("utf-8")
+                quit_after_response = result == "ready"
+            elif command == "update_logout":
                 response = b"ok\n" if controller.recordUpdateLogout() else b"skipped\n"
             else:
                 controller.trayController.showWindow()
@@ -98,6 +112,10 @@ def show_existing_window_requests(server: QLocalServer, controller: AppControlle
             connection.write(response)
             connection.waitForBytesWritten(250)
             connection.disconnectFromServer()
+            if quit_after_response:
+                app = QApplication.instance()
+                if app is not None:
+                    QTimer.singleShot(0, app.quit)
 
 
 def create_engine(controller: AppController) -> QQmlApplicationEngine:

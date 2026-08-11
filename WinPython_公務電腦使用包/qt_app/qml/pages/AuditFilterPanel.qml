@@ -178,6 +178,18 @@ ColumnLayout {
             horizontalAlignment: Text.AlignLeft
             elide: Text.ElideRight
             wrapMode: Text.NoWrap
+            activeFocusOnTab: truncated
+            Accessible.name: text
+
+            HoverHandler {
+                id: auditRefreshStatusHover
+            }
+
+            ToolTip.visible: auditRefreshStatusText.truncated
+                                 && (auditRefreshStatusHover.hovered || auditRefreshStatusText.activeFocus)
+            ToolTip.text: auditRefreshStatusText.text
+            ToolTip.delay: 400
+            ToolTip.timeout: 10000
         }
     }
 

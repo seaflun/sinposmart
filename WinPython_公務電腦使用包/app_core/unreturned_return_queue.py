@@ -15,6 +15,7 @@ from app_core.duty_task_projection import action_completion_key
 
 QUEUE_FILENAME = "unreturned_return_queue.json"
 RETENTION = timedelta(hours=18)
+BRIDGE_HISTORY_RETENTION = timedelta(hours=36)
 CURRENT_SHIFT_RETRY = timedelta(minutes=5)
 HANDOVER_RETRY = timedelta(minutes=10)
 
@@ -36,7 +37,20 @@ class UnreturnedReturnQueue:
     def active_records(self) -> list[dict[str, Any]]:
         """Return active records without exposing the queue's mutable backing store."""
 
-        return [dict(record) for record in self._records.values()]
+        return [
+            dict(record)
+            for record in self._records.values()
+            if record.get("record_type") in ("single", "handoff_group")
+        ]
+
+    def bridge_history_records(self) -> list[dict[str, Any]]:
+        """Return resolved bridge records that still suppress skipped handoff actions."""
+
+        return [
+            dict(record)
+            for record in self._records.values()
+            if record.get("record_type") == "bridge_history"
+        ]
 
     def get(self, queue_id: str) -> dict[str, Any] | None:
         record = self._records.get(str(queue_id or ""))
@@ -183,9 +197,56 @@ class UnreturnedReturnQueue:
         record["completed_statuses"] = completed_statuses
         expected = {str(key) for key in record.get("completion_keys", [])}
         if expected and expected.issubset(completed):
+            if record.get("bridge_history"):
+                record["record_type"] = "bridge_history"
+                record["resolved_at"] = self._timestamp(self.now_factory())
+                self._inflight_ids.discard(queue_id)
+                self._write_records()
+                return dict(record), True
             return self.resolve(queue_id), True
         self._write_records()
         return dict(record), False
+
+    def bridge_handoff_group(
+        self,
+        queue_id: str,
+        actions: Sequence[Mapping[str, Any]],
+        schedule_data: Mapping[str, Any],
+        *,
+        bridge_at: datetime,
+        skipped_actor_nos: Sequence[str],
+        incoming_actor_nos: Sequence[str],
+        skipped_action_keys: Sequence[str],
+    ) -> dict[str, Any] | None:
+        """Replace an untouched paused handoff with its scheduled bridge group."""
+
+        record = self._records.get(str(queue_id or ""))
+        if (
+            record is None
+            or record.get("record_type") != "handoff_group"
+            or record.get("completed_keys")
+        ):
+            return None
+        bridge_actions = [self._json_mapping(action) for action in actions if isinstance(action, Mapping)]
+        if not bridge_actions:
+            return None
+        history = list(record.get("bridge_history", []))
+        history.append(
+            {
+                "bridged_at": self._timestamp(bridge_at),
+                "skipped_actor_nos": [str(actor_no or "").strip() for actor_no in skipped_actor_nos],
+                "incoming_actor_nos": [str(actor_no or "").strip() for actor_no in incoming_actor_nos],
+                "skipped_action_keys": [str(key or "").strip() for key in skipped_action_keys],
+            }
+        )
+        record["actions"] = bridge_actions
+        record["completion_keys"] = [action_completion_key(action) for action in bridge_actions]
+        record["completed_keys"] = []
+        record["completed_statuses"] = {}
+        record["schedule_context"] = self._schedule_context(schedule_data)
+        record["bridge_history"] = history
+        self._write_records()
+        return dict(record)
 
     def claim_due(self, actor_no: str, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Claim one due record and schedule its next safe retry window."""
@@ -194,6 +255,7 @@ class UnreturnedReturnQueue:
         candidates = [
             record
             for record in self._records.values()
+            if record.get("record_type") in ("single", "handoff_group")
             if record.get("queue_id") not in self._inflight_ids
             and self._parse_timestamp(record.get("next_retry_at")) <= current
         ]
@@ -258,6 +320,7 @@ class UnreturnedReturnQueue:
         expired_ids = [
             queue_id
             for queue_id, record in self._records.items()
+            if record.get("record_type") in ("single", "handoff_group")
             if self._parse_timestamp(record.get("expires_at")) <= current
         ]
         expired = [dict(self._records.pop(queue_id)) for queue_id in expired_ids]
@@ -266,6 +329,23 @@ class UnreturnedReturnQueue:
         if expired:
             self._write_records()
         return expired
+
+    def prune_bridge_history(self, *, now: datetime | None = None) -> None:
+        """Discard resolved bridge history after it can no longer affect a fire day."""
+
+        current = now or self.now_factory()
+        expired_ids = [
+            queue_id
+            for queue_id, record in self._records.items()
+            if record.get("record_type") == "bridge_history"
+            and self._parse_timestamp(record.get("resolved_at")) + BRIDGE_HISTORY_RETENTION <= current
+        ]
+        if not expired_ids:
+            return
+        for queue_id in expired_ids:
+            self._records.pop(queue_id, None)
+            self._inflight_ids.discard(queue_id)
+        self._write_records()
 
     @staticmethod
     def retry_interval(record: Mapping[str, Any], actor_no: str) -> timedelta:

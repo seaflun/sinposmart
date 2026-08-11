@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import os
 from datetime import datetime
@@ -21,6 +22,28 @@ def package_dir() -> Path:
     if len(candidates) != 1:
         raise AssertionError(f"expected one WinPython package directory, found {len(candidates)}")
     return candidates[0]
+
+
+def run_powershell_contract(source: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        contract_path = Path(temp_dir) / "contract.ps1"
+        contract_path.write_text(source, encoding="utf-8-sig")
+        return subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(contract_path),
+            ],
+            cwd=package_dir(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
 
 
 def rest_time_module():
@@ -2772,10 +2795,308 @@ class PackageSmokeTests(unittest.TestCase):
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
 
         self.assertIn("function Send-UpdateLogoutEvent", script)
-        self.assertIn("update_logout", script)
+        self.assertIn("update_prepare", script)
         self.assertIn("NamedPipeClientStream", script)
         self.assertIn("TYFD.SinpoSmart.DutyAutomation.Qt", script)
-        self.assertLess(script.index("Send-UpdateLogoutEvent"), script.index("$wasRunning = Stop-RunningDutyGui"))
+        install_start = script.index("$runningDutyGuiProcesses")
+        install_section = script[
+            install_start:script.index("Copy-UpdateTree -SourceDir", install_start)
+        ]
+        self.assertIn('$prepareResult -ne "ready"', install_section)
+        self.assertIn("$runningDutyGuiProcesses.Count -ne 1", install_section)
+        self.assertIn("Test-IsQtDutyGuiProcess -Process $runningQtProcess", install_section)
+        self.assertIn("-ExpectedProcessId $handshakenProcessId", install_section)
+        self.assertLess(
+            install_section.index("$runningDutyGuiProcesses.Count -ne 1"),
+            install_section.index("Send-UpdateLogoutEvent"),
+        )
+        self.assertLess(
+            install_section.index('$prepareResult -ne "ready"'),
+            install_section.index("Stop-RunningDutyGui"),
+        )
+
+    def test_update_package_preserves_running_gui_without_ready_handshake(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        install_start = script.index("$runningDutyGuiProcesses")
+        install_section = script[
+            install_start:script.index("Copy-UpdateTree -SourceDir", install_start)
+        ]
+
+        self.assertIn('"busy"', script)
+        self.assertIn('"failed"', script)
+        self.assertIn('"timeout"', script)
+        self.assertIn('$prepareResult -ne "ready"', install_section)
+        self.assertIn("Stop-RunningDutyGui -Processes $runningDutyGuiProcesses -Ready", install_section)
+        self.assertLess(
+            install_section.index('$prepareResult -ne "ready"'),
+            install_section.index("Stop-RunningDutyGui"),
+        )
+
+    def test_update_package_detects_relative_entrypoints_fail_closed(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        helper_start = script.index("function Get-DutyGuiEntrypointToken")
+        helper_end = script.index("function Send-UpdateLogoutEvent", helper_start)
+        helper_source = script[helper_start:helper_end]
+        contract = f"""
+$ErrorActionPreference = "Stop"
+$packageDir = 'C:\\SinpoSmart Package'
+{helper_source}
+$script:FakeProcesses = @(
+    [pscustomobject]@{{ ProcessId = 11; CommandLine = 'pythonw.exe duty_gui.pyw' }},
+    [pscustomobject]@{{ ProcessId = 12; CommandLine = 'python.exe ..\\package\\duty_gui.py' }},
+    [pscustomobject]@{{ ProcessId = 13; CommandLine = 'pythonw.exe "C:\\SinpoSmart Package\\duty_gui.pyw"' }},
+    [pscustomobject]@{{ ProcessId = 14; CommandLine = 'pythonw.exe "C:\\Other Package\\duty_gui.pyw"' }}
+)
+function Get-CimInstance {{
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$ClassName)
+    return $script:FakeProcesses
+}}
+$found = @(Get-RunningDutyGuiProcesses)
+$ids = @($found | ForEach-Object {{ [int]$_.ProcessId }})
+if ($found.Count -ne 3 -or 11 -notin $ids -or 12 -notin $ids -or 13 -notin $ids) {{
+    throw "Relative or local duty_gui process was not detected. IDs: $($ids -join ',')"
+}}
+if (14 -in $ids) {{
+    throw "A confirmed external absolute duty_gui path was incorrectly claimed."
+}}
+if (-not (Test-IsQtDutyGuiProcess -Process $found[0])) {{
+    throw "The relative QML entrypoint was not classified as Qt."
+}}
+if (Test-IsQtDutyGuiProcess -Process $found[1]) {{
+    throw "The relative Tk entrypoint was incorrectly classified as Qt."
+}}
+"ok"
+"""
+
+        result = run_powershell_contract(contract)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_update_package_accepts_handshaken_process_natural_exit(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        helper_start = script.index("function Get-DutyGuiEntrypointToken")
+        helper_end = script.index("function Send-UpdateLogoutEvent", helper_start)
+        stop_start = script.index("function Stop-RunningDutyGui")
+        stop_end = script.index("function Start-DutyGui", stop_start)
+        contract = f"""
+$ErrorActionPreference = "Stop"
+$packageDir = 'C:\\SinpoSmart Package'
+{script[helper_start:helper_end]}
+{script[stop_start:stop_end]}
+$missingPid = [int]::MaxValue
+$initial = [pscustomobject]@{{ ProcessId = $missingPid; CommandLine = 'pythonw.exe duty_gui.pyw' }}
+function Get-RunningDutyGuiProcesses {{ return @() }}
+if (-not (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -Ready)) {{
+    throw "A handshaken process that exited naturally was rejected."
+}}
+$liveInitial = [pscustomobject]@{{ ProcessId = $PID; CommandLine = 'pythonw.exe duty_gui.pyw' }}
+if (Stop-RunningDutyGui -Processes @($liveInitial) -ExpectedProcessId $PID -Ready) {{
+    throw "An unclassified but still-live handshaken PID was accepted."
+}}
+function Get-RunningDutyGuiProcesses {{
+    return @([pscustomobject]@{{ ProcessId = 42; CommandLine = 'pythonw.exe duty_gui.pyw' }})
+}}
+if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -Ready) {{
+    throw "A replacement PID was accepted after the handshake."
+}}
+"ok"
+"""
+
+        result = run_powershell_contract(contract)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_operational_status_updates_share_lock_and_replace_atomically(self) -> None:
+        module = package_module("app_core.operational_sync_service")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = module.OperationalSyncService(Path(temp_dir))
+            original_load = service._load_sync_status
+            first_loaded = threading.Event()
+            release_first = threading.Event()
+            load_count = 0
+            count_lock = threading.Lock()
+
+            def controlled_load():
+                nonlocal load_count
+                current = original_load()
+                with count_lock:
+                    load_count += 1
+                    current_count = load_count
+                if current_count == 1:
+                    first_loaded.set()
+                    release_first.wait(2)
+                return current
+
+            service._load_sync_status = controlled_load
+            event_thread = threading.Thread(
+                target=service._record_sync_status,
+                args=("event", "ok", "event complete"),
+            )
+            board_thread = threading.Thread(
+                target=service._record_sync_status,
+                args=("board", "ok", "board complete"),
+            )
+            event_thread.start()
+            self.assertTrue(first_loaded.wait(1))
+            board_thread.start()
+            release_first.set()
+            event_thread.join(2)
+            board_thread.join(2)
+
+            self.assertFalse(event_thread.is_alive())
+            self.assertFalse(board_thread.is_alive())
+            status = json.loads(service.status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["event"]["state"], "ok")
+            self.assertEqual(status["board"]["state"], "ok")
+            self.assertEqual(list(service.status_path.parent.glob(f".{service.status_path.name}.*.tmp")), [])
+
+    def test_durable_event_queue_does_not_wait_for_http_delivery(self) -> None:
+        module = package_module("app_core.operational_sync_service")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = module.OperationalSyncService(Path(temp_dir))
+            payload = service.enqueue_event(
+                "logout",
+                trigger_type="update",
+                actor_no="10",
+                durable_only=True,
+            )
+            pending = service._load_pending_events()
+
+        self.assertEqual([entry["event_id"] for entry in pending], [payload["event_id"]])
+
+    def test_session_timeout_allows_retry_and_ignores_late_first_result(self) -> None:
+        package_module("app_core.credential_repository")
+        from app_core.credential_repository import CredentialRepository
+        from app_core.login_verifier import LoginResult
+        from app_core.session import SessionState
+        from qt_app.controllers.session_controller import SessionController
+
+        class FakeThread:
+            def __init__(self) -> None:
+                self.interruption_requested = False
+                self.deleted = False
+
+            def requestInterruption(self) -> None:
+                self.interruption_requested = True
+
+            def deleteLater(self) -> None:
+                self.deleted = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SessionState()
+            repository = CredentialRepository(Path(temp_dir) / "saved_login.json", "SinpoSmart", None)
+            controller = SessionController(state, repository=repository, verifier=object())
+            attempt_id = state.begin_login()
+            self.assertIsNotNone(attempt_id)
+            controller._pending_credentials[attempt_id] = ("user10", "secret", False)
+            thread = FakeThread()
+            controller._login_workers[attempt_id] = (thread, object())
+
+            controller._login_timed_out(attempt_id)
+
+            self.assertFalse(controller.isBusy)
+            self.assertTrue(controller.hasRunningLoginWorkers)
+            self.assertTrue(thread.interruption_requested)
+            controller._login_succeeded(
+                attempt_id,
+                LoginResult(actor_no="10", user_id="user10", actor_name="late"),
+            )
+            self.assertFalse(controller.isLoggedIn)
+            self.assertIsNotNone(state.begin_login())
+
+            controller._finalize_login_thread(attempt_id)
+            self.assertFalse(controller.hasRunningLoginWorkers)
+            self.assertTrue(thread.deleted)
+
+        source = (
+            package_dir() / "qt_app" / "controllers" / "session_controller.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        login_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "login"
+        )
+        self.assertNotIn("_login_workers", ast.unparse(login_method.body[0].test))
+        self.assertIn("_poll_login_thread_finished", source)
+        self.assertIn("QTimer.singleShot", source)
+
+    def test_tray_and_update_guards_reject_busy_stop_without_waiting(self) -> None:
+        package_module("app_core.update_repository")
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.tray_controller import TrayController
+        from qt_app.controllers.update_controller import UpdateController
+
+        class FakeApp:
+            def __init__(self) -> None:
+                self.quit_calls = 0
+
+            def quit(self) -> None:
+                self.quit_calls += 1
+
+        block_reason = "勤務登打仍在執行"
+        fake_app = FakeApp()
+        notices = []
+        tray = TrayController(
+            fake_app,
+            tray_available=False,
+            native_notifier=lambda title, message: notices.append((title, message)) or True,
+            stop_guard=lambda: block_reason,
+        )
+        tray.requestQuit()
+        self.assertEqual(fake_app.quit_calls, 0)
+        self.assertFalse(tray.quitRequested)
+        self.assertIn(block_reason, notices[0][1])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.08.10.0001\n", encoding="utf-8")
+            script_path = version_path.with_name("update_package.ps1")
+            script_path.write_text("# updater\n", encoding="utf-8")
+            launched = []
+            update = UpdateController(
+                UpdateRepository(version_path),
+                process_launcher=lambda path: launched.append(path),
+                stop_guard=lambda: block_reason,
+            )
+            update._update_available = True
+            update.launchUpdate()
+
+            self.assertEqual(launched, [])
+            self.assertIn(block_reason, update.statusText)
+
+    def test_owned_qt_workers_poll_after_wait_timeout_without_sticky_state(self) -> None:
+        controller_root = package_dir() / "qt_app" / "controllers"
+
+        for relative in (
+            "app_controller.py",
+            "session_controller.py",
+            "update_controller.py",
+            "duty_controller.py",
+            "duty_execution_controller.py",
+            "daily_vehicle_controller.py",
+            "duty_sheet_controller.py",
+            "rest_monthly_controller.py",
+            "rescue_video_controller.py",
+        ):
+            with self.subTest(relative=relative):
+                source = (controller_root / relative).read_text(encoding="utf-8")
+                self.assertIn("if not thread.wait(5_000):", source)
+                self.assertIn("thread.isFinished()", source)
+                self.assertIn("QTimer.singleShot", source)
+
+    def test_update_prepare_quits_only_after_ready_response(self) -> None:
+        source = (package_dir() / "qt_app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn('command == "update_prepare"', source)
+        self.assertIn('result not in {"ready", "busy", "failed"}', source)
+        self.assertIn('quit_after_response = result == "ready"', source)
+        self.assertIn("if quit_after_response:", source)
 
     def test_update_backup_includes_qt_application_directories(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
@@ -2867,7 +3188,7 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("Update zip is missing required PySide6/QML file", script)
         self.assertLess(
             script.index("$requiredQtPackageFiles"),
-            script.index("$wasRunning = Stop-RunningDutyGui"),
+            script.index("$runningDutyGuiProcesses"),
         )
 
     def test_powershell_scripts_parse(self) -> None:

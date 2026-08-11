@@ -166,16 +166,51 @@ Rectangle {
                 selectedState: taskRow.selected
                 tone: taskRow.statusTone
                 errorText: taskRow.errorText
+                activeFocusOnTab: true
+                Accessible.role: dutyTaskArea.modeIndex === 0 ? Accessible.CheckBox : Accessible.Button
+                Accessible.name: (dutyTaskArea.modeIndex === 0 ? "值班任務" : "審核項目")
+                                 + "，" + taskRow.timeText
+                                 + "，" + taskRow.systemText
+                                 + "，" + taskRow.detailText
+                                 + "，" + taskRow.statusText
+                Accessible.description: taskRow.errorText
+                Accessible.checked: dutyTaskArea.modeIndex === 0 && taskRow.selected
+
+                function activateRow() {
+                    if (dutyTaskArea.modeIndex === 0)
+                        dutyTaskArea.backend.dutyController.toggleTaskSelection(taskRow.taskIndex)
+                    else
+                        dutyTaskArea.auditDetailRequested(taskRow.fullDetailText)
+                }
+
+                Keys.onSpacePressed: function(event) {
+                    taskRow.activateRow()
+                    event.accepted = true
+                }
+                Keys.onReturnPressed: function(event) {
+                    taskRow.activateRow()
+                    event.accepted = true
+                }
+                Keys.onEnterPressed: function(event) {
+                    taskRow.activateRow()
+                    event.accepted = true
+                }
+                Accessible.onPressAction: taskRow.activateRow()
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: {
-                        if (dutyTaskArea.modeIndex === 0) {
-                            dutyTaskArea.backend.dutyController.toggleTaskSelection(taskRow.taskIndex);
-                        } else {
-                            dutyTaskArea.auditDetailRequested(taskRow.fullDetailText);
-                        }
-                    }
+                    onPressed: taskRow.forceActiveFocus(Qt.MouseFocusReason)
+                    onClicked: taskRow.activateRow()
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    visible: taskRow.activeFocus
+                    radius: taskRow.radius
+                    color: Design.transparent
+                    border.width: Design.focusBorderWidth
+                    border.color: Design.blue
+                    z: 2
                 }
 
                 RowLayout {
@@ -229,6 +264,7 @@ Rectangle {
                 }
 
                 Label {
+                    id: dutyTaskErrorText
                     objectName: "dutyTaskErrorText"
                     visible: dutyTaskArea.modeIndex === 0 && taskRow.errorText.length > 0
                     anchors.left: parent.left
@@ -243,6 +279,18 @@ Rectangle {
                     font.bold: true
                     elide: Text.ElideRight
                     verticalAlignment: Text.AlignVCenter
+                    activeFocusOnTab: visible && truncated
+                    Accessible.name: text
+
+                    HoverHandler {
+                        id: dutyTaskErrorHover
+                    }
+
+                    ToolTip.visible: dutyTaskErrorText.truncated
+                                         && (dutyTaskErrorHover.hovered || dutyTaskErrorText.activeFocus)
+                    ToolTip.text: dutyTaskErrorText.text
+                    ToolTip.delay: 400
+                    ToolTip.timeout: 10000
                 }
 
                 RowLayout {
@@ -318,7 +366,7 @@ Rectangle {
 
                     Label {
                         Layout.fillWidth: true
-                        text: dutyTaskArea.modeIndex === 1 ? "此日期尚無審核任務" : "目前沒有勤務任務"
+                        text: dutyTaskArea.modeIndex === 1 ? "此日期尚無可顯示資料" : "目前沒有勤務任務"
                         color: Design.infoText
                         font.pixelSize: Design.sectionTitleSize
                         font.bold: true

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, QUrl, Signal, Slot
 
 from app_core.rest_monthly_service import (
     MonthlyBaseRequest,
@@ -45,6 +45,7 @@ class RestMonthlyController(QObject):
         self._failure_stage = "unknown"
         self._failure_detail = ""
         self._workers: dict[int, tuple[QThread, RestMonthlyWorker]] = {}
+        self._shutdown_admission = False
 
     @Property(str, notify=stateChanged)
     def restWorkbookPath(self) -> str:
@@ -171,7 +172,12 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def confirmRun(self) -> None:
-        if self._pending_request is None or not self._pending_tool_id or self._workers:
+        if (
+            self._shutdown_admission
+            or self._pending_request is None
+            or not self._pending_tool_id
+            or self._workers
+        ):
             return
         self._request_id += 1
         request_id = self._request_id
@@ -274,19 +280,41 @@ class RestMonthlyController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_worker_thread_finished(request_id)
             return
-        self._workers.pop(request_id, None)
+        self._finalize_worker_thread(request_id)
+
+    def _poll_worker_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_worker_thread_finished(request_id))
+            return
+        self._finalize_worker_thread(request_id)
+
+    def _finalize_worker_thread(self, request_id: int) -> None:
+        worker_pair = self._workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         thread.deleteLater()
         self.stateChanged.emit()
 
     @Slot()
+    def prepare_shutdown_admission(self) -> None:
+        self._shutdown_admission = True
+
+    @Slot()
     def shutdown(self) -> None:
+        self.prepare_shutdown_admission()
         for request_id, (thread, _worker) in tuple(self._workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(120_000):
-                self._workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._finalize_worker_thread(request_id)
 
     def _set_error(self, message: str) -> None:
         self._status_text = message

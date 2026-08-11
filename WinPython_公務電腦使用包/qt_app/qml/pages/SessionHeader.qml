@@ -70,6 +70,7 @@ ColumnLayout {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
+                    id: loggedInStatusLabel
                     objectName: "loggedInStatusLabel"
                     Layout.fillWidth: true
                     Layout.preferredHeight: 24
@@ -80,12 +81,24 @@ ColumnLayout {
                     elide: Text.ElideRight
                     wrapMode: Text.NoWrap
                     verticalAlignment: Text.AlignVCenter
+                    activeFocusOnTab: truncated
+                    Accessible.name: text
+
+                    HoverHandler {
+                        id: loggedInStatusHover
+                    }
+
+                    ToolTip.visible: loggedInStatusLabel.truncated
+                                         && (loggedInStatusHover.hovered || loggedInStatusLabel.activeFocus)
+                    ToolTip.text: loggedInStatusLabel.text
+                    ToolTip.delay: 400
+                    ToolTip.timeout: 10000
                 }
                 DangerButton {
                     implicitHeight: 30
                     implicitWidth: 74
                     text: "登出"
-                    onClicked: sessionHeader.backend.sessionController.logout()
+                    onClicked: sessionHeader.backend.requestLogout()
                 }
             }
         }
@@ -192,6 +205,7 @@ ColumnLayout {
                 spacing: 8
 
                 Label {
+                    id: loginStatusLabel
                     objectName: "loginStatusLabel"
                     Layout.fillWidth: true
                     text: sessionHeader.backend.sessionController.loginStatus
@@ -199,6 +213,18 @@ ColumnLayout {
                     font.pixelSize: Design.controlSize
                     elide: Text.ElideRight
                     verticalAlignment: Text.AlignVCenter
+                    activeFocusOnTab: truncated
+                    Accessible.name: text
+
+                    HoverHandler {
+                        id: loginStatusHover
+                    }
+
+                    ToolTip.visible: loginStatusLabel.truncated
+                                         && (loginStatusHover.hovered || loginStatusLabel.activeFocus)
+                    ToolTip.text: loginStatusLabel.text
+                    ToolTip.delay: 400
+                    ToolTip.timeout: 10000
                 }
             }
         }

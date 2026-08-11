@@ -114,8 +114,8 @@ RowLayout {
         text: "模式"
         tone: "menu"
         instantFeedback: true
-        showFocusRing: false
-        focusPolicy: Qt.NoFocus
+        showFocusRing: true
+        focusPolicy: Qt.TabFocus
         scale: 1
         onPressed: closesOpenMenu = modeMenu.visible
         onClicked: {
@@ -143,8 +143,8 @@ RowLayout {
         text: "系統"
         tone: "menu"
         instantFeedback: true
-        showFocusRing: false
-        focusPolicy: Qt.NoFocus
+        showFocusRing: true
+        focusPolicy: Qt.TabFocus
         scale: 1
         onPressed: closesOpenMenu = systemMenu.visible
         onClicked: {
@@ -172,8 +172,8 @@ RowLayout {
         text: "視窗"
         tone: "menu"
         instantFeedback: true
-        showFocusRing: false
-        focusPolicy: Qt.NoFocus
+        showFocusRing: true
+        focusPolicy: Qt.TabFocus
         scale: 1
         onPressed: closesOpenMenu = windowMenu.visible
         onClicked: {
@@ -275,7 +275,7 @@ RowLayout {
         CommandMenuItem {
             objectName: "logoutMenuItem"
             text: "登出"
-            onTriggered: dutyOperationBar.backend.sessionController.logout()
+            onTriggered: dutyOperationBar.backend.requestLogout()
         }
         MenuSeparator {}
         CommandMenuItem {

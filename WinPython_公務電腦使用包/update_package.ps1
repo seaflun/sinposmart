@@ -88,14 +88,72 @@ function Test-SkipPackagePath {
     return $skipExtensions -contains $extension
 }
 
+function Get-DutyGuiEntrypointToken {
+    param([object]$Process)
+
+    if (-not $Process -or -not $Process.CommandLine) {
+        return ""
+    }
+    $match = [regex]::Match(
+        [string]$Process.CommandLine,
+        '(?i)(?:"(?<quoted>[^"]*duty_gui\.pyw?)"|(?<bare>[^\s"]*duty_gui\.pyw?))(?=$|\s)'
+    )
+    if (-not $match.Success) {
+        return ""
+    }
+    if ($match.Groups["quoted"].Success) {
+        return $match.Groups["quoted"].Value
+    }
+    return $match.Groups["bare"].Value
+}
+
+function Test-IsPossiblePackageDutyGuiProcess {
+    param([object]$Process)
+
+    $entrypoint = Get-DutyGuiEntrypointToken -Process $Process
+    if (-not $entrypoint) {
+        return $false
+    }
+    if (-not [System.IO.Path]::IsPathRooted($entrypoint)) {
+        # A bare or relative entrypoint may have been launched with packageDir as
+        # its working directory. Treat it as ours so updating fails closed.
+        return $true
+    }
+    try {
+        $entrypointDirectory = [System.IO.Path]::GetDirectoryName(
+            [System.IO.Path]::GetFullPath($entrypoint)
+        )
+        $normalizedPackageDir = [System.IO.Path]::GetFullPath($packageDir).TrimEnd([char]92, [char]47)
+        $normalizedEntrypointDir = $entrypointDirectory.TrimEnd([char]92, [char]47)
+        return [string]::Equals(
+            $normalizedEntrypointDir,
+            $normalizedPackageDir,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        # If an apparent absolute path cannot be normalized, do not risk
+        # overwriting files while it might still belong to this package.
+        return $true
+    }
+}
+
 function Get-RunningDutyGuiProcesses {
-    $packagePath = $packageDir.TrimEnd([char]92)
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.CommandLine -and
-            $_.CommandLine -match "duty_gui\.pyw?" -and
-            $_.CommandLine.Contains($packagePath)
-        }
+        Where-Object { Test-IsPossiblePackageDutyGuiProcess -Process $_ }
+}
+
+function Test-IsQtDutyGuiProcess {
+    param([object]$Process)
+
+    $entrypoint = Get-DutyGuiEntrypointToken -Process $Process
+    if (-not $entrypoint -or -not (Test-IsPossiblePackageDutyGuiProcess -Process $Process)) {
+        return $false
+    }
+    return [string]::Equals(
+        [System.IO.Path]::GetFileName($entrypoint),
+        "duty_gui.pyw",
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 function Send-UpdateLogoutEvent {
@@ -109,25 +167,31 @@ function Send-UpdateLogoutEvent {
             [System.IO.Pipes.PipeOptions]::Asynchronous
         )
         $pipe.Connect(1500)
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes("update_logout`n")
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("update_prepare`n")
         $pipe.Write($bytes, 0, $bytes.Length)
         $pipe.Flush()
 
         $buffer = New-Object byte[] 64
         $readResult = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
         if (-not $readResult.AsyncWaitHandle.WaitOne(1500)) {
-            Write-Warning "Could not confirm update logout: command server timeout."
-            return $false
+            Write-Warning "Could not prepare the running app for update: command server timeout."
+            return "timeout"
         }
         $count = $pipe.EndRead($readResult)
-        if ($count -gt 0) {
-            $response = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count).Trim()
-            Write-Host "Update logout event: $response"
+        if ($count -le 0) {
+            Write-Warning "Could not prepare the running app for update: empty response."
+            return "failed"
         }
-        return $true
+        $response = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count).Trim().ToLowerInvariant()
+        if ($response -notin @("ready", "busy", "failed")) {
+            Write-Warning "Could not prepare the running app for update: invalid response '$response'."
+            return "failed"
+        }
+        Write-Host "Update preparation: $response"
+        return $response
     } catch {
-        Write-Warning "Could not report update logout: $_"
-        return $false
+        Write-Warning "Could not prepare the running app for update: $_"
+        return "failed"
     } finally {
         if ($readResult -and $readResult.AsyncWaitHandle) {
             $readResult.AsyncWaitHandle.Dispose()
@@ -139,19 +203,75 @@ function Send-UpdateLogoutEvent {
 }
 
 function Stop-RunningDutyGui {
-    $processes = @(Get-RunningDutyGuiProcesses)
-    if (-not $processes) {
+    param(
+        [object[]]$Processes = @(),
+        [int]$ExpectedProcessId = 0,
+        [switch]$Ready
+    )
+
+    if (-not $Ready) {
+        Write-Warning "Refused to stop SinpoSmart without a ready update handshake."
+        return $false
+    }
+
+    $processes = @($Processes)
+    if ($processes.Count -ne 1 -or $ExpectedProcessId -le 0) {
+        Write-Warning "Refused to stop SinpoSmart because exactly one handshaken Qt process is required."
+        return $false
+    }
+
+    $process = $processes[0]
+    if (
+        -not (Test-IsQtDutyGuiProcess -Process $process) -or
+        [int]$process.ProcessId -ne $ExpectedProcessId
+    ) {
+        Write-Warning "Refused to stop SinpoSmart because the supplied process is not the handshaken Qt duty_gui.pyw process."
+        return $false
+    }
+
+    $currentProcesses = @(Get-RunningDutyGuiProcesses)
+    if ($currentProcesses.Count -eq 0) {
+        try {
+            $remainingProcess = [System.Diagnostics.Process]::GetProcessById($ExpectedProcessId)
+            $remainingProcess.Dispose()
+            Write-Warning "Refused to update because handshaken process $ExpectedProcessId still exists but could not be classified safely."
+            return $false
+        } catch [System.ArgumentException] {
+            Write-Host "The handshaken SinpoSmart process $ExpectedProcessId exited cleanly."
+            return $true
+        } catch {
+            Write-Warning "Could not confirm whether handshaken process $ExpectedProcessId exited: $_"
+            return $false
+        }
+    }
+    if (
+        $currentProcesses.Count -ne 1 -or
+        -not (Test-IsQtDutyGuiProcess -Process $currentProcesses[0]) -or
+        [int]$currentProcesses[0].ProcessId -ne $ExpectedProcessId
+    ) {
+        Write-Warning "Refused to stop SinpoSmart because the running GUI process set changed after the update handshake."
         return $false
     }
 
     Write-Host "Closing running SinpoSmart app so the updated files can load..."
-    foreach ($process in $processes) {
-        try {
-            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-            Write-Host "Closed process $($process.ProcessId)."
-        } catch {
-            Write-Warning "Could not close process $($process.ProcessId): $_"
+    $allClosed = $true
+    try {
+        Wait-Process -Id $ExpectedProcessId -Timeout 10 -ErrorAction SilentlyContinue
+        if (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $ExpectedProcessId -Force -ErrorAction Stop
         }
+        if (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue) {
+            $allClosed = $false
+            Write-Warning "Process $ExpectedProcessId is still running."
+        } else {
+            Write-Host "Closed process $ExpectedProcessId."
+        }
+    } catch {
+        $allClosed = $false
+        Write-Warning "Could not close process ${ExpectedProcessId}: $_"
+    }
+    if (-not $allClosed) {
+        return $false
     }
     Start-Sleep -Milliseconds 800
     return $true
@@ -185,7 +305,13 @@ function Start-DutyGui {
 }
 
 function Restart-DutyGuiIfRunning {
-    if (Stop-RunningDutyGui) {
+    param(
+        [object[]]$Processes = @(),
+        [int]$ExpectedProcessId = 0,
+        [switch]$Ready
+    )
+
+    if (Stop-RunningDutyGui -Processes $Processes -ExpectedProcessId $ExpectedProcessId -Ready:$Ready) {
         Start-DutyGui
         return $true
     }
@@ -495,8 +621,25 @@ try {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
 
-    Send-UpdateLogoutEvent | Out-Null
-    $wasRunning = Stop-RunningDutyGui
+    $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
+    $wasRunning = $runningDutyGuiProcesses.Count -gt 0
+    if ($wasRunning) {
+        if ($runningDutyGuiProcesses.Count -ne 1) {
+            throw "Update postponed because exactly one SinpoSmart GUI process must be running. No process was stopped."
+        }
+        $runningQtProcess = $runningDutyGuiProcesses[0]
+        if (-not (Test-IsQtDutyGuiProcess -Process $runningQtProcess)) {
+            throw "Update postponed because the running SinpoSmart GUI is not the Qt duty_gui.pyw app. No process was stopped."
+        }
+        $handshakenProcessId = [int]$runningQtProcess.ProcessId
+        $prepareResult = Send-UpdateLogoutEvent
+        if ($prepareResult -ne "ready") {
+            throw "Update postponed because the running SinpoSmart app did not report ready ($prepareResult). The app remains open."
+        }
+        if (-not (Stop-RunningDutyGui -Processes $runningDutyGuiProcesses -Ready -ExpectedProcessId $handshakenProcessId)) {
+            throw "Update postponed because the running SinpoSmart app could not be closed safely."
+        }
+    }
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
     Invoke-SetupAfterUpdate
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8

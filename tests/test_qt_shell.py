@@ -93,6 +93,33 @@ class SessionStateTests(unittest.TestCase):
         self.assertIs(state.clear_session(), session)
         self.assertIsNone(state.session)
 
+    def test_session_generation_changes_for_every_authenticated_session_boundary(self) -> None:
+        from app_core.session import LoginSession, SessionState
+
+        state = SessionState()
+        self.assertEqual(state.generation, 0)
+
+        first_attempt = state.begin_login()
+        self.assertTrue(
+            state.complete_login(
+                first_attempt,
+                LoginSession("10", "user10", "secret", verified=True),
+            )
+        )
+        self.assertEqual(state.generation, 1)
+
+        state.clear_session()
+        self.assertEqual(state.generation, 2)
+
+        second_attempt = state.begin_login()
+        self.assertTrue(
+            state.complete_login(
+                second_attempt,
+                LoginSession("10", "user10", "secret", verified=True),
+            )
+        )
+        self.assertEqual(state.generation, 3)
+
 
 class LoginVerifierTests(unittest.TestCase):
     class SwitchTo:
@@ -3832,6 +3859,17 @@ class TrayControllerTests(unittest.TestCase):
         self.assertFalse(unavailable.interceptClose())
         self.assertFalse(unavailable_window.hidden)
 
+        notices: list[tuple[str, str]] = []
+        busy_without_tray = TrayController(
+            app,
+            tray_available=False,
+            native_notifier=lambda title, message: notices.append((title, message)) or True,
+            stop_guard=lambda: "勤務登打尚未完成",
+        )
+        busy_without_tray.attach_window(self.Window())
+        self.assertTrue(busy_without_tray.interceptClose())
+        self.assertIn("勤務登打尚未完成", notices[0][1])
+
         window.hidden = False
         controller.initialize(window)
         action_labels = [action.text() for action in controller._menu.actions() if not action.isSeparator()]
@@ -4274,6 +4312,17 @@ class QtShellTests(unittest.TestCase):
 
         cls.app = QApplication.instance() or QApplication(["test_qt_shell"])
 
+    def setUp(self) -> None:
+        self.addCleanup(self._flush_qt_deferred_deletes)
+
+    @staticmethod
+    def _flush_qt_deferred_deletes() -> None:
+        from PySide6.QtCore import QCoreApplication, QEvent
+
+        for _ in range(2):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            QCoreApplication.processEvents()
+
     def test_qml_visual_literals_are_centralized_in_design_tokens(self) -> None:
         qml_path = PACKAGE_ROOT / "qt_app" / "qml" / "Main.qml"
         design_path = PACKAGE_ROOT / "qt_app" / "qml" / "styles" / "Design.qml"
@@ -4312,6 +4361,26 @@ class QtShellTests(unittest.TestCase):
             runtime_qml,
             r"(?m)^\s+(?:fillColor|hoverColor|strokeColor|textColor):",
         )
+
+    def test_qml_duty_error_bar_and_keyboard_task_contract(self) -> None:
+        qml_root = PACKAGE_ROOT / "qt_app" / "qml"
+        main = (qml_root / "Main.qml").read_text(encoding="utf-8")
+        task_area = (qml_root / "pages" / "DutyTaskArea.qml").read_text(encoding="utf-8")
+        operation_bar = (qml_root / "pages" / "DutyOperationBar.qml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('objectName: "globalDutyErrorBar"', main)
+        self.assertIn("window.backend.sessionController.isLoggedIn", main)
+        self.assertIn("window.errorMessage.length > 0", main)
+        self.assertIn('objectName: "dismissGlobalDutyErrorButton"', main)
+        self.assertIn("Accessible.role: Accessible.AlertMessage", main)
+        self.assertIn("function activateRow()", task_area)
+        self.assertIn("Keys.onSpacePressed", task_area)
+        self.assertIn("Keys.onReturnPressed", task_area)
+        self.assertIn("Accessible.onPressAction", task_area)
+        self.assertIn("Accessible.CheckBox", task_area)
+        self.assertNotIn("focusPolicy: Qt.NoFocus", operation_bar)
 
     def test_qml_tool_buttons_and_audit_mode_preserve_released_gui_contract(self) -> None:
         qml_root = PACKAGE_ROOT / "qt_app" / "qml"
@@ -4427,7 +4496,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('objectName: "auditEmptyState"', task_area)
         self.assertIn("visible: taskList.count === 0", task_area)
         self.assertIn(
-            'text: dutyTaskArea.modeIndex === 1 ? "此日期尚無審核任務" : "目前沒有勤務任務"',
+            'text: dutyTaskArea.modeIndex === 1 ? "此日期尚無可顯示資料" : "目前沒有勤務任務"',
             task_area,
         )
         self.assertIn("font.pixelSize: Design.sectionTitleSize", task_area)
@@ -6503,11 +6572,13 @@ class QtShellTests(unittest.TestCase):
 
         target_date = business_roc_date()
         controller = DutyController()
+        controller.set_session_context(1, "user10")
         controller.liveScheduleCaptured.connect(
             lambda data: controller.set_actor_no(data["_authenticated_actor"]["actor_no"])
         )
         controller._active_capture_request = 1
         controller._capture_targets[1] = target_date
+        controller._capture_contexts[1] = (1, "user10", "")
         error_spy = QSignalSpy(controller.errorOccurred)
 
         controller._capture_schedule_ready(
@@ -6546,26 +6617,38 @@ class QtShellTests(unittest.TestCase):
         from qt_app.controllers.duty_controller import DutyController
 
         class FinishedThread:
+            def __init__(self):
+                self.finished = False
+                self.deleted = False
+
             def quit(self):
                 pass
 
             def wait(self, _timeout):
-                return True
+                return False
+
+            def isFinished(self):
+                return self.finished
 
             def deleteLater(self):
-                pass
+                self.deleted = True
 
         controller = DutyController()
         spy = QSignalSpy(controller.scheduleChanged)
-        controller._capture_workers[7] = (FinishedThread(), object())
+        thread = FinishedThread()
+        controller._capture_workers[7] = (thread, object())
         controller._capture_targets[7] = "1150729"
 
         self.assertTrue(controller.isRefreshing)
         self.assertFalse(controller.refresh_live_schedule("user10", "secret", "10"))
         controller._capture_worker_finished(7)
+        self.assertTrue(controller.isRefreshing)
+        thread.finished = True
+        controller._poll_owned_thread_finished("capture", 7)
 
         self.assertFalse(controller.isRefreshing)
         self.assertEqual(spy.count(), 1)
+        self.assertTrue(thread.deleted)
 
     def test_duty_failures_emit_frontend_error_signal(self) -> None:
         from PySide6.QtTest import QSignalSpy
@@ -7288,6 +7371,63 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_app_controller_audit_mode_blocks_due_execution_until_live_duty_refresh(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        generated_requests: list[list[int]] = []
+        controller.dutyController._auto_execution_enabled = True
+        controller.dutyController.load_audit_schedule = lambda _target: None
+        controller.dutyController.due_submission_requests = (
+            lambda _user, _password, indices: generated_requests.append(list(indices)) or []
+        )
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "session-secret", verified=True),
+        )
+
+        try:
+            controller.openAuditMode()
+            controller._enqueue_due_tasks([0])
+
+            self.assertFalse(controller._duty_mode_active)
+            self.assertFalse(controller.dutyController._auto_execution_enabled)
+            self.assertEqual(generated_requests, [])
+        finally:
+            controller.shutdown()
+
+    def test_returning_to_duty_mode_requires_a_fresh_live_capture(self) -> None:
+        from app_core.schedule_repository import business_roc_date
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        controller.dutyController.refresh_live_schedule = (
+            lambda *args, **kwargs: calls.append((args, kwargs)) or True
+        )
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "session-secret", verified=True),
+        )
+        controller.dutyController._auto_execution_enabled = True
+
+        try:
+            controller.setDutyModeActive(False)
+            controller.returnToDutySchedule()
+
+            self.assertTrue(controller._duty_mode_active)
+            self.assertFalse(controller.dutyController._auto_execution_enabled)
+            self.assertEqual(len(calls), 1)
+            args, kwargs = calls[0]
+            self.assertEqual(args[:3], ("user10", "session-secret", "10"))
+            self.assertEqual(kwargs["target_roc_date"], business_roc_date())
+        finally:
+            controller.shutdown()
+
     def test_app_controller_refreshes_audit_data_without_publishing_nas_events(self) -> None:
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
@@ -7870,6 +8010,7 @@ if return_code != 0 or loaded:
                 )
 
         controller = RescueVideoController(FakeService())
+        self.addCleanup(controller.shutdown)
         success_spy = QSignalSpy(controller.runSucceeded)
         error_spy = QSignalSpy(controller.errorOccurred)
         delete_spy = QSignalSpy(controller.deleteConfirmationRequested)
@@ -7892,15 +8033,21 @@ if return_code != 0 or loaded:
         controller.checkAndPreview("source", "2026-07-29", "92")
         controller.preparePreview("source", "destination", "2026-07-29", "92", "", False)
         self.assertEqual(error_spy.count(), 1)
+        for _ in range(40):
+            if not controller._workers:
+                break
+            QTest.qWait(25)
         self.assertFalse(controller._workers)
+        first_success_count = success_spy.count()
+        self.assertEqual(first_success_count, 1)
 
         controller.checkAndPreview("source", "2026-07-29", "92")
         for _ in range(20):
-            if success_spy.count() and not controller._workers:
+            if success_spy.count() > first_success_count and not controller._workers:
                 break
             success_spy.wait(250)
         self.assertTrue(controller.isReady)
-        self.assertEqual(success_spy.count(), 1)
+        self.assertEqual(success_spy.count(), first_success_count + 1)
         self.assertEqual(controller.resultModel.rowCount(), 1)
         self.assertTrue(controller.hasPreview)
         self.assertIn("複製啟動", controller.summaryText)
@@ -8286,8 +8433,11 @@ if return_code != 0 or loaded:
 
         controller = AppController()
         notifications: list[tuple[str, str]] = []
+        operational_events: list[tuple[tuple[object, ...], dict[str, object]]] = []
         controller._tray_controller.notify = lambda title, message: notifications.append((title, message))
-        controller._send_operational_event = lambda *_args, **_kwargs: None
+        controller._send_operational_event = (
+            lambda *args, **kwargs: operational_events.append((args, kwargs))
+        )
         actual_action = {
             "kind": "entry_log",
             "target": "8",
@@ -8314,9 +8464,16 @@ if return_code != 0 or loaded:
                 "_handoff_preflight_group_id": "handoff:test",
             },
         )
+        ungrouped_preflight_request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {"target_date": "1150808", "actions": [preflight_action]},
+        )
         try:
             controller._submission_queued(actual_request)
             self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜準備登打")])
+            self.assertEqual(operational_events[0][0], ("action_queued",))
             controller._submission_finished(
                 actual_request,
                 DutySubmissionResult(
@@ -8368,6 +8525,7 @@ if return_code != 0 or loaded:
             )
 
             notifications.clear()
+            operational_events.clear()
             controller._submission_queued(preflight_request)
             controller._submission_finished(
                 preflight_request,
@@ -8386,7 +8544,15 @@ if return_code != 0 or loaded:
                 "timeout",
                 "",
             )
+            controller._submission_queued(ungrouped_preflight_request)
+            controller._submission_failed(
+                ungrouped_preflight_request,
+                "預檢失敗",
+                "timeout",
+                "",
+            )
             self.assertEqual(notifications, [])
+            self.assertEqual(operational_events, [])
         finally:
             controller.shutdown()
 
@@ -8688,6 +8854,7 @@ if return_code != 0 or loaded:
                 schedule_capture_service=FakeCaptureService(),
                 operational_sync_service=operational_sync,
             )
+            self.addCleanup(controller.shutdown)
             finished_spy = QSignalSpy(controller.dutyExecutionController.actionFinished)
             attempt_id = controller._session_state.begin_login()
             controller._session_state.complete_login(
@@ -8825,6 +8992,7 @@ if return_code != 0 or loaded:
                 repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
                 operational_sync_service=operational_sync,
             )
+            controller.dutyController.load_current_schedule = lambda: None
             controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: None
             try:
                 attempt_id = controller._session_state.begin_login()
@@ -8867,7 +9035,340 @@ if return_code != 0 or loaded:
         self.assertEqual(fields["actor_no"], "10")
         self.assertEqual(fields["user_id"], "user10")
         self.assertEqual(fields["display_name"], "10番 測試員")
-        self.assertTrue(fields["immediate"])
+        self.assertTrue(fields["durable_only"])
+
+    def test_update_shutdown_is_busy_during_submission_and_durably_records_logout(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+        service = FakeOperationalSyncService()
+        controller = AppController(
+            operational_sync_service=service,
+            read_only_acceptance=True,
+        )
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "secret", verified=True),
+        )
+        controller.dutyExecutionController._entry_active_request_id = 99
+        try:
+            self.assertEqual(controller.prepareUpdateShutdown(), "busy")
+            self.assertEqual(service.events, [])
+
+            controller.dutyExecutionController._entry_active_request_id = None
+            self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+
+            self.assertEqual(len(service.events), 1)
+            record_type, fields = service.events[0]
+            self.assertEqual(record_type, "logout")
+            self.assertEqual(fields["actor_no"], "10")
+            self.assertEqual(fields["user_id"], "user10")
+            self.assertTrue(fields["durable_only"])
+            self.assertIsNotNone(controller.trayController._stop_guard)
+            self.assertIsNotNone(controller.updateController._stop_guard)
+            request = DutySubmissionRequest(
+                "user10",
+                "secret",
+                0,
+                {
+                    "target_date": "1150810",
+                    "actions": [
+                        {
+                            "kind": "work_log",
+                            "time": "18:00",
+                            "source": "在隊訓練",
+                            "fields": {"勤務項目": "更新競態測試"},
+                        }
+                    ],
+                },
+            )
+            self.assertFalse(controller.dutyExecutionController.enqueue(request))
+            self.assertFalse(
+                controller.dutyController.refresh_live_schedule("user10", "secret", "10")
+            )
+            self.assertFalse(controller._hourly_refresh_timer.isActive())
+            self.assertFalse(controller._board_retry_timer.isActive())
+            self.assertFalse(controller._tomorrow_schedule_timer.isActive())
+
+            class ScheduledFolderService:
+                def __init__(self) -> None:
+                    self.claim_calls = 0
+
+                def claim_due_folder(self, _now):
+                    self.claim_calls += 1
+                    return Path("must-not-open")
+
+            scheduled_service = ScheduledFolderService()
+            controller._scheduled_folder_service = scheduled_service
+            controller._check_scheduled_folders()
+            controller._start_operational_sync("event", record_type="must_not_start")
+            self.assertEqual(scheduled_service.claim_calls, 0)
+            self.assertFalse(controller._scheduled_folder_workers)
+            self.assertFalse(controller._operational_sync_workers)
+            self.assertFalse(controller._operational_sync_queue)
+
+            controller.sessionController.login("new-user", "secret", False)
+            controller.updateController.check()
+            self.assertFalse(controller.sessionController._login_workers)
+            self.assertFalse(controller.updateController._workers)
+
+            controller.dailyVehicleController._pending_request = object()
+            controller.dutySheetController._pending_request = object()
+            controller.restMonthlyController._pending_request = object()
+            controller.restMonthlyController._pending_tool_id = "rest_time"
+            controller.rescueVideoController._pending_request = object()
+            controller.dailyVehicleController.confirmRun()
+            controller.dutySheetController.confirmRun()
+            controller.restMonthlyController.confirmRun()
+            controller.rescueVideoController.confirmDelete()
+            self.assertFalse(controller.dailyVehicleController._workers)
+            self.assertFalse(controller.dutySheetController._workers)
+            self.assertFalse(controller.restMonthlyController._workers)
+            self.assertFalse(controller.rescueVideoController._workers)
+        finally:
+            controller.dutyExecutionController._entry_active_request_id = None
+            controller.shutdown()
+
+    def test_manual_logout_waits_for_active_submission_to_reach_terminal_state(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "secret", verified=True),
+        )
+        controller.dutyExecutionController._entry_active_request_id = 41
+        try:
+            controller.requestLogout()
+
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertTrue(controller._logout_pending)
+            self.assertIn("完成目前登打", controller.sessionController.loginStatus)
+
+            controller.dutyExecutionController._entry_active_request_id = None
+            controller._finish_pending_logout()
+
+            self.assertFalse(controller.sessionController.isLoggedIn)
+            self.assertFalse(controller._logout_pending)
+        finally:
+            controller.dutyExecutionController._entry_active_request_id = None
+            controller.shutdown()
+
+    def test_stale_submission_result_keeps_new_schedule_clean_and_uses_original_actor_event(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.app_controller import AppController
+
+        action = {
+            "kind": "work_log",
+            "time": "18:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "舊帳號任務"},
+            "duplicate_key": "old-session-action",
+        }
+        request = DutySubmissionRequest(
+            "user-a",
+            "secret",
+            0,
+            {
+                "target_date": "1150810",
+                "today": {"staff": {"10": {"name": "舊值班"}}},
+                "actions": [action],
+            },
+            trigger_type="due",
+            session_generation=1,
+            schedule_generation=1,
+            action_key="old-session-action",
+            session_actor_no="10",
+        )
+        result = DutySubmissionResult(
+            0,
+            "submitted",
+            "舊任務完成",
+            Path("old-result.json"),
+            action,
+        )
+        controller = AppController(read_only_acceptance=True)
+        events: list[tuple[str, dict[str, object]]] = []
+        controller._send_operational_event = (
+            lambda record_type, **fields: events.append((record_type, fields))
+        )
+        controller.trayController.notify = lambda *_args: None
+        controller.dutyController.set_session_context(2, "user-b")
+        controller.dutyController.set_actor_no("20")
+        controller.dutyController.replace_schedule_data(
+            {
+                "target_date": "1150810",
+                "today": {"staff": {"20": {"name": "新值班"}}},
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "18:00",
+                        "actor": "20",
+                        "target": "20",
+                        "source": "在隊訓練",
+                        "fields": {"勤務項目": "新帳號任務"},
+                        "duplicate_key": "new-session-action",
+                    }
+                ],
+            }
+        )
+        try:
+            controller._submission_finished(request, result)
+
+            self.assertEqual(controller.dutyController._executed_indices, set())
+            self.assertEqual(len(events), 1)
+            record_type, fields = events[0]
+            self.assertEqual(record_type, "action_result")
+            self.assertEqual(fields["actor_no"], "10")
+            self.assertEqual(fields["user_id"], "user-a")
+            self.assertEqual(fields["display_name"], "10番 舊值班")
+            self.assertEqual(fields["target"], "10番 舊值班")
+        finally:
+            controller.shutdown()
+
+    def test_actual_started_and_cancelled_events_remain_visible_while_preflight_stays_silent(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from qt_app.controllers.app_controller import AppController
+
+        actual_action = {
+            "kind": "work_log",
+            "time": "18:00",
+            "source": "在隊訓練",
+            "target": "10",
+            "fields": {"勤務項目": "實際勤務"},
+            "duplicate_key": "actual-duty",
+        }
+        preflight_action = {
+            "kind": "handoff_preflight",
+            "time": "18:00",
+            "source": "值班交接",
+            "target": "10",
+            "fields": {"勤務項目": "交接預檢"},
+            "duplicate_key": "preflight-duty",
+        }
+        actual_request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {"target_date": "1150810", "actions": [actual_action]},
+            trigger_type="due",
+            action_key="actual-duty",
+            session_actor_no="10",
+        )
+        preflight_request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {
+                "target_date": "1150810",
+                "actions": [preflight_action],
+                "_handoff_preflight_group_id": "group-1",
+            },
+            trigger_type="due",
+            action_key="preflight-duty",
+            session_actor_no="10",
+        )
+        controller = AppController(read_only_acceptance=True)
+        notices: list[str] = []
+        events: list[tuple[str, dict[str, object]]] = []
+        controller.trayController.notify = lambda _title, message: notices.append(message)
+        controller._send_operational_event = (
+            lambda record_type, **fields: events.append((record_type, fields))
+        )
+        try:
+            self.assertFalse(controller.dutyController.is_handoff_preflight_request(actual_request))
+            self.assertTrue(controller.dutyController.is_handoff_preflight_request(preflight_request))
+
+            controller.dutyExecutionController.submissionStarted.emit(actual_request)
+            controller.dutyExecutionController.submissionStarted.emit(preflight_request)
+            controller._submission_queued(actual_request)
+            controller._submission_queued(preflight_request)
+            controller.dutyExecutionController.submissionCancelled.emit(
+                actual_request,
+                "登入階段結束，取消尚未開始的勤務。",
+                "session_ended",
+            )
+            controller.dutyExecutionController.submissionCancelled.emit(
+                preflight_request,
+                "登入階段結束，取消預檢。",
+                "session_ended",
+            )
+
+            self.assertEqual(len(notices), 2)
+            self.assertIn("開始登打", notices[0])
+            self.assertIn("準備登打", notices[1])
+            self.assertEqual(
+                [(record_type, fields["status"]) for record_type, fields in events],
+                [
+                    ("action_queued", "pending_write_automation"),
+                    ("action_result", "cancelled"),
+                ],
+            )
+        finally:
+            controller.shutdown()
+
+    def test_current_session_login_failure_survives_action_removal(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from qt_app.controllers.app_controller import AppController
+
+        old_action = {
+            "kind": "work_log",
+            "time": "18:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "已被刷新移除"},
+            "duplicate_key": "removed-current-action",
+        }
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {
+                "target_date": "1150810",
+                "today": {"staff": {"10": {"name": "值班員"}}},
+                "actions": [old_action],
+            },
+            session_generation=1,
+            schedule_generation=1,
+            action_key="removed-current-action",
+            session_actor_no="10",
+        )
+        controller = AppController(read_only_acceptance=True)
+        logout_messages: list[str] = []
+        controller._send_operational_event = lambda *_args, **_kwargs: None
+        controller.trayController.notify = lambda *_args: None
+        controller._force_logout = logout_messages.append
+        controller.dutyController.set_session_context(1, "user10")
+        controller.dutyController.set_actor_no("10")
+        controller.dutyController.replace_schedule_data(
+            {"target_date": "1150810", "actions": []}
+        )
+        try:
+            controller._submission_failed(
+                request,
+                "勤務系統登入已失效",
+                "login_failed",
+                "",
+            )
+
+            self.assertEqual(logout_messages, ["勤務系統登入已失效"])
+        finally:
+            controller.shutdown()
 
     def test_app_controller_persists_queued_logout_before_shutdown(self) -> None:
         from qt_app.controllers.app_controller import AppController
@@ -9328,6 +9829,11 @@ if return_code != 0 or loaded:
                 operational_sync.events.clear()
                 controller.dutyController._active_capture_request = 1
                 controller.dutyController._capture_targets[1] = business_roc_date()
+                controller.dutyController._capture_contexts[1] = (
+                    controller._session_state.generation,
+                    "user10",
+                    "10",
+                )
 
                 controller.dutyController._capture_failed(
                     1,
@@ -9484,6 +9990,331 @@ if return_code != 0 or loaded:
             self.assertEqual(failure["status"], "failed")
             self.assertTrue(failure["error"])
             self.assertTrue(failure["snapshot"]["failure_stage"])
+
+    def test_duty_controller_rejects_capture_callbacks_from_an_older_session(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_session_context(1, "user-a")
+        controller.set_actor_no("10")
+        controller._active_capture_request = 7
+        controller._capture_contexts[7] = (1, "user-a", "10")
+        controller._capture_publish_events[7] = True
+        controller._capture_auto_execution[7] = True
+        controller.set_session_context(2, "user-b")
+        controller.set_actor_no("20")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150810",
+                "today": {"staff": {"20": {"name": "新值班"}}},
+                "actions": [],
+            }
+        )
+        live_spy = QSignalSpy(controller.liveScheduleCaptured)
+        relogin_spy = QSignalSpy(controller.reloginRequired)
+        stale_snapshot = ScheduleSnapshot(
+            Path("schedule_output_1150809.json"),
+            {
+                "target_date": "1150809",
+                "today": {"staff": {"10": {"name": "舊值班"}}},
+                "actions": [],
+            },
+            "1150809",
+            authenticated_actor_no="10",
+            authenticated_actor_name="舊值班",
+        )
+
+        controller._capture_succeeded(7, "10", stale_snapshot)
+        controller._capture_failed(7, "10", "舊帳號登入失效", "login_failed")
+
+        self.assertEqual(controller._actor_no, "20")
+        self.assertEqual(controller.targetDateText, "1150810")
+        self.assertFalse(controller._auto_execution_enabled)
+        self.assertEqual(live_spy.count(), 0)
+        self.assertEqual(relogin_spy.count(), 0)
+
+    def test_new_session_actor_cannot_inherit_auto_execution_from_previous_login(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.schedule_repository import business_roc_date
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_session_context(1, "user-a")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": business_roc_date(),
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "00:00",
+                        "actor": "20",
+                        "target": "20",
+                        "source": "在隊訓練",
+                        "fields": {"勤務項目": "新值班人員任務"},
+                    }
+                ],
+            }
+        )
+        controller.enable_auto_execution()
+        due_spy = QSignalSpy(controller.dueTasksAvailable)
+
+        controller.set_session_context(2, "user-b")
+        controller.set_actor_no("20")
+
+        self.assertFalse(controller._auto_execution_enabled)
+        self.assertEqual(due_spy.count(), 0)
+
+    def test_new_session_retries_live_capture_after_old_lane_releases(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        refresh_calls: list[tuple[str, str]] = []
+        controller.dutyController.load_current_schedule = lambda: None
+
+        def fake_refresh(user_id, _password, actor_no, **_kwargs):
+            refresh_calls.append((user_id, actor_no))
+            return len(refresh_calls) > 1
+
+        controller.dutyController.refresh_live_schedule = fake_refresh
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("20", "user-b", "secret-b", verified=True),
+        )
+        try:
+            controller._sync_session_actor()
+
+            self.assertEqual(refresh_calls, [("user-b", "20")])
+            self.assertEqual(
+                controller._pending_live_refresh_generation,
+                controller._session_state.generation,
+            )
+
+            controller.dutyController.scheduleChanged.emit()
+
+            self.assertEqual(refresh_calls, [("user-b", "20"), ("user-b", "20")])
+            self.assertIsNone(controller._pending_live_refresh_generation)
+        finally:
+            controller.shutdown()
+
+    def test_tomorrow_prefetch_login_failure_cannot_logout_a_new_session(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        first_attempt = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            first_attempt,
+            LoginSession("10", "user-a", "secret-a", verified=True),
+        )
+        old_generation = controller._session_state.generation
+        controller._tomorrow_schedule_contexts[7] = (
+            old_generation,
+            "user-a",
+            "10",
+            "tomorrow-schedule:7",
+        )
+        controller._session_state.clear_session()
+        second_attempt = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            second_attempt,
+            LoginSession("20", "user-b", "secret-b", verified=True),
+        )
+        logout_messages: list[str] = []
+        controller._force_logout = logout_messages.append
+        try:
+            controller._tomorrow_schedule_failed(
+                7,
+                "10",
+                "舊帳號登入失效",
+                "login_failed",
+            )
+
+            self.assertEqual(logout_messages, [])
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertEqual(controller.sessionController.userId, "user-b")
+            self.assertEqual(controller.sessionController.actorNo, "20")
+        finally:
+            controller._tomorrow_schedule_contexts.clear()
+            controller.shutdown()
+
+    def test_submission_result_remaps_by_action_key_after_same_day_reorder(self) -> None:
+        from datetime import datetime
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        action_a = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "A"},
+            "duplicate_key": "work:A",
+        }
+        action_b = {
+            "kind": "work_log",
+            "time": "09:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "B"},
+            "duplicate_key": "work:B",
+        }
+        controller = DutyController()
+        controller.set_session_context(3, "user10")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {"target_date": "1150810", "actions": [action_a, action_b]}
+        )
+        request = controller.manual_submission_requests(
+            "user10",
+            "secret",
+            [0],
+            submit_at=datetime(2026, 8, 10, 10, 0),
+        )[0]
+        controller.mark_submission_enqueued(0)
+
+        controller.replace_schedule_data(
+            {"target_date": "1150810", "actions": [action_b, action_a]}
+        )
+        applied = controller.handle_submission_request_result(
+            request,
+            "submitted",
+            "A 完成",
+            "result.json",
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(controller._executed_indices, {1})
+        self.assertEqual(controller._comparisons[1]["group"], "done")
+        self.assertNotIn(0, controller._executed_indices)
+        self.assertNotIn(0, controller._submitting_indices)
+
+    def test_submission_result_never_crosses_fire_day_with_the_same_action_key(self) -> None:
+        from datetime import datetime
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        action = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "每日相同勤務"},
+            "duplicate_key": "same-key-every-day",
+        }
+        controller = DutyController()
+        controller.set_session_context(3, "user10")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data({"target_date": "1150810", "actions": [action]})
+        request = controller.manual_submission_requests(
+            "user10",
+            "secret",
+            [0],
+            submit_at=datetime(2026, 8, 10, 10, 0),
+        )[0]
+        controller.mark_submission_enqueued(0)
+
+        controller.replace_schedule_data({"target_date": "1150811", "actions": [action]})
+        applied = controller.handle_submission_request_result(
+            request,
+            "submitted",
+            "前一日完成",
+            "result.json",
+        )
+
+        self.assertFalse(applied)
+        self.assertEqual(controller._executed_indices, set())
+        self.assertEqual(controller._submitting_indices, set())
+        self.assertNotEqual(controller._comparisons.get(0, {}).get("group"), "done")
+
+    def test_duplicate_action_key_uses_original_index_while_schedule_generation_is_unchanged(self) -> None:
+        from datetime import datetime
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        action = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "重複鍵勤務"},
+            "duplicate_key": "duplicate-action-key",
+        }
+        controller = DutyController()
+        controller.set_session_context(4, "user10")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {"target_date": "1150810", "actions": [dict(action), dict(action)]}
+        )
+        request = controller.manual_submission_requests(
+            "user10",
+            "secret",
+            [0],
+            submit_at=datetime(2026, 8, 10, 10, 0),
+        )[0]
+        controller.mark_submission_enqueued(0)
+
+        applied = controller.handle_submission_request_result(
+            request,
+            "submitted",
+            "完成",
+            "result.json",
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(controller._executed_indices, {0})
+        self.assertEqual(controller._submitting_indices, set())
+
+    def test_manual_confirmation_remaps_by_action_key_after_schedule_refresh(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        action_a = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "A"},
+            "duplicate_key": "manual:A",
+        }
+        action_b = {
+            "kind": "work_log",
+            "time": "09:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "fields": {"勤務項目": "B"},
+            "duplicate_key": "manual:B",
+        }
+        controller = DutyController()
+        controller.set_session_context(4, "user10")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {"target_date": "1150810", "actions": [action_a, action_b]}
+        )
+        requested_spy = QSignalSpy(controller.manualSubmissionRequested)
+        controller.toggleTaskSelection(0)
+        controller.prepareManualSubmission()
+
+        controller.replace_schedule_data(
+            {"target_date": "1150810", "actions": [action_b, action_a]}
+        )
+        controller.confirmManualSubmission()
+
+        self.assertEqual(requested_spy.count(), 1)
+        self.assertEqual(requested_spy.at(0)[0], [1])
 
     def test_auto_logout_requires_post_login_handoff_and_completed_group(self) -> None:
         from datetime import datetime
@@ -9870,6 +10701,332 @@ if return_code != 0 or loaded:
         work_action = stamped_actions[2]
         self.assertEqual(work_action["fields"]["工作時間"], "18:25")
         self.assertEqual(work_action["fields"]["處理情形"].splitlines()[0], "一、時間:16:00-18:25")
+
+    def test_recovery_bridges_missed_handoff_to_current_scheduled_duty(self) -> None:
+        from datetime import datetime
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        def handoff_actions(hour: int, actor: str, incoming: str, start: str) -> list[dict]:
+            return [
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值退:{actor}",
+                    "fields": {"出或入": "值退", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": incoming,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值班:{incoming}",
+                    "fields": {"出或入": "值班", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "work_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"work:1150807:{hour}:值班交接:{actor}",
+                    "fields": {"處理情形": f"一、時間: {start}-{hour:02d}:00"},
+                },
+            ]
+
+        at_ten = datetime(2026, 8, 7, 10, 0)
+        at_twelve = datetime(2026, 8, 7, 12, 0)
+        old_group = handoff_actions(10, "6", "7", "08:00")
+        scheduled_group = handoff_actions(12, "7", "8", "10:00")
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(Path(temporary_queue_dir.name), now_factory=lambda: at_twelve)
+        record, created = queue.pause_group(
+            old_group,
+            {"target_date": "1150807", "today": {"staff": {}}},
+            owner_actor_no="6",
+            now=at_ten,
+        )
+        self.assertTrue(created)
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("8")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"6": {}, "7": {}, "8": {}}},
+                "actions": old_group + scheduled_group,
+            }
+        )
+
+        preflight_requests = controller.recovery_submission_requests(
+            "user8",
+            "secret",
+            record,
+            submit_at=at_twelve,
+        )
+
+        self.assertEqual(len(preflight_requests), 1)
+        preflight_action = preflight_requests[0].schedule_data["actions"][0]
+        self.assertEqual(preflight_action["kind"], "handoff_preflight")
+        self.assertEqual(preflight_action["target"], "8")
+        self.assertEqual(
+            [
+                action["target"]
+                for action in queue.record_actions(queue.get(record["queue_id"]))
+                if action["kind"] == "entry_log"
+            ],
+            ["6", "7"],
+        )
+
+        self.assertTrue(controller.handle_handoff_preflight_ready(preflight_requests[0]))
+        actual_requests = controller.handoff_group_submission_requests(
+            "user8",
+            "secret",
+            preflight_requests[0],
+            submit_at=at_twelve,
+        )
+        actual_actions = [request.schedule_data["actions"][request.action_index] for request in actual_requests]
+        self.assertEqual([action["kind"] for action in actual_actions], ["entry_log", "entry_log", "work_log"])
+        self.assertEqual(actual_actions[0]["target"], "6")
+        self.assertEqual(actual_actions[1]["target"], "8")
+        self.assertTrue(all(action["time"] == "12:00" for action in actual_actions))
+        self.assertEqual(actual_actions[2]["fields"]["處理情形"], "一、時間:08:00-12:00")
+
+        for request, action in zip(actual_requests, actual_actions):
+            controller.handle_external_return_queue_result(
+                record["queue_id"],
+                action,
+                "submitted",
+                str(request.schedule_data["_unreturned_return_component_key"]),
+            )
+
+        self.assertEqual(queue.active_records(), [])
+        history = queue.bridge_history_records()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["bridge_history"][0]["skipped_actor_nos"], ["7"])
+        restored_queue = UnreturnedReturnQueue(Path(temporary_queue_dir.name), now_factory=lambda: at_twelve)
+        restored = DutyController(unreturned_return_queue=restored_queue)
+        self.addCleanup(restored.shutdown)
+        restored.set_actor_no("7")
+        restored.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"6": {}, "7": {}, "8": {}}},
+                "actions": old_group + scheduled_group,
+            }
+        )
+        restored.enable_auto_execution()
+        self.assertEqual(restored._due_task_indices, [])
+
+    def test_recovery_bridge_skips_each_unavailable_scheduled_shift(self) -> None:
+        from datetime import datetime
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        def group(hour: int, actor: str, incoming: str) -> list[dict]:
+            return [
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值退:{actor}",
+                    "fields": {"出或入": "值退"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": incoming,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值班:{incoming}",
+                    "fields": {"出或入": "值班"},
+                },
+                {
+                    "kind": "work_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"work:1150807:{hour}:值班交接:{actor}",
+                    "fields": {"處理情形": f"一、時間: {hour - 2:02d}:00-{hour:02d}:00"},
+                },
+            ]
+
+        at_ten = datetime(2026, 8, 7, 10, 0)
+        at_twelve = datetime(2026, 8, 7, 12, 0)
+        at_fourteen = datetime(2026, 8, 7, 14, 0)
+        old_group = group(10, "6", "7")
+        missed_eight = group(12, "7", "8")
+        scheduled_nine = group(14, "8", "9")
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(Path(temporary_queue_dir.name), now_factory=lambda: at_fourteen)
+        record, _created = queue.pause_group(
+            old_group,
+            {"target_date": "1150807", "today": {"staff": {}}},
+            owner_actor_no="6",
+            now=at_ten,
+        )
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"6": {}, "7": {}, "8": {}, "9": {}}},
+                "actions": old_group + missed_eight + scheduled_nine,
+            }
+        )
+        controller.set_actor_no("8")
+        missed_preflight = controller.recovery_submission_requests(
+            "user8",
+            "secret",
+            record,
+            submit_at=at_twelve,
+        )
+        self.assertEqual(missed_preflight[0].schedule_data["actions"][0]["target"], "8")
+        controller.handle_handoff_preflight_paused(missed_preflight[0])
+        self.assertEqual(
+            [
+                action["target"]
+                for action in queue.record_actions(queue.get(record["queue_id"]))
+                if action["kind"] == "entry_log"
+            ],
+            ["6", "7"],
+        )
+
+        controller.set_actor_no("9")
+        bridge_preflight = controller.recovery_submission_requests(
+            "user9",
+            "secret",
+            queue.get(record["queue_id"]),
+            submit_at=at_fourteen,
+        )
+        self.assertEqual(bridge_preflight[0].schedule_data["actions"][0]["target"], "9")
+        self.assertTrue(controller.handle_handoff_preflight_ready(bridge_preflight[0]))
+        bridge_requests = controller.handoff_group_submission_requests(
+            "user9",
+            "secret",
+            bridge_preflight[0],
+            submit_at=at_fourteen,
+        )
+        bridge_actions = [request.schedule_data["actions"][request.action_index] for request in bridge_requests]
+        self.assertEqual([action["target"] for action in bridge_actions if action["kind"] == "entry_log"], ["6", "9"])
+        history = queue.get(record["queue_id"])["bridge_history"][0]
+        self.assertEqual(history["skipped_actor_nos"], ["7", "8"])
+
+    def test_recovery_bridge_can_skip_multiple_shifts_across_fire_day(self) -> None:
+        from datetime import datetime
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        old_group = [
+            {
+                "kind": "entry_log",
+                "time": "22:00",
+                "actor": "6",
+                "target": "6",
+                "source": "值班交接",
+                "duplicate_key": "entry:1150807:22:值退:6",
+                "fields": {"出或入": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "22:00",
+                "actor": "6",
+                "target": "7",
+                "source": "值班交接",
+                "duplicate_key": "entry:1150807:22:值班:7",
+                "fields": {"出或入": "值班"},
+            },
+            {
+                "kind": "work_log",
+                "time": "22:00",
+                "actor": "6",
+                "target": "6",
+                "source": "值班交接",
+                "duplicate_key": "work:1150807:22:值班交接:6",
+                "fields": {"處理情形": "一、時間: 20:00-22:00"},
+            },
+        ]
+        at_next_fire_day = datetime(2026, 8, 8, 8, 0)
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(Path(temporary_queue_dir.name), now_factory=lambda: at_next_fire_day)
+        record, _created = queue.pause_group(
+            old_group,
+            {"target_date": "1150807", "today": {"staff": {}}},
+            owner_actor_no="6",
+            now=datetime(2026, 8, 7, 22, 0),
+        )
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("9")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150808",
+                "today": {"staff": {"9": {}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "8",
+                        "target": "8",
+                        "source": "值班交接",
+                        "duplicate_key": "entry:1150808:08:值退:8",
+                        "fields": {"出或入": "值退"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "8",
+                        "target": "9",
+                        "source": "值班交接",
+                        "duplicate_key": "entry:1150808:08:值班:9",
+                        "fields": {"出或入": "值班"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "8",
+                        "target": "8",
+                        "source": "值班交接",
+                        "duplicate_key": "work:1150808:08:值班交接:8",
+                        "fields": {"處理情形": "一、時間: 06:00-08:00"},
+                    },
+                ],
+            }
+        )
+
+        preflight_requests = controller.recovery_submission_requests(
+            "user9",
+            "secret",
+            record,
+            submit_at=at_next_fire_day,
+        )
+
+        self.assertEqual(len(preflight_requests), 1)
+        self.assertEqual(preflight_requests[0].schedule_data["target_date"], "1150808")
+        self.assertEqual(preflight_requests[0].schedule_data["actions"][0]["target"], "9")
+        self.assertTrue(controller.handle_handoff_preflight_ready(preflight_requests[0]))
+        actual_requests = controller.handoff_group_submission_requests(
+            "user9",
+            "secret",
+            preflight_requests[0],
+            submit_at=at_next_fire_day,
+        )
+        actual_actions = [request.schedule_data["actions"][request.action_index] for request in actual_requests]
+        self.assertEqual(actual_actions[1]["target"], "9")
+        self.assertTrue(all(action["submit_target_date"] == "1150808" for action in actual_actions))
 
     def test_handoff_preflight_defers_early_checkout_until_group_is_queued(self) -> None:
         from datetime import datetime as RealDateTime
@@ -10850,8 +12007,6 @@ if return_code != 0 or loaded:
                 self.copy_started = threading.Event()
                 self.release_copy = threading.Event()
                 self.requests = []
-                self.copy_started = threading.Event()
-                self.release_copy = threading.Event()
 
             def load_defaults(self, *_args, **_kwargs):
                 defaults = RescueVideoDefaults(
@@ -10903,11 +12058,6 @@ if return_code != 0 or loaded:
                     self.release_copy.wait(timeout=5)
                     transfer_callback("X:/DCIM/clip.mp4", 100, 100, "驗證完成")
                     status_callback("救護影片測試執行中")
-                if request.mode == "delete" and transfer_callback is not None:
-                    transfer_callback("X:/DCIM/clip.mp4", 50, 100, "傳輸中")
-                    self.copy_started.set()
-                    self.release_copy.wait(timeout=5)
-                    transfer_callback("X:/DCIM/clip.mp4", 100, 100, "驗證完成")
                 return RescueVideoRunResult(
                     summary_text="預覽完成" if request.mode == "preview" else "複製完成",
                     warning_text="",
@@ -11744,31 +12894,25 @@ if return_code != 0 or loaded:
                 click(wait_for("rescueVideoCopyStartButton"), rescue_window)
                 rescue_delete_confirmation = root.findChild(QObject, "rescueVideoDeleteConfirmation")
                 self.assertIsNotNone(rescue_delete_confirmation)
-                for control in (
-                    rescue_vehicle_combo,
-                    rescue_date_field,
-                    rescue_check_button,
-                    rescue_copy_button,
-                    rescue_minimize_button,
-                    rescue_maximize_button,
-                    rescue_title_close_button,
-                    rescue_bottom_close_button,
-                ):
-                    self.assertTrue(control.property("enabled"))
+                confirmation_controls = {
+                    rescue_vehicle_combo: False,
+                    rescue_date_field: False,
+                    rescue_check_button: False,
+                    rescue_copy_button: False,
+                    rescue_minimize_button: True,
+                    rescue_maximize_button: True,
+                    rescue_title_close_button: False,
+                    rescue_bottom_close_button: False,
+                }
+                for control, expected_enabled in confirmation_controls.items():
+                    with self.subTest(control=control.objectName(), stage="delete_confirmation_open"):
+                        self.assertEqual(control.property("enabled"), expected_enabled)
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
                 self.assertTrue(rescue_delete_confirmation.property("visible"))
-                for control in (
-                    rescue_vehicle_combo,
-                    rescue_date_field,
-                    rescue_check_button,
-                    rescue_copy_button,
-                    rescue_minimize_button,
-                    rescue_maximize_button,
-                    rescue_title_close_button,
-                    rescue_bottom_close_button,
-                ):
-                    self.assertTrue(control.property("enabled"))
+                for control, expected_enabled in confirmation_controls.items():
+                    with self.subTest(control=control.objectName(), stage="window_close_intercepted"):
+                        self.assertEqual(control.property("enabled"), expected_enabled)
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
                 self.assertEqual(
@@ -11781,34 +12925,10 @@ if return_code != 0 or loaded:
                 self.assertTrue(rescue_video_service.copy_started.wait(timeout=2))
                 QTest.qWait(50)
                 self.assertTrue(controller.rescueVideoController.isRunning)
-                for control in (
-                    rescue_vehicle_combo,
-                    rescue_date_field,
-                    rescue_check_button,
-                    rescue_copy_button,
-                    rescue_minimize_button,
-                    rescue_maximize_button,
-                    rescue_title_close_button,
-                    rescue_bottom_close_button,
-                ):
-                    self.assertFalse(control.property("enabled"))
-                self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
-                self.assertTrue(rescue_window.property("visible"))
-                rescue_video_service.release_copy.set()
-                self.assertTrue(rescue_video_service.copy_started.wait(timeout=2))
-                QTest.qWait(50)
-                self.assertTrue(controller.rescueVideoController.isRunning)
-                for control in (
-                    rescue_vehicle_combo,
-                    rescue_date_field,
-                    rescue_check_button,
-                    rescue_copy_button,
-                    rescue_minimize_button,
-                    rescue_maximize_button,
-                    rescue_title_close_button,
-                    rescue_bottom_close_button,
-                ):
-                    self.assertFalse(control.property("enabled"))
+                running_controls = dict(confirmation_controls)
+                for control, expected_enabled in running_controls.items():
+                    with self.subTest(control=control.objectName(), stage="copy_running"):
+                        self.assertEqual(control.property("enabled"), expected_enabled)
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
                 rescue_video_service.release_copy.set()
@@ -12294,6 +13414,32 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.loginStatus, "登入成功；NAS 帳密同步連線失敗。")
         self.assertEqual(controller.loginStatusTone, "warning")
 
+    def test_credential_sync_callback_cannot_overwrite_a_new_session_status(self) -> None:
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.session_controller import SessionController
+
+        state = SessionState()
+        first_attempt = state.begin_login()
+        state.complete_login(
+            first_attempt,
+            LoginSession("10", "user-a", "secret-a", verified=True),
+        )
+        controller = SessionController(state)
+        controller._credential_sync_contexts[7] = (state.generation, "user-a")
+
+        state.clear_session()
+        second_attempt = state.begin_login()
+        state.complete_login(
+            second_attempt,
+            LoginSession("20", "user-b", "secret-b", verified=True),
+        )
+        controller._set_status("20番 新值班登入成功")
+
+        controller._credential_sync_succeeded(7, 2, notify_user=True)
+        controller._credential_sync_failed(7, "舊帳號同步失敗", notify_user=False)
+
+        self.assertEqual(controller.loginStatus, "20番 新值班登入成功")
+
     def test_session_controller_timeout_rejects_late_worker_success(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
@@ -12309,14 +13455,22 @@ if return_code != 0 or loaded:
 
             def verify(self, **kwargs):
                 self.calls += 1
+                call_number = self.calls
                 self.started.set()
-                self.release.wait(2)
-                return LoginResult(actor_no="10", user_id=kwargs["user_id"], actor_name="測試員")
+                if call_number == 1:
+                    self.release.wait(2)
+                return LoginResult(
+                    actor_no="10" if call_number == 1 else "20",
+                    user_id=kwargs["user_id"],
+                    actor_name="舊登入" if call_number == 1 else "新登入",
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = CredentialRepository(Path(temp_dir) / "saved_login.json", "SinpoSmart", None)
             verifier = SlowVerifier()
             controller = SessionController(repository=repository, verifier=verifier, login_timeout_ms=20)
+            self.addCleanup(controller.shutdown)
+            self.addCleanup(verifier.release.set)
             error_spy = QSignalSpy(controller.errorOccurred)
             failure_spy = QSignalSpy(controller.loginAttemptFailed)
 
@@ -12326,13 +13480,19 @@ if return_code != 0 or loaded:
             self.assertTrue(error_spy.wait(1000))
             self.assertIn("登入逾時", controller.loginStatus)
             self.assertFalse(controller.isLoggedIn)
-            self.assertTrue(controller.isBusy)
+            self.assertFalse(controller.isBusy)
+            self.assertTrue(controller.hasRunningLoginWorkers)
             self.assertEqual(failure_spy.count(), 1)
             self.assertEqual(failure_spy.at(0), ["user10", controller.loginStatus, "timeout"])
 
             controller.login("user10", "secret", False)
-            QTest.qWait(50)
-            self.assertEqual(verifier.calls, 1)
+            for _ in range(100):
+                if controller.isLoggedIn:
+                    break
+                QTest.qWait(10)
+            self.assertEqual(verifier.calls, 2)
+            self.assertTrue(controller.isLoggedIn)
+            self.assertEqual(controller.actorNo, "20")
 
             verifier.release.set()
             for _ in range(100):
@@ -12340,8 +13500,9 @@ if return_code != 0 or loaded:
                     break
                 QTest.qWait(10)
 
-            self.assertFalse(controller.isLoggedIn)
-            self.assertIn("登入逾時", controller.loginStatus)
+            self.assertTrue(controller.isLoggedIn)
+            self.assertEqual(controller.actorNo, "20")
+            self.assertIn("新登入", controller.displayName)
             self.assertFalse(controller._login_workers)
             self.assertFalse(controller.isBusy)
 
@@ -12373,6 +13534,11 @@ if return_code != 0 or loaded:
             release_timer.join()
 
             self.assertFalse(controller._login_workers)
+            self.app.processEvents()
+            self.assertFalse(controller.isLoggedIn)
+            self.assertFalse(controller.isBusy)
+            self.assertFalse(controller._pending_credentials)
+            self.assertFalse(controller._credential_sync_workers)
 
 
 if __name__ == "__main__":

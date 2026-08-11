@@ -109,6 +109,7 @@ class OperationalSyncService:
         self._board_poster = board_poster
         self._event_lock = threading.Lock()
         self._board_lock = threading.Lock()
+        self._status_lock = threading.Lock()
         self._last_board_hash = ""
         self._board_inflight_hashes: set[str] = set()
 
@@ -151,8 +152,9 @@ class OperationalSyncService:
         content: str = "",
         snapshot: Mapping[str, Any] | None = None,
         immediate: bool = False,
+        durable_only: bool = False,
     ) -> dict[str, Any] | None:
-        if not self.event_enabled:
+        if not self.event_enabled and not durable_only:
             self._record_sync_status(
                 "event",
                 "disabled",
@@ -173,7 +175,9 @@ class OperationalSyncService:
             content=content,
             snapshot=snapshot,
         )
-        if immediate:
+        if durable_only:
+            self.persist_event_payload(payload)
+        elif immediate:
             self.send_event_payload(payload)
         else:
             threading.Thread(target=self.send_event_payload, args=(payload,), daemon=True).start()
@@ -255,6 +259,23 @@ class OperationalSyncService:
                 )
                 return
             self._record_sync_status("event", "ok", "NAS 後台事件已同步。", pending_count=0)
+
+    def persist_event_payload(self, payload: Mapping[str, Any]) -> None:
+        """Durably queue one event without waiting for NAS HTTP delivery."""
+
+        sanitized = sanitize_payload(dict(payload))
+        event_id = str(sanitized.get("event_id") or "")
+        with self._event_lock:
+            pending = self._load_pending_events()
+            if not event_id or all(str(entry.get("event_id") or "") != event_id for entry in pending):
+                pending.append(sanitized)
+            self._write_pending_events(pending)
+            self._record_sync_status(
+                "event",
+                "pending",
+                "NAS 後台事件已安全排入本機佇列。",
+                pending_count=len(pending),
+            )
 
     def sync_board_async(self, schedule_data: Mapping[str, Any]) -> bool:
         if not self.board_enabled:
@@ -372,7 +393,7 @@ class OperationalSyncService:
     def _write_pending_events(self, entries: list[dict[str, Any]]) -> None:
         self.pending_path.parent.mkdir(parents=True, exist_ok=True)
         body = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
-        self.pending_path.write_text(body, encoding="utf-8")
+        self._write_text_atomically(self.pending_path, body)
 
     def record_unhandled_failure(self, operation: str, error: BaseException) -> None:
         """Persist a safe status when a Qt worker exits unexpectedly."""
@@ -390,21 +411,22 @@ class OperationalSyncService:
         pending_count: int | None = None,
     ) -> None:
         try:
-            current = self._load_sync_status()
-            status = {
-                "state": str(state or "unknown"),
-                "detail": str(detail or "")[:300],
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            if pending_count is not None:
-                status["pending_count"] = max(0, int(pending_count))
-            current[str(channel)] = status
-            current["updated_at"] = status["updated_at"]
-            self.status_path.parent.mkdir(parents=True, exist_ok=True)
-            self.status_path.write_text(
-                json.dumps(sanitize_payload(current), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            with self._status_lock:
+                current = self._load_sync_status()
+                status = {
+                    "state": str(state or "unknown"),
+                    "detail": str(detail or "")[:300],
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                if pending_count is not None:
+                    status["pending_count"] = max(0, int(pending_count))
+                current[str(channel)] = status
+                current["updated_at"] = status["updated_at"]
+                self.status_path.parent.mkdir(parents=True, exist_ok=True)
+                self._write_text_atomically(
+                    self.status_path,
+                    json.dumps(sanitize_payload(current), ensure_ascii=False, indent=2),
+                )
         except OSError:
             return
 
@@ -414,6 +436,20 @@ class OperationalSyncService:
         except (OSError, json.JSONDecodeError):
             return {}
         return dict(payload) if isinstance(payload, Mapping) else {}
+
+    @staticmethod
+    def _write_text_atomically(path: Path, body: str) -> None:
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
+        )
+        try:
+            temp_path.write_text(body, encoding="utf-8")
+            temp_path.replace(path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _safe_failure_detail(error: BaseException, label: str) -> str:

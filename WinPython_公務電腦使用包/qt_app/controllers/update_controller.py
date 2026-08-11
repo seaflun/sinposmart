@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Property, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
 from app_core.update_repository import UpdateCheckError, UpdateRepository, VersionInfo
 from qt_app.workers.update_check_worker import UpdateCheckWorker
@@ -39,17 +39,20 @@ class UpdateController(QObject):
         repository: UpdateRepository,
         *,
         process_launcher: Callable[[Path], Any] = launch_update_process,
+        stop_guard: Callable[[], str] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._repository = repository
         self._process_launcher = process_launcher
+        self._stop_guard = stop_guard
         self._current_version = ""
         self._latest_version = ""
         self._status_text = "尚未檢查更新"
         self._update_available = False
         self._request_id = 0
         self._workers: dict[int, tuple[QThread, UpdateCheckWorker]] = {}
+        self._shutdown_admission = False
         try:
             self._current_version = repository.current_version()
         except UpdateCheckError as exc:
@@ -75,9 +78,12 @@ class UpdateController(QObject):
     def isChecking(self) -> bool:
         return bool(self._workers)
 
+    def setStopGuard(self, guard: Callable[[], str] | None) -> None:
+        self._stop_guard = guard
+
     @Slot()
     def check(self) -> None:
-        if self._workers:
+        if self._shutdown_admission or self._workers:
             return
         self._request_id += 1
         request_id = self._request_id
@@ -101,6 +107,13 @@ class UpdateController(QObject):
             self._status_text = "目前沒有可安裝的新版。"
             self.stateChanged.emit()
             return
+        block_reason = self._stop_block_reason()
+        if block_reason:
+            message = f"目前無法更新：{block_reason}"
+            self._status_text = message
+            self.stateChanged.emit()
+            self.errorOccurred.emit(message)
+            return
         script_path = self._repository.version_path.with_name("update_package.ps1")
         if not script_path.is_file():
             message = f"找不到更新腳本：{script_path}"
@@ -118,6 +131,14 @@ class UpdateController(QObject):
             return
         self._status_text = "已開啟更新程式，請依更新視窗完成操作。"
         self.stateChanged.emit()
+
+    def _stop_block_reason(self) -> str:
+        if self._stop_guard is None:
+            return ""
+        try:
+            return str(self._stop_guard() or "").strip()
+        except Exception:
+            return "無法確認目前工作是否已安全結束"
 
     @Slot(int, object)
     def _check_succeeded(self, request_id: int, info: VersionInfo) -> None:
@@ -155,16 +176,39 @@ class UpdateController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_worker_thread_finished(request_id)
             return
-        self._workers.pop(request_id, None)
+        self._finalize_worker_thread(request_id)
         thread.deleteLater()
+
+    def _poll_worker_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_worker_thread_finished(request_id))
+            return
+        self._finalize_worker_thread(request_id)
+        thread.deleteLater()
+
+    def _finalize_worker_thread(self, request_id: int) -> None:
+        worker_pair = self._workers.pop(request_id, None)
+        if worker_pair is None:
+            return
         self.stateChanged.emit()
 
     @Slot()
+    def prepare_shutdown_admission(self) -> None:
+        self._shutdown_admission = True
+
+    @Slot()
     def shutdown(self) -> None:
+        self.prepare_shutdown_admission()
         for request_id, (thread, _worker) in tuple(self._workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(15_000):
-                self._workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(15_000):
+                thread.wait()
+            self._finalize_worker_thread(request_id)
+            thread.deleteLater()

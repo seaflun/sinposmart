@@ -75,6 +75,10 @@ class DutyController(QObject):
         self._schedule_status = "尚未登入"
         self._preview_loaded = False
         self._actor_no = ""
+        self._session_generation = 0
+        self._session_user_id = ""
+        self._session_closing = False
+        self._schedule_generation = 0
         self._actions: list[dict[str, Any]] = []
         self._schedule_data: dict[str, Any] = {}
         self._staff: dict[str, dict[str, Any]] = {}
@@ -91,8 +95,12 @@ class DutyController(QObject):
         self._task_errors: dict[int, str] = {}
         self._selected_indices: set[int] = set()
         self._pending_manual_indices: list[int] = []
+        self._pending_manual_action_keys: tuple[str, ...] = ()
+        self._pending_manual_schedule_generation = 0
         self._manual_confirmation_summary = ""
         self._pending_external_return_indices: list[int] = []
+        self._pending_external_return_action_keys: tuple[str, ...] = ()
+        self._pending_external_return_schedule_generation = 0
         self._external_return_confirmation_summary = ""
         self._external_return_queue_ids_by_action_index: dict[int, str] = {}
         self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
@@ -111,12 +119,17 @@ class DutyController(QObject):
         self._active_capture_request = 0
         self._capture_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
         self._capture_targets: dict[int, str] = {}
+        self._capture_contexts: dict[int, tuple[int, str, str]] = {}
+        self._capture_lane_owners: dict[int, str] = {}
         self._capture_schedule_ready_ids: set[int] = set()
         self._capture_publish_events: dict[int, bool] = {}
         self._capture_auto_execution: dict[int, bool] = {}
         self._comparison_request_id = 0
         self._comparison_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
         self._comparison_targets: dict[int, str] = {}
+        self._comparison_contexts: dict[int, tuple[int, str, str]] = {}
+        self._comparison_lane_owners: dict[int, str] = {}
+        self._capture_lane_owner = ""
         self._task_model = DutyTaskListModel(self)
         self._audit_model = DutyTaskListModel(self)
         self._clock_timer = QTimer(self)
@@ -166,7 +179,43 @@ class DutyController(QObject):
 
     @Property(bool, notify=scheduleChanged)
     def isRefreshing(self) -> bool:
-        return bool(self._schedule_workers or self._capture_workers or self._comparison_workers)
+        return bool(
+            self._schedule_workers
+            or self._capture_workers
+            or self._comparison_workers
+            or self._capture_lane_owner
+        )
+
+    @property
+    def session_generation(self) -> int:
+        return self._session_generation
+
+    @property
+    def schedule_generation(self) -> int:
+        return self._schedule_generation
+
+    def claim_capture_lane(self, owner: str) -> bool:
+        """Atomically reserve the browser-capture lane for any capture producer."""
+
+        owner = str(owner or "").strip()
+        if (
+            self._session_closing
+            or not owner
+            or self._capture_lane_owner
+            or self._capture_workers
+            or self._comparison_workers
+        ):
+            return False
+        self._capture_lane_owner = owner
+        self.scheduleChanged.emit()
+        return True
+
+    def release_capture_lane(self, owner: str) -> None:
+        owner = str(owner or "").strip()
+        if not owner or owner != self._capture_lane_owner:
+            return
+        self._capture_lane_owner = ""
+        self.scheduleChanged.emit()
 
     @Property(bool, notify=scheduleChanged)
     def isPreviewLoaded(self) -> bool:
@@ -316,6 +365,8 @@ class DutyController(QObject):
 
     @Slot()
     def prepareManualSubmission(self) -> None:
+        if self._session_closing:
+            return
         if not self._can_manually_submit_selected():
             self._schedule_status = "選取項目包含已登打或不可手動登打的勤務"
             self._refresh_projection()
@@ -347,7 +398,14 @@ class DutyController(QObject):
         summaries = "\n".join(f"• {action_summary(self._actions[index])}" for index in ready[:8])
         if len(ready) > 8:
             summaries += f"\n…另 {len(ready) - 8} 筆"
+        action_keys = tuple(action_completion_key(self._actions[index]) for index in ready)
+        if len(set(action_keys)) != len(action_keys):
+            self._schedule_status = "選取任務識別重複，請重新更新勤務資料"
+            self._refresh_projection()
+            return
         self._pending_manual_indices = ready
+        self._pending_manual_action_keys = action_keys
+        self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = (
             f"將登打勤務系統 {len(ready)} 筆：\n{summaries}\n\n"
             "將使用按下確認時的當下時間登打。"
@@ -357,10 +415,26 @@ class DutyController(QObject):
 
     @Slot()
     def confirmManualSubmission(self) -> None:
+        if self._session_closing:
+            return
         if not self._pending_manual_indices:
             return
-        indices = list(self._pending_manual_indices)
+        action_keys = self._pending_manual_action_keys or tuple(
+            action_completion_key(self._actions[index])
+            for index in self._pending_manual_indices
+            if 0 <= index < len(self._actions)
+        )
+        indices = self._resolve_action_keys(action_keys)
+        if indices is None or not all(self._is_manual_submission_eligible(index) for index in indices):
+            self._pending_manual_indices.clear()
+            self._pending_manual_action_keys = ()
+            self._manual_confirmation_summary = ""
+            self._schedule_status = "勤務資料已變更，請重新選取後再確認"
+            self._refresh_projection()
+            return
         self._pending_manual_indices.clear()
+        self._pending_manual_action_keys = ()
+        self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = ""
         self._selected_indices.clear()
         self.scheduleChanged.emit()
@@ -369,12 +443,16 @@ class DutyController(QObject):
     @Slot()
     def cancelManualSubmission(self) -> None:
         self._pending_manual_indices.clear()
+        self._pending_manual_action_keys = ()
+        self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = ""
         self._schedule_status = "已取消手動登打"
         self.scheduleChanged.emit()
 
     @Slot()
     def prepareExternalReturnManualSubmission(self) -> None:
+        if self._session_closing:
+            return
         if not self.canConfirmExternalReturnManualSubmissionSelected:
             self._schedule_status = "請只選取未返隊暫停的退勤項目。"
             self._refresh_projection()
@@ -385,6 +463,10 @@ class DutyController(QObject):
             for index in indices
         )
         self._pending_external_return_indices = indices
+        self._pending_external_return_action_keys = tuple(
+            action_completion_key(self._actions[index]) for index in indices
+        )
+        self._pending_external_return_schedule_generation = self._schedule_generation
         self._external_return_confirmation_summary = (
             "請確認人員已返隊。確認後將以目前時間手動登打下列暫停項目：\n"
             f"{summaries}"
@@ -394,11 +476,31 @@ class DutyController(QObject):
 
     @Slot()
     def confirmExternalReturnManualSubmission(self) -> None:
+        if self._session_closing:
+            return
         if not self._pending_external_return_indices:
             return
-        indices = list(self._pending_external_return_indices)
-        queue_id = self._external_return_queue_ids_by_action_index.get(indices[0], "")
+        action_keys = self._pending_external_return_action_keys or tuple(
+            action_completion_key(self._actions[index])
+            for index in self._pending_external_return_indices
+            if 0 <= index < len(self._actions)
+        )
+        indices = self._resolve_action_keys(action_keys)
+        queue_ids = {
+            self._external_return_queue_ids_by_action_index.get(index, "")
+            for index in (indices or [])
+        }
+        queue_id = next(iter(queue_ids)) if len(queue_ids) == 1 and "" not in queue_ids else ""
+        if indices is None or not queue_id or set(indices) != self._queue_action_indices(queue_id):
+            self._pending_external_return_indices.clear()
+            self._pending_external_return_action_keys = ()
+            self._external_return_confirmation_summary = ""
+            self._schedule_status = "勤務資料已變更，請重新選取返隊項目"
+            self._refresh_projection()
+            return
         self._pending_external_return_indices.clear()
+        self._pending_external_return_action_keys = ()
+        self._pending_external_return_schedule_generation = self._schedule_generation
         self._external_return_confirmation_summary = ""
         self._selected_indices.clear()
         self.scheduleChanged.emit()
@@ -408,6 +510,8 @@ class DutyController(QObject):
     @Slot()
     def cancelExternalReturnManualSubmission(self) -> None:
         self._pending_external_return_indices.clear()
+        self._pending_external_return_action_keys = ()
+        self._pending_external_return_schedule_generation = self._schedule_generation
         self._external_return_confirmation_summary = ""
         self._schedule_status = "已取消確認返隊手動登打"
         self.scheduleChanged.emit()
@@ -445,6 +549,108 @@ class DutyController(QObject):
             and self._comparisons.get(index, {}).get("group") == "paused"
         )
 
+    def set_session_context(self, generation: int, user_id: str) -> None:
+        """Reset transient duty state when the authenticated identity changes."""
+
+        generation = max(0, int(generation))
+        user_id = str(user_id or "").strip()
+        if generation == self._session_generation and user_id == self._session_user_id:
+            return
+        self._session_generation = generation
+        self._session_user_id = user_id
+        self._session_closing = not bool(user_id)
+        self._auto_execution_enabled = False
+        self._executed_indices.clear()
+        self._submitting_indices.clear()
+        self._blocked_indices.clear()
+        self._retry_after.clear()
+        self._task_errors.clear()
+        self._selected_indices.clear()
+        self._pending_manual_indices.clear()
+        self._pending_manual_action_keys = ()
+        self._pending_manual_schedule_generation = self._schedule_generation
+        self._manual_confirmation_summary = ""
+        self._pending_external_return_indices.clear()
+        self._pending_external_return_action_keys = ()
+        self._pending_external_return_schedule_generation = self._schedule_generation
+        self._external_return_confirmation_summary = ""
+        self._handoff_preflight_groups.clear()
+        self._login_started_at = datetime.now() if user_id else None
+        self._cancel_auto_logout()
+        self._refresh_projection()
+
+    def request_matches_current_session(self, request: DutySubmissionRequest) -> bool:
+        if request.session_generation != self._session_generation:
+            return False
+        if self._session_user_id and request.user_id != self._session_user_id:
+            return False
+        return not request.session_actor_no or request.session_actor_no == self._actor_no
+
+    def _unique_action_indices_by_key(self) -> dict[str, int]:
+        grouped: dict[str, list[int]] = {}
+        for index, action in enumerate(self._actions):
+            grouped.setdefault(action_completion_key(action), []).append(index)
+        return {
+            key: indices[0]
+            for key, indices in grouped.items()
+            if key and len(indices) == 1
+        }
+
+    def _resolve_action_keys(self, action_keys: tuple[str, ...]) -> list[int] | None:
+        indices_by_key = self._unique_action_indices_by_key()
+        indices = [indices_by_key.get(key, -1) for key in action_keys]
+        if not indices or any(index < 0 for index in indices) or len(set(indices)) != len(indices):
+            return None
+        return indices
+
+    def _resolve_request_action_index(self, request: DutySubmissionRequest) -> int | None:
+        if not self.request_matches_current_session(request):
+            return None
+        request_target_date = str(request.schedule_data.get("target_date", "") or "").strip()
+        if request_target_date != str(self._target_date_text or "").strip():
+            return None
+        action_key = str(request.action_key or "").strip()
+        if not action_key:
+            actions = request.schedule_data.get("actions", [])
+            if not isinstance(actions, list) or not 0 <= request.action_index < len(actions):
+                return None
+            action = actions[request.action_index]
+            if not isinstance(action, Mapping):
+                return None
+            action_key = action_completion_key(action)
+        if request.schedule_generation == self._schedule_generation:
+            action_index = request.action_index
+            if (
+                0 <= action_index < len(self._actions)
+                and action_completion_key(self._actions[action_index]) == action_key
+            ):
+                return action_index
+        return self._unique_action_indices_by_key().get(action_key)
+
+    def _submission_request(
+        self,
+        user_id: str,
+        password: str,
+        action_index: int,
+        schedule_data: Mapping[str, Any],
+        *,
+        trigger_type: str,
+        action_key: str = "",
+    ) -> DutySubmissionRequest:
+        actions = schedule_data.get("actions", [])
+        action = actions[action_index]
+        return DutySubmissionRequest(
+            user_id=user_id,
+            password=password,
+            action_index=action_index,
+            schedule_data=schedule_data,
+            trigger_type=trigger_type,
+            session_generation=self._session_generation,
+            schedule_generation=self._schedule_generation,
+            action_key=str(action_key or action_completion_key(action)),
+            session_actor_no=self._actor_no,
+        )
+
     def set_actor_no(self, actor_no: str) -> None:
         actor_no = str(actor_no or "").strip()
         if actor_no == self._actor_no:
@@ -456,12 +662,36 @@ class DutyController(QObject):
         if actor_no and actor_no != previous_actor:
             self._login_started_at = datetime.now()
         if not actor_no:
+            self._auto_execution_enabled = False
             self._schedule_status = "尚未登入"
             self._selected_indices.clear()
             self._task_errors.clear()
             self._login_started_at = None
             self._cancel_auto_logout()
         self._refresh_projection()
+
+    def _capture_context_is_current(
+        self,
+        contexts: Mapping[int, tuple[int, str, str]],
+        request_id: int,
+    ) -> bool:
+        context = contexts.get(request_id)
+        if context is None:
+            return self._session_generation == 0 and not self._session_user_id
+        generation, user_id, actor_no = context
+        if generation != self._session_generation:
+            return False
+        if self._session_generation == 0 and not self._session_user_id:
+            return True
+        return (
+            user_id == self._session_user_id
+            and (not actor_no or actor_no == self._actor_no)
+        )
+
+    def _invalidate_capture_callbacks(self) -> None:
+        self._active_capture_request = 0
+        self._capture_contexts.clear()
+        self._comparison_contexts.clear()
 
     def enable_auto_execution(self) -> None:
         if self._auto_execution_enabled:
@@ -487,12 +717,15 @@ class DutyController(QObject):
         publish_events: bool = True,
         allow_auto_execution: bool = True,
     ) -> bool:
-        if not user_id or not password or self._capture_workers:
+        if not user_id or not password:
+            return False
+        self._capture_request_id += 1
+        request_id = self._capture_request_id
+        lane_owner = f"duty-schedule:{request_id}"
+        if not self.claim_capture_lane(lane_owner):
             return False
         self.disable_auto_execution()
         self._preview_loaded = False
-        self._capture_request_id += 1
-        request_id = self._capture_request_id
         self._active_capture_request = request_id
         request = (
             ScheduleCaptureRequest(user_id, password, actor_no, target_roc_date, actor_name)
@@ -511,6 +744,12 @@ class DutyController(QObject):
         worker.finished.connect(self._capture_worker_finished)
         self._capture_workers[request_id] = (thread, worker)
         self._capture_targets[request_id] = request.target_roc_date
+        self._capture_contexts[request_id] = (
+            self._session_generation,
+            str(user_id).strip(),
+            str(actor_no or "").strip(),
+        )
+        self._capture_lane_owners[request_id] = lane_owner
         self._capture_publish_events[request_id] = bool(publish_events)
         self._capture_auto_execution[request_id] = bool(allow_auto_execution)
         self._schedule_status = "正在即時更新勤務與比對資料…"
@@ -528,11 +767,14 @@ class DutyController(QObject):
     ) -> bool:
         """Refresh saved-record comparisons without replacing the loaded duty schedule."""
 
-        if not user_id or not password or self._comparison_workers:
+        if not user_id or not password:
             return False
         target = str(target_roc_date or business_roc_date()).strip()
         self._comparison_request_id += 1
         request_id = self._comparison_request_id
+        lane_owner = f"duty-comparison:{request_id}"
+        if not self.claim_capture_lane(lane_owner):
+            return False
         request = ScheduleCaptureRequest(user_id, password, actor_no, target, actor_name)
         worker = ScheduleCaptureWorker(
             request_id,
@@ -551,6 +793,12 @@ class DutyController(QObject):
         worker.finished.connect(self._comparison_worker_finished)
         self._comparison_workers[request_id] = (thread, worker)
         self._comparison_targets[request_id] = target
+        self._comparison_contexts[request_id] = (
+            self._session_generation,
+            str(user_id).strip(),
+            str(actor_no or "").strip(),
+        )
+        self._comparison_lane_owners[request_id] = lane_owner
         self._schedule_status = "正在更新已登打比對資料…"
         self.scheduleChanged.emit()
         thread.start()
@@ -562,7 +810,7 @@ class DutyController(QObject):
         password: str,
         indices: list[int],
     ) -> list[DutySubmissionRequest]:
-        if not self._auto_execution_enabled or not user_id or not password:
+        if self._session_closing or not self._auto_execution_enabled or not user_id or not password:
             return []
         requests: list[DutySubmissionRequest] = []
         handled_group_ids: set[str] = set()
@@ -582,7 +830,13 @@ class DutyController(QObject):
                 ):
                     continue
                 requests.append(
-                    DutySubmissionRequest(user_id, password, index, self._schedule_data, trigger_type="due")
+                    self._submission_request(
+                        user_id,
+                        password,
+                        index,
+                        self._schedule_data,
+                        trigger_type="due",
+                    )
                 )
                 continue
             group_id = self._handoff_group_id(group_indices)
@@ -601,14 +855,26 @@ class DutyController(QObject):
                 requests.extend(preflight_requests)
                 continue
             requests.extend(
-                DutySubmissionRequest(user_id, password, group_index, self._schedule_data, trigger_type="due")
+                self._submission_request(
+                    user_id,
+                    password,
+                    group_index,
+                    self._schedule_data,
+                    trigger_type="due",
+                )
                 for group_index in group_indices
             )
         return requests
 
     @staticmethod
     def is_handoff_preflight_request(request: DutySubmissionRequest) -> bool:
-        return bool(request.schedule_data.get("_handoff_preflight_group_id"))
+        if request.schedule_data.get("_handoff_preflight_group_id"):
+            return True
+        actions = request.schedule_data.get("actions", [])
+        if not isinstance(actions, list) or not 0 <= request.action_index < len(actions):
+            return False
+        action = actions[request.action_index]
+        return isinstance(action, Mapping) and action.get("kind") == "handoff_preflight"
 
     def _due_handoff_priority_times(
         self,
@@ -703,7 +969,18 @@ class DutyController(QObject):
 
     def _handoff_group_id(self, indices: tuple[int, ...]) -> str:
         return "handoff:" + "|".join(
-            action_completion_key(self._actions[index]) for index in indices
+            sorted(action_completion_key(self._actions[index]) for index in indices)
+        )
+
+    def _handoff_state_indices(self, state: Mapping[str, Any]) -> tuple[int, ...]:
+        action_keys = tuple(str(key or "") for key in state.get("action_keys", ()))
+        if action_keys:
+            indices = self._resolve_action_keys(action_keys)
+            return tuple(indices or ())
+        return tuple(
+            int(index)
+            for index in state.get("indices", ())
+            if 0 <= int(index) < len(self._actions)
         )
 
     @staticmethod
@@ -719,6 +996,120 @@ class DutyController(QObject):
                 incoming.append(dict(action))
         return incoming
 
+    def _scheduled_bridge_incoming_actions(
+        self,
+        current: datetime,
+    ) -> tuple[datetime, list[dict[str, Any]]] | None:
+        """Return the current actor's latest scheduled value-handoff arrival group."""
+
+        if not self._actor_no:
+            return None
+        candidates: list[tuple[datetime, int]] = []
+        for index, action in enumerate(self._actions):
+            fields = action.get("fields", {})
+            if (
+                action.get("kind") != "entry_log"
+                or action.get("source") != "值班交接"
+                or not isinstance(fields, Mapping)
+                or fields.get("出或入") != "值班"
+                or str(action.get("target", "") or "") != self._actor_no
+            ):
+                continue
+            action_at = action_datetime(
+                action,
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if action_at <= current:
+                candidates.append((action_at, index))
+        if not candidates:
+            return None
+        handoff_at, anchor_index = max(candidates, key=lambda item: item[0])
+        group_indices = self._handoff_group_indices(anchor_index)
+        incoming_actions = self._handoff_incoming_actions(
+            [self._actions[index] for index in group_indices]
+        )
+        return (handoff_at, incoming_actions) if incoming_actions else None
+
+    def _recovery_cross_shift_bridge(
+        self,
+        record: Mapping[str, Any],
+        actions: list[Mapping[str, Any]],
+        current: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """Replace missed handoff arrivals with the current scheduled duty group."""
+
+        if record.get("completed_keys"):
+            return None
+        original_incoming = self._handoff_incoming_actions(actions)
+        scheduled = self._scheduled_bridge_incoming_actions(current)
+        if not original_incoming or scheduled is None:
+            return None
+        scheduled_at, scheduled_incoming = scheduled
+        source_target_date = str(record.get("source_target_date") or self._target_date_text)
+        original_at = min(
+            action_datetime(action, source_target_date, fallback_date=current.date())
+            for action in actions
+        )
+        if scheduled_at <= original_at:
+            return None
+        original_targets = {
+            str(action.get("target", "") or "") for action in original_incoming
+        }
+        scheduled_targets = {
+            str(action.get("target", "") or "") for action in scheduled_incoming
+        }
+        if not scheduled_targets or scheduled_targets == original_targets:
+            return None
+
+        bridge_actor_no = next(
+            (str(action.get("actor", "") or "") for action in actions if action.get("actor")),
+            "",
+        )
+        bridge_incoming = []
+        for action in scheduled_incoming:
+            bridge_action = dict(action)
+            if bridge_actor_no:
+                bridge_action["actor"] = bridge_actor_no
+            bridge_incoming.append(bridge_action)
+        outgoing_actions = [
+            dict(action)
+            for action in actions
+            if action not in original_incoming and action.get("kind") != "work_log"
+        ]
+        work_actions = [dict(action) for action in actions if action.get("kind") == "work_log"]
+        bridge_actions = outgoing_actions + bridge_incoming + work_actions
+        bridge_action_keys = {action_completion_key(action) for action in bridge_actions}
+        skipped_action_keys = {action_completion_key(action) for action in original_incoming}
+        skipped_actor_nos = set(original_targets)
+        for action in self._actions:
+            if action.get("source") != "值班交接":
+                continue
+            action_at = action_datetime(
+                action,
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if not original_at <= action_at <= scheduled_at:
+                continue
+            completion_key = action_completion_key(action)
+            if completion_key in bridge_action_keys:
+                continue
+            skipped_action_keys.add(completion_key)
+            fields = action.get("fields", {})
+            if (
+                action.get("kind") == "entry_log"
+                and isinstance(fields, Mapping)
+                and fields.get("出或入") == "值班"
+            ):
+                skipped_actor_nos.add(str(action.get("target", "") or ""))
+        return bridge_actions, {
+            "bridge_at": current,
+            "skipped_actor_nos": tuple(sorted(actor_no for actor_no in skipped_actor_nos if actor_no)),
+            "incoming_actor_nos": tuple(sorted(actor_no for actor_no in scheduled_targets if actor_no)),
+            "skipped_action_keys": tuple(sorted(skipped_action_keys)),
+        }
+
     def _handoff_preflight_requests(
         self,
         user_id: str,
@@ -730,17 +1121,22 @@ class DutyController(QObject):
         trigger_type: str,
         queue_id: str = "",
         submit_at: datetime | None = None,
+        bridge: Mapping[str, Any] | None = None,
     ) -> list[DutySubmissionRequest]:
         incoming_actions = self._handoff_incoming_actions(actions)
         if not incoming_actions:
             return []
         pending_keys = {action_completion_key(action) for action in incoming_actions}
+        if len(pending_keys) != len(incoming_actions):
+            return []
         self._handoff_preflight_groups[group_id] = {
             "indices": tuple(group_indices),
+            "action_keys": tuple(action_completion_key(action) for action in actions),
             "actions": [dict(action) for action in actions],
             "pending_keys": pending_keys,
             "paused": False,
             "queue_id": queue_id,
+            "bridge": dict(bridge or {}),
         }
         current = submit_at or datetime.now()
         target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
@@ -748,20 +1144,23 @@ class DutyController(QObject):
         for incoming in incoming_actions:
             preflight = dict(incoming)
             preflight["kind"] = "handoff_preflight"
-            schedule_data = dict(self._schedule_data if not queue_id else {})
+            schedule_data = dict(self._schedule_data if not queue_id or bridge else {})
             if queue_id:
                 record = self._unreturned_return_queue.get(queue_id) or {}
-                schedule_data.update(record.get("schedule_context", {}))
+                if not bridge:
+                    schedule_data.update(record.get("schedule_context", {}))
                 schedule_data["target_date"] = target_date
                 schedule_data["actions"] = [preflight]
                 action_index = 0
             else:
                 schedule_actions = [dict(action) for action in self._actions]
-                action_index = next(
-                    index
-                    for index, action in enumerate(schedule_actions)
-                    if action_completion_key(action) == action_completion_key(incoming)
+                action_index = self._unique_action_indices_by_key().get(
+                    action_completion_key(incoming),
+                    -1,
                 )
+                if action_index < 0:
+                    self._handoff_preflight_groups.pop(group_id, None)
+                    return []
                 schedule_actions[action_index] = preflight
                 schedule_data["actions"] = schedule_actions
             schedule_data["_handoff_preflight_group_id"] = group_id
@@ -770,12 +1169,13 @@ class DutyController(QObject):
             if queue_id:
                 schedule_data["_unreturned_return_queue_id"] = queue_id
             requests.append(
-                DutySubmissionRequest(
+                self._submission_request(
                     user_id,
                     password,
                     action_index,
                     schedule_data,
                     trigger_type=trigger_type,
+                    action_key=action_completion_key(incoming),
                 )
             )
         return requests
@@ -803,7 +1203,7 @@ class DutyController(QObject):
             schedule_data = dict(self._schedule_data)
             schedule_data["actions"] = actions
             requests.append(
-                DutySubmissionRequest(
+                self._submission_request(
                     user_id,
                     password,
                     index,
@@ -860,15 +1260,18 @@ class DutyController(QObject):
         current = submit_at or datetime.now()
         if record.get("record_type") == "handoff_group":
             actions = self._unreturned_return_queue.incomplete_actions(record)
+            bridge = self._recovery_cross_shift_bridge(record, actions, current)
+            bridge_actions, bridge_metadata = bridge if bridge is not None else (actions, None)
             group_id = "queue:" + str(record.get("queue_id") or "")
             return self._handoff_preflight_requests(
                 user_id,
                 password,
-                actions,
+                bridge_actions,
                 group_id=group_id,
                 trigger_type="recovery",
                 queue_id=str(record.get("queue_id") or ""),
                 submit_at=current,
+                bridge=bridge_metadata,
             )
         return self._queue_submission_requests(
             user_id,
@@ -1003,6 +1406,31 @@ class DutyController(QObject):
         self._refresh_projection()
         self.errorOccurred.emit(message)
 
+    def handle_submission_request_result(
+        self,
+        request: DutySubmissionRequest,
+        status: str,
+        message: str,
+        result_path: str,
+    ) -> bool:
+        action_index = self._resolve_request_action_index(request)
+        if action_index is None:
+            return False
+        self.handle_submission_result(action_index, status, message, result_path)
+        return True
+
+    def handle_submission_request_failure(
+        self,
+        request: DutySubmissionRequest,
+        message: str,
+        error_code: str,
+    ) -> bool:
+        action_index = self._resolve_request_action_index(request)
+        if action_index is None:
+            return False
+        self.handle_submission_failure(action_index, message, error_code)
+        return True
+
     def load_current_schedule(self) -> None:
         if self._schedule_workers:
             return
@@ -1011,6 +1439,8 @@ class DutyController(QObject):
     def load_audit_schedule(self, target_roc_date: str) -> None:
         """Load a saved schedule and comparison snapshot without a web login."""
 
+        self.disable_auto_execution()
+        self._invalidate_capture_callbacks()
         if self._schedule_workers:
             return
         self._start_schedule_load(target_roc_date=target_roc_date)
@@ -1044,6 +1474,7 @@ class DutyController(QObject):
 
     def _load_preview_path(self, preview_path: Path) -> None:
         self.disable_auto_execution()
+        self._invalidate_capture_callbacks()
         self._start_schedule_load(preview_path)
 
     def _start_schedule_load(
@@ -1081,28 +1512,43 @@ class DutyController(QObject):
 
     @Slot()
     def shutdown(self) -> None:
+        self._session_closing = True
         for request_id, (thread, _worker) in tuple(self._schedule_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(10_000):
-                self._schedule_workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(10_000):
+                thread.wait()
+            self._schedule_thread_finished(request_id)
+            thread.deleteLater()
         for request_id, (thread, _worker) in tuple(self._capture_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(120_000):
-                self._capture_workers.pop(request_id, None)
-                self._capture_targets.pop(request_id, None)
-                self._capture_publish_events.pop(request_id, None)
-                self._capture_auto_execution.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._capture_thread_finished(request_id)
+            thread.deleteLater()
         for request_id, (thread, _worker) in tuple(self._comparison_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(120_000):
-                self._comparison_workers.pop(request_id, None)
-                self._comparison_targets.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._comparison_thread_finished(request_id)
+            thread.deleteLater()
+        self._capture_lane_owner = ""
+
+    def prepare_session_end(self) -> bool:
+        """Stop admitting capture or submission work before logout or update."""
+
+        self._session_closing = True
+        self.disable_auto_execution()
+        self._pending_manual_indices.clear()
+        self._pending_manual_action_keys = ()
+        self._manual_confirmation_summary = ""
+        self._pending_external_return_indices.clear()
+        self._pending_external_return_action_keys = ()
+        self._external_return_confirmation_summary = ""
+        self.scheduleChanged.emit()
+        return not self.isRefreshing
 
     def replace_schedule_data(
         self,
@@ -1112,16 +1558,36 @@ class DutyController(QObject):
         comparison_data: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         next_target_date = str(data.get("target_date", "") or "")
-        same_schedule_date = bool(next_target_date and next_target_date == self._target_date_text)
+        same_schedule_date = bool(next_target_date) and next_target_date == self._target_date_text
+        previous_unique_indices = self._unique_action_indices_by_key()
+        previous_executed_keys = {
+            key for key, index in previous_unique_indices.items() if index in self._executed_indices
+        }
+        previous_submitting_keys = {
+            key for key, index in previous_unique_indices.items() if index in self._submitting_indices
+        } if same_schedule_date else set()
+        previous_blocked_keys = {
+            key for key, index in previous_unique_indices.items() if index in self._blocked_indices
+        } if same_schedule_date else set()
         previous_completed_by_key = {
-            action_completion_key(self._actions[index]): {
+            key: {
                 **dict(self._comparisons.get(index, {})),
                 "compare": str(self._comparisons.get(index, {}).get("compare", "已登打") or "已登打"),
                 "group": "done",
             }
-            for index in self._executed_indices
-            if 0 <= index < len(self._actions)
+            for key, index in previous_unique_indices.items()
+            if key in previous_executed_keys
         }
+        previous_retry_by_key = {
+            key: self._retry_after[index]
+            for key, index in previous_unique_indices.items()
+            if index in self._retry_after
+        } if same_schedule_date else {}
+        previous_errors_by_key = {
+            key: self._task_errors[index]
+            for key, index in previous_unique_indices.items()
+            if index in self._task_errors
+        } if same_schedule_date else {}
         actions = data.get("actions", [])
         today = data.get("today", {})
         yesterday = data.get("yesterday", {})
@@ -1146,7 +1612,17 @@ class DutyController(QObject):
             if isinstance(info, Mapping)
         }
         self._target_date_text = next_target_date
+        if not same_schedule_date:
+            self._pending_manual_indices.clear()
+            self._pending_manual_action_keys = ()
+            self._manual_confirmation_summary = ""
+            self._pending_external_return_indices.clear()
+            self._pending_external_return_action_keys = ()
+            self._external_return_confirmation_summary = ""
+            self._handoff_preflight_groups.clear()
+            self._cancel_auto_logout()
         self._append_active_queue_actions()
+        self._schedule_generation += 1
         incoming_comparisons = {
             int(index): dict(comparison)
             for index, comparison in (comparisons or {}).items()
@@ -1169,37 +1645,65 @@ class DutyController(QObject):
                     for index, comparison in case_comparisons.items()
                 }
             )
-        if same_schedule_date:
-            incoming_comparisons.update(
-                {
-                    index: dict(self._comparisons[index])
-                    for index in self._executed_indices
-                    if index in self._comparisons and index < len(self._actions)
-                }
-            )
-            carried_completed_indices = set(self._executed_indices)
-        else:
-            carried_completed_indices = {
-                index
-                for index, action in enumerate(self._actions)
-                if action_completion_key(action) in previous_completed_by_key
+        next_unique_indices = self._unique_action_indices_by_key()
+        carried_completed_indices = {
+            next_unique_indices[key]
+            for key in previous_executed_keys
+            if key in next_unique_indices
+        }
+        incoming_comparisons.update(
+            {
+                next_unique_indices[key]: previous_completed_by_key[key]
+                for key in previous_completed_by_key
+                if key in next_unique_indices
             }
-            incoming_comparisons.update(
-                {
-                    index: previous_completed_by_key[action_completion_key(action)]
-                    for index, action in enumerate(self._actions)
-                    if index in carried_completed_indices
-                }
-            )
+        )
         self._comparisons = incoming_comparisons
         self._selected_indices.clear()
-        if not same_schedule_date:
-            self._executed_indices = carried_completed_indices
-            self._submitting_indices.clear()
-            self._blocked_indices.clear()
-            self._retry_after.clear()
+        self._executed_indices = carried_completed_indices
+        self._submitting_indices = {
+            next_unique_indices[key]
+            for key in previous_submitting_keys
+            if key in next_unique_indices
+        }
+        self._blocked_indices = {
+            next_unique_indices[key]
+            for key in previous_blocked_keys
+            if key in next_unique_indices
+        }
+        self._retry_after = {
+            next_unique_indices[key]: retry_at
+            for key, retry_at in previous_retry_by_key.items()
+            if key in next_unique_indices
+        }
+        self._task_errors = {
+            next_unique_indices[key]: message
+            for key, message in previous_errors_by_key.items()
+            if key in next_unique_indices
+        }
         self._refresh_queue_action_indices()
+        self._remap_pending_confirmations()
         self._refresh_projection()
+
+    def _remap_pending_confirmations(self) -> None:
+        if self._pending_manual_action_keys:
+            indices = self._resolve_action_keys(self._pending_manual_action_keys)
+            if indices is None:
+                self._pending_manual_indices.clear()
+                self._pending_manual_action_keys = ()
+                self._manual_confirmation_summary = ""
+            else:
+                self._pending_manual_indices = indices
+                self._pending_manual_schedule_generation = self._schedule_generation
+        if self._pending_external_return_action_keys:
+            indices = self._resolve_action_keys(self._pending_external_return_action_keys)
+            if indices is None:
+                self._pending_external_return_indices.clear()
+                self._pending_external_return_action_keys = ()
+                self._external_return_confirmation_summary = ""
+            else:
+                self._pending_external_return_indices = indices
+                self._pending_external_return_schedule_generation = self._schedule_generation
 
     def _projection_state(self) -> DutyTaskProjectionState:
         return DutyTaskProjectionState(
@@ -1278,6 +1782,7 @@ class DutyController(QObject):
         self._refresh_unreturned_return_queue()
 
     def _refresh_unreturned_return_queue(self) -> None:
+        self._unreturned_return_queue.prune_bridge_history()
         expired = self._unreturned_return_queue.expire_due()
         for record in expired:
             self._mark_expired_unreturned_return(record)
@@ -1359,7 +1864,14 @@ class DutyController(QObject):
             schedule_data["_unreturned_return_queue_id"] = queue_id
             schedule_data["_unreturned_return_component_key"] = action_completion_key(original_action)
             requests.append(
-                DutySubmissionRequest(user_id, password, 0, schedule_data, trigger_type=trigger_type)
+                self._submission_request(
+                    user_id,
+                    password,
+                    0,
+                    schedule_data,
+                    trigger_type=trigger_type,
+                    action_key=action_completion_key(original_action),
+                )
             )
         return requests
 
@@ -1371,6 +1883,8 @@ class DutyController(QObject):
         *,
         submit_at: datetime | None = None,
     ) -> list[DutySubmissionRequest]:
+        if not self.request_matches_current_session(preflight_request):
+            return []
         group_id = str(preflight_request.schedule_data.get("_handoff_preflight_group_id") or "")
         state = self._handoff_preflight_groups.get(group_id)
         if state is None or state.get("paused"):
@@ -1390,15 +1904,8 @@ class DutyController(QObject):
             )
 
         actions = [dict(action) for action in self._actions]
-        action_indices_by_completion_key = {
-            action_completion_key(action): index
-            for index, action in enumerate(actions)
-        }
-        group_indices = tuple(
-            action_indices_by_completion_key.get(action_completion_key(action), -1)
-            for action in state.get("actions", [])
-        )
-        if not group_indices or any(index < 0 for index in group_indices):
+        group_indices = self._handoff_state_indices(state)
+        if not group_indices:
             return []
         target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
         for index in group_indices:
@@ -1421,7 +1928,7 @@ class DutyController(QObject):
         schedule_data["target_date"] = target_date
         schedule_data["actions"] = actions
         return [
-            DutySubmissionRequest(
+            self._submission_request(
                 user_id,
                 password,
                 index,
@@ -1432,31 +1939,60 @@ class DutyController(QObject):
         ]
 
     def handle_handoff_preflight_ready(self, request: DutySubmissionRequest) -> bool:
+        if not self.request_matches_current_session(request):
+            return False
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
         state = self._handoff_preflight_groups.get(group_id)
         if state is None or state.get("paused"):
             return False
-        source_index = int(request.schedule_data.get("_handoff_preflight_source_index", -1) or -1)
-        if source_index >= 0:
+        component_key = str(request.schedule_data.get("_handoff_preflight_component_key") or "")
+        source_index = self._unique_action_indices_by_key().get(component_key)
+        if source_index is not None:
             self._submitting_indices.discard(source_index)
         pending_keys = set(state.get("pending_keys", set()))
-        pending_keys.discard(str(request.schedule_data.get("_handoff_preflight_component_key") or ""))
+        pending_keys.discard(component_key)
         state["pending_keys"] = pending_keys
+        if not pending_keys:
+            bridge = state.get("bridge", {})
+            queue_id = str(state.get("queue_id") or "")
+            if bridge and queue_id:
+                record = self._unreturned_return_queue.bridge_handoff_group(
+                    queue_id,
+                    state.get("actions", []),
+                    self._schedule_data,
+                    bridge_at=bridge.get("bridge_at", datetime.now()),
+                    skipped_actor_nos=bridge.get("skipped_actor_nos", ()),
+                    incoming_actor_nos=bridge.get("incoming_actor_nos", ()),
+                    skipped_action_keys=bridge.get("skipped_action_keys", ()),
+                )
+                if record is None:
+                    self._handoff_preflight_groups.pop(group_id, None)
+                    self._unreturned_return_queue.defer(queue_id, self._actor_no)
+                    self._schedule_status = "跨班交接資料已變更，將重新確認。"
+                    self._refresh_queue_action_indices()
+                    self._refresh_projection()
+                    return False
+                self._refresh_queue_action_indices()
         self._refresh_projection()
         return not pending_keys
 
     def finish_handoff_preflight_group(self, request: DutySubmissionRequest) -> None:
+        if not self.request_matches_current_session(request):
+            return
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
         if self._handoff_preflight_groups.pop(group_id, None) is not None:
             self._refresh_due_tasks(force_emit=True)
 
     def handle_handoff_preflight_paused(self, request: DutySubmissionRequest) -> None:
+        if not self.request_matches_current_session(request):
+            return
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
         state = self._handoff_preflight_groups.get(group_id)
         if state is None:
             return
-        source_index = int(request.schedule_data.get("_handoff_preflight_source_index", -1) or -1)
-        if source_index >= 0:
+        component_key = str(request.schedule_data.get("_handoff_preflight_component_key") or "")
+        source_index = self._unique_action_indices_by_key().get(component_key)
+        if source_index is not None:
             self._submitting_indices.discard(source_index)
         state["paused"] = True
         queue_id = str(state.get("queue_id") or "")
@@ -1472,13 +2008,14 @@ class DutyController(QObject):
             if created:
                 self._publish_unreturned_return_event("pending", record, trigger_type="due")
         if record is not None:
-            for index in self._queue_action_indices(queue_id) | set(state.get("indices", ())):
+            handoff_indices = set(self._handoff_state_indices(state))
+            for index in self._queue_action_indices(queue_id) | handoff_indices:
                 self._comparisons[index] = {
                     "compare": "未返隊，暫停登打",
                     "group": "paused",
                     "matched": [],
                 }
-            self._schedule_auto_logout_for_handoff_indices(set(state.get("indices", ())))
+            self._schedule_auto_logout_for_handoff_indices(handoff_indices)
         self._refresh_queue_action_indices()
         self._refresh_projection()
         self._refresh_due_tasks(force_emit=True)
@@ -1489,6 +2026,8 @@ class DutyController(QObject):
         message: str,
         error_code: str,
     ) -> None:
+        if not self.request_matches_current_session(request):
+            return
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
         state = self._handoff_preflight_groups.pop(group_id, None)
         if state is None:
@@ -1497,7 +2036,7 @@ class DutyController(QObject):
         if queue_id:
             self.handle_external_return_queue_failure(queue_id)
             return
-        for index in state.get("indices", ()):
+        for index in self._handoff_state_indices(state):
             self._submitting_indices.discard(index)
             self._retry_after[index] = datetime.now() + timedelta(minutes=1)
         self._schedule_status = message
@@ -1511,7 +2050,7 @@ class DutyController(QObject):
         return {
             index
             for state in self._handoff_preflight_groups.values()
-            for index in state.get("indices", ())
+            for index in self._handoff_state_indices(state)
         }
 
     def _queue_action_indices(self, queue_id: str) -> set[int]:
@@ -1584,6 +2123,31 @@ class DutyController(QObject):
                 "group": "done",
                 "matched": [],
             }
+        unique_indices = self._unique_action_indices_by_key()
+        for record in self._unreturned_return_queue.bridge_history_records():
+            for action in self._unreturned_return_queue.record_actions(record):
+                index = unique_indices.get(action_completion_key(action))
+                if index is None:
+                    continue
+                self._executed_indices.add(index)
+                self._comparisons[index] = {
+                    "compare": "已由跨班接續登打",
+                    "group": "done",
+                    "matched": [],
+                }
+            for bridge in record.get("bridge_history", []):
+                if not isinstance(bridge, Mapping):
+                    continue
+                for completion_key in bridge.get("skipped_action_keys", []):
+                    index = unique_indices.get(str(completion_key or ""))
+                    if index is None:
+                        continue
+                    self._blocked_indices.add(index)
+                    self._comparisons[index] = {
+                        "compare": "跨班接續已略過未返隊人員",
+                        "group": "skipped",
+                        "matched": [],
+                    }
 
     def _mark_expired_unreturned_return(self, record: Mapping[str, Any]) -> None:
         expired_keys = {
@@ -1728,20 +2292,32 @@ class DutyController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_owned_thread_finished("schedule", request_id)
             return
-        self._schedule_workers.pop(request_id, None)
+        self._schedule_thread_finished(request_id)
         thread.deleteLater()
+
+    def _schedule_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._schedule_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
         self.scheduleChanged.emit()
 
     @Slot(int, str)
     def _capture_progress(self, request_id: int, message: str) -> None:
-        if request_id == self._active_capture_request:
+        if (
+            request_id == self._active_capture_request
+            and self._capture_context_is_current(self._capture_contexts, request_id)
+        ):
             self._schedule_status = message
             self.scheduleChanged.emit()
 
     @Slot(int, str, object)
     def _capture_schedule_ready(self, request_id: int, actor_no: str, snapshot: ScheduleSnapshot) -> None:
-        if request_id != self._active_capture_request:
+        if (
+            request_id != self._active_capture_request
+            or not self._capture_context_is_current(self._capture_contexts, request_id)
+        ):
             return
         self._capture_schedule_ready_ids.add(request_id)
         self._active_schedule_request = 0
@@ -1773,7 +2349,10 @@ class DutyController(QObject):
 
     @Slot(int, str, object)
     def _capture_succeeded(self, request_id: int, actor_no: str, snapshot: ScheduleSnapshot) -> None:
-        if request_id != self._active_capture_request:
+        if (
+            request_id != self._active_capture_request
+            or not self._capture_context_is_current(self._capture_contexts, request_id)
+        ):
             return
         schedule_was_ready = request_id in self._capture_schedule_ready_ids
         self._active_schedule_request = 0
@@ -1818,7 +2397,7 @@ class DutyController(QObject):
 
     @Slot(int, str)
     def _comparison_capture_progress(self, request_id: int, message: str) -> None:
-        if request_id not in self._comparison_workers:
+        if not self._capture_context_is_current(self._comparison_contexts, request_id):
             return
         self._schedule_status = message
         self.scheduleChanged.emit()
@@ -1826,7 +2405,10 @@ class DutyController(QObject):
     @Slot(int, str, object)
     def _comparisons_ready(self, request_id: int, _actor_no: str, comparison_data: object) -> None:
         target = self._comparison_targets.get(request_id, "")
-        if request_id not in self._comparison_workers or target != self._target_date_text:
+        if (
+            not self._capture_context_is_current(self._comparison_contexts, request_id)
+            or target != self._target_date_text
+        ):
             return
         payload = comparison_data if isinstance(comparison_data, Mapping) else {}
         comparisons = build_schedule_comparisons(self._schedule_data, self._actions, payload)
@@ -1849,7 +2431,7 @@ class DutyController(QObject):
         message: str,
         error_code: str,
     ) -> None:
-        if request_id not in self._comparison_workers:
+        if not self._capture_context_is_current(self._comparison_contexts, request_id):
             return
         self._schedule_status = message
         self.scheduleChanged.emit()
@@ -1865,10 +2447,20 @@ class DutyController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_owned_thread_finished("comparison", request_id)
             return
-        self._comparison_workers.pop(request_id, None)
-        self._comparison_targets.pop(request_id, None)
+        self._comparison_thread_finished(request_id)
         thread.deleteLater()
+
+    def _comparison_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._comparison_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        self._comparison_targets.pop(request_id, None)
+        self._comparison_contexts.pop(request_id, None)
+        lane_owner = self._comparison_lane_owners.pop(request_id, "")
+        self.release_capture_lane(lane_owner)
         self.scheduleChanged.emit()
 
     @Slot(int, str, str, str)
@@ -1879,7 +2471,10 @@ class DutyController(QObject):
         message: str,
         error_code: str,
     ) -> None:
-        if request_id != self._active_capture_request:
+        if (
+            request_id != self._active_capture_request
+            or not self._capture_context_is_current(self._capture_contexts, request_id)
+        ):
             return
         comparison_failure = (
             request_id in self._capture_schedule_ready_ids
@@ -1908,13 +2503,49 @@ class DutyController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_owned_thread_finished("capture", request_id)
             return
-        self._capture_workers.pop(request_id, None)
+        self._capture_thread_finished(request_id)
+        thread.deleteLater()
+
+    def _poll_owned_thread_finished(self, cleanup_kind: str, request_id: int) -> None:
+        workers = {
+            "schedule": self._schedule_workers,
+            "capture": self._capture_workers,
+            "comparison": self._comparison_workers,
+        }.get(cleanup_kind)
+        if workers is None:
+            return
+        worker_pair = workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(
+                50,
+                lambda: self._poll_owned_thread_finished(cleanup_kind, request_id),
+            )
+            return
+        if cleanup_kind == "schedule":
+            self._schedule_thread_finished(request_id)
+        elif cleanup_kind == "capture":
+            self._capture_thread_finished(request_id)
+        else:
+            self._comparison_thread_finished(request_id)
+        thread.deleteLater()
+
+    def _capture_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._capture_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         self._capture_targets.pop(request_id, None)
+        self._capture_contexts.pop(request_id, None)
+        lane_owner = self._capture_lane_owners.pop(request_id, "")
         self._capture_schedule_ready_ids.discard(request_id)
         self._capture_publish_events.pop(request_id, None)
         self._capture_auto_execution.pop(request_id, None)
-        thread.deleteLater()
+        self.release_capture_lane(lane_owner)
         self.scheduleChanged.emit()
 
     def _update_clock(self) -> None:

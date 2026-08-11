@@ -56,6 +56,8 @@ class SessionController(QObject):
         self._login_workers: dict[int, tuple[QThread, LoginWorker]] = {}
         self._credential_sync_request_id = 0
         self._credential_sync_workers: dict[int, tuple[QThread, CredentialSyncWorker]] = {}
+        self._credential_sync_contexts: dict[int, tuple[int, str]] = {}
+        self._shutdown_admission = False
         self._reload_accounts()
 
     @Property(str, notify=sessionChanged)
@@ -86,7 +88,15 @@ class SessionController(QObject):
 
     @Property(bool, notify=sessionChanged)
     def isBusy(self) -> bool:
-        return self._state.login_running or bool(self._login_workers)
+        return self._state.login_running
+
+    @Property(bool, notify=sessionChanged)
+    def hasRunningLoginWorkers(self) -> bool:
+        return bool(self._login_workers)
+
+    @Property(bool, notify=sessionChanged)
+    def hasRunningWorkers(self) -> bool:
+        return bool(self._login_workers or self._credential_sync_workers)
 
     @Property(QObject, constant=True)
     def savedAccountsModel(self) -> SavedAccountListModel:
@@ -94,7 +104,7 @@ class SessionController(QObject):
 
     @Slot(str, str, bool)
     def login(self, user_id: str, password: str, remember: bool = False) -> None:
-        if self._state.login_running or self._login_workers:
+        if self._shutdown_admission or self._state.login_running:
             return
         user_id = str(user_id or "").strip()
         account = self._account_by_user_id(user_id)
@@ -199,11 +209,15 @@ class SessionController(QObject):
 
     @Slot()
     def syncSavedAccounts(self) -> None:
+        if self._shutdown_admission:
+            return
         self._start_credential_sync(notify_user=True)
 
     def resolve_actor_no(self, actor_no: str, actor_name: str = "") -> bool:
         """Apply the duty number resolved from the existing schedule capture."""
 
+        if self._shutdown_admission:
+            return False
         session = self._state.session
         actor_no = str(actor_no or "").strip()
         actor_name = str(actor_name or session.actor_name if session else actor_name or "").strip()
@@ -276,20 +290,28 @@ class SessionController(QObject):
         self._set_status(str(message or "系統已登出"), tone="warning")
 
     @Slot()
+    def prepare_shutdown_admission(self) -> None:
+        self._shutdown_admission = True
+        self._pending_credentials.clear()
+        if self._state.timeout_login(self._state.attempt_id):
+            self._display_name = ""
+            self.sessionChanged.emit()
+
+    @Slot()
     def shutdown(self) -> None:
+        self.prepare_shutdown_admission()
         for attempt_id, (thread, _worker) in tuple(self._login_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(60_000):
-                self._login_workers.pop(attempt_id, None)
-                self._pending_credentials.pop(attempt_id, None)
-                thread.deleteLater()
+            if not thread.wait(60_000):
+                thread.wait()
+            self._finalize_login_thread(attempt_id)
         for request_id, (thread, _worker) in tuple(self._credential_sync_workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(60_000):
-                self._credential_sync_workers.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(60_000):
+                thread.wait()
+            self._finalize_credential_sync_thread(request_id)
 
     def _reload_accounts(self) -> None:
         snapshot = self._repository.load()
@@ -358,7 +380,7 @@ class SessionController(QObject):
     @Slot(int, object)
     def _login_succeeded(self, attempt_id: int, result: LoginResult) -> None:
         pending = self._pending_credentials.pop(attempt_id, None)
-        if pending is None:
+        if self._shutdown_admission or pending is None:
             return
         user_id, password, remember = pending
         session = LoginSession(
@@ -419,6 +441,9 @@ class SessionController(QObject):
         pending = self._pending_credentials.pop(attempt_id, None)
         if not self._state.timeout_login(attempt_id):
             return
+        worker_pair = self._login_workers.get(attempt_id)
+        if worker_pair is not None:
+            worker_pair[0].requestInterruption()
         self._display_name = ""
         message = "登入逾時：請確認帳號密碼或勤務系統是否有回應。"
         self._set_status(message, error=True)
@@ -459,8 +484,25 @@ class SessionController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_login_thread_finished(attempt_id)
             return
-        self._login_workers.pop(attempt_id, None)
+        self._finalize_login_thread(attempt_id)
+
+    def _poll_login_thread_finished(self, attempt_id: int) -> None:
+        worker_pair = self._login_workers.get(attempt_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_login_thread_finished(attempt_id))
+            return
+        self._finalize_login_thread(attempt_id)
+
+    def _finalize_login_thread(self, attempt_id: int) -> None:
+        worker_pair = self._login_workers.pop(attempt_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         thread.deleteLater()
         self.sessionChanged.emit()
 
@@ -470,6 +512,8 @@ class SessionController(QObject):
         extra_account: dict[str, str] | None = None,
         notify_user: bool,
     ) -> None:
+        if self._shutdown_admission:
+            return
         if not self._credential_sync_service.enabled:
             message = "尚未設定 NAS 帳密同步 URL 或 token。"
             if notify_user:
@@ -504,15 +548,35 @@ class SessionController(QObject):
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(self._credential_sync_worker_finished)
         self._credential_sync_workers[request_id] = (thread, worker)
+        session = self._state.session
+        self._credential_sync_contexts[request_id] = (
+            self._state.generation,
+            str(session.user_id or "").strip() if session is not None else "",
+        )
         thread.start()
 
+    def _credential_sync_is_current(self, request_id: int) -> bool:
+        if self._shutdown_admission:
+            return False
+        context = self._credential_sync_contexts.get(request_id)
+        if context is None:
+            return True
+        generation, user_id = context
+        session = self._state.session
+        current_user_id = str(session.user_id or "").strip() if session is not None else ""
+        return generation == self._state.generation and user_id == current_user_id
+
     @Slot(int, int, bool)
-    def _credential_sync_succeeded(self, _request_id: int, count: int, notify_user: bool) -> None:
+    def _credential_sync_succeeded(self, request_id: int, count: int, notify_user: bool) -> None:
+        if not self._credential_sync_is_current(request_id):
+            return
         if notify_user:
             self._set_status(f"已同步 {count} 組帳密。")
 
     @Slot(int, str, bool)
-    def _credential_sync_failed(self, _request_id: int, message: str, notify_user: bool) -> None:
+    def _credential_sync_failed(self, request_id: int, message: str, notify_user: bool) -> None:
+        if not self._credential_sync_is_current(request_id):
+            return
         if notify_user:
             self._set_status(message, error=True)
         elif self.isLoggedIn:
@@ -526,9 +590,31 @@ class SessionController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_credential_sync_thread_finished(request_id)
             return
-        self._credential_sync_workers.pop(request_id, None)
+        self._finalize_credential_sync_thread(request_id)
+
+    def _poll_credential_sync_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._credential_sync_workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(
+                50,
+                lambda: self._poll_credential_sync_thread_finished(request_id),
+            )
+            return
+        self._finalize_credential_sync_thread(request_id)
+
+    def _finalize_credential_sync_thread(self, request_id: int) -> None:
+        worker_pair = self._credential_sync_workers.pop(request_id, None)
+        self._credential_sync_contexts.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         thread.deleteLater()
+        self.sessionChanged.emit()
 
     def _set_status(
         self,

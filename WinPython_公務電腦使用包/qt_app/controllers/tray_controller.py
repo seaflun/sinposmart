@@ -141,12 +141,14 @@ class TrayController(QObject):
         *,
         tray_available: bool | None = None,
         native_notifier: Callable[[str, str], bool] = show_windows_notification,
+        stop_guard: Callable[[], str] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._app = app
         self._availability_override = tray_available
         self._native_notifier = native_notifier
+        self._stop_guard = stop_guard
         self._available = bool(tray_available) if tray_available is not None else False
         self._quit_requested = False
         self._window: Any | None = None
@@ -200,9 +202,18 @@ class TrayController(QObject):
     def attach_window(self, window: Any) -> None:
         self._window = window
 
+    def setStopGuard(self, guard: Callable[[], str] | None) -> None:
+        self._stop_guard = guard
+
     @Slot(result=bool)
     def interceptClose(self) -> bool:
-        if not self._available or self._quit_requested:
+        if self._quit_requested:
+            return False
+        if not self._available:
+            block_reason = self._stop_block_reason()
+            if block_reason:
+                self.notify("SinpoSmart", f"目前無法結束程式：{block_reason}")
+                return True
             return False
         self.hideWindow()
         return True
@@ -233,12 +244,24 @@ class TrayController(QObject):
 
     @Slot()
     def requestQuit(self) -> None:
+        block_reason = self._stop_block_reason()
+        if block_reason:
+            self.notify("SinpoSmart", f"目前無法結束程式：{block_reason}")
+            return
         self._quit_requested = True
         if self._tray is not None:
             self._tray.hide()
         self.stateChanged.emit()
         if self._app is not None:
             self._app.quit()
+
+    def _stop_block_reason(self) -> str:
+        if self._stop_guard is None:
+            return ""
+        try:
+            return str(self._stop_guard() or "").strip()
+        except Exception:
+            return "無法確認目前工作是否已安全結束"
 
     @Slot()
     def shutdown(self) -> None:

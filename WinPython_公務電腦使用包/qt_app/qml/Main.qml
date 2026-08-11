@@ -497,8 +497,8 @@ ApplicationWindow {
                 font.pixelSize: Design.appWindowControlIconSize
                 font.weight: Font.Normal
                 instantFeedback: true
-                showFocusRing: false
-                focusPolicy: Qt.NoFocus
+                showFocusRing: true
+                focusPolicy: Qt.TabFocus
                 scale: 1
                 Accessible.name: "縮小視窗"
                 onClicked: window.showMinimized()
@@ -522,8 +522,8 @@ ApplicationWindow {
                     iconToggled: window.visibility === Window.Maximized
                     tone: "windowControl"
                     instantFeedback: true
-                    showFocusRing: false
-                    focusPolicy: Qt.NoFocus
+                    showFocusRing: true
+                    focusPolicy: Qt.TabFocus
                     scale: 1
                     Accessible.name: window.visibility === Window.Maximized ? "還原視窗" : "最大化視窗"
                     onClicked: window.toggleWindowMaximize()
@@ -546,8 +546,8 @@ ApplicationWindow {
                 font.pixelSize: Design.appWindowControlIconSize
                 font.weight: Font.Normal
                 instantFeedback: true
-                showFocusRing: false
-                focusPolicy: Qt.NoFocus
+                showFocusRing: true
+                focusPolicy: Qt.TabFocus
                 scale: 1
                 Accessible.name: "關閉視窗"
                 onClicked: window.close()
@@ -668,6 +668,68 @@ ApplicationWindow {
         Item {
             visible: modeTabs.currentIndex === 0 && !window.backend.sessionController.isLoggedIn
             Layout.fillHeight: visible
+        }
+
+        Rectangle {
+            id: globalDutyErrorBar
+            objectName: "globalDutyErrorBar"
+            visible: modeTabs.currentIndex === 0
+                     && window.backend.sessionController.isLoggedIn
+                     && window.errorMessage.length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? 44 : 0
+            Layout.minimumHeight: Layout.preferredHeight
+            Layout.maximumHeight: Layout.preferredHeight
+            radius: Design.radiusSmall
+            color: Design.dangerSurface
+            border.width: Design.borderWidth
+            border.color: Design.dangerBorder
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: window.errorMessage
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 8
+                spacing: 8
+
+                Label {
+                    id: globalDutyErrorText
+                    objectName: "globalDutyErrorText"
+                    Layout.fillWidth: true
+                    text: window.errorMessage
+                    color: Design.dangerStrong
+                    font.pixelSize: Design.controlSize
+                    font.bold: true
+                    elide: Text.ElideRight
+                    wrapMode: Text.NoWrap
+                    verticalAlignment: Text.AlignVCenter
+                    activeFocusOnTab: truncated
+                    Accessible.name: text
+
+                    HoverHandler {
+                        id: globalDutyErrorHover
+                    }
+
+                    ToolTip.visible: globalDutyErrorText.truncated
+                                         && (globalDutyErrorHover.hovered || globalDutyErrorText.activeFocus)
+                    ToolTip.text: globalDutyErrorText.text
+                    ToolTip.delay: 400
+                    ToolTip.timeout: 10000
+                }
+
+                AppleButton {
+                    objectName: "dismissGlobalDutyErrorButton"
+                    implicitWidth: 58
+                    implicitHeight: 30
+                    text: "關閉"
+                    tone: "danger"
+                    showFocusRing: true
+                    focusPolicy: Qt.TabFocus
+                    Accessible.name: "關閉錯誤訊息"
+                    onClicked: window.errorMessage = ""
+                }
+            }
         }
     }
 

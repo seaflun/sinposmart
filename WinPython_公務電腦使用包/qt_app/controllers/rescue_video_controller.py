@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Property, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, QUrl, Signal, Slot
 
 from app_core.rescue_video_service import (
     RescueVideoDefaults,
@@ -61,6 +61,7 @@ class RescueVideoController(QObject):
         self._failure_stage = "unknown"
         self._workers: dict[int, tuple[QThread, RescueVideoWorker]] = {}
         self._worker_modes: dict[int, str] = {}
+        self._shutting_down = False
         self._last_completed_mode = ""
         self._result_model = RescueVideoResultModel(self)
 
@@ -174,7 +175,7 @@ class RescueVideoController(QObject):
 
     @Slot()
     def loadDefaults(self) -> None:
-        if self._workers:
+        if self._shutting_down or self._workers:
             return
         self._is_ready = False
         self._has_preview = False
@@ -203,7 +204,7 @@ class RescueVideoController(QObject):
         *,
         preview_after_check: bool,
     ) -> None:
-        if self._workers:
+        if self._shutting_down or self._workers:
             return
         self._is_ready = False
         self._has_preview = False
@@ -222,7 +223,7 @@ class RescueVideoController(QObject):
 
     @Slot(str, str)
     def refreshVehicleOptions(self, source_path: str, target_date: str) -> None:
-        if self._workers or self._awaiting_confirmation:
+        if self._shutting_down or self._workers or self._awaiting_confirmation:
             return
         self._source_path = source_path
         self._target_date = target_date
@@ -276,6 +277,8 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if self._shutting_down:
+            return
         if not self._is_ready or self._awaiting_confirmation:
             self._set_error("請先按「檢查及預覽分類」並確認結果通過。")
             return
@@ -360,7 +363,7 @@ class RescueVideoController(QObject):
 
     @Slot()
     def confirmDelete(self) -> None:
-        if self._pending_request is None or self._workers:
+        if self._shutting_down or self._pending_request is None or self._workers:
             return
         request = self._pending_request
         self._pending_request = None
@@ -428,6 +431,8 @@ class RescueVideoController(QObject):
         defaults_date: str = "",
         defaults_vehicle: str = "",
     ) -> None:
+        if self._shutting_down:
+            return
         if operation == "execute" and self._session_state is not None:
             session = self._session_state.session
             if session is None or not session.verified or not str(session.actor_no or "").strip():
@@ -592,11 +597,33 @@ class RescueVideoController(QObject):
         thread, _worker = worker_pair
         thread.quit()
         if not thread.wait(5_000):
+            self._poll_worker_thread_finished(request_id)
             return
-        self._workers.pop(request_id, None)
+        self._finalize_worker_thread(request_id)
+
+    def _poll_worker_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_worker_thread_finished(request_id))
+            return
+        self._finalize_worker_thread(request_id)
+
+    def _finalize_worker_thread(self, request_id: int) -> None:
+        worker_pair = self._workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
         mode = self._worker_modes.pop(request_id, "")
         thread.deleteLater()
-        if mode == "" and self._preview_after_check and self._is_ready:
+        if (
+            not self._shutting_down
+            and mode == ""
+            and self._preview_after_check
+            and self._is_ready
+        ):
             self._preview_after_check = False
             request = self._request(
                 self._source_path,
@@ -613,14 +640,18 @@ class RescueVideoController(QObject):
         self.stateChanged.emit()
 
     @Slot()
+    def prepare_shutdown_admission(self) -> None:
+        self._shutting_down = True
+
+    @Slot()
     def shutdown(self) -> None:
+        self.prepare_shutdown_admission()
         for request_id, (thread, _worker) in tuple(self._workers.items()):
             thread.requestInterruption()
             thread.quit()
-            if thread.wait(120_000):
-                self._workers.pop(request_id, None)
-                self._worker_modes.pop(request_id, None)
-                thread.deleteLater()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._finalize_worker_thread(request_id)
 
     def _set_error(self, message: str) -> None:
         self._status_text = message

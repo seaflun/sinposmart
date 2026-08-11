@@ -260,7 +260,7 @@ def select_due_task_indices(
         if retry_at is not None and current < retry_at:
             continue
         comparison = state.comparisons.get(index, {})
-        if comparison.get("group") in ("done", "manual", "near", "adjust", "review"):
+        if comparison.get("group") in ("done", "manual", "near", "adjust", "review", "skipped"):
             continue
         if not is_auto_duty_action(action):
             continue
@@ -347,6 +347,8 @@ def _task_status(
         return "正在登打", "running"
     if comparison.get("group") == "done":
         return _display_status(comparison.get("compare") or "已存在"), "triggered"
+    if comparison.get("group") == "skipped":
+        return _display_status(comparison.get("compare") or "跨班接續已略過"), "manual"
     if index in state.comparison_wait_statuses:
         return state.comparison_wait_statuses[index], "manual"
     if index in state.paused_indices:
