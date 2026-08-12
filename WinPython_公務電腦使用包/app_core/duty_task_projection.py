@@ -365,7 +365,10 @@ def _task_status(
         return "前班手動", "waiting"
     if comparison.get("group") == "manual" or not is_auto_duty_action(action):
         return "手動", "waiting"
-    return ("到點待執行", "ready") if action_datetime(action, state.target_roc_date) <= now else ("等待", "waiting")
+    action_at = action_datetime(action, state.target_roc_date)
+    if action_at + AUTO_DUE_CATCH_UP_WINDOW < now:
+        return "逾時未補跑", "manual"
+    return ("到點待執行", "ready") if action_at <= now else ("等待", "waiting")
 
 
 def project_duty_tasks(

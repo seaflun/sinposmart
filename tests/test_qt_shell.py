@@ -811,6 +811,27 @@ class DutyTaskProjectionTests(unittest.TestCase):
             [],
         )
 
+    def test_projection_marks_automatic_task_past_catch_up_window_as_overdue(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
+
+        action = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "fields": {"出或入": "入", "領用事由及地點": "到勤"},
+        }
+        rows = project_duty_tasks(
+            [action],
+            DutyTaskProjectionState(actor_no="10", target_roc_date="1150807"),
+            now=datetime(2026, 8, 7, 10, 1),
+        )
+
+        self.assertEqual(rows[0]["statusText"], "逾時未補跑")
+        self.assertEqual(rows[0]["statusTone"], "manual")
+
     def test_only_known_work_tasks_can_auto_submit_without_generic_pause_controls(self) -> None:
         from datetime import datetime
 
@@ -2651,6 +2672,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
 class DailyVehicleServiceTests(unittest.TestCase):
     def test_execute_uses_existing_script_with_ephemeral_credentials_and_cleanup(self) -> None:
         from datetime import date
+        from io import StringIO
 
         from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService
 
@@ -2664,10 +2686,28 @@ class DailyVehicleServiceTests(unittest.TestCase):
 
             class FakeProcess:
                 pid = 12345
-                returncode = 0
 
-                def communicate(self, timeout=None):
-                    return "[done] automation finished", None
+                def __init__(self) -> None:
+                    self._stream_finished = threading.Event()
+
+                    class ReportingStdout(StringIO):
+                        def readline(stream_self):
+                            line = super(ReportingStdout, stream_self).readline()
+                            if not line:
+                                self._stream_finished.set()
+                            return line
+
+                    self.stdout = ReportingStdout(
+                        "[sinposmart-stage] login\n"
+                        "[sinposmart-stage] maintenance_check\n"
+                        "[done] automation finished\n"
+                    )
+                    self.returncode = None
+
+                def poll(self):
+                    if self._stream_finished.is_set():
+                        self.returncode = 0
+                    return self.returncode
 
                 def kill(self):
                     raise AssertionError("successful process must not be killed")
@@ -2702,8 +2742,71 @@ class DailyVehicleServiceTests(unittest.TestCase):
             self.assertFalse((project_dir / ".daily_vehicle_runner.pid").exists())
             self.assertNotIn("session-secret", repr(request))
             self.assertTrue(progress)
+            self.assertIn("正在登入車輛保養系統…", progress)
+            self.assertIn("正在執行車輛保養檢查…", progress)
+
+    def test_execute_returns_after_runner_exits_when_retained_browser_keeps_stdout_open(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            project_dir = package_root / "daily_vehicle_legacy"
+            script = project_dir / "automation" / "ppe_selenium_daily.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# placeholder\n", encoding="utf-8")
+
+            class RetainedBrowserStdout:
+                def __init__(self) -> None:
+                    self._first_line = True
+                    self.line_read = threading.Event()
+                    self.release = threading.Event()
+
+                def readline(self):
+                    if self._first_line:
+                        self._first_line = False
+                        self.line_read.set()
+                        return "[sinposmart-stage] equipment_check\n"
+                    self.release.wait(5)
+                    return ""
+
+                def close(self):
+                    self.release.set()
+
+            class FakeProcess:
+                pid = 12345
+
+                def __init__(self) -> None:
+                    self.stdout = RetainedBrowserStdout()
+                    self.returncode = None
+
+                def poll(self):
+                    if self.stdout.line_read.is_set():
+                        self.returncode = 0
+                    return self.returncode
+
+                def kill(self):
+                    raise AssertionError("successful process must not be killed")
+
+            process = FakeProcess()
+            service = DailyVehicleService(
+                package_root,
+                process_factory=lambda *_args, **_kwargs: process,
+                process_checker=lambda _pid: False,
+            )
+            progress: list[str] = []
+
+            result = service.execute(
+                DailyVehicleRequest("user10", "session-secret"),
+                status_callback=progress.append,
+            )
+
+        self.assertEqual(result, "車輛保養清點已完成。")
+        self.assertIn("正在執行隨車器材清點…", progress)
+        self.assertTrue(process.stdout.release.is_set())
 
     def test_browser_start_failure_uses_safe_shared_driver_message(self) -> None:
+        from io import StringIO
+
         from app_core.daily_vehicle_service import (
             DailyVehicleExecutionError,
             DailyVehicleRequest,
@@ -2719,15 +2822,28 @@ class DailyVehicleServiceTests(unittest.TestCase):
 
             class FailedProcess:
                 pid = 12345
-                returncode = 1
 
-                def communicate(self, timeout=None):
-                    return (
+                def __init__(self) -> None:
+                    self._stream_finished = threading.Event()
+
+                    class ReportingStdout(StringIO):
+                        def readline(stream_self):
+                            line = super(ReportingStdout, stream_self).readline()
+                            if not line:
+                                self._stream_finished.set()
+                            return line
+
+                    self.stdout = ReportingStdout(
                         "[sinposmart-stage] browser_start\n"
                         "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。\n"
-                        "WebDriverException: raw startup detail",
-                        None,
+                        "WebDriverException: raw startup detail"
                     )
+                    self.returncode = None
+
+                def poll(self):
+                    if self._stream_finished.is_set():
+                        self.returncode = 1
+                    return self.returncode
 
                 def kill(self):
                     raise AssertionError("failed process must not be killed after it exits")
@@ -11985,6 +12101,10 @@ if return_code != 0 or loaded:
             "user10", "secret", [0], submit_at=early
         )[0]
         self.assertEqual(arrival_request.schedule_data["actions"][0]["time"], "07:55")
+        self.assertEqual(
+            controller._manual_time_summary(controller._actions[0], datetime(2026, 8, 9, 10, 1)),
+            "表定時間（逾時未補跑）",
+        )
         self.assertTrue(controller._is_manual_submission_eligible(1, now=datetime(2026, 8, 9, 8, 2)))
         checkout_request = controller.manual_submission_requests(
             "user10", "secret", [1], submit_at=datetime(2026, 8, 9, 8, 2)

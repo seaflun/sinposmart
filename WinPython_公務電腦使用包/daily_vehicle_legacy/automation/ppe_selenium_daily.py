@@ -73,17 +73,9 @@ def load_config() -> dict[str, object]:
         "password": password,
         "headless": read_bool("HEADLESS", True),
         "keep_browser_open": read_bool("KEEP_BROWSER_OPEN", False),
-        "send_line_result": read_bool("SEND_LINE_RESULT", True),
         "timeout_seconds": int(os.getenv("SELENIUM_TIMEOUT_SECONDS", "60")),
         "selenium_remote_url": os.getenv("SELENIUM_REMOTE_URL", "").strip(),
         "selenium_remote_ready_timeout_seconds": int(os.getenv("SELENIUM_REMOTE_READY_TIMEOUT_SECONDS", "180")),
-        "line_channel_access_token": os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip(),
-        "line_to_user_id": os.getenv("LINE_TO_USER_ID", "").strip(),
-        "line_to_user_ids": [
-            item.strip()
-            for item in os.getenv("LINE_TO_USER_IDS", "").split(",")
-            if item.strip()
-        ],
     }
 
 
@@ -174,37 +166,6 @@ def wait_for_login_site(url: str, timeout_seconds: int) -> None:
         time.sleep(2)
 
     raise RuntimeError(f"Login site was not reachable within {timeout_seconds}s: {last_error}")
-
-
-def send_line_push(config: dict[str, object], text: str) -> None:
-    token = str(config["line_channel_access_token"])
-    user_ids = list(config["line_to_user_ids"])
-    fallback_user_id = str(config["line_to_user_id"])
-    if not user_ids and fallback_user_id:
-        user_ids = [fallback_user_id]
-    if not token or not user_ids:
-        print("[line] skipped: missing LINE_CHANNEL_ACCESS_TOKEN or LINE_TO_USER_IDS")
-        return
-
-    for user_id in user_ids:
-        payload = json.dumps(
-            {
-                "to": user_id,
-                "messages": [{"type": "text", "text": text[:5000]}],
-            }
-        ).encode("utf-8")
-
-        request = urllib.request.Request(
-            "https://api.line.me/v2/bot/message/push",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=20) as response:
-            print(f"[line] push sent to {user_id}: {getattr(response, 'status', 'unknown')}")
 
 
 def login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password: str) -> None:
@@ -476,11 +437,7 @@ def main(argv: list[str] | None = None) -> None:
         process_maintain_checks(driver, wait, today_strings, today)
         print("[sinposmart-stage] equipment_check", flush=True)
         process_equip_checks(driver, wait)
-        print("[sinposmart-stage] artifact_write", flush=True)
-        save_artifacts(driver, "last-run")
         print("[done] automation finished")
-        if config["send_line_result"]:
-            send_line_push(config, f"PPE 自動化完成\n時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n結果: 成功")
     except Exception as error:
         if driver is not None:
             save_artifacts(driver, "error")
@@ -489,11 +446,6 @@ def main(argv: list[str] | None = None) -> None:
             f"時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n"
             f"錯誤: {type(error).__name__}: {error}"
         )
-        if config["send_line_result"]:
-            try:
-                send_line_push(config, message)
-            except Exception as line_error:
-                print(f"[line] push failed: {line_error}")
         print(traceback.format_exc())
         raise
     finally:

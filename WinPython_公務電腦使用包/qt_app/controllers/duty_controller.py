@@ -589,6 +589,13 @@ class DutyController(QObject):
         return str(action.get("source", "") or "") in ("外勤簽出", "休息簽出")
 
     def _manual_time_summary(self, action: Mapping[str, Any], current: datetime) -> str:
+        action_at = action_datetime(
+            action,
+            self._target_date_text,
+            fallback_date=current.date(),
+        )
+        if is_auto_duty_action(action) and current > action_at + AUTO_DUE_CATCH_UP_WINDOW:
+            return "表定時間（逾時未補跑）"
         if self._manual_submission_uses_scheduled_time(action, current):
             return "表定時間"
         if is_auto_duty_action(action):

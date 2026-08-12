@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -128,10 +131,10 @@ class DailyVehicleService:
             self._write_running_pid(project_dir, process.pid)
             try:
                 report_stage("process_running")
-                output, _ = process.communicate(timeout=self._timeout_seconds())
+                output = self._wait_for_process_exit(process, status_callback)
             except subprocess.TimeoutExpired as exc:
                 process.kill()
-                process.communicate()
+                self._close_process_stdout(process)
                 raise DailyVehicleExecutionError(
                     "車輛保養清點執行逾時。",
                     failure_stage=stage,
@@ -192,6 +195,84 @@ class DailyVehicleService:
             re.MULTILINE,
         )
         return stages[-1] if stages else fallback
+
+    def _wait_for_process_exit(
+        self,
+        process: subprocess.Popen,
+        status_callback: Callable[[str], None] | None,
+    ) -> str:
+        """Return when the automation Python process exits, not when retained Chrome closes stdout."""
+        stdout = getattr(process, "stdout", None)
+        if stdout is None:
+            output, _ = process.communicate(timeout=self._timeout_seconds())
+            return str(output or "")
+
+        output_lines: list[str] = []
+        output_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_stdout() -> None:
+            try:
+                for line in iter(stdout.readline, ""):
+                    output_queue.put(str(line))
+            except (OSError, ValueError):
+                pass
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_stdout, name="daily-vehicle-output", daemon=True)
+        reader.start()
+        timeout_seconds = self._timeout_seconds()
+        deadline = time.monotonic() + timeout_seconds
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("daily_vehicle", timeout_seconds)
+            try:
+                line = output_queue.get(timeout=min(0.2, remaining))
+            except queue.Empty:
+                continue
+            if line is not None:
+                self._record_output_line(output_lines, line, status_callback)
+
+        while True:
+            try:
+                line = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is not None:
+                self._record_output_line(output_lines, line, status_callback)
+        self._close_process_stdout(process)
+        return "".join(output_lines)
+
+    @staticmethod
+    def _close_process_stdout(process: subprocess.Popen) -> None:
+        try:
+            stdout = getattr(process, "stdout", None)
+            if stdout is not None:
+                stdout.close()
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _record_output_line(
+        output_lines: list[str],
+        line: str,
+        status_callback: Callable[[str], None] | None,
+    ) -> None:
+        output_lines.append(line)
+        if len(output_lines) > 500:
+            del output_lines[:-500]
+        if status_callback is None:
+            return
+        stage = re.search(r"^\[sinposmart-stage\]\s+([a-z0-9_]+)\s*$", line.strip())
+        messages = {
+            "browser_start": "正在啟動專用瀏覽器…",
+            "login": "正在登入車輛保養系統…",
+            "maintenance_check": "正在執行車輛保養檢查…",
+            "equipment_check": "正在執行隨車器材清點…",
+        }
+        if stage is not None and stage.group(1) in messages:
+            status_callback(messages[stage.group(1)])
 
     @staticmethod
     def _timeout_seconds() -> int:
