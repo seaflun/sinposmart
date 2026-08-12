@@ -2057,6 +2057,33 @@ def is_active_checkout_column(column: str) -> bool:
     return column not in OFF_DUTY_SUMMARY_KEYS and column != "檢核欄"
 
 
+def has_active_assignment_at(sheet: DutySheet | None, no: str, hour: int) -> bool:
+    if not sheet:
+        return False
+    row = row_for_hour(sheet, hour)
+    if row:
+        return any(
+            no in values
+            for column, values in row.columns.items()
+            if is_active_checkout_column(column)
+        )
+    return no in sheet.summary.get("在勤", [])
+
+
+def active_assignment_numbers(sheet: DutySheet | None) -> set[str]:
+    if not sheet:
+        return set()
+    if sheet.rows:
+        return {
+            no
+            for row in sheet.rows
+            for column, values in row.columns.items()
+            if is_active_checkout_column(column)
+            for no in values
+        }
+    return set(sheet.summary.get("在勤", []))
+
+
 def needs_next_morning_checkout(sheet: DutySheet, no: str) -> bool:
     row = row_for_hour(sheet, 22)
     if not row:
@@ -2153,21 +2180,6 @@ def has_external_duty(row: DutyRow | None, no: str) -> bool:
     return any(no in values for values in external_columns(row).values())
 
 
-def adjacent_rest_start(sheet: DutySheet, no: str, start: int) -> int:
-    probe = start - 1
-    block_start = start
-    while probe >= 0:
-        row = row_for_hour(sheet, probe)
-        if not row or no not in row.columns.get("休息", []):
-            break
-        row_start = slot_start(row.slot)
-        if row_start is None:
-            break
-        block_start = row_start
-        probe = row_start - 1
-    return block_start
-
-
 def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | None) -> bool:
     if start == 8:
         return False
@@ -2179,10 +2191,14 @@ def rest_is_external_route(sheet: DutySheet, no: str, start: int, end: int | Non
 def rest_checkout_targets(sheet: DutySheet | None, next_sheet: DutySheet | None) -> set[str]:
     if not sheet or not next_sheet:
         return set()
-    next_on = set(next_sheet.summary.get("在勤", []))
     targets: set[str] = set()
     for no, start, end in rest_blocks(sheet, next_sheet):
-        if start < 8 and no not in next_on and (end is None or end >= 8) and not rest_is_external_route(sheet, no, start, end):
+        if (
+            start < 8
+            and not has_active_assignment_at(next_sheet, no, 8)
+            and (end is None or end >= 8)
+            and not rest_is_external_route(sheet, no, start, end)
+        ):
             targets.add(no)
     return targets
 
@@ -2200,10 +2216,7 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
         for column, values in external_columns(row).items():
             for no in values:
                 current.add((column, no))
-                route_start = adjacent_rest_start(sheet, no, start)
-                if route_start < 8 <= start:
-                    route_start = start
-                active.setdefault((column, no), start if route_start == 8 else route_start)
+                active.setdefault((column, no), start)
         for key in list(active.keys()):
             if key not in current:
                 duty_name, no = key
@@ -2220,7 +2233,7 @@ def external_duty_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) 
                             break
                         block_end = next_end
                         probe = next_end
-                elif block_end == 8 and next_sheet and no not in next_sheet.summary.get("在勤", []):
+                elif block_end == 8 and next_sheet and not has_active_assignment_at(next_sheet, no, 8):
                     block_end = None
                 blocks.append((duty_name, no, block_start, block_end, 0))
         # Extend currently active keys through this row by keeping them in active.
@@ -2469,9 +2482,8 @@ def planned_actions(
     work_log_defaults = load_work_log_defaults()
 
     # 08 boundary, including rest-start exceptions.
-    today_on = set(today.summary.get("在勤", []))
-    yesterday_on = set(yesterday.summary.get("在勤", [])) if yesterday else set()
-    tomorrow_on = set(tomorrow.summary.get("在勤", [])) if tomorrow else set()
+    today_on = active_assignment_numbers(today)
+    yesterday_on = active_assignment_numbers(yesterday)
     today_rest_start_08 = rest_starting_at(today, 8, tomorrow)
     yesterday_rest_start_06 = rest_starting_at(yesterday, 6, today) if yesterday else {}
     today_rest_checkouts = rest_checkout_targets(today, tomorrow)
@@ -2540,11 +2552,16 @@ def planned_actions(
         )
 
     for no, start, end in rest_blocks(today, tomorrow):
-        if no not in today_on or (start == 8 and no not in yesterday_on):
+        if start == 8 and no in today_on and not has_active_assignment_at(yesterday, no, 7):
             continue
         start_offset = 1 if start < 8 else 0
         end_offset = 1 if end is not None and (end <= 8 or end >= 24) else 0
-        rest_checkout = start_offset == 1 and tomorrow and no not in tomorrow_on and (end is None or end >= 8)
+        rest_checkout = (
+            start_offset == 1
+            and tomorrow
+            and not has_active_assignment_at(tomorrow, no, 8)
+            and (end is None or end >= 8)
+        )
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         start_reason = "休息後退勤" if rest_checkout else "休息"
         actions.append(
@@ -2822,10 +2839,12 @@ def planned_actions(
             return 2
         if outin == "值班":
             return 3
-        if source == "外勤簽出" and outin == "出":
+        if reason == "到勤" and outin == "入":
             return 4
-        if source == "休息簽出" and reason == "休息":
+        if source == "外勤簽出" and outin == "出":
             return 5
+        if source == "休息簽出" and reason == "休息":
+            return 6
         return 50
 
     def sort_key(index_and_action: tuple[int, PlannedAction]) -> tuple[int, int, int]:
@@ -2834,7 +2853,7 @@ def planned_actions(
         return action.date_offset * 1440 + hour * 60 + minute, entry_priority(action), index
 
     # Keep insertion order inside the same minute after applying the required
-    # entry sequence: 外勤入, 休息入, 值退, 值班, 外勤出, 休息出.
+    # entry sequence: 外勤入, 休息入, 值退, 值班, 到勤, 外勤出, 休息出.
     return [action for _, action in sorted(enumerate(actions), key=sort_key)]
 
 

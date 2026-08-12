@@ -545,6 +545,196 @@ class PackageSmokeTests(unittest.TestCase):
             ],
         )
 
+    def test_external_duty_after_rest_uses_schedule_time_for_partial_public_leave(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150812",
+            rows=[
+                module.DutyRow("09~17", {"值班": ["17"], "救助複訓": ["21"]}),
+                module.DutyRow("17~18", {"值班": ["23"], "休息": ["21"]}),
+                module.DutyRow("18~20", {"值班": ["5"], "防溺車巡": ["21"]}),
+            ],
+            summary={"公假": ["21"], "在勤": ["5", "17", "23"]},
+        )
+
+        self.assertEqual(
+            [block for block in module.external_duty_blocks(today) if block[1] == "21"],
+            [
+                ("救助複訓", "21", 9, 17, 0),
+                ("防溺車巡", "21", 18, 20, 0),
+            ],
+        )
+        self.assertEqual(
+            [block for block in module.rest_blocks(today) if block[0] == "21"],
+            [("21", 17, 18)],
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150812"), [], None)
+        person_actions = [
+            (
+                action.time,
+                action.source,
+                action.actor,
+                action.target,
+                action.fields.get("出或入"),
+                action.fields.get("領用事由及地點"),
+                action.date_offset,
+            )
+            for action in actions
+            if action.target == "21"
+            and action.source in ("外勤簽出", "外勤簽入", "休息簽出", "休息結束")
+        ]
+
+        self.assertEqual(
+            person_actions,
+            [
+                ("09:00", "外勤簽出", "17", "21", "出", "救助複訓", 0),
+                ("17:00", "外勤簽入", "17", "21", "入", "返隊", 0),
+                ("17:00", "休息簽出", "17", "21", "出", "休息", 0),
+                ("18:00", "休息結束", "23", "21", "入", "休息返隊", 0),
+                ("18:00", "外勤簽出", "23", "21", "出", "防溺車巡", 0),
+                ("20:00", "外勤簽入", "5", "21", "入", "返隊", 0),
+            ],
+        )
+
+    def test_partial_public_leave_rest_at_0800_uses_previous_day_worker_state(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150812",
+            rows=[
+                module.DutyRow("08~09", {"值班": ["17"], "休息": ["21"]}),
+                module.DutyRow("09~17", {"值班": ["17"], "救助複訓": ["21"]}),
+            ],
+            summary={"公假": ["21"], "在勤": ["17"]},
+        )
+        yesterday = module.DutySheet(
+            roc_date="1150811",
+            rows=[module.DutyRow("06~08", {"值班": ["10"], "備勤": ["21"]})],
+            summary={"在勤": ["10", "21"]},
+        )
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150812"), [], None)
+        person_actions = [
+            (
+                action.time,
+                action.source,
+                action.actor,
+                action.fields.get("出或入"),
+                action.fields.get("領用事由及地點"),
+                action.date_offset,
+            )
+            for action in actions
+            if action.target == "21"
+        ]
+
+        self.assertEqual(
+            person_actions,
+            [
+                ("08:00", "休息簽出", "10", "出", "休息", 0),
+                ("09:00", "休息結束", "17", "入", "休息返隊", 0),
+                ("09:00", "外勤簽出", "17", "出", "救助複訓", 0),
+                ("17:00", "外勤簽入", "17", "入", "返隊", 0),
+            ],
+        )
+
+    def test_partial_public_leave_rest_at_0800_delays_arrival_after_previous_day_off(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150812",
+            rows=[
+                module.DutyRow("08~09", {"值班": ["17"], "休息": ["21"]}),
+                module.DutyRow("09~17", {"值班": ["17"], "救助複訓": ["21"]}),
+            ],
+            summary={"公假": ["21"], "在勤": ["17"]},
+        )
+        yesterday = module.DutySheet(
+            roc_date="1150811",
+            rows=[module.DutyRow("06~08", {"值班": ["10"], "備勤": []})],
+            summary={"輪休": ["21"], "在勤": ["10"]},
+        )
+
+        actions = module.planned_actions(today, yesterday, [], module.parse_roc_date("1150812"), [], None)
+        person_actions = [
+            (
+                action.time,
+                action.source,
+                action.actor,
+                action.fields.get("出或入"),
+                action.fields.get("領用事由及地點"),
+                action.date_offset,
+            )
+            for action in actions
+            if action.target == "21"
+        ]
+
+        self.assertEqual(
+            person_actions,
+            [
+                ("09:00", "今日在勤且昨日未在勤", "17", "入", "到勤", 0),
+                ("09:00", "外勤簽出", "17", "出", "救助複訓", 0),
+                ("17:00", "外勤簽入", "17", "入", "返隊", 0),
+            ],
+        )
+
+    def test_next_morning_rest_uses_actual_rows_before_public_leave_summary(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150812",
+            rows=[
+                module.DutyRow("06~08", {"值班": ["5"], "休息": ["21"]}),
+                module.DutyRow("08~10", {"值班": ["17"], "休息": []}),
+            ],
+            summary={"在勤": ["5", "17", "21"]},
+        )
+        tomorrow = module.DutySheet(
+            roc_date="1150813",
+            rows=[module.DutyRow("08~10", {"值班": ["23"], "防溺車巡": ["21"]})],
+            summary={"公假": ["21"], "在勤": ["23"]},
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150812"), [], tomorrow)
+        rest_actions = [
+            (
+                action.time,
+                action.fields.get("出或入"),
+                action.fields.get("領用事由及地點"),
+                action.source,
+                action.date_offset,
+            )
+            for action in actions
+            if action.target == "21"
+            and action.source in ("休息簽出", "休息結束", "休息後退勤")
+        ]
+
+        self.assertEqual(
+            rest_actions,
+            [
+                ("06:00", "出", "休息", "休息簽出", 1),
+                ("08:00", "入", "休息返隊", "休息結束", 1),
+            ],
+        )
+
+    def test_next_morning_external_return_uses_actual_rows_before_public_leave_summary(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150812",
+            rows=[
+                module.DutyRow("06~08", {"值班": ["5"], "防溺車巡": ["21"]}),
+                module.DutyRow("08~10", {"值班": ["17"], "防溺車巡": []}),
+            ],
+            summary={"在勤": ["5", "17", "21"]},
+        )
+        tomorrow = module.DutySheet(
+            roc_date="1150813",
+            rows=[module.DutyRow("08~10", {"值班": ["23"], "備勤": ["21"]})],
+            summary={"公假": ["21"], "在勤": ["23"]},
+        )
+
+        self.assertEqual(
+            [block for block in module.external_duty_blocks(today, tomorrow) if block[1] == "21"],
+            [("防溺車巡", "21", 6, 8, 0)],
+        )
+
     def test_duty_sheet_truncates_external_duty_names_to_24_display_units(self) -> None:
         module = legacy_duty_sheet_module()
 

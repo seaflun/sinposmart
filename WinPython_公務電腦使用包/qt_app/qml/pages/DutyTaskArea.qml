@@ -176,13 +176,12 @@ Rectangle {
                 Accessible.description: taskRow.errorText
                 Accessible.checked: dutyTaskArea.modeIndex === 0 && taskRow.selected
 
-                function activateRow() {
+                function activateRow(clearFocusOnDeselect) {
                     if (dutyTaskArea.modeIndex === 0) {
+                        const wasSelected = taskRow.selected
                         dutyTaskArea.backend.dutyController.toggleTaskSelection(taskRow.taskIndex)
-                        Qt.callLater(function() {
-                            if (!taskRow.selected)
-                                taskList.forceActiveFocus(Qt.MouseFocusReason)
-                        })
+                        if (wasSelected && clearFocusOnDeselect)
+                            Qt.callLater(function() { taskRow.focus = false })
                     } else {
                         dutyTaskArea.auditDetailRequested(taskRow.fullDetailText)
                     }
@@ -205,7 +204,7 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onPressed: taskRow.forceActiveFocus(Qt.MouseFocusReason)
-                    onClicked: taskRow.activateRow()
+                    onClicked: taskRow.activateRow(true)
                 }
 
                 Rectangle {
