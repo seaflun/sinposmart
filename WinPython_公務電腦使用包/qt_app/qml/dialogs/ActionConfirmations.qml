@@ -7,6 +7,7 @@ Item {
     required property var hostWindow
     required property var backend
     property string updateStatusText: ""
+    property string statusDialogTitle: "檢查更新"
 
     anchors.fill: parent
 
@@ -35,7 +36,14 @@ Item {
     }
 
     function openUpdateStatus(message) {
+        statusDialogTitle = "檢查更新"
         updateStatusText = String(message || "檢查更新完成。")
+        updateStatusDialog.open()
+    }
+
+    function openDiagnosticsStatus(message) {
+        statusDialogTitle = "問題包"
+        updateStatusText = String(message || "問題包處理完成。")
         updateStatusDialog.open()
     }
 
@@ -102,7 +110,7 @@ Item {
         anchors.centerIn: parent
         width: Math.min(actionConfirmations.hostWindow.width - 72, 460)
         modal: true
-        title: "檢查更新"
+        title: actionConfirmations.statusDialogTitle
         standardButtons: Dialog.Close
 
         Label {

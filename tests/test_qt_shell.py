@@ -4012,6 +4012,30 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(launched, [script_path])
             self.assertIn("已開啟更新程式", controller.statusText)
 
+    def test_update_controller_defers_busy_update_and_disables_future_checks(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.08.12.0001\n", encoding="utf-8")
+            fetched: list[str] = []
+            controller = UpdateController(
+                UpdateRepository(
+                    version_path,
+                    text_fetcher=lambda _url, _timeout: fetched.append("checked") or "2026.08.12.0002",
+                ),
+                stop_guard=lambda: "勤務登打仍在執行",
+            )
+            controller._update_available = True
+
+            controller.launchUpdate()
+            controller.check()
+
+            self.assertTrue(controller.updateDeferred)
+            self.assertIn("更新已延後", controller.statusText)
+            self.assertEqual(fetched, [])
+
     def test_update_controller_emits_update_prompt_or_completed_status(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
@@ -4399,6 +4423,9 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("Keys.onReturnPressed", task_area)
         self.assertIn("Accessible.onPressAction", task_area)
         self.assertIn("Accessible.CheckBox", task_area)
+        self.assertIn("Qt.callLater(function()", task_area)
+        self.assertIn("taskList.forceActiveFocus(Qt.MouseFocusReason)", task_area)
+        self.assertIn("updateDeferred", operation_bar)
         self.assertNotIn("focusPolicy: Qt.NoFocus", operation_bar)
 
     def test_qml_tool_buttons_and_audit_mode_preserve_released_gui_contract(self) -> None:
@@ -7515,6 +7542,13 @@ if return_code != 0 or loaded:
         controller.toggleTaskSelection(0)
         self.assertEqual(controller.selectedTaskCount, 1)
         self.assertEqual(controller.dueTaskCount, 1)
+        controller.toggleTaskSelection(0)
+        self.assertEqual(controller.selectedTaskCount, 0)
+        self.assertFalse(
+            controller.taskModel.data(
+                controller.taskModel.index(0, 0), controller.taskModel.SelectedRole
+            )
+        )
         self.assertFalse(hasattr(controller, "pauseSelectedTasks"))
         self.assertFalse(hasattr(controller, "resumeSelectedTasks"))
 
@@ -8444,7 +8478,7 @@ if return_code != 0 or loaded:
 
         self.assertEqual(message, "交接預檢｜值班(宿) 08 接班人員｜檢查中")
 
-    def test_submission_notifications_exclude_handoff_preflight(self) -> None:
+    def test_submission_notifications_skip_queued_and_unreturned_recovery_attempts(self) -> None:
         from pathlib import Path
 
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
@@ -8489,10 +8523,34 @@ if return_code != 0 or loaded:
             0,
             {"target_date": "1150808", "actions": [preflight_action]},
         )
+        recovery_request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {
+                "target_date": "1150808",
+                "actions": [actual_action],
+                "_unreturned_return_queue_id": "retrying-queue",
+            },
+            trigger_type="recovery",
+        )
+        unreturned_action = {
+            "kind": "entry_log",
+            "target": "8",
+            "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+        }
+        unreturned_due_request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {"target_date": "1150808", "actions": [unreturned_action]},
+        )
         try:
             controller._submission_queued(actual_request)
-            self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜準備登打")])
+            self.assertEqual(notifications, [])
             self.assertEqual(operational_events[0][0], ("action_queued",))
+            controller._submission_started(actual_request)
+            self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜開始登打")])
             controller._submission_finished(
                 actual_request,
                 DutySubmissionResult(
@@ -8507,7 +8565,7 @@ if return_code != 0 or loaded:
             self.assertEqual(
                 notifications,
                 [
-                    ("SinpoSmart", "出入｜值班 / 值班 08｜準備登打"),
+                    ("SinpoSmart", "出入｜值班 / 值班 08｜開始登打"),
                     ("SinpoSmart", "出入｜值班 / 值班 08｜登打完成"),
                 ],
             )
@@ -8544,6 +8602,67 @@ if return_code != 0 or loaded:
             )
 
             notifications.clear()
+            controller._submission_started(unreturned_due_request)
+            controller._submission_finished(
+                unreturned_due_request,
+                DutySubmissionResult(
+                    0,
+                    "paused_external",
+                    "人員尚未返隊",
+                    Path("unreturned-paused.json"),
+                    {},
+                    unreturned_action,
+                ),
+            )
+            self.assertEqual(notifications, [])
+            controller._submission_finished(
+                unreturned_due_request,
+                DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "確認返隊後完成",
+                    Path("unreturned-submitted.json"),
+                    {},
+                    unreturned_action,
+                ),
+            )
+            self.assertEqual(len(notifications), 1)
+
+            notifications.clear()
+            controller._submission_queued(recovery_request)
+            controller._submission_started(recovery_request)
+            controller._submission_finished(
+                recovery_request,
+                DutySubmissionResult(
+                    0,
+                    "paused_external",
+                    "人員尚未返隊",
+                    Path("recovery-paused.json"),
+                    {},
+                    actual_action,
+                ),
+            )
+            controller._submission_failed(
+                recovery_request,
+                "人員尚未返隊",
+                "unknown_error",
+                "",
+            )
+            self.assertEqual(notifications, [])
+            controller._submission_finished(
+                recovery_request,
+                DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "確認返隊後完成",
+                    Path("recovery-submitted.json"),
+                    {},
+                    actual_action,
+                ),
+            )
+            self.assertEqual(notifications, [("SinpoSmart", "出入｜值班 / 值班 08｜登打完成")])
+
+            notifications.clear()
             operational_events.clear()
             controller._submission_queued(preflight_request)
             controller._submission_finished(
@@ -8572,6 +8691,29 @@ if return_code != 0 or loaded:
             )
             self.assertEqual(notifications, [])
             self.assertEqual(operational_events, [])
+        finally:
+            controller.shutdown()
+
+    def test_manual_issue_package_uses_in_app_status_without_tray_notification(self) -> None:
+        from pathlib import Path
+
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeDiagnosticsService:
+            def export(self, _snapshot):
+                return Path("issue-package.zip")
+
+        controller = AppController(diagnostics_service=FakeDiagnosticsService())
+        notifications: list[tuple[str, str]] = []
+        presented_statuses: list[str] = []
+        controller._tray_controller.notify = lambda title, message: notifications.append((title, message))
+        controller.diagnosticsStatusRequested.connect(presented_statuses.append)
+        try:
+            controller.exportIssuePackage()
+
+            self.assertEqual(notifications, [])
+            self.assertEqual(presented_statuses, ["問題包已匯出：issue-package.zip"])
+            self.assertEqual(controller.diagnosticsStatus, presented_statuses[0])
         finally:
             controller.shutdown()
 
@@ -8989,6 +9131,54 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.events[0][0], "unreturned_return")
         self.assertEqual(controller.events[0][1]["target"], "10番 測試甲、12番 測試乙")
 
+        controller.events.clear()
+        AppController._publish_unreturned_return_event(
+            controller,
+            {
+                "status": "resolved",
+                "trigger_type": "manual",
+                "record": {
+                    "record_type": "bridge_history",
+                    "actions": [
+                        {
+                            "kind": "entry_log",
+                            "time": "10:00",
+                            "target": "7",
+                            "fields": {"出或入": "值退"},
+                        },
+                        {
+                            "kind": "entry_log",
+                            "time": "12:00",
+                            "target": "9",
+                            "fields": {"出或入": "值班"},
+                        },
+                    ],
+                    "schedule_context": {
+                        "today": {
+                            "staff": {
+                                "7": {"name": "原值退"},
+                                "8": {"name": "表定接班"},
+                                "9": {"name": "實際接班"},
+                            }
+                        }
+                    },
+                    "bridge_history": [
+                        {
+                            "bridged_at": "2026-08-11T12:00:00",
+                            "skipped_actor_nos": ["8"],
+                            "incoming_actor_nos": ["9"],
+                        }
+                    ],
+                },
+            },
+        )
+
+        handoff = controller.events[0][1]["snapshot"]["handoff"]
+        self.assertEqual(handoff["outgoing_person"], "7番 原值退")
+        self.assertEqual(handoff["scheduled_incoming_person"], "9番 實際接班")
+        self.assertEqual(handoff["actual_incoming_people"], "9番 實際接班")
+        self.assertEqual(handoff["skipped_scheduled_people"], "8番 表定接班")
+
     def test_app_controller_preserves_update_logout_identity_and_legacy_event_contract(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from app_core.session import LoginSession
@@ -9083,6 +9273,7 @@ if return_code != 0 or loaded:
         try:
             self.assertEqual(controller.prepareUpdateShutdown(), "busy")
             self.assertEqual(service.events, [])
+            self.assertTrue(controller.updateController.updateDeferred)
 
             controller.dutyExecutionController._entry_active_request_id = None
             self.assertEqual(controller.prepareUpdateShutdown(), "ready")
@@ -10376,6 +10567,95 @@ if return_code != 0 or loaded:
         controller.handle_submission_result(0, "skipped_duplicate", "已存在", "result.json")
         self.assertFalse(controller._auto_logout_timer.isActive())
 
+    def test_auto_logout_waits_for_paused_handoff_queue_then_restarts_ten_minutes(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(
+            Path(temporary_queue_dir.name),
+            now_factory=lambda: datetime(2026, 8, 11, 10, 0),
+        )
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "10:00",
+                "actor": "7",
+                "target": "7",
+                "source": "值班交接",
+                "duplicate_key": "entry:1150811:10:值退:7",
+                "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "10:00",
+                "actor": "7",
+                "target": "8",
+                "source": "值班交接",
+                "duplicate_key": "entry:1150811:10:值班:8",
+                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            },
+            {
+                "kind": "work_log",
+                "time": "10:00",
+                "actor": "7",
+                "target": "7",
+                "source": "值班交接",
+                "duplicate_key": "work:1150811:10:值班交接:7",
+                "fields": {"勤務項目": "值班(宿)"},
+            },
+        ]
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("7")
+        controller.replace_schedule_data(
+            {"target_date": "1150811", "actions": actions}
+        )
+        controller._login_started_at = datetime(2026, 8, 11, 7, 59)
+        record, created = queue.pause_group(
+            actions,
+            controller._schedule_data,
+            owner_actor_no="7",
+            now=datetime(2026, 8, 11, 10, 0),
+        )
+        self.assertTrue(created)
+        controller._refresh_queue_action_indices()
+        controller._schedule_auto_logout_for_handoff_indices({0, 1, 2})
+        self.assertEqual(controller._auto_logout_actor_no, "7")
+        controller._pause_auto_logout_for_handoff_queue(record["queue_id"], {0, 1, 2})
+        logout_spy = QSignalSpy(controller.autoLogoutRequested)
+        unreturned_event_spy = QSignalSpy(controller.unreturnedReturnEvent)
+
+        controller._check_auto_logout()
+
+        self.assertEqual(logout_spy.count(), 0)
+        self.assertFalse(controller._auto_logout_timer.isActive())
+        self.assertEqual(controller._auto_logout_pending_handoff_queue_id, record["queue_id"])
+
+        for action in actions:
+            controller.handle_external_return_queue_result(
+                record["queue_id"],
+                action,
+                "submitted",
+                action_completion_key(action),
+                trigger_type="manual",
+            )
+
+        self.assertEqual(queue.active_records(), [])
+        self.assertTrue(controller._auto_logout_handoff_completed)
+        self.assertEqual(unreturned_event_spy.at(unreturned_event_spy.count() - 1)[0]["status"], "resolved")
+        self.assertEqual(unreturned_event_spy.at(unreturned_event_spy.count() - 1)[0]["trigger_type"], "manual")
+        self.assertTrue(controller._auto_logout_timer.isActive())
+        self.assertEqual(controller._auto_logout_pending_handoff_queue_id, "")
+        controller._check_auto_logout()
+        self.assertEqual(logout_spy.count(), 1)
+
     def test_fire_day_reload_preserves_executed_actions_by_completion_key(self) -> None:
         from qt_app.controllers.duty_controller import DutyController
 
@@ -10507,6 +10787,19 @@ if return_code != 0 or loaded:
         controller.handle_submission_result(0, "paused_external", "人員尚未返隊", "")
         controller.toggleTaskSelection(0)
 
+        self.assertEqual(controller.dueTaskCount, 0)
+        self.assertEqual(
+            controller.taskModel.data(
+                controller.taskModel.index(0, 0), controller.taskModel.StatusTextRole
+            ),
+            "未返隊暫停",
+        )
+        self.assertEqual(
+            controller.taskModel.data(
+                controller.taskModel.index(0, 0), controller.taskModel.StatusToneRole
+            ),
+            "manual",
+        )
         self.assertTrue(controller.hasExternalReturnPauseSelected)
         self.assertTrue(controller.canConfirmExternalReturnManualSubmissionSelected)
         controller.prepareExternalReturnManualSubmission()

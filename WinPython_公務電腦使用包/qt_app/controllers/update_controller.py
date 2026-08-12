@@ -50,6 +50,7 @@ class UpdateController(QObject):
         self._latest_version = ""
         self._status_text = "尚未檢查更新"
         self._update_available = False
+        self._update_deferred = False
         self._request_id = 0
         self._workers: dict[int, tuple[QThread, UpdateCheckWorker]] = {}
         self._shutdown_admission = False
@@ -78,12 +79,16 @@ class UpdateController(QObject):
     def isChecking(self) -> bool:
         return bool(self._workers)
 
+    @Property(bool, notify=stateChanged)
+    def updateDeferred(self) -> bool:
+        return self._update_deferred
+
     def setStopGuard(self, guard: Callable[[], str] | None) -> None:
         self._stop_guard = guard
 
     @Slot()
     def check(self) -> None:
-        if self._shutdown_admission or self._workers:
+        if self._shutdown_admission or self._update_deferred or self._workers:
             return
         self._request_id += 1
         request_id = self._request_id
@@ -103,16 +108,15 @@ class UpdateController(QObject):
 
     @Slot()
     def launchUpdate(self) -> None:
+        if self._update_deferred:
+            return
         if not self._update_available:
             self._status_text = "目前沒有可安裝的新版。"
             self.stateChanged.emit()
             return
         block_reason = self._stop_block_reason()
         if block_reason:
-            message = f"目前無法更新：{block_reason}"
-            self._status_text = message
-            self.stateChanged.emit()
-            self.errorOccurred.emit(message)
+            self.deferUpdate(block_reason)
             return
         script_path = self._repository.version_path.with_name("update_package.ps1")
         if not script_path.is_file():
@@ -131,6 +135,15 @@ class UpdateController(QObject):
             return
         self._status_text = "已開啟更新程式，請依更新視窗完成操作。"
         self.stateChanged.emit()
+
+    @Slot(str)
+    def deferUpdate(self, block_reason: str) -> None:
+        if self._update_deferred:
+            return
+        self._update_deferred = True
+        self._status_text = f"更新已延後：{str(block_reason or '').strip()}"
+        self.stateChanged.emit()
+        self.errorOccurred.emit(self._status_text)
 
     def _stop_block_reason(self) -> str:
         if self._stop_guard is None:

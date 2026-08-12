@@ -299,6 +299,14 @@ ApplicationWindow {
     }
 
     Connections {
+        target: window.backend
+
+        function onDiagnosticsStatusRequested(message) {
+            actionConfirmations.openDiagnosticsStatus(message)
+        }
+    }
+
+    Connections {
         target: window.backend.toolController
 
         function onErrorOccurred(message) {

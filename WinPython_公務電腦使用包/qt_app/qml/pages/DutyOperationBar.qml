@@ -240,8 +240,11 @@ RowLayout {
 
         CommandMenuItem {
             objectName: "checkForUpdatesMenuItem"
-            text: dutyOperationBar.backend.updateController.isChecking ? "檢查中…" : "檢查更新"
+            text: dutyOperationBar.backend.updateController.updateDeferred
+                  ? "更新已延後"
+                  : dutyOperationBar.backend.updateController.isChecking ? "檢查中…" : "檢查更新"
             enabled: !dutyOperationBar.backend.updateController.isChecking
+                     && !dutyOperationBar.backend.updateController.updateDeferred
             onTriggered: dutyOperationBar.backend.updateController.check()
         }
         CommandMenuItem {

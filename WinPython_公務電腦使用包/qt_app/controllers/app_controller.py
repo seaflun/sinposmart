@@ -53,6 +53,7 @@ from qt_app.workers.scheduled_folder_worker import ScheduledFolderWorker
 
 class AppController(QObject):
     diagnosticsChanged = Signal()
+    diagnosticsStatusRequested = Signal(str)
     nativeTitleBarRequested = Signal(QObject)
 
     def __init__(
@@ -339,11 +340,11 @@ class AppController(QObject):
         except DiagnosticExportError as exc:
             self._diagnostics_status = str(exc)
             self.diagnosticsChanged.emit()
-            self._tray_controller.notify("SinpoSmart", self._diagnostics_status)
+            self.diagnosticsStatusRequested.emit(self._diagnostics_status)
             return
         self._diagnostics_status = f"問題包已匯出：{package_path.name}"
         self.diagnosticsChanged.emit()
-        self._tray_controller.notify("SinpoSmart", self._diagnostics_status)
+        self.diagnosticsStatusRequested.emit(self._diagnostics_status)
 
     @Slot(result=bool)
     def recordUpdateLogout(self) -> bool:
@@ -387,7 +388,7 @@ class AppController(QObject):
             return "ready"
         block_reason = self._stop_block_reason()
         if block_reason:
-            self._tray_controller.notify("SinpoSmart", f"更新已延後：{block_reason}")
+            self._update_controller.deferUpdate(block_reason)
             return "busy"
         session = self._session_state.session
         has_identity = bool(
@@ -1100,11 +1101,39 @@ class AppController(QObject):
     @Slot(object)
     def _publish_unreturned_return_event(self, event: Mapping) -> None:
         record = event.get("record", {}) if isinstance(event, Mapping) else {}
-        action = record.get("action", {}) if isinstance(record, Mapping) else {}
-        if not isinstance(action, Mapping):
+        if not isinstance(record, Mapping):
+            return
+        actions = [
+            dict(item)
+            for item in record.get("actions", [])
+            if isinstance(item, Mapping)
+        ]
+        if not actions and isinstance(record.get("action"), Mapping):
+            actions = [dict(record["action"])]
+        if not actions:
             return
         context = record.get("schedule_context", {}) if isinstance(record, Mapping) else {}
         staff = operational_staff_from_schedule(context) if isinstance(context, Mapping) else {}
+        outgoing = next(
+            (
+                action
+                for action in actions
+                if action.get("kind") == "entry_log"
+                and isinstance(action.get("fields"), Mapping)
+                and action["fields"].get("出或入") == "值退"
+            ),
+            actions[0],
+        )
+        incoming = next(
+            (
+                action
+                for action in actions
+                if action.get("kind") == "entry_log"
+                and isinstance(action.get("fields"), Mapping)
+                and action["fields"].get("出或入") == "值班"
+            ),
+            None,
+        )
         snapshot = {
             key: str(record.get(key) or "")
             for key in (
@@ -1120,13 +1149,48 @@ class AppController(QObject):
             )
         }
         snapshot["retry_interval_minutes"] = int(record.get("retry_interval_minutes") or 0)
+        if record.get("record_type") in {"handoff_group", "bridge_history"}:
+            bridge_history = [
+                bridge
+                for bridge in record.get("bridge_history", [])
+                if isinstance(bridge, Mapping)
+            ]
+            latest_bridge = bridge_history[-1] if bridge_history else {}
+            snapshot["handoff"] = {
+                "original_handoff_time": str(outgoing.get("time") or ""),
+                "outgoing_person": operational_person_label(
+                    str(outgoing.get("target") or outgoing.get("actor") or ""),
+                    staff or self._operational_staff,
+                ),
+                "scheduled_incoming_person": operational_person_label(
+                    str(incoming.get("target") or "") if incoming else "",
+                    staff or self._operational_staff,
+                ),
+                "actual_incoming_person": operational_person_label(
+                    str(incoming.get("target") or "") if incoming else "",
+                    staff or self._operational_staff,
+                ),
+                "bridge_at": str(latest_bridge.get("bridged_at") or ""),
+                "skipped_scheduled_people": "、".join(
+                    operational_person_label(
+                        str(actor_no or ""), staff or self._operational_staff
+                    )
+                    for actor_no in latest_bridge.get("skipped_actor_nos", [])
+                ),
+                "actual_incoming_people": "、".join(
+                    operational_person_label(
+                        str(actor_no or ""), staff or self._operational_staff
+                    )
+                    for actor_no in latest_bridge.get("incoming_actor_nos", [])
+                ),
+            }
         self._send_operational_event(
             "unreturned_return",
             status=str(event.get("status") or "pending"),
             trigger_type=str(event.get("trigger_type") or "recovery"),
-            action=dict(action),
+            action=outgoing,
             target=operational_person_label(
-                str(action.get("target") or ""),
+                str(outgoing.get("target") or ""),
                 staff or self._operational_staff,
             ),
             snapshot=snapshot,
@@ -1151,9 +1215,40 @@ class AppController(QObject):
         target_text = f" {target}" if target and target != "-" else ""
         return f"{kind}｜{summary}{target_text}｜{outcome}"
 
+    def _should_notify_duty_submission(
+        self,
+        request: DutySubmissionRequest,
+        result: DutySubmissionResult | None = None,
+    ) -> bool:
+        if self._duty_controller.is_handoff_preflight_request(request):
+            return False
+        if self._is_unreturned_return_check_request(request):
+            if request.trigger_type == "manual":
+                return True
+            return bool(
+                result is not None
+                and result.status in ("submitted", "skipped_duplicate", "review_required")
+            )
+        if not self._external_return_queue_id(request):
+            return True
+        if request.trigger_type != "recovery":
+            return True
+        return bool(result is not None and result.status in ("submitted", "skipped_duplicate"))
+
+    def _is_unreturned_return_check_request(self, request: DutySubmissionRequest) -> bool:
+        if request.trigger_type not in ("due", "recovery", "manual"):
+            return False
+        action = self._submission_action(request)
+        fields = action.get("fields", {})
+        return bool(
+            action.get("kind") == "entry_log"
+            and isinstance(fields, Mapping)
+            and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤")
+        )
+
     @Slot(object)
     def _submission_started(self, request: DutySubmissionRequest) -> None:
-        if self._duty_controller.is_handoff_preflight_request(request):
+        if not self._should_notify_duty_submission(request):
             return
         action = self._submission_action(request)
         self._tray_controller.notify(
@@ -1168,13 +1263,8 @@ class AppController(QObject):
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
-        staff = self._submission_staff(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
         if not is_handoff_preflight:
-            self._tray_controller.notify(
-                "SinpoSmart",
-                self._format_duty_notification(action, staff, "準備登打"),
-            )
             self._send_operational_event(
                 "action_queued",
                 status="pending_write_automation",
@@ -1242,6 +1332,7 @@ class AppController(QObject):
                 action,
                 result.status,
                 component_key,
+                trigger_type=request.trigger_type,
             )
         elif not is_handoff_preflight and not queue_id:
             self._duty_controller.handle_submission_request_result(
@@ -1270,10 +1361,11 @@ class AppController(QObject):
                 outcome = "已有資料，略過"
             else:
                 outcome = str(result.message or "登打未完成").strip()
-            self._tray_controller.notify(
-                "SinpoSmart",
-                self._format_duty_notification(action, self._submission_staff(request), outcome),
-            )
+            if self._should_notify_duty_submission(request, result):
+                self._tray_controller.notify(
+                    "SinpoSmart",
+                    self._format_duty_notification(action, self._submission_staff(request), outcome),
+                )
 
     @Slot(object, str, str, str)
     def _submission_failed(
@@ -1298,6 +1390,7 @@ class AppController(QObject):
                 action,
                 message,
                 component_key,
+                trigger_type=request.trigger_type,
             )
             if error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()
@@ -1327,14 +1420,15 @@ class AppController(QObject):
                 **self._submission_event_fields(request, action),
             )
             detail = str(message or "登打失敗").strip()
-            self._tray_controller.notify(
-                "SinpoSmart",
-                self._format_duty_notification(
-                    action,
-                    self._submission_staff(request),
-                    f"登打失敗：{detail}",
-                ),
-            )
+            if self._should_notify_duty_submission(request):
+                self._tray_controller.notify(
+                    "SinpoSmart",
+                    self._format_duty_notification(
+                        action,
+                        self._submission_staff(request),
+                        f"登打失敗：{detail}",
+                    ),
+                )
         if not result_path or error_code == "validation_error":
             return
         try:
@@ -1351,8 +1445,6 @@ class AppController(QObject):
             self._diagnostics_status = str(exc)
         else:
             self._diagnostics_status = f"問題包已匯出：{package_path.name}"
-            if not is_handoff_preflight:
-                self._tray_controller.notify("SinpoSmart", self._diagnostics_status)
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:

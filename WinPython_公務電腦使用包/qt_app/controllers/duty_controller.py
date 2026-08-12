@@ -109,6 +109,8 @@ class DutyController(QObject):
         self._auto_logout_actor_no = ""
         self._auto_logout_handoff_at: datetime | None = None
         self._auto_logout_deadline: datetime | None = None
+        self._auto_logout_pending_handoff_queue_id = ""
+        self._auto_logout_handoff_completed = False
         self._auto_logout_timer = QTimer(self)
         self._auto_logout_timer.setSingleShot(True)
         self._auto_logout_timer.timeout.connect(self._check_auto_logout)
@@ -1309,6 +1311,8 @@ class DutyController(QObject):
         action: Mapping[str, Any],
         status: str,
         completion_key: str = "",
+        *,
+        trigger_type: str = "recovery",
     ) -> None:
         record, resolved = self._unreturned_return_queue.complete_action(
             queue_id,
@@ -1320,9 +1324,10 @@ class DutyController(QObject):
         if action_index is not None and status in ("submitted", "skipped_duplicate"):
             self._task_errors.pop(action_index, None)
         if record is not None and resolved:
-            self._publish_unreturned_return_event("resolved", record, trigger_type="recovery")
+            self._publish_unreturned_return_event("resolved", record, trigger_type=trigger_type)
+            self._resume_auto_logout_after_handoff_resolution(record)
         elif record is not None and status not in ("submitted", "skipped_duplicate"):
-            self._publish_unreturned_return_event("pending", record, trigger_type="recovery")
+            self._publish_unreturned_return_event("pending", record, trigger_type=trigger_type)
         self._refresh_queue_action_indices()
         self._refresh_projection()
 
@@ -1332,13 +1337,15 @@ class DutyController(QObject):
         action: Mapping[str, Any] | None = None,
         message: str = "",
         completion_key: str = "",
+        *,
+        trigger_type: str = "recovery",
     ) -> None:
         record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
         action_index = self._queue_component_action_index(queue_id, action, completion_key)
         if action_index is not None and message:
             self._task_errors[action_index] = str(message).strip()
         if record is not None:
-            self._publish_unreturned_return_event("pending", record, trigger_type="recovery")
+            self._publish_unreturned_return_event("pending", record, trigger_type=trigger_type)
         self._refresh_queue_action_indices()
         self._refresh_projection()
 
@@ -1712,7 +1719,9 @@ class DutyController(QObject):
             staff=self._staff,
             comparisons=self._comparisons,
             submitting_indices=frozenset(self._submitting_indices),
-            paused_indices=frozenset(self._blocked_indices),
+            paused_indices=frozenset(
+                set(self._blocked_indices) | set(self._external_return_queue_ids_by_action_index)
+            ),
             executed_indices=frozenset(self._executed_indices),
             selected_indices=frozenset(self._selected_indices),
             forced_visible_indices=frozenset(self._external_return_queue_ids_by_action_index),
@@ -2016,6 +2025,7 @@ class DutyController(QObject):
                     "matched": [],
                 }
             self._schedule_auto_logout_for_handoff_indices(handoff_indices)
+            self._pause_auto_logout_for_handoff_queue(queue_id, handoff_indices)
         self._refresh_queue_action_indices()
         self._refresh_projection()
         self._refresh_due_tasks(force_emit=True)
@@ -2204,12 +2214,65 @@ class DutyController(QObject):
                 continue
             self._schedule_auto_logout_if_needed(index)
 
+    def _pause_auto_logout_for_handoff_queue(
+        self,
+        queue_id: str,
+        handoff_indices: set[int],
+    ) -> None:
+        if not queue_id or not self._auto_logout_actor_no:
+            return
+        if not any(
+            0 <= index < len(self._actions)
+            and str(self._actions[index].get("actor", "") or "")
+            == self._auto_logout_actor_no
+            for index in handoff_indices
+        ):
+            return
+        self._auto_logout_pending_handoff_queue_id = queue_id
+        self._auto_logout_handoff_completed = False
+        self._auto_logout_deadline = None
+        self._auto_logout_timer.stop()
+
+    def _resume_auto_logout_after_handoff_resolution(
+        self,
+        record: Mapping[str, Any],
+    ) -> None:
+        queue_id = str(record.get("queue_id") or "")
+        if queue_id != self._auto_logout_pending_handoff_queue_id:
+            return
+        if self._actor_no != self._auto_logout_actor_no:
+            self._cancel_auto_logout()
+            return
+        self._auto_logout_pending_handoff_queue_id = ""
+        self._auto_logout_handoff_completed = True
+        self._auto_logout_deadline = datetime.now() + timedelta(minutes=10)
+        self._auto_logout_timer.start(10 * 60 * 1000)
+        self._schedule_status = "未返隊交接已完成，10 分鐘後自動登出"
+        self.scheduleChanged.emit()
+
     @Slot()
     def _check_auto_logout(self) -> None:
         if not self._auto_logout_actor_no or self._auto_logout_handoff_at is None:
             return
         if self._actor_no != self._auto_logout_actor_no:
             self._cancel_auto_logout()
+            return
+        if self._auto_logout_pending_handoff_queue_id:
+            self._auto_logout_timer.stop()
+            self._auto_logout_deadline = None
+            self._schedule_status = "未返隊交接尚未完成，暫停自動登出"
+            self.scheduleChanged.emit()
+            return
+        if self._auto_logout_handoff_completed:
+            if self._submitting_indices:
+                self._auto_logout_deadline = datetime.now() + timedelta(minutes=10)
+                self._auto_logout_timer.start(10 * 60 * 1000)
+                self._schedule_status = "交接登打仍在進行，10 分鐘後再檢查自動登出"
+                self.scheduleChanged.emit()
+                return
+            actor_no = self._auto_logout_actor_no
+            self._cancel_auto_logout()
+            self.autoLogoutRequested.emit(actor_no)
             return
         group = [
             index
@@ -2248,6 +2311,8 @@ class DutyController(QObject):
         self._auto_logout_actor_no = ""
         self._auto_logout_handoff_at = None
         self._auto_logout_deadline = None
+        self._auto_logout_pending_handoff_queue_id = ""
+        self._auto_logout_handoff_completed = False
 
     @Slot(int, object)
     def _schedule_loaded(self, request_id: int, snapshot: ScheduleSnapshot) -> None:

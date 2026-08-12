@@ -177,10 +177,15 @@ Rectangle {
                 Accessible.checked: dutyTaskArea.modeIndex === 0 && taskRow.selected
 
                 function activateRow() {
-                    if (dutyTaskArea.modeIndex === 0)
+                    if (dutyTaskArea.modeIndex === 0) {
                         dutyTaskArea.backend.dutyController.toggleTaskSelection(taskRow.taskIndex)
-                    else
+                        Qt.callLater(function() {
+                            if (!taskRow.selected)
+                                taskList.forceActiveFocus(Qt.MouseFocusReason)
+                        })
+                    } else {
                         dutyTaskArea.auditDetailRequested(taskRow.fullDetailText)
+                    }
                 }
 
                 Keys.onSpacePressed: function(event) {
