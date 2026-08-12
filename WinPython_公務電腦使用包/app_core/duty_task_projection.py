@@ -20,6 +20,9 @@ from compare_rehearsal_records import (
 )
 
 
+AUTO_DUE_CATCH_UP_WINDOW = timedelta(hours=2)
+
+
 @dataclass(frozen=True)
 class DutyTaskProjectionState:
     actor_no: str
@@ -264,7 +267,8 @@ def select_due_task_indices(
             continue
         if not is_auto_duty_action(action):
             continue
-        if action_datetime(action, state.target_roc_date, fallback_date=current.date()) <= current:
+        action_at = action_datetime(action, state.target_roc_date, fallback_date=current.date())
+        if action_at <= current <= action_at + AUTO_DUE_CATCH_UP_WINDOW:
             due.append(index)
     return sorted(due, key=lambda index: (action_datetime(actions[index], state.target_roc_date), index))
 

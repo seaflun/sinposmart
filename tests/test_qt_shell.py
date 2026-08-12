@@ -791,6 +791,26 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 7, 59)), [])
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 8, 0)), [0])
 
+    def test_due_selection_limits_automatic_catch_up_to_two_hours(self) -> None:
+        from datetime import datetime, timedelta
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        action = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "fields": {"出或入": "入", "領用事由及地點": "到勤"},
+        }
+        state = DueTaskSelectionState(actor_no="10", target_roc_date="1150807")
+        due_at = datetime(2026, 8, 7, 8, 0)
+
+        self.assertEqual(select_due_task_indices([action], state, now=due_at + timedelta(hours=2)), [0])
+        self.assertEqual(
+            select_due_task_indices([action], state, now=due_at + timedelta(hours=2, seconds=1)),
+            [],
+        )
+
     def test_only_known_work_tasks_can_auto_submit_without_generic_pause_controls(self) -> None:
         from datetime import datetime
 
@@ -10912,6 +10932,7 @@ if return_code != 0 or loaded:
 
     def test_handoff_external_pause_groups_three_items_and_manual_uses_actual_time(self) -> None:
         from datetime import datetime
+        from unittest.mock import patch
 
         from PySide6.QtTest import QSignalSpy
 
@@ -10968,9 +10989,18 @@ if return_code != 0 or loaded:
             }
         )
         controller._due_task_indices = [0, 1, 2]
-        controller.enable_auto_execution()
 
-        preflight_requests = controller.due_submission_requests("user10", "secret", [0, 1, 2])
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 7, 0, 0, tzinfo=tz)
+
+        with (
+            patch("qt_app.controllers.duty_controller.datetime", FixedDateTime),
+            patch("app_core.duty_task_projection.datetime", FixedDateTime),
+        ):
+            controller.enable_auto_execution()
+            preflight_requests = controller.due_submission_requests("user10", "secret", [0, 1, 2])
 
         self.assertEqual(len(preflight_requests), 1)
         self.assertEqual(
@@ -11349,6 +11379,7 @@ if return_code != 0 or loaded:
         from qt_app.controllers.duty_controller import DutyController
 
         fixed_now = RealDateTime(2026, 8, 9, 8, 0)
+        preflight_finished_at = RealDateTime(2026, 8, 9, 8, 2)
 
         class FixedDateTime(RealDateTime):
             @classmethod
@@ -11434,10 +11465,15 @@ if return_code != 0 or loaded:
                     "user10",
                     "secret",
                     preflight_requests[0],
-                    submit_at=fixed_now,
+                    submit_at=preflight_finished_at,
                 )
 
                 self.assertEqual([request.action_index for request in group_requests], [1, 2, 3])
+                grouped_actions = group_requests[0].schedule_data["actions"]
+                self.assertEqual(group_requests[0].schedule_data["target_date"], "1150809")
+                self.assertEqual(grouped_actions[1]["fields"]["系統寫入時間"], "08:00")
+                self.assertEqual(grouped_actions[2]["fields"]["系統寫入時間"], "08:00")
+                self.assertEqual(grouped_actions[3]["fields"]["工作時間"], "08:00")
                 for request in group_requests:
                     controller.mark_submission_enqueued(request.action_index)
                 released_spy = QSignalSpy(controller.dueTasksAvailable)
@@ -11534,6 +11570,39 @@ if return_code != 0 or loaded:
         requests = controller.due_submission_requests("user27", "secret", [1])
 
         self.assertEqual(requests, [])
+
+    def test_due_submission_rejects_automatic_task_more_than_two_hours_late(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        class FixedDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 10, 1, tzinfo=tz)
+
+        with patch("qt_app.controllers.duty_controller.datetime", FixedDateTime):
+            controller = DutyController()
+            controller.set_actor_no("10")
+            controller.replace_schedule_data(
+                {
+                    "target_date": "1150809",
+                    "actions": [
+                        {
+                            "kind": "entry_log",
+                            "time": "08:00",
+                            "actor": "10",
+                            "target": "10",
+                            "fields": {"出或入": "入", "領用事由及地點": "到勤"},
+                        }
+                    ],
+                }
+            )
+            controller._auto_execution_enabled = True
+            controller._due_task_indices = [0]
+
+            self.assertEqual(controller.due_submission_requests("user10", "secret", [0]), [])
 
     def test_handoff_preflight_rejects_replaced_future_action(self) -> None:
         from datetime import datetime
@@ -11824,7 +11893,7 @@ if return_code != 0 or loaded:
         controller.prepareManualSubmission()
 
         self.assertEqual(confirmation_spy.count(), 1)
-        self.assertIn("使用按下確認時的當下時間", controller.manualConfirmationSummary)
+        self.assertIn("確認時的當下時間", controller.manualConfirmationSummary)
         controller.confirmManualSubmission()
         self.assertEqual(requested_spy.count(), 1)
         requests = controller.manual_submission_requests(
@@ -11837,6 +11906,150 @@ if return_code != 0 or loaded:
         self.assertEqual(action["time"], "01:02")
         self.assertEqual(action["fields"]["工作時間"], "01:02")
         self.assertEqual(action["submit_target_date"], "1150730")
+
+    def test_manual_time_rules_restrict_early_departures_and_preserve_due_auto_times(self) -> None:
+        from datetime import datetime
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150809",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"出或入": "入", "領用事由及地點": "到勤"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {
+                            "登打時間": "08:00",
+                            "系統寫入時間": "08:05",
+                            "出或入": "出",
+                            "領用事由及地點": "退勤",
+                        },
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "外勤簽出",
+                        "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "外勤簽入",
+                        "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "休息簽出",
+                        "fields": {"出或入": "出", "領用事由及地點": "休息"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "休息結束",
+                        "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+                    },
+                ],
+            }
+        )
+        early = datetime(2026, 8, 9, 7, 55)
+
+        self.assertTrue(controller._is_manual_submission_eligible(0, now=early))
+        self.assertFalse(controller._is_manual_submission_eligible(1, now=early))
+        self.assertFalse(controller._is_manual_submission_eligible(2, now=early))
+        self.assertTrue(controller._is_manual_submission_eligible(3, now=early))
+        self.assertFalse(controller._is_manual_submission_eligible(4, now=early))
+        self.assertTrue(controller._is_manual_submission_eligible(5, now=early))
+
+        arrival_request = controller.manual_submission_requests(
+            "user10", "secret", [0], submit_at=early
+        )[0]
+        self.assertEqual(arrival_request.schedule_data["actions"][0]["time"], "07:55")
+        self.assertTrue(controller._is_manual_submission_eligible(1, now=datetime(2026, 8, 9, 8, 2)))
+        checkout_request = controller.manual_submission_requests(
+            "user10", "secret", [1], submit_at=datetime(2026, 8, 9, 8, 2)
+        )[0]
+        checkout = checkout_request.schedule_data["actions"][1]
+        self.assertEqual(checkout["fields"]["登打時間"], "08:00")
+        self.assertEqual(checkout["fields"]["系統寫入時間"], "08:05")
+
+    def test_manual_handoff_uses_preflight_and_preserves_scheduled_time(self) -> None:
+        from datetime import datetime
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150809",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "fields": {"登打時間": "10:00", "系統寫入時間": "10:00", "出或入": "值退"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "值班交接",
+                        "fields": {"登打時間": "10:00", "系統寫入時間": "10:00", "出或入": "值班"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "fields": {"工作時間": "10:00", "勤務項目": "值班(宿)"},
+                    },
+                ],
+            }
+        )
+
+        preflight_requests = controller.manual_submission_requests(
+            "user10", "secret", [0, 1, 2], submit_at=datetime(2026, 8, 9, 10, 2)
+        )
+
+        self.assertEqual(len(preflight_requests), 1)
+        self.assertEqual(
+            preflight_requests[0].schedule_data["actions"][preflight_requests[0].action_index]["kind"],
+            "handoff_preflight",
+        )
+        self.assertTrue(controller.handle_handoff_preflight_ready(preflight_requests[0]))
+        actual_requests = controller.handoff_group_submission_requests(
+            "user10", "secret", preflight_requests[0], submit_at=datetime(2026, 8, 9, 10, 3)
+        )
+        actual_actions = actual_requests[0].schedule_data["actions"]
+        self.assertEqual([action["time"] for action in actual_actions], ["10:00", "10:00", "10:00"])
+        self.assertEqual(actual_actions[0]["fields"]["系統寫入時間"], "10:00")
+        self.assertEqual(actual_actions[1]["fields"]["系統寫入時間"], "10:00")
+        self.assertEqual(actual_actions[2]["fields"]["工作時間"], "10:00")
 
     def test_qml_logged_out_account_manager_opens_as_legacy_window(self) -> None:
         from PySide6.QtCore import QObject, QPointF, Qt

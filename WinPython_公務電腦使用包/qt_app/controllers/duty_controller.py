@@ -12,6 +12,7 @@ from PySide6.QtCore import QDateTime, QObject, Property, QThread, QTimer, QUrl, 
 
 from compare_rehearsal_records import build_case_work_audits
 from app_core.duty_task_projection import (
+    AUTO_DUE_CATCH_UP_WINDOW,
     DueTaskSelectionState,
     DutyTaskProjectionState,
     action_completion_key,
@@ -397,7 +398,11 @@ class DutyController(QObject):
             self._schedule_status = "選取任務無法手動登打"
             self._refresh_projection()
             return
-        summaries = "\n".join(f"• {action_summary(self._actions[index])}" for index in ready[:8])
+        current = datetime.now()
+        summaries = "\n".join(
+            f"• {action_summary(self._actions[index])}（{self._manual_time_summary(self._actions[index], current)}）"
+            for index in ready[:8]
+        )
         if len(ready) > 8:
             summaries += f"\n…另 {len(ready) - 8} 筆"
         action_keys = tuple(action_completion_key(self._actions[index]) for index in ready)
@@ -410,7 +415,7 @@ class DutyController(QObject):
         self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = (
             f"將登打勤務系統 {len(ready)} 筆：\n{summaries}\n\n"
-            "將使用按下確認時的當下時間登打。"
+            "時間依據如各項括號所示；確認時會再次依規則檢查。"
         )
         self.scheduleChanged.emit()
         self.manualSubmissionConfirmationRequested.emit()
@@ -525,7 +530,12 @@ class DutyController(QObject):
             self._is_manual_submission_eligible(index) for index in self._selected_indices
         )
 
-    def _is_manual_submission_eligible(self, index: int) -> bool:
+    def _is_manual_submission_eligible(
+        self,
+        index: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
         if not 0 <= index < len(self._actions):
             return False
         action = self._actions[index]
@@ -534,7 +544,7 @@ class DutyController(QObject):
             comparison.get("group") == "review"
             and str(action.get("source", "") or "").startswith("外勤")
         )
-        return (
+        if not (
             action.get("kind") in ("work_log", "entry_log")
             and index not in self._submitting_indices
             and index not in self._executed_indices
@@ -542,7 +552,48 @@ class DutyController(QObject):
                 comparison.get("group") not in ("done", "near", "review")
                 or is_manual_external_review
             )
-        )
+        ):
+            return False
+        current = now or datetime.now()
+        if self._manual_submission_uses_scheduled_time(action, current):
+            return True
+        if is_auto_duty_action(action):
+            return self._entry_reason(action) == "到勤"
+        return not self._is_early_manual_departure(action, current)
+
+    def _manual_submission_uses_scheduled_time(
+        self,
+        action: Mapping[str, Any],
+        current: datetime,
+    ) -> bool:
+        return is_auto_duty_action(action) and action_datetime(
+            action,
+            self._target_date_text,
+            fallback_date=current.date(),
+        ) <= current
+
+    @staticmethod
+    def _entry_reason(action: Mapping[str, Any]) -> str:
+        fields = action.get("fields", {})
+        if not isinstance(fields, Mapping):
+            return ""
+        return str(fields.get("領用事由及地點", "") or "")
+
+    def _is_early_manual_departure(
+        self,
+        action: Mapping[str, Any],
+        current: datetime,
+    ) -> bool:
+        if action_datetime(action, self._target_date_text, fallback_date=current.date()) <= current:
+            return False
+        return str(action.get("source", "") or "") in ("外勤簽出", "休息簽出")
+
+    def _manual_time_summary(self, action: Mapping[str, Any], current: datetime) -> str:
+        if self._manual_submission_uses_scheduled_time(action, current):
+            return "表定時間"
+        if is_auto_duty_action(action):
+            return "確認時的當下時間（提前到勤）"
+        return "確認時的當下時間"
 
     def _is_external_return_pause(self, index: int) -> bool:
         return bool(
@@ -821,7 +872,12 @@ class DutyController(QObject):
         for index in indices:
             if index not in self._due_task_indices or not 0 <= index < len(self._actions):
                 continue
-            if action_datetime(self._actions[index], self._target_date_text, fallback_date=current.date()) > current:
+            action_at = action_datetime(
+                self._actions[index],
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if not action_at <= current <= action_at + AUTO_DUE_CATCH_UP_WINDOW:
                 continue
             group_indices = self._handoff_group_indices(index)
             if not group_indices:
@@ -1194,10 +1250,37 @@ class DutyController(QObject):
             return []
         current = submit_at or datetime.now()
         requests: list[DutySubmissionRequest] = []
+        handled_handoff_group_ids: set[str] = set()
         for index in indices:
             if not 0 <= index < len(self._actions):
                 continue
-            action = self._stamped_submission_action(self._actions[index], current)
+            if not self._is_manual_submission_eligible(index, now=current):
+                continue
+            original_action = self._actions[index]
+            group_indices = self._handoff_group_indices(index)
+            if group_indices:
+                group_id = self._handoff_group_id(group_indices)
+                if group_id in handled_handoff_group_ids:
+                    continue
+                handled_handoff_group_ids.add(group_id)
+                if any(group_index not in indices for group_index in group_indices):
+                    continue
+                requests.extend(
+                    self._handoff_preflight_requests(
+                        user_id,
+                        password,
+                        [self._actions[group_index] for group_index in group_indices],
+                        group_id=group_id,
+                        group_indices=group_indices,
+                        trigger_type="manual",
+                    )
+                )
+                continue
+            action = (
+                dict(original_action)
+                if self._manual_submission_uses_scheduled_time(original_action, current)
+                else self._stamped_submission_action(original_action, current)
+            )
             if action is None:
                 continue
             actions = [dict(item) for item in self._actions]
@@ -1916,25 +1999,20 @@ class DutyController(QObject):
         group_indices = self._handoff_state_indices(state)
         if not group_indices:
             return []
-        target_date = f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
         for index in group_indices:
-            if (
-                not 0 <= index < len(actions)
-                or str(actions[index].get("actor", "") or "") != self._actor_no
-                or action_datetime(
-                    actions[index],
-                    self._target_date_text,
-                    fallback_date=current.date(),
-                )
-                > current
+            if not 0 <= index < len(actions) or str(actions[index].get("actor", "") or "") != self._actor_no:
+                return []
+            action_at = action_datetime(
+                actions[index],
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if action_at > current or (
+                preflight_request.trigger_type == "due"
+                and current > action_at + AUTO_DUE_CATCH_UP_WINDOW
             ):
                 return []
-            action = self._stamped_submission_action(actions[index], current)
-            if action is None:
-                return []
-            actions[index] = action
         schedule_data = dict(self._schedule_data)
-        schedule_data["target_date"] = target_date
         schedule_data["actions"] = actions
         return [
             self._submission_request(
