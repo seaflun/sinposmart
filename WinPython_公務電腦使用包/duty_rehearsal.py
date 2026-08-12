@@ -1883,18 +1883,61 @@ def capture_case_query_table(driver: webdriver.Chrome) -> dict[str, Any]:
         const text = (element) => (element.innerText || element.textContent || element.value || '').trim();
         const tables = Array.from(document.querySelectorAll('table'));
         for (const table of tables) {
-          const rows = Array.from(table.querySelectorAll('tr')).map(tr => ({
-            cells: Array.from(tr.children).map(text),
-            personnel_source: tr.querySelector("input[id^='_btnChoose']")?.getAttribute('onclick') || '',
-          }));
-          const matrix = rows.map(row => row.cells);
-          const headers = matrix.find(row => row.some(cell => /返隊/.test(cell))) || [];
-          if (headers.length && matrix.some(row => row.some(cell => /\d{1,2}:\d{2}:\d{2}/.test(cell)))) {
-            return {
-              headers,
-              rows: rows.filter(row => row.cells !== headers && row.cells.filter(Boolean).length >= 3),
-            };
+          const occupiedColumns = [];
+          const rows = Array.from(table.querySelectorAll('tr'))
+            .filter(tr => tr.closest('table') === table)
+            .map((tr, rowIndex) => {
+              for (let index = 0; index < occupiedColumns.length; index += 1) {
+                occupiedColumns[index] = Math.max(0, (occupiedColumns[index] || 0) - 1);
+              }
+              const cells = [];
+              const headerCells = [];
+              let column = 0;
+              for (const cell of Array.from(tr.children)) {
+                while (occupiedColumns[column] > 0) column += 1;
+                const columnSpan = Math.max(1, Number(cell.colSpan) || 1);
+                const rowSpan = Math.max(1, Number(cell.rowSpan) || 1);
+                const cellText = text(cell);
+                headerCells.push({ column, columnSpan, text: cellText });
+                for (let offset = 0; offset < columnSpan; offset += 1) {
+                  cells[column + offset] = offset === 0 ? cellText : '';
+                  if (rowSpan > 1) occupiedColumns[column + offset] = rowSpan;
+                }
+                column += columnSpan;
+              }
+              return {
+                cells,
+                personnel_source: tr.querySelector("input[id^='_btnChoose']")?.getAttribute('onclick') || '',
+                header_cells: headerCells,
+                has_time: cells.some(cell => /\d{1,2}:\d{2}:\d{2}/.test(cell)),
+                row_index: rowIndex,
+              };
+            });
+          const firstDataRowIndex = rows.findIndex(row => row.has_time);
+          if (firstDataRowIndex < 0) continue;
+          const returnHeaders = [];
+          for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+            const row = rows[rowIndex];
+            if (rowIndex >= firstDataRowIndex || row.has_time || row.personnel_source) continue;
+            for (const headerCell of row.header_cells) {
+              if (headerCell.columnSpan !== 1 || headerCell.text.replace(/\s+/g, '') !== '返隊時間') continue;
+              returnHeaders.push({ rowIndex, column: headerCell.column });
+            }
           }
+          const returnHeader = returnHeaders.at(-1);
+          if (!returnHeader) continue;
+          const header = rows[returnHeader.rowIndex];
+          const returnColumn = returnHeader.column;
+          return {
+            headers: header.cells,
+            rows: rows
+              .filter(row => row.row_index >= firstDataRowIndex && row.cells.filter(Boolean).length >= 3)
+              .map(row => ({
+                cells: row.cells,
+                personnel_source: row.personnel_source,
+                return_value: row.cells[returnColumn] || '',
+              })),
+          };
         }
         return {headers: [], rows: []};
         """
@@ -1958,7 +2001,10 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
         if not re.search(r"\d{1,2}:\d{2}:\d{2}", joined):
             continue
         times = re.findall(r"\d{1,2}:\d{2}:\d{2}", joined)
-        return_time = case_return_time(row[return_column]) if return_column < len(row) else ""
+        return_value = captured_row.get("return_value")
+        if return_value is None:
+            return_value = row[return_column] if return_column < len(row) else ""
+        return_time = case_return_time(str(return_value or ""))
         category = ""
         for cell in row:
             if "緊急救護" in cell or is_fire_case_category(cell):

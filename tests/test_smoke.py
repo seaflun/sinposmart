@@ -2728,6 +2728,88 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(cases[0].return_time, "21:45:00")
         self.assertEqual(items, [])
 
+    def test_case_query_uses_aligned_return_value_when_header_index_is_misaligned(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+                return {
+                    "headers": ["案件編號", "受理時間", "到達時間", "案件類別", "地點", "返隊時間"],
+                    "rows": [{
+                        "cells": [
+                            "case-1",
+                            "2026/08/12 15:20:35",
+                            "2026/08/12 15:50:01",
+                            "緊急救護-車禍",
+                            "桃園市中壢區示例路",
+                            "",
+                        ],
+                        "personnel_source": "",
+                        "return_value": "2026/08/12 15:50:01",
+                    }],
+                }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
+            module.time, "sleep"
+        ), mock.patch.object(
+            module, "wait_for_query_completion"
+        ):
+            cases = module.query_cases(Driver(), "1150812")
+
+        items = module.unreturned_case_vehicle_items(
+            cases,
+            dict(module.DEFAULT_WORK_LOG_DEFAULTS),
+            "1150812",
+            before_hour=16,
+        )
+
+        self.assertEqual(cases[0].return_time, "15:50:01")
+        self.assertEqual(items, [])
+
+    def test_case_query_keeps_blank_aligned_return_value_unreturned(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+                return {
+                    "headers": ["案件編號", "受理時間", "到達時間", "案件類別", "地點", "返隊時間"],
+                    "rows": [{
+                        "cells": [
+                            "case-2",
+                            "2026/08/12 15:20:35",
+                            "2026/08/12 15:21:10",
+                            "緊急救護-車禍",
+                            "桃園市中壢區示例路",
+                            "",
+                        ],
+                        "personnel_source": "",
+                        "return_value": "",
+                    }],
+                }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set"), mock.patch.object(module, "js_click"), mock.patch.object(
+            module.time, "sleep"
+        ), mock.patch.object(
+            module, "wait_for_query_completion"
+        ):
+            cases = module.query_cases(Driver(), "1150812")
+
+        items = module.unreturned_case_vehicle_items(
+            cases,
+            dict(module.DEFAULT_WORK_LOG_DEFAULTS),
+            "1150812",
+            before_hour=16,
+        )
+
+        self.assertEqual(cases[0].return_time, "")
+        self.assertEqual(sum(item["count"] for item in items), 1)
+
     def test_visible_table_waits_for_completion_and_requests_200_rows(self) -> None:
         module = duty_rehearsal_module()
 

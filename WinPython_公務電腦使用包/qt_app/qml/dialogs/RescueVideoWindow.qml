@@ -41,13 +41,13 @@ Window {
     }
 
     function resultColumnMinimumWidth(column) {
-        return column === "source" ? 80
-             : column === "time" ? 110
-             : column === "case" ? 100
-             : column === "status" ? 150
-             : column === "transfer" ? 80
-             : column === "destination" ? 160
-             : 180
+        return column === "source" ? 70
+             : column === "time" ? 95
+             : column === "case" ? 80
+             : column === "status" ? 90
+             : column === "transfer" ? 70
+             : column === "destination" ? 120
+             : 120
     }
 
     function resizeResultColumns(leftColumn, rightColumn, preferredLeftWidth) {
@@ -69,6 +69,7 @@ Window {
         property real pressHeaderX: 0
         property real initialLeftWidth: 0
 
+        objectName: "rescueVideoResultResize_" + leftColumn
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         width: 12

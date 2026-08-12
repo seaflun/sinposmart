@@ -116,7 +116,13 @@ def parse_args() -> argparse.Namespace:
         help="案件工作／返隊紀錄 JSON 資料夾",
     )
     parser.add_argument("--work-before-minutes", type=float, default=15, help="工作時間前允許分鐘數")
-    parser.add_argument("--return-grace-minutes", type=float, default=10, help="返隊時間後允許分鐘數")
+    parser.add_argument(
+        "--return-grace-minutes",
+        type=float,
+        choices=(0,),
+        default=0,
+        help="返隊後不得歸入前案，固定為 0",
+    )
     parser.add_argument("--case-folder-tolerance-minutes", type=float, default=10, help="工作時間與案件資料夾時間容許差")
     parser.add_argument(
         "--extension",
@@ -479,13 +485,12 @@ def choose_case(
     before: timedelta,
     after: timedelta,
     work_before: timedelta,
-    return_grace: timedelta,
 ) -> CaseFolder | None:
     candidates: list[tuple[CaseFolder, float]] = []
     for case in cases:
         if case.work_start is not None:
             range_start = case.work_start - work_before
-            range_end = (case.return_time + return_grace) if case.return_time else case.work_start + after
+            range_end = case.return_time if case.return_time else case.work_start + after
             if video_end < range_start or video_start > range_end:
                 continue
             if video_start > range_end:
@@ -629,7 +634,6 @@ def classify(
             before,
             after,
             timedelta(0),
-            timedelta(0),
         )
         if case is None:
             results.append(
@@ -767,7 +771,6 @@ def classify_with_work_logs(
     before = timedelta(minutes=args.before_minutes)
     after = timedelta(minutes=args.after_minutes)
     work_before = timedelta(minutes=args.work_before_minutes)
-    return_grace = timedelta(minutes=args.return_grace_minutes)
     results: list[Result] = []
 
     for source in sources:
@@ -783,7 +786,7 @@ def classify_with_work_logs(
         if selected_date and not video_overlaps_selected_date(video_start, video_end, selected_date):
             continue
 
-        case = choose_case(video_start, video_end, cases, before, after, work_before, return_grace)
+        case = choose_case(video_start, video_end, cases, before, after, work_before)
         if case is None:
             results.append(
                 Result(

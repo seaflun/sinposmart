@@ -316,7 +316,7 @@ def build_args(values: Mapping[str, object], mode: str) -> argparse.Namespace:
         segment_minutes=6,
         work_log_root=Path(work_log_text),
         work_before_minutes=15,
-        return_grace_minutes=10,
+        return_grace_minutes=0,
         case_folder_tolerance_minutes=10,
         extension=".TS",
         apply=apply,

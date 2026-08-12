@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from io import StringIO
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -90,10 +92,13 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn('text: rescueVideoResultRow.transferPercent + "%"', source)
         self.assertNotIn('text: rescueVideoResultRow.transferText', source)
         self.assertIn("component ResultColumnResizeHandle", source)
+        self.assertIn('objectName: "rescueVideoResultResize_" + leftColumn', source)
         self.assertIn("resizeResultColumns(", source)
+        self.assertIn('column === "case" ? 80', source)
+        self.assertIn('column === "status" ? 90', source)
         self.assertIn("columnWidthOverride: rescueVideoWindow.resultColumnWidth", source)
         self.assertIn("status: 160", source)
-        self.assertIn('column === "status" ? 150', source)
+        self.assertIn('column === "status" ? 90', source)
         self.assertIn('modelData.level === "pending"', source)
         self.assertIn("onClosing: function(closeEvent)", source)
         self.assertIn("controller.resetForNextSession()", source)
@@ -183,6 +188,47 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertEqual(sample, complete)
         self.assertEqual(duration, timedelta(minutes=5))
         duration_reader.assert_called_once_with(complete)
+
+    def test_video_after_return_selects_the_following_case(self) -> None:
+        classifier = self._classifier_module()
+        previous = classifier.CaseFolder(
+            Path("08120753-92"),
+            "08120753-92",
+            "92",
+            datetime(2026, 8, 12, 7, 53),
+            work_start=datetime(2026, 8, 12, 7, 53),
+            return_time=datetime(2026, 8, 12, 9, 39, 44),
+        )
+        following = classifier.CaseFolder(
+            Path("08120942-92"),
+            "08120942-92",
+            "92",
+            datetime(2026, 8, 12, 9, 42),
+            work_start=datetime(2026, 8, 12, 9, 42),
+        )
+
+        selected = classifier.choose_case(
+            datetime(2026, 8, 12, 9, 44, 47),
+            datetime(2026, 8, 12, 9, 49, 47),
+            [previous, following],
+            timedelta(minutes=30),
+            timedelta(minutes=120),
+            timedelta(minutes=15),
+        )
+
+        self.assertIs(selected, following)
+
+    def test_work_log_classification_defaults_to_no_post_return_grace(self) -> None:
+        classifier = self._classifier_module()
+        with mock.patch.object(sys, "argv", ["classify_rescue_video.py"]):
+            self.assertEqual(classifier.parse_args().return_grace_minutes, 0)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["classify_rescue_video.py", "--return-grace-minutes", "1"],
+        ), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            classifier.parse_args()
 
     def test_copy_reports_byte_progress_for_the_current_video(self) -> None:
         classifier = self._classifier_module()
