@@ -134,7 +134,6 @@ class DailyVehicleService:
                 output = self._wait_for_process_exit(process, status_callback)
             except subprocess.TimeoutExpired as exc:
                 process.kill()
-                self._close_process_stdout(process)
                 raise DailyVehicleExecutionError(
                     "車輛保養清點執行逾時。",
                     failure_stage=stage,
@@ -241,17 +240,7 @@ class DailyVehicleService:
                 break
             if line is not None:
                 self._record_output_line(output_lines, line, status_callback)
-        self._close_process_stdout(process)
         return "".join(output_lines)
-
-    @staticmethod
-    def _close_process_stdout(process: subprocess.Popen) -> None:
-        try:
-            stdout = getattr(process, "stdout", None)
-            if stdout is not None:
-                stdout.close()
-        except (OSError, ValueError):
-            pass
 
     @staticmethod
     def _record_output_line(

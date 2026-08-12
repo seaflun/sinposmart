@@ -2760,6 +2760,7 @@ class DailyVehicleServiceTests(unittest.TestCase):
                     self._first_line = True
                     self.line_read = threading.Event()
                     self.release = threading.Event()
+                    self.close_called = threading.Event()
 
                 def readline(self):
                     if self._first_line:
@@ -2770,7 +2771,8 @@ class DailyVehicleServiceTests(unittest.TestCase):
                     return ""
 
                 def close(self):
-                    self.release.set()
+                    self.close_called.set()
+                    self.release.wait(5)
 
             class FakeProcess:
                 pid = 12345
@@ -2794,15 +2796,41 @@ class DailyVehicleServiceTests(unittest.TestCase):
                 process_checker=lambda _pid: False,
             )
             progress: list[str] = []
+            result: list[str] = []
+            failures: list[BaseException] = []
+            finished = threading.Event()
 
-            result = service.execute(
-                DailyVehicleRequest("user10", "session-secret"),
-                status_callback=progress.append,
-            )
+            def execute() -> None:
+                try:
+                    result.append(
+                        service.execute(
+                            DailyVehicleRequest("user10", "session-secret"),
+                            status_callback=progress.append,
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    finished.set()
 
-        self.assertEqual(result, "車輛保養清點已完成。")
+            runner = threading.Thread(target=execute, daemon=True)
+            runner.start()
+            try:
+                self.assertTrue(
+                    finished.wait(1),
+                    "runner exited but retained browser stdout blocked tool completion",
+                )
+                self.assertFalse(process.stdout.close_called.is_set())
+            finally:
+                process.stdout.release.set()
+                runner.join(1)
+
+        self.assertFalse(runner.is_alive())
+        if failures:
+            raise failures[0]
+        self.assertEqual(result, ["車輛保養清點已完成。"])
         self.assertIn("正在執行隨車器材清點…", progress)
-        self.assertTrue(process.stdout.release.is_set())
+        self.assertFalse(process.stdout.close_called.is_set())
 
     def test_browser_start_failure_uses_safe_shared_driver_message(self) -> None:
         from io import StringIO

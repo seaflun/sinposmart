@@ -3051,6 +3051,7 @@ def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
     def start() -> None:
         try:
             service = ChromeService(
+                log_output=subprocess.DEVNULL,
                 popen_kw={"creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
             )
             driver = webdriver.Chrome(service=service, options=options)

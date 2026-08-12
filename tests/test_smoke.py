@@ -2014,6 +2014,7 @@ class PackageSmokeTests(unittest.TestCase):
             service.creation_flags,
             getattr(module.subprocess, "CREATE_NO_WINDOW", 0),
         )
+        self.assertEqual(service.log_output, module.subprocess.DEVNULL)
 
     def test_legacy_daily_vehicle_launcher_never_opens_a_console(self) -> None:
         source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
