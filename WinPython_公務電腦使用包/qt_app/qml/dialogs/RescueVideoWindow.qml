@@ -95,9 +95,9 @@ Window {
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter
             anchors.horizontalCenter: parent.horizontalCenter
-            width: 1
-            height: parent.height - 10
-            color: parent.containsMouse || parent.pressed ? Design.blue : Design.divider
+            width: 2
+            height: parent.height - 8
+            color: parent.containsMouse || parent.pressed ? Design.blue : Design.border
         }
     }
 

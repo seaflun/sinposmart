@@ -94,6 +94,10 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("component ResultColumnResizeHandle", source)
         self.assertIn('objectName: "rescueVideoResultResize_" + leftColumn', source)
         self.assertIn("resizeResultColumns(", source)
+        self.assertIn(
+            "color: parent.containsMouse || parent.pressed ? Design.blue : Design.border",
+            source,
+        )
         self.assertIn('column === "case" ? 80', source)
         self.assertIn('column === "status" ? 90', source)
         self.assertIn("columnWidthOverride: rescueVideoWindow.resultColumnWidth", source)
