@@ -12,6 +12,11 @@ Button {
     property bool showFocusRing: true
     property string iconKind: ""
     property bool iconToggled: false
+    property bool showStatusLight: false
+    property bool statusLightOn: false
+    property string statusLightObjectName: ""
+    property color statusLightColor: Design.warningStrong
+    property color statusLightBorderColor: Design.warningBorder
     property real cornerRadius: Design.radius
     property color fillColor: tone === "primary" ? Design.blue
                             : tone === "success" ? Design.successSurface
@@ -216,6 +221,21 @@ Button {
             ColorAnimation {
                 duration: appleButton.instantFeedback ? 0 : Design.buttonColorTransitionDuration
             }
+        }
+
+        Rectangle {
+            objectName: appleButton.statusLightObjectName
+            visible: appleButton.showStatusLight && appleButton.statusLightOn
+            width: Design.dutyQuickToolLightSize
+            height: width
+            radius: width / 2
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.rightMargin: Design.dutyQuickToolLightInset
+            anchors.topMargin: Design.dutyQuickToolLightInset
+            color: appleButton.statusLightColor
+            border.width: Design.borderWidth
+            border.color: appleButton.statusLightBorderColor
         }
     }
 }

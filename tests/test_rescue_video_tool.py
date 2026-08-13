@@ -132,7 +132,11 @@ class RescueVideoPackageTests(unittest.TestCase):
         )[0]
 
         self.assertLess(daily_tools.index('text: "勤務表登打"'), daily_tools.index('text: "車輛保養清點"'))
-        self.assertLess(daily_tools.index('text: "車輛保養清點"'), daily_tools.index('text: "行車紀錄器"'))
+        self.assertLess(
+            daily_tools.index('text: "車輛保養清點"'),
+            daily_tools.index('text: "救護行車紀錄器"'),
+        )
+        self.assertIn('tone: "review"', daily_tools)
         self.assertIn("dutyQuickToolsPanel.rescueVideoWindow.open()", daily_tools)
 
     def test_update_backup_keeps_rescue_video_sources(self) -> None:

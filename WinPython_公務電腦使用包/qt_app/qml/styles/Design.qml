@@ -123,6 +123,9 @@ QtObject {
     readonly property int dutyActionButtonWidth: 104
     readonly property int externalReturnManualButtonWidth: 184
     readonly property int dutyActionButtonHeight: 38
+    readonly property int dutyQuickToolCompletionSize: 9
+    readonly property int dutyQuickToolLightSize: 10
+    readonly property int dutyQuickToolLightInset: -3
     readonly property int settingsButtonSize: 34
     readonly property int settingsIconSize: 16
     readonly property int settingsIconRingSize: 10

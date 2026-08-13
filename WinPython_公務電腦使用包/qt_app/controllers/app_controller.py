@@ -198,6 +198,7 @@ class AppController(QObject):
         self._duty_controller.liveCaptureFailed.connect(self._live_capture_failed)
         self._duty_controller.cachedScheduleLoaded.connect(self._cached_schedule_loaded)
         self._duty_controller.fireDayChanged.connect(self._refresh_after_fire_day_change)
+        self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
@@ -240,12 +241,12 @@ class AppController(QObject):
             lambda message: self._tool_run_failed("daily_vehicle", "車輛保養清點", message)
         )
         self._rescue_video_controller.runStarted.connect(
-            lambda mode: self._tool_run_started("rescue_video", "行車紀錄器（BETA）", mode=mode)
+            lambda mode: self._tool_run_started("rescue_video", "救護行車紀錄器", mode=mode)
         )
         self._rescue_video_controller.runSucceeded.connect(
             lambda message: self._tool_run_finished(
                 "rescue_video",
-                "行車紀錄器（BETA）",
+                "救護行車紀錄器",
                 message,
                 notify=self._rescue_video_controller.lastCompletedMode in {"copy", "delete"},
             )
@@ -253,7 +254,7 @@ class AppController(QObject):
         self._rescue_video_controller.runFailed.connect(
             lambda mode, message: self._tool_run_failed(
                 "rescue_video",
-                "行車紀錄器（BETA）",
+                "救護行車紀錄器",
                 message,
                 mode=mode,
                 notify=False,
@@ -449,7 +450,7 @@ class AppController(QObject):
             (self._duty_sheet_controller.isRunning, "勤務表登打"),
             (self._rest_monthly_controller.isRunning, "休息時間或勤務基準表登打"),
             (self._daily_vehicle_controller.isRunning, "車輛保養清點"),
-            (self._rescue_video_controller.isRunning, "行車紀錄器處理"),
+            (self._rescue_video_controller.isRunning, "救護行車紀錄器處理"),
         )
         for is_running, label in running_tools:
             if is_running:

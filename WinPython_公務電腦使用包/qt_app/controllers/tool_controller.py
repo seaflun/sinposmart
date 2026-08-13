@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -51,13 +51,14 @@ TOOL_CATALOG = (
     },
     {
         "toolId": "rescue_video",
-        "label": "行車紀錄器（BETA）",
+        "label": "救護行車紀錄器",
         "description": "預覽分類結果，核對後複製並清理記憶卡",
         "statusText": "原生表單可用",
         "tone": "ready",
         "available": True,
     },
 )
+DAILY_TOOL_IDS = ("duty_sheet", "daily_vehicle")
 MONTHLY_TOOL_IDS = {"rest_time", "monthly_base"}
 TOOL_USAGE_RESULT_LABELS = {
     "duty_sheet": "勤務表",
@@ -67,10 +68,26 @@ TOOL_USAGE_RESULT_LABELS = {
 }
 
 
+def _next_roc_date(value: str) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    if len(digits) != 7:
+        return ""
+    try:
+        next_day = date(
+            int(digits[:3]) + 1911,
+            int(digits[3:5]),
+            int(digits[5:7]),
+        ) + timedelta(days=1)
+    except ValueError:
+        return ""
+    return f"{next_day.year - 1911:03d}{next_day.month:02d}{next_day.day:02d}"
+
+
 class ToolController(QObject):
     statusChanged = Signal()
     errorOccurred = Signal(str)
     usageChanged = Signal(str)
+    dailyCompletionChanged = Signal()
 
     def __init__(
         self,
@@ -82,6 +99,7 @@ class ToolController(QObject):
         super().__init__(parent)
         self._package_root = Path(package_root)
         self._now_factory = now_factory
+        self._daily_completion_date = business_roc_date(self._now_factory())
         self._usage_path = self._package_root / "runtime_outputs" / "tool_usage_history.json"
         self._usage_history = self._load_usage_history()
         self._active_usage_ids: dict[str, str] = {}
@@ -98,6 +116,38 @@ class ToolController(QObject):
     @Property(str, notify=statusChanged)
     def statusText(self) -> str:
         return self._status_text
+
+    @Property(int, notify=dailyCompletionChanged)
+    def dailyCompletionCount(self) -> int:
+        current_business_date = business_roc_date(self._now_factory())
+        return sum(
+            self._is_daily_tool_completed_for_date(tool_id, current_business_date)
+            for tool_id in DAILY_TOOL_IDS
+        )
+
+    @Property(bool, notify=dailyCompletionChanged)
+    def dutySheetCompleted(self) -> bool:
+        return self.isDailyToolCompleted("duty_sheet")
+
+    @Property(bool, notify=dailyCompletionChanged)
+    def dailyVehicleCompleted(self) -> bool:
+        return self.isDailyToolCompleted("daily_vehicle")
+
+    @Slot(str, result=bool)
+    def isDailyToolCompleted(self, tool_id: str) -> bool:
+        normalized_tool_id = str(tool_id or "").strip()
+        if normalized_tool_id not in DAILY_TOOL_IDS:
+            return False
+        current_business_date = business_roc_date(self._now_factory())
+        return self._is_daily_tool_completed_for_date(normalized_tool_id, current_business_date)
+
+    @Slot(str)
+    def refreshDailyCompletion(self, _fire_day: str = "") -> None:
+        current_business_date = business_roc_date(self._now_factory())
+        if current_business_date == self._daily_completion_date:
+            return
+        self._daily_completion_date = current_business_date
+        self.dailyCompletionChanged.emit()
 
     @Slot(str)
     def launch(self, tool_id: str) -> None:
@@ -233,6 +283,37 @@ class ToolController(QObject):
         self._save_usage_history()
         self._refresh_usage_model(tool_id)
         self.usageChanged.emit(tool_id)
+        if tool_id in DAILY_TOOL_IDS:
+            self._daily_completion_date = business_roc_date(self._now_factory())
+            self.dailyCompletionChanged.emit()
+
+    def _is_daily_tool_completed_for_date(self, tool_id: str, business_date: str) -> bool:
+        expected_usage_period = (
+            _next_roc_date(business_date)
+            if tool_id == "duty_sheet"
+            else business_date
+        )
+        return any(
+            entry.get("tool_name") == tool_id
+            and entry.get("report") == "已完成"
+            and self._entry_business_date(entry) == business_date
+            and (
+                tool_id != "duty_sheet"
+                or str(entry.get("usage_period", "") or "").strip() == expected_usage_period
+            )
+            for entry in self._usage_history
+        )
+
+    @staticmethod
+    def _entry_business_date(entry: dict[str, str]) -> str:
+        business_date = str(entry.get("business_roc_date", "") or "").strip()
+        if business_date:
+            return business_date
+        try:
+            recorded_at = datetime.strptime(str(entry.get("time", "")), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return ""
+        return business_roc_date(recorded_at)
 
     def _usage_rows(
         self,

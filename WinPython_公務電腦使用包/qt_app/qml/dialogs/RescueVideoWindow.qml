@@ -19,7 +19,7 @@ Window {
     height: Design.rescueWindowHeight + Design.appTitleBarHeight
     minimumWidth: Design.rescueWindowMinimumWidth
     minimumHeight: Design.rescueWindowMinimumHeight + Design.appTitleBarHeight
-    title: "SinpoSmart - 行車紀錄器"
+    title: "SinpoSmart - 救護行車紀錄器"
     color: Design.transparent
     flags: Qt.Window | Qt.FramelessWindowHint
     modality: Qt.NonModal
@@ -212,7 +212,7 @@ Window {
             anchors.left: parent.left
             anchors.leftMargin: 12
             anchors.verticalCenter: parent.verticalCenter
-            text: "SinpoSmart - 行車紀錄器"
+            text: "SinpoSmart - 救護行車紀錄器"
             color: Design.infoText
             font.pixelSize: Design.controlSize
             font.bold: true
@@ -244,7 +244,7 @@ Window {
                 focusPolicy: Qt.NoFocus
                 scale: 1
                 enabled: true
-                Accessible.name: "縮小行車紀錄器"
+                Accessible.name: "縮小救護行車紀錄器"
                 onClicked: rescueVideoWindow.showMinimized()
             }
 
@@ -268,7 +268,7 @@ Window {
                 focusPolicy: Qt.NoFocus
                 scale: 1
                 enabled: true
-                Accessible.name: rescueVideoWindow.visibility === Window.Maximized ? "還原行車紀錄器" : "最大化行車紀錄器"
+                Accessible.name: rescueVideoWindow.visibility === Window.Maximized ? "還原救護行車紀錄器" : "最大化救護行車紀錄器"
                 onClicked: {
                     if (rescueVideoWindow.visibility === Window.Maximized)
                         rescueVideoWindow.showNormal()
@@ -296,7 +296,7 @@ Window {
                 focusPolicy: Qt.NoFocus
                 scale: 1
                 enabled: !rescueVideoWindow.interactionsLocked
-                Accessible.name: "關閉行車紀錄器"
+                Accessible.name: "關閉救護行車紀錄器"
                 onClicked: rescueVideoWindow.close()
             }
         }
@@ -366,7 +366,7 @@ Window {
                 anchors.rightMargin: 24
                 StrongHeaderTitle {
                     objectName: "rescueVideoTitleLabel"
-                    text: "救護行車影片分類"
+                    text: "救護行車紀錄器"
                 }
                 Label {
                     objectName: "rescueVideoStatusBadge"

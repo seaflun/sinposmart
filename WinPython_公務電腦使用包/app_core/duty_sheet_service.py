@@ -15,6 +15,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Callable, Iterator
 
+from app_core.duty_task_projection import parse_roc_date
+from app_core.schedule_repository import business_roc_date
+
 
 LEGACY_MODULE_NAME = "_sinposmart_qt_duty_sheet_automation"
 LEGACY_SCRIPT_NAME = "sinposmart_1.py"
@@ -129,7 +132,7 @@ class DutySheetService:
         options = config.get("car_options", {}) if isinstance(config.get("car_options"), dict) else {}
         notification = config.get("notification", {}) if isinstance(config.get("notification"), dict) else {}
         workbook = self._resolve_workbook(str(last.get("workbook_path", "") or ""))
-        target = (now or datetime.now()) + timedelta(days=1)
+        target = parse_roc_date(business_roc_date(now or datetime.now())) + timedelta(days=1)
         return DutySheetDefaults(
             workbook_path=str(workbook) if workbook else "",
             target_date=target.strftime("%Y/%m/%d"),

@@ -16,12 +16,11 @@ Rectangle {
     property bool dutyModeActive: false
     objectName: "dutyQuickToolsPanel"
     Layout.fillWidth: true
-    implicitHeight: dutyQuickToolsLayout.implicitHeight + 20
+    implicitHeight: dutyQuickToolsLayout.implicitHeight
     visible: dutyQuickToolsPanel.backend.sessionController.isLoggedIn && dutyQuickToolsPanel.dutyModeActive
-    radius: Design.radius
-    color: Design.panel
-    border.width: Design.borderWidth
-    border.color: dutyQuickToolsPanel.hostWindow.border
+    color: Design.transparent
+    border.width: Design.noBorderWidth
+    radius: Design.noRadius
 
     function isSelected(panel) {
         return dutyQuickToolsPanel.hostWindow.activeToolSidePanel === panel && panel.opened
@@ -32,92 +31,161 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        anchors.margins: 10
         spacing: 8
 
-        RowLayout {
+        Rectangle {
+            id: dailyMonthlyOperationCard
+            objectName: "dailyMonthlyOperationCard"
             Layout.fillWidth: true
-            spacing: 8
-            Label {
-                Layout.preferredWidth: 58
-                text: "每日作業"
-                color: Design.blueHover
-                font.bold: true
-            }
-            AppleButton {
-                objectName: "quickDutySheetToolButton"
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredWidth: 1
-                text: "勤務表登打"
-                tone: "info"
-                selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.dutySheetPanel)
-                onClicked: {
-                    dutyQuickToolsPanel.backend.dutySheetController.loadDefaults()
-                    dutyQuickToolsPanel.dutySheetPanel.open()
-                }
-            }
-            AppleButton {
-                objectName: "quickDailyVehicleToolButton"
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredWidth: 1
-                text: "車輛保養清點"
-                tone: "info"
-                selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.dailyVehiclePanel)
-                onClicked: {
-                    dutyQuickToolsPanel.backend.dailyVehicleController.loadDefaults()
-                    dutyQuickToolsPanel.dailyVehiclePanel.open()
-                }
-            }
-            AppleButton {
-                objectName: "quickRescueVideoToolButton"
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredWidth: 1
-                text: "行車紀錄器"
-                tone: "warning"
-                selectedState: dutyQuickToolsPanel.rescueVideoWindow.visible
-                onClicked: {
-                    dutyQuickToolsPanel.backend.rescueVideoController.loadDefaults()
-                    dutyQuickToolsPanel.rescueVideoWindow.open()
-                }
-            }
-        }
+            implicitHeight: dailyMonthlyOperationLayout.implicitHeight + 20
+            radius: Design.radius
+            color: Design.panel
+            border.width: Design.borderWidth
+            border.color: dutyQuickToolsPanel.hostWindow.border
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
-            Label {
-                Layout.preferredWidth: 58
-                text: "每月作業"
-                color: Design.monthlyText
-                font.bold: true
-            }
-            AppleButton {
-                objectName: "quickRestTimeToolButton"
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredWidth: 1
-                text: "休息時間登打"
-                tone: "monthly"
-                selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.restTimePanel)
-                onClicked: {
-                    dutyQuickToolsPanel.backend.restMonthlyController.loadRestDefaults()
-                    dutyQuickToolsPanel.restTimePanel.open()
+            ColumnLayout {
+                id: dailyMonthlyOperationLayout
+                anchors.fill: parent
+                anchors.margins: 10
+                spacing: 8
+
+                Item {
+                    id: dailyOperationCard
+                    objectName: "dailyOperationCard"
+                    Layout.fillWidth: true
+                    implicitHeight: dailyOperationLayout.implicitHeight
+
+                    RowLayout {
+                        id: dailyOperationLayout
+                        anchors.fill: parent
+                        spacing: 8
+
+                        Item {
+                            id: dailyOperationLabelArea
+                            objectName: "dailyOperationLabelArea"
+                            Layout.preferredWidth: 58
+                            Layout.minimumWidth: 58
+                            Layout.alignment: Qt.AlignVCenter
+                            implicitHeight: 40
+
+                            Label {
+                                id: dailyOperationLabel
+                                objectName: "dailyOperationLabel"
+                                anchors.left: parent.left
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "每日作業"
+                                color: Design.blueHover
+                                font.bold: true
+                            }
+                            Label {
+                                objectName: "dailyOperationCompletionLabel"
+                                anchors.left: parent.left
+                                width: dailyOperationLabel.width
+                                anchors.bottom: parent.bottom
+                                text: "已完成 " + dutyQuickToolsPanel.backend.toolController.dailyCompletionCount + " / 2"
+                                color: dutyQuickToolsPanel.backend.toolController.dailyCompletionCount === 2
+                                       ? Design.successText
+                                       : Design.muted
+                                font.pixelSize: Design.dutyQuickToolCompletionSize
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                        }
+
+                        AppleButton {
+                            objectName: "quickDutySheetToolButton"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            text: "勤務表登打"
+                            tone: "info"
+                            showStatusLight: true
+                            statusLightOn: !dutyQuickToolsPanel.backend.toolController.dutySheetCompleted
+                            statusLightObjectName: "quickDutySheetCompletionLight"
+                            selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.dutySheetPanel)
+                            onClicked: {
+                                dutyQuickToolsPanel.backend.dutySheetController.loadDefaults()
+                                dutyQuickToolsPanel.dutySheetPanel.open()
+                            }
+                        }
+                        AppleButton {
+                            objectName: "quickDailyVehicleToolButton"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            text: "車輛保養清點"
+                            tone: "info"
+                            showStatusLight: true
+                            statusLightOn: !dutyQuickToolsPanel.backend.toolController.dailyVehicleCompleted
+                            statusLightObjectName: "quickDailyVehicleCompletionLight"
+                            selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.dailyVehiclePanel)
+                            onClicked: {
+                                dutyQuickToolsPanel.backend.dailyVehicleController.loadDefaults()
+                                dutyQuickToolsPanel.dailyVehiclePanel.open()
+                            }
+                        }
+                        AppleButton {
+                            objectName: "quickRescueVideoToolButton"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            text: "救護行車紀錄器"
+                            tone: "review"
+                            selectedState: dutyQuickToolsPanel.rescueVideoWindow.visible
+                            onClicked: {
+                                dutyQuickToolsPanel.backend.rescueVideoController.loadDefaults()
+                                dutyQuickToolsPanel.rescueVideoWindow.open()
+                            }
+                        }
+                    }
                 }
-            }
-            AppleButton {
-                objectName: "quickMonthlyBaseToolButton"
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredWidth: 1
-                text: "勤務基準表登打"
-                tone: "monthly"
-                selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.monthlyBasePanel)
-                onClicked: {
-                    dutyQuickToolsPanel.backend.restMonthlyController.loadMonthlyDefaults()
-                    dutyQuickToolsPanel.monthlyBasePanel.open()
+
+                Item {
+                    id: monthlyOperationCard
+                    objectName: "monthlyOperationCard"
+                    Layout.fillWidth: true
+                    implicitHeight: monthlyOperationLayout.implicitHeight
+
+                    RowLayout {
+                        id: monthlyOperationLayout
+                        anchors.fill: parent
+                        spacing: 8
+
+                        Label {
+                            objectName: "monthlyOperationLabel"
+                            Layout.preferredWidth: 58
+                            Layout.minimumWidth: 58
+                            Layout.alignment: Qt.AlignVCenter
+                            text: "每月作業"
+                            color: Design.monthlyText
+                            font.bold: true
+                        }
+                        AppleButton {
+                            objectName: "quickRestTimeToolButton"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            text: "休息時間登打"
+                            tone: "monthly"
+                            selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.restTimePanel)
+                            onClicked: {
+                                dutyQuickToolsPanel.backend.restMonthlyController.loadRestDefaults()
+                                dutyQuickToolsPanel.restTimePanel.open()
+                            }
+                        }
+                        AppleButton {
+                            objectName: "quickMonthlyBaseToolButton"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            text: "勤務基準表登打"
+                            tone: "monthly"
+                            selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.monthlyBasePanel)
+                            onClicked: {
+                                dutyQuickToolsPanel.backend.restMonthlyController.loadMonthlyDefaults()
+                                dutyQuickToolsPanel.monthlyBasePanel.open()
+                            }
+                        }
+                    }
                 }
             }
         }

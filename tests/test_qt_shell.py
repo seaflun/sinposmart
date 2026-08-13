@@ -1003,6 +1003,8 @@ class DutySheetServiceTests(unittest.TestCase):
             )
 
             self.assertEqual(defaults.target_date, "2026/07/30")
+            overnight_defaults = service.load_defaults(datetime(2026, 7, 30, 2, 0))
+            self.assertEqual(overnight_defaults.target_date, "2026/07/30")
             self.assertEqual(defaults.attack_options, ("A",))
             self.assertNotIn("secret", repr(defaults))
             self.assertNotIn("password", repr(request))
@@ -3926,6 +3928,74 @@ class ToolControllerTests(unittest.TestCase):
             "8番 曾彥綸",
         )
 
+    def test_daily_operation_completion_uses_next_day_duty_sheet_and_current_day_vehicle(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.tool_controller import ToolController
+
+        current_time = [datetime(2026, 7, 30, 9, 15)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = ToolController(
+                Path(temp_dir),
+                now_factory=lambda: current_time[0],
+            )
+            completion_spy = QSignalSpy(controller.dailyCompletionChanged)
+
+            self.assertEqual(controller.dailyCompletionCount, 0)
+            controller.record_started(
+                "duty_sheet",
+                "勤務表登打",
+                "10番 測試員",
+                actor_no="10",
+            )
+            controller.record_finished("duty_sheet", "completed", "1150730 勤務表已登打完成")
+
+            self.assertFalse(controller.isDailyToolCompleted("duty_sheet"))
+            self.assertEqual(controller.dailyCompletionCount, 0)
+
+            controller.record_started(
+                "duty_sheet",
+                "勤務表登打",
+                "10番 測試員",
+                actor_no="10",
+            )
+            controller.record_finished("duty_sheet", "completed", "1150731 勤務表已登打完成")
+
+            self.assertTrue(controller.isDailyToolCompleted("duty_sheet"))
+            self.assertEqual(controller.dailyCompletionCount, 1)
+
+            controller.record_started(
+                "daily_vehicle",
+                "車輛保養清點",
+                "10番 測試員",
+                actor_no="10",
+            )
+            controller.record_finished("daily_vehicle", "completed")
+
+            self.assertTrue(controller.isDailyToolCompleted("daily_vehicle"))
+            self.assertEqual(controller.dailyCompletionCount, 2)
+            self.assertGreaterEqual(completion_spy.count(), 1)
+
+            controller.record_started(
+                "rest_time",
+                "休息時間登打",
+                "10番 測試員",
+                "11507",
+                actor_no="10",
+            )
+            controller.record_finished("rest_time", "completed")
+            self.assertEqual(controller.dailyCompletionCount, 2)
+
+            current_time[0] = datetime(2026, 7, 31, 9, 15)
+            controller.refreshDailyCompletion("1150731")
+
+            self.assertEqual(controller.dailyCompletionCount, 0)
+            self.assertFalse(controller.isDailyToolCompleted("duty_sheet"))
+            self.assertFalse(controller.isDailyToolCompleted("daily_vehicle"))
+            self.assertGreaterEqual(completion_spy.count(), 2)
+
     def test_usage_model_shows_latest_daily_result_and_current_monthly_operator(self) -> None:
         from datetime import datetime
 
@@ -5107,6 +5177,9 @@ class QtShellTests(unittest.TestCase):
         tray_controller = (
             PACKAGE_ROOT / "qt_app" / "controllers" / "tray_controller.py"
         ).read_text(encoding="utf-8")
+        apple_button = (
+            PACKAGE_ROOT / "qt_app" / "qml" / "components" / "AppleButton.qml"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             "accountManagerWindow.sessionController.deleteSavedAccount(",
@@ -5184,7 +5257,7 @@ class QtShellTests(unittest.TestCase):
         for tool_text in (
             "勤務表登打",
             "車輛保養清點",
-            "行車紀錄器",
+            "救護行車紀錄器",
             "休息時間登打",
             "勤務基準表登打",
         ):
@@ -5194,6 +5267,19 @@ class QtShellTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(quick_tools.count("Layout.preferredWidth: 1"), 5)
         self.assertNotIn("Item { Layout.fillWidth: true }", quick_tools)
+        self.assertIn('objectName: "dailyMonthlyOperationCard"', quick_tools)
+        self.assertEqual(quick_tools.count("border.width: Design.borderWidth"), 1)
+        self.assertIn('objectName: "dailyOperationLabel"', quick_tools)
+        self.assertIn('objectName: "dailyOperationLabelArea"', quick_tools)
+        self.assertEqual(quick_tools.count("Layout.preferredWidth: 58"), 2)
+        self.assertEqual(quick_tools.count("Layout.minimumWidth: 58"), 2)
+        self.assertIn("anchors.verticalCenter: parent.verticalCenter", quick_tools)
+        self.assertIn("anchors.bottom: parent.bottom", quick_tools)
+        self.assertIn("width: dailyOperationLabel.width", quick_tools)
+        self.assertIn("horizontalAlignment: Text.AlignHCenter", quick_tools)
+        self.assertIn("Design.dutyQuickToolCompletionSize", quick_tools + design)
+        self.assertIn("Design.dutyQuickToolLightSize", quick_tools + apple_button + design)
+        self.assertIn("Design.dutyQuickToolLightInset", apple_button + design)
         self.assertIn('objectName: "rescueVideoCheckButton"', rescue_video)
         self.assertIn('text: "檢查結果"', rescue_video)
         self.assertIn('text: "檢查及預覽分類"', rescue_video)
@@ -5442,9 +5528,9 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("ToolSidePanel {\n    id: dailyVehicleDialog", daily_vehicle_panel)
         self.assertIn("RescueVideoWindow {\n        id: rescueVideoDialog", source)
         self.assertIn("Window {", rescue_video)
-        self.assertIn('title: "SinpoSmart - 行車紀錄器"', rescue_video)
+        self.assertIn('title: "SinpoSmart - 救護行車紀錄器"', rescue_video)
         self.assertIn('objectName: "rescueVideoWindowTitleLabel"', rescue_video)
-        self.assertIn('text: "SinpoSmart - 行車紀錄器"', rescue_video)
+        self.assertIn('text: "SinpoSmart - 救護行車紀錄器"', rescue_video)
         self.assertNotIn("Drawer {", source)
         self.assertIn("readonly property int dutyMainWidth: 550", source)
         self.assertIn("readonly property int auditMainWidth: 780", source)
@@ -5474,7 +5560,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('text: "人員"', usage_component)
         self.assertIn('text: "結果"', usage_component)
         self.assertIn("function onErrorOccurred(message)", source)
-        self.assertIn("function onActionFailed(_index, message, _errorCode)", source)
+        self.assertIn("function onDutyActionFailed(actionKey, message)", source)
         self.assertIn(
             'objectName: dutyTaskArea.modeIndex === 1 ? "auditTaskRow" : "dutyTaskRow"',
             source,
@@ -5699,10 +5785,10 @@ class QtShellTests(unittest.TestCase):
         )[0]
 
         for expected in (
-            'title: "SinpoSmart - 行車紀錄器"',
+            'title: "SinpoSmart - 救護行車紀錄器"',
             "width: Design.rescueWindowWidth",
             "height: Design.rescueWindowHeight + Design.appTitleBarHeight",
-            'text: "救護行車影片分類"',
+            'text: "救護行車紀錄器"',
             'text: "車號"',
             'text: "日期"',
             'objectName: "rescueVideoSummaryText"',
@@ -6159,7 +6245,7 @@ class QtShellTests(unittest.TestCase):
         from unittest.mock import patch
 
         from PySide6.QtTest import QTest
-        from app_core.schedule_repository import ScheduleSnapshot, business_roc_date
+        from app_core.schedule_repository import ScheduleSnapshot
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
 
@@ -7691,18 +7777,24 @@ if return_code != 0 or loaded:
             controller.shutdown()
 
     def test_duty_controller_has_no_generic_pause_or_resume_controls(self) -> None:
+        from datetime import datetime
+
         from qt_app.controllers.duty_controller import DutyController
 
+        current = datetime.now()
+        target_roc_date = (
+            f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+        )
         controller = DutyController()
         controller.set_actor_no("10")
         controller.replace_schedule_data(
             {
-                "target_date": "1150729",
+                "target_date": target_roc_date,
                 "today": {"staff": {"10": {"name": "本班"}}},
                 "actions": [
                     {
                         "kind": "work_log",
-                        "time": "00:00",
+                        "time": current.strftime("%H:%M"),
                         "actor": "10",
                         "target": "10",
                         "source": "在隊訓練",
@@ -9091,6 +9183,8 @@ if return_code != 0 or loaded:
             controller.shutdown()
 
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
+        from datetime import datetime
+
         from PySide6.QtTest import QSignalSpy, QTest
 
         from app_core.credential_repository import CredentialRepository
@@ -9100,7 +9194,11 @@ if return_code != 0 or loaded:
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
 
-        target_roc_date = business_roc_date()
+        current = datetime.now()
+        target_roc_date = (
+            f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+        )
+        action_time = current.strftime("%H:%M")
 
         class FakeScheduleRepository:
             def load_current(self):
@@ -9110,7 +9208,7 @@ if return_code != 0 or loaded:
                     "actions": [
                         {
                             "kind": "work_log",
-                            "time": "00:00",
+                            "time": action_time,
                             "actor": "10",
                             "target": "10",
                             "source": "在隊訓練",
@@ -9696,9 +9794,8 @@ if return_code != 0 or loaded:
                 "session_ended",
             )
 
-            self.assertEqual(len(notices), 2)
+            self.assertEqual(len(notices), 1)
             self.assertIn("開始登打", notices[0])
-            self.assertIn("準備登打", notices[1])
             self.assertEqual(
                 [(record_type, fields["status"]) for record_type, fields in events],
                 [
@@ -11933,17 +12030,28 @@ if return_code != 0 or loaded:
         self.assertEqual(controller._pending_manual_indices, [])
 
     def test_login_failure_requests_relogin_instead_of_retry(self) -> None:
+        from datetime import datetime
+
         from PySide6.QtTest import QSignalSpy
 
         from qt_app.controllers.duty_controller import DutyController
 
+        current = datetime.now()
+        target_roc_date = (
+            f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+        )
         controller = DutyController()
         controller.set_actor_no("10")
         controller.replace_schedule_data(
             {
-                "target_date": "1150729",
+                "target_date": target_roc_date,
                 "actions": [
-                    {"kind": "work_log", "time": "00:00", "actor": "10", "source": "在隊訓練"}
+                    {
+                        "kind": "work_log",
+                        "time": current.strftime("%H:%M"),
+                        "actor": "10",
+                        "source": "在隊訓練",
+                    }
                 ],
             }
         )
@@ -12815,6 +12923,7 @@ if return_code != 0 or loaded:
 
     def test_qml_shell_loads_with_app_controller(self) -> None:
         from dataclasses import replace
+        from datetime import datetime
 
         from PySide6.QtCore import QMetaObject, QObject, QPointF, Qt
         from PySide6.QtTest import QTest
@@ -12912,7 +13021,11 @@ if return_code != 0 or loaded:
                 self.requests.append(request)
                 if status_callback is not None:
                     status_callback("勤務表測試執行中")
-                return "勤務表完成"
+                target_date = date.fromisoformat(request.target_date.replace("/", "-"))
+                target_roc_date = (
+                    f"{target_date.year - 1911:03d}{target_date.month:02d}{target_date.day:02d}"
+                )
+                return f"勤務表已登打完成：{target_roc_date}"
 
         class FakeRestMonthlyService:
             def __init__(self):
@@ -13054,7 +13167,10 @@ if return_code != 0 or loaded:
             controller = AppController(
                 repository=repository,
                 operational_sync_service=operational_sync_service,
-                tool_controller=ToolController(Path(temp_dir)),
+                tool_controller=ToolController(
+                    Path(temp_dir),
+                    now_factory=lambda: datetime(2026, 7, 29, 9, 15),
+                ),
                 work_log_settings_service=settings_service,
                 duty_sheet_service=duty_sheet_service,
                 rest_monthly_service=rest_monthly_service,
@@ -13155,11 +13271,96 @@ if return_code != 0 or loaded:
                 for button_name, tone in (
                     ("quickDutySheetToolButton", "info"),
                     ("quickDailyVehicleToolButton", "info"),
-                    ("quickRescueVideoToolButton", "warning"),
+                    ("quickRescueVideoToolButton", "review"),
                     ("quickRestTimeToolButton", "monthly"),
                     ("quickMonthlyBaseToolButton", "monthly"),
                 ):
                     self.assertEqual(wait_for(button_name).property("tone"), tone)
+                daily_operation_card = wait_for("dailyOperationCard")
+                monthly_operation_card = wait_for("monthlyOperationCard")
+                daily_monthly_operation_card = wait_for("dailyMonthlyOperationCard")
+                self.assertEqual(daily_operation_card.x(), monthly_operation_card.x())
+                self.assertLess(daily_operation_card.y(), monthly_operation_card.y())
+                self.assertGreater(
+                    daily_monthly_operation_card.height(),
+                    monthly_operation_card.y() + monthly_operation_card.height(),
+                )
+                daily_operation_label = wait_for("dailyOperationLabel")
+                monthly_operation_label = wait_for("monthlyOperationLabel")
+                daily_operation_label_area = wait_for("dailyOperationLabelArea")
+                daily_completion_label = wait_for("dailyOperationCompletionLabel")
+                duty_quick_button = wait_for("quickDutySheetToolButton")
+                monthly_quick_button = wait_for("quickRestTimeToolButton")
+                daily_vehicle_quick_button = wait_for("quickDailyVehicleToolButton")
+                self.assertAlmostEqual(
+                    daily_completion_label.mapToItem(
+                        daily_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    daily_operation_label.mapToItem(
+                        daily_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    delta=1,
+                )
+                self.assertAlmostEqual(
+                    daily_operation_label.mapToItem(
+                        daily_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    monthly_operation_label.mapToItem(
+                        monthly_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    delta=1,
+                )
+                self.assertAlmostEqual(
+                    duty_quick_button.mapToItem(
+                        daily_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    monthly_quick_button.mapToItem(
+                        monthly_operation_card,
+                        QPointF(0, 0),
+                    ).x(),
+                    delta=1,
+                )
+                self.assertAlmostEqual(
+                    daily_operation_label.mapToItem(
+                        daily_operation_card,
+                        QPointF(0, daily_operation_label.height() / 2)
+                    ).y(),
+                    monthly_operation_label.mapToItem(
+                        monthly_operation_card,
+                        QPointF(0, monthly_operation_label.height() / 2)
+                    ).y(),
+                    delta=1,
+                )
+                self.assertAlmostEqual(daily_operation_label_area.width(), 58, delta=1)
+                self.assertAlmostEqual(monthly_operation_label.width(), 58, delta=1)
+                self.assertAlmostEqual(
+                    daily_completion_label.width(),
+                    daily_operation_label.width(),
+                    delta=1,
+                )
+                self.assertEqual(daily_completion_label.property("font").pixelSize(), 9)
+                self.assertEqual(daily_completion_label.property("text"), "已完成 0 / 2")
+                self.assertTrue(duty_quick_button.property("statusLightOn"))
+                self.assertTrue(daily_vehicle_quick_button.property("statusLightOn"))
+                duty_completion_light = wait_for("quickDutySheetCompletionLight")
+                vehicle_completion_light = wait_for("quickDailyVehicleCompletionLight")
+                self.assertTrue(duty_completion_light.property("visible"))
+                self.assertTrue(vehicle_completion_light.property("visible"))
+                self.assertEqual((duty_completion_light.width(), duty_completion_light.height()), (10, 10))
+                duty_light_position = duty_completion_light.mapToItem(
+                    duty_quick_button,
+                    QPointF(0, 0),
+                )
+                self.assertLess(duty_light_position.y(), 0)
+                self.assertGreater(
+                    duty_light_position.x() + duty_completion_light.width(),
+                    duty_quick_button.width(),
+                )
                 controller.sessionController.errorOccurred.emit("驗收錯誤訊息")
                 QTest.qWait(50)
                 self.assertEqual(
@@ -13685,6 +13886,11 @@ if return_code != 0 or loaded:
                     and root.width() == 964,
                     "勤務表完成後側邊面板不應收合",
                 )
+                self.assertEqual(daily_completion_label.property("text"), "已完成 1 / 2")
+                self.assertFalse(duty_quick_button.property("statusLightOn"))
+                self.assertTrue(daily_vehicle_quick_button.property("statusLightOn"))
+                self.assertFalse(wait_for("quickDutySheetCompletionLight").property("visible"))
+                self.assertTrue(wait_for("quickDailyVehicleCompletionLight").property("visible"))
 
                 click(wait_for("quickRestTimeToolButton"))
                 rest_run_button = wait_for("restTimeRunButton")
@@ -13780,6 +13986,11 @@ if return_code != 0 or loaded:
                     and root.width() == 964,
                     "車輛保養完成後側邊面板不應收合",
                 )
+                self.assertEqual(daily_completion_label.property("text"), "已完成 2 / 2")
+                self.assertFalse(duty_quick_button.property("statusLightOn"))
+                self.assertFalse(daily_vehicle_quick_button.property("statusLightOn"))
+                self.assertFalse(wait_for("quickDutySheetCompletionLight").property("visible"))
+                self.assertFalse(wait_for("quickDailyVehicleCompletionLight").property("visible"))
 
                 click(wait_for("quickRescueVideoToolButton"))
                 wait_until(
@@ -13820,7 +14031,7 @@ if return_code != 0 or loaded:
                 self.assertEqual(rescue_vehicle_combo.width(), 112)
                 self.assertEqual(rescue_date_field.width(), 140)
                 self.assertEqual(rescue_title_label.property("font").pixelSize(), 24)
-                self.assertEqual(rescue_window_title.property("text"), "SinpoSmart - 行車紀錄器")
+                self.assertEqual(rescue_window_title.property("text"), "SinpoSmart - 救護行車紀錄器")
                 self.assertEqual(rescue_result_title.property("font").pixelSize(), 16)
                 self.assertGreater(rescue_source_card.width(), 0)
                 self.assertGreater(rescue_videos_card.width(), 0)
