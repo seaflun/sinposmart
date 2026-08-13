@@ -53,6 +53,8 @@ class DutyController(QObject):
     cachedScheduleLoaded = Signal(object)
     fireDayChanged = Signal(str)
     errorOccurred = Signal(str)
+    comparisonWarningOccurred = Signal(str)
+    comparisonWarningCleared = Signal()
 
     def __init__(
         self,
@@ -655,6 +657,32 @@ class DutyController(QObject):
             for key, indices in grouped.items()
             if key and len(indices) == 1
         }
+
+    def ui_action_key_for_request(self, request: DutySubmissionRequest) -> str:
+        """Build a UI error key only for a task that is still safe to identify."""
+
+        if not self.request_matches_current_session(request):
+            return ""
+        action_key = str(request.action_key or "").strip()
+        if not action_key:
+            actions = request.schedule_data.get("actions", [])
+            if not isinstance(actions, list) or not 0 <= request.action_index < len(actions):
+                return ""
+            action = actions[request.action_index]
+            if not isinstance(action, Mapping):
+                return ""
+            action_key = action_completion_key(action)
+        if action_key in self._unique_action_indices_by_key():
+            return action_key
+        if request.schedule_generation != self._schedule_generation:
+            return ""
+        action_index = request.action_index
+        if (
+            not 0 <= action_index < len(self._actions)
+            or action_completion_key(self._actions[action_index]) != action_key
+        ):
+            return ""
+        return f"slot:{self._schedule_generation}:{action_index}:{action_key}"
 
     def _resolve_action_keys(self, action_keys: tuple[str, ...]) -> list[int] | None:
         indices_by_key = self._unique_action_indices_by_key()
@@ -1403,7 +1431,7 @@ class DutyController(QObject):
         completion_key: str = "",
         *,
         trigger_type: str = "recovery",
-    ) -> None:
+    ) -> bool:
         record, resolved = self._unreturned_return_queue.complete_action(
             queue_id,
             action,
@@ -1420,6 +1448,7 @@ class DutyController(QObject):
             self._publish_unreturned_return_event("pending", record, trigger_type=trigger_type)
         self._refresh_queue_action_indices()
         self._refresh_projection()
+        return action_index is not None
 
     def handle_external_return_queue_failure(
         self,
@@ -1429,7 +1458,7 @@ class DutyController(QObject):
         completion_key: str = "",
         *,
         trigger_type: str = "recovery",
-    ) -> None:
+    ) -> bool:
         record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
         action_index = self._queue_component_action_index(queue_id, action, completion_key)
         if action_index is not None and message:
@@ -1438,6 +1467,7 @@ class DutyController(QObject):
             self._publish_unreturned_return_event("pending", record, trigger_type=trigger_type)
         self._refresh_queue_action_indices()
         self._refresh_projection()
+        return action_index is not None
 
     def mark_submission_enqueued(self, action_index: int) -> None:
         if not 0 <= action_index < len(self._actions):
@@ -2138,8 +2168,11 @@ class DutyController(QObject):
         self._refresh_projection()
         self._refresh_due_tasks(force_emit=True)
         if error_code == "login_failed":
-            self.errorOccurred.emit(message)
-            self.reloginRequired.emit(message)
+            login_failure_message = (
+                f"交接預檢登入失敗，尚未執行正式交接：{message}"
+            )
+            self.errorOccurred.emit(login_failure_message)
+            self.reloginRequired.emit(login_failure_message)
 
     def _handoff_preflight_blocked_indices(self) -> set[int]:
         return {
@@ -2504,6 +2537,7 @@ class DutyController(QObject):
             or not self._capture_context_is_current(self._capture_contexts, request_id)
         ):
             return
+        self.comparisonWarningCleared.emit()
         schedule_was_ready = request_id in self._capture_schedule_ready_ids
         self._active_schedule_request = 0
         self._preview_loaded = False
@@ -2560,6 +2594,7 @@ class DutyController(QObject):
             or target != self._target_date_text
         ):
             return
+        self.comparisonWarningCleared.emit()
         payload = comparison_data if isinstance(comparison_data, Mapping) else {}
         comparisons = build_schedule_comparisons(self._schedule_data, self._actions, payload)
         comparisons.update(
@@ -2585,9 +2620,11 @@ class DutyController(QObject):
             return
         self._schedule_status = message
         self.scheduleChanged.emit()
-        self.errorOccurred.emit(message)
-        if error_code == "login_failed":
+        if error_code in {"login_failed", "comparison_login_failed"}:
+            self.errorOccurred.emit(message)
             self.reloginRequired.emit(message)
+        else:
+            self.comparisonWarningOccurred.emit(message)
 
     @Slot(int)
     def _comparison_worker_finished(self, request_id: int) -> None:
@@ -2634,10 +2671,14 @@ class DutyController(QObject):
             self.disable_auto_execution()
         self._schedule_status = message
         self.scheduleChanged.emit()
-        self.errorOccurred.emit(message)
+        is_login_failure = error_code in {"login_failed", "comparison_login_failed"}
+        if comparison_failure and not is_login_failure:
+            self.comparisonWarningOccurred.emit(message)
+        else:
+            self.errorOccurred.emit(message)
         if self._capture_publish_events.get(request_id, True):
             self.liveCaptureFailed.emit(message, error_code)
-        if error_code in {"login_failed", "comparison_login_failed"}:
+        if is_login_failure:
             self.reloginRequired.emit(message)
             return
         if comparison_failure:

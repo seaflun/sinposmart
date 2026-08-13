@@ -4581,6 +4581,11 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("window.backend.sessionController.isLoggedIn", main)
         self.assertIn("window.errorMessage.length > 0", main)
         self.assertIn('objectName: "dismissGlobalDutyErrorButton"', main)
+        self.assertIn("property string globalDutyErrorActionKey", main)
+        self.assertIn("function onDutyActionFailed(actionKey, message)", main)
+        self.assertIn("function onDutyActionRecovered(actionKey)", main)
+        self.assertNotIn("target: window.backend.dutyExecutionController", main)
+        self.assertIn('objectName: "globalDutyWarningBar"', main)
         self.assertIn("Accessible.role: Accessible.AlertMessage", main)
         self.assertIn("function activateRow(clearFocusOnDeselect)", task_area)
         self.assertIn("Keys.onSpacePressed", task_area)
@@ -6793,6 +6798,7 @@ class QtShellTests(unittest.TestCase):
         controller._capture_targets[1] = target_date
         controller._capture_contexts[1] = (1, "user10", "")
         error_spy = QSignalSpy(controller.errorOccurred)
+        warning_spy = QSignalSpy(controller.comparisonWarningOccurred)
 
         controller._capture_schedule_ready(
             1,
@@ -6821,7 +6827,8 @@ class QtShellTests(unittest.TestCase):
         )
 
         self.assertTrue(controller._auto_execution_enabled)
-        self.assertEqual(error_spy.count(), 1)
+        self.assertEqual(error_spy.count(), 0)
+        self.assertEqual(warning_spy.count(), 1)
         self.assertEqual(controller.targetDateText, target_date)
 
     def test_duty_refresh_state_stays_busy_until_worker_cleanup(self) -> None:
@@ -9544,6 +9551,8 @@ if return_code != 0 or loaded:
             controller.shutdown()
 
     def test_stale_submission_result_keeps_new_schedule_clean_and_uses_original_actor_event(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
         from qt_app.controllers.app_controller import AppController
 
@@ -9580,6 +9589,7 @@ if return_code != 0 or loaded:
         )
         controller = AppController(read_only_acceptance=True)
         events: list[tuple[str, dict[str, object]]] = []
+        recovered_spy = QSignalSpy(controller.dutyActionRecovered)
         controller._send_operational_event = (
             lambda record_type, **fields: events.append((record_type, fields))
         )
@@ -9607,6 +9617,7 @@ if return_code != 0 or loaded:
             controller._submission_finished(request, result)
 
             self.assertEqual(controller.dutyController._executed_indices, set())
+            self.assertEqual(recovered_spy.count(), 0)
             self.assertEqual(len(events), 1)
             record_type, fields = events[0]
             self.assertEqual(record_type, "action_result")
@@ -10639,6 +10650,10 @@ if return_code != 0 or loaded:
             [0],
             submit_at=datetime(2026, 8, 10, 10, 0),
         )[0]
+        self.assertEqual(
+            controller.ui_action_key_for_request(request),
+            f"slot:{controller.schedule_generation}:0:{request.action_key}",
+        )
         controller.mark_submission_enqueued(0)
 
         applied = controller.handle_submission_request_result(
@@ -12201,6 +12216,278 @@ if return_code != 0 or loaded:
         self.assertEqual(actual_actions[0]["fields"]["系統寫入時間"], "10:00")
         self.assertEqual(actual_actions[1]["fields"]["系統寫入時間"], "10:00")
         self.assertEqual(actual_actions[2]["fields"]["工作時間"], "10:00")
+
+    def test_handoff_preflight_login_failure_states_formal_handoff_not_started(self) -> None:
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.duty_task_projection import action_completion_key
+        from qt_app.controllers.duty_controller import DutyController
+
+        action = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "handoff",
+            "duplicate_key": "handoff:preflight-login-failure",
+            "fields": {"status": "incoming"},
+        }
+        controller = DutyController()
+        controller.set_session_context(1, "user10")
+        controller.set_actor_no("10")
+        controller.replace_schedule_data({"target_date": "1150813", "actions": [action]})
+        completion_key = action_completion_key(action)
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {
+                "target_date": "1150813",
+                "actions": [{**action, "kind": "handoff_preflight"}],
+                "_handoff_preflight_group_id": "preflight-login-failure",
+                "_handoff_preflight_component_key": completion_key,
+            },
+            session_generation=1,
+            schedule_generation=controller.schedule_generation,
+            action_key=completion_key,
+            session_actor_no="10",
+        )
+        controller._handoff_preflight_groups["preflight-login-failure"] = {
+            "indices": (0,),
+            "action_keys": (completion_key,),
+            "actions": [dict(action)],
+            "pending_keys": {completion_key},
+            "paused": False,
+            "queue_id": "",
+            "bridge": {},
+        }
+        error_spy = QSignalSpy(controller.errorOccurred)
+        relogin_spy = QSignalSpy(controller.reloginRequired)
+
+        controller.handle_handoff_preflight_failure(
+            request,
+            "勤務系統登入已失效",
+            "login_failed",
+        )
+
+        self.assertEqual(error_spy.count(), 1)
+        self.assertIn("交接預檢登入失敗", error_spy.at(0)[0])
+        self.assertIn("尚未執行正式交接", error_spy.at(0)[0])
+        self.assertEqual(relogin_spy.count(), 1)
+        self.assertIn("交接預檢登入失敗", relogin_spy.at(0)[0])
+        self.assertIn("尚未執行正式交接", relogin_spy.at(0)[0])
+        self.assertIn("勤務系統登入已失效", relogin_spy.at(0)[0])
+        self.assertIn(0, controller._retry_after)
+
+    def test_qml_global_duty_error_respects_submission_lifecycle(self) -> None:
+        from PySide6.QtCore import QObject
+        from PySide6.QtTest import QTest
+
+        from app_core.credential_repository import CredentialRepository
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        action_a = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "handoff",
+            "duplicate_key": "handoff:lifecycle:a",
+            "fields": {"status": "incoming"},
+        }
+        action_b = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "handoff",
+            "duplicate_key": "handoff:lifecycle:b",
+            "fields": {"status": "work"},
+        }
+        action_c = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "source": "handoff",
+            "duplicate_key": "handoff:lifecycle:c",
+            "fields": {"status": "duplicate"},
+        }
+        schedule_data = {"target_date": "1150813", "actions": [action_a, action_b, action_c]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved_login.json", "SinpoSmart", None),
+                credential_sync_service=SimpleNamespace(enabled=False),
+                read_only_acceptance=True,
+            )
+            controller.dutyController.load_current_schedule = lambda: None
+            controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+            controller.trayController.notify = lambda *_args, **_kwargs: None
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+
+            try:
+                attempt_id = controller._session_state.begin_login()
+                self.assertTrue(
+                    controller._session_state.complete_login(
+                        attempt_id,
+                        LoginSession("10", "user10", "secret", verified=True),
+                    )
+                )
+                controller.sessionController.sessionChanged.emit()
+                QTest.qWait(25)
+                controller.dutyController.replace_schedule_data(schedule_data)
+
+                def submission_request(index: int) -> DutySubmissionRequest:
+                    action = schedule_data["actions"][index]
+                    return DutySubmissionRequest(
+                        "user10",
+                        "secret",
+                        index,
+                        schedule_data,
+                        session_generation=controller._session_state.generation,
+                        schedule_generation=controller.dutyController._schedule_generation,
+                        action_key=action_completion_key(action),
+                        session_actor_no="10",
+                    )
+
+                request_a = submission_request(0)
+                request_b = submission_request(1)
+                request_c = submission_request(2)
+                error_bar = root.findChild(QObject, "globalDutyErrorBar")
+                warning_bar = root.findChild(QObject, "globalDutyWarningBar")
+                self.assertIsNotNone(error_bar)
+                self.assertIsNotNone(warning_bar)
+                self.assertTrue(controller.sessionController.isLoggedIn)
+
+                preflight_data = {
+                    "target_date": schedule_data["target_date"],
+                    "actions": [{**action_a, "kind": "handoff_preflight"}],
+                    "_handoff_preflight_group_id": "lifecycle-preflight",
+                }
+                preflight_request = DutySubmissionRequest(
+                    "user10",
+                    "secret",
+                    0,
+                    preflight_data,
+                    session_generation=controller._session_state.generation,
+                    schedule_generation=controller.dutyController._schedule_generation,
+                    action_key=request_a.action_key,
+                    session_actor_no="10",
+                )
+                controller.dutyController._handoff_preflight_groups["lifecycle-preflight"] = {
+                    "indices": (0,),
+                    "action_keys": (request_a.action_key,),
+                    "actions": [dict(action_a)],
+                    "pending_keys": {request_a.action_key},
+                    "paused": False,
+                    "queue_id": "",
+                    "bridge": {},
+                }
+                controller.dutyExecutionController.actionFailed.emit(0, "preflight timeout", "timeout")
+                controller.dutyExecutionController.submissionFailed.emit(
+                    preflight_request,
+                    "preflight timeout",
+                    "timeout",
+                    "",
+                )
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "")
+                self.assertFalse(error_bar.property("visible"))
+
+                controller.dutyExecutionController.actionFailed.emit(0, "temporary failure", "timeout")
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "")
+                controller.dutyExecutionController.submissionFailed.emit(
+                    request_a,
+                    "temporary failure",
+                    "timeout",
+                    "",
+                )
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "temporary failure")
+                self.assertEqual(root.property("globalDutyErrorActionKey"), request_a.action_key)
+                self.assertTrue(error_bar.property("visible"))
+
+                result_b = DutySubmissionResult(
+                    1,
+                    "submitted",
+                    "B submitted",
+                    Path("result_b.json"),
+                    {},
+                    action_b,
+                )
+                controller.dutyExecutionController.actionFinished.emit(1, "submitted", "B submitted", "result_b.json")
+                controller.dutyExecutionController.submissionFinished.emit(request_b, result_b)
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "temporary failure")
+
+                result_a = DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "A submitted",
+                    Path("result_a.json"),
+                    {},
+                    action_a,
+                )
+                controller.dutyExecutionController.actionFinished.emit(0, "submitted", "A submitted", "result_a.json")
+                controller.dutyExecutionController.submissionFinished.emit(request_a, result_a)
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "")
+                self.assertEqual(root.property("globalDutyErrorActionKey"), "")
+
+                controller.dutyExecutionController.actionFailed.emit(2, "temporary failure", "timeout")
+                controller.dutyExecutionController.submissionFailed.emit(
+                    request_c,
+                    "temporary failure",
+                    "timeout",
+                    "",
+                )
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "temporary failure")
+                self.assertEqual(root.property("globalDutyErrorActionKey"), request_c.action_key)
+                result_c_duplicate = DutySubmissionResult(
+                    2,
+                    "skipped_duplicate",
+                    "already submitted",
+                    Path("result_c_duplicate.json"),
+                    {},
+                    action_c,
+                )
+                controller.dutyExecutionController.actionFinished.emit(
+                    2,
+                    "skipped_duplicate",
+                    "already submitted",
+                    "result_c_duplicate.json",
+                )
+                controller.dutyExecutionController.submissionFinished.emit(request_c, result_c_duplicate)
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "")
+
+                controller.dutyController.comparisonWarningOccurred.emit("comparison still usable")
+                QTest.qWait(25)
+                self.assertEqual(root.property("warningMessage"), "comparison still usable")
+                self.assertTrue(warning_bar.property("visible"))
+                self.assertFalse(error_bar.property("visible"))
+                controller.dutyController.comparisonWarningCleared.emit()
+                QTest.qWait(25)
+                self.assertEqual(root.property("warningMessage"), "")
+
+                controller.dutyController.errorOccurred.emit("generic schedule error")
+                QTest.qWait(25)
+                controller.dutyExecutionController.actionFinished.emit(0, "submitted", "A submitted", "result_a.json")
+                controller.dutyExecutionController.submissionFinished.emit(request_a, result_a)
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "generic schedule error")
+            finally:
+                root.close()
+                controller.shutdown()
 
     def test_qml_logged_out_account_manager_opens_as_legacy_window(self) -> None:
         from PySide6.QtCore import QObject, QPointF, Qt

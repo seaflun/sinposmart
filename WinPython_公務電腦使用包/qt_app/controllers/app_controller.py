@@ -55,6 +55,8 @@ class AppController(QObject):
     diagnosticsChanged = Signal()
     diagnosticsStatusRequested = Signal(str)
     nativeTitleBarRequested = Signal(QObject)
+    dutyActionFailed = Signal(str, str)
+    dutyActionRecovered = Signal(str)
 
     def __init__(
         self,
@@ -1075,6 +1077,11 @@ class AppController(QObject):
             return dict(actions[request.action_index])
         return {}
 
+    def _submission_ui_action_key(self, request: DutySubmissionRequest) -> str:
+        """Return a key only when it still names one current task in the UI."""
+
+        return self._duty_controller.ui_action_key_for_request(request)
+
     @staticmethod
     def _submission_staff(request: DutySubmissionRequest) -> dict[str, dict]:
         return operational_staff_from_schedule(request.schedule_data)
@@ -1310,6 +1317,7 @@ class AppController(QObject):
         queue_id = self._external_return_queue_id(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
         request_is_current = self._duty_controller.request_matches_current_session(request)
+        result_applied = False
         if is_handoff_preflight and request_is_current:
             if result.status == "paused_external":
                 self._duty_controller.handle_handoff_preflight_paused(request)
@@ -1327,7 +1335,7 @@ class AppController(QObject):
             component_key = str(
                 request.schedule_data.get("_unreturned_return_component_key", "") or ""
             )
-            self._duty_controller.handle_external_return_queue_result(
+            result_applied = self._duty_controller.handle_external_return_queue_result(
                 queue_id,
                 action,
                 result.status,
@@ -1335,13 +1343,21 @@ class AppController(QObject):
                 trigger_type=request.trigger_type,
             )
         elif not is_handoff_preflight and not queue_id:
-            self._duty_controller.handle_submission_request_result(
+            result_applied = self._duty_controller.handle_submission_request_result(
                 request,
                 result.status,
                 result.message,
                 str(result.result_path),
             )
         action = self._submission_action(request, result)
+        if (
+            not is_handoff_preflight
+            and result_applied
+            and result.status in {"submitted", "skipped_duplicate"}
+        ):
+            action_key = self._submission_ui_action_key(request)
+            if action_key:
+                self.dutyActionRecovered.emit(action_key)
         if not is_handoff_preflight:
             self._send_operational_event(
                 "action_result",
@@ -1379,13 +1395,14 @@ class AppController(QObject):
         action = self._submission_action(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
         request_is_current = self._duty_controller.request_matches_current_session(request)
+        failure_applied = False
         if is_handoff_preflight and request_is_current:
             self._duty_controller.handle_handoff_preflight_failure(request, message, error_code)
         elif queue_id and request_is_current:
             component_key = str(
                 request.schedule_data.get("_unreturned_return_component_key", "") or ""
             )
-            self._duty_controller.handle_external_return_queue_failure(
+            failure_applied = self._duty_controller.handle_external_return_queue_failure(
                 queue_id,
                 action,
                 message,
@@ -1404,6 +1421,10 @@ class AppController(QObject):
             if not failure_applied and request_is_current and error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()
                 self._force_logout(message)
+        if not is_handoff_preflight and failure_applied:
+            action_key = self._submission_ui_action_key(request)
+            if action_key:
+                self.dutyActionFailed.emit(action_key, str(message or "").strip())
         if not is_handoff_preflight:
             self._send_operational_event(
                 "action_result",

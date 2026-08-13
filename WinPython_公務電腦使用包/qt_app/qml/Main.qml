@@ -55,6 +55,8 @@ ApplicationWindow {
     property var activeToolSidePanel: null
     property string auditDetailText: ""
     property string errorMessage: ""
+    property string globalDutyErrorActionKey: ""
+    property string warningMessage: ""
     property bool lastHandledLoginState: false
     // qmllint disable unqualified
     readonly property var backend: appController
@@ -86,6 +88,7 @@ ApplicationWindow {
 
     function showAppError(message) {
         const normalized = String(message || "").trim()
+        window.globalDutyErrorActionKey = ""
         if (!window.backend.sessionController.isLoggedIn) {
             window.errorMessage = ""
             return
@@ -98,7 +101,31 @@ ApplicationWindow {
         const normalized = String(message || "").trim()
         if (!window.backend.sessionController.isLoggedIn || normalized.length === 0)
             return
+        window.globalDutyErrorActionKey = ""
         window.errorMessage = normalized
+    }
+
+    function showDutyActionError(actionKey, message) {
+        const normalized = String(message || "").trim()
+        if (!window.backend.sessionController.isLoggedIn || normalized.length === 0)
+            return
+        window.globalDutyErrorActionKey = String(actionKey || "").trim()
+        window.errorMessage = normalized
+    }
+
+    function clearDutyActionError(actionKey) {
+        const normalizedKey = String(actionKey || "").trim()
+        if (normalizedKey.length === 0 || window.globalDutyErrorActionKey !== normalizedKey)
+            return
+        window.errorMessage = ""
+        window.globalDutyErrorActionKey = ""
+    }
+
+    function showDutyWarning(message) {
+        const normalized = String(message || "").trim()
+        if (!window.backend.sessionController.isLoggedIn || normalized.length === 0)
+            return
+        window.warningMessage = normalized
     }
 
     function shiftSlashDate(value, days) {
@@ -212,6 +239,8 @@ ApplicationWindow {
 
             window.lastHandledLoginState = isLoggedIn
             window.errorMessage = ""
+            window.globalDutyErrorActionKey = ""
+            window.warningMessage = ""
             if (isLoggedIn)
                 sessionHeader.passwordText = ""
             else {
@@ -272,13 +301,13 @@ ApplicationWindow {
         function onErrorOccurred(message) {
             window.showDutyStatusError(message)
         }
-    }
 
-    Connections {
-        target: window.backend.dutyExecutionController
+        function onComparisonWarningOccurred(message) {
+            window.showDutyWarning(message)
+        }
 
-        function onActionFailed(_index, message, _errorCode) {
-            window.showDutyStatusError(message)
+        function onComparisonWarningCleared() {
+            window.warningMessage = ""
         }
     }
 
@@ -303,6 +332,14 @@ ApplicationWindow {
 
         function onDiagnosticsStatusRequested(message) {
             actionConfirmations.openDiagnosticsStatus(message)
+        }
+
+        function onDutyActionFailed(actionKey, message) {
+            window.showDutyActionError(actionKey, message)
+        }
+
+        function onDutyActionRecovered(actionKey) {
+            window.clearDutyActionError(actionKey)
         }
     }
 
@@ -735,7 +772,72 @@ ApplicationWindow {
                     showFocusRing: true
                     focusPolicy: Qt.TabFocus
                     Accessible.name: "關閉錯誤訊息"
-                    onClicked: window.errorMessage = ""
+                    onClicked: {
+                        window.errorMessage = ""
+                        window.globalDutyErrorActionKey = ""
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            id: globalDutyWarningBar
+            objectName: "globalDutyWarningBar"
+            visible: modeTabs.currentIndex === 0
+                     && window.backend.sessionController.isLoggedIn
+                     && window.warningMessage.length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? 44 : 0
+            Layout.minimumHeight: Layout.preferredHeight
+            Layout.maximumHeight: Layout.preferredHeight
+            radius: Design.radiusSmall
+            color: Design.warningSurface
+            border.width: Design.borderWidth
+            border.color: Design.warningBorder
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: window.warningMessage
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 8
+                spacing: 8
+
+                Label {
+                    id: globalDutyWarningText
+                    objectName: "globalDutyWarningText"
+                    Layout.fillWidth: true
+                    text: window.warningMessage
+                    color: Design.warningStrong
+                    font.pixelSize: Design.controlSize
+                    font.bold: true
+                    elide: Text.ElideRight
+                    wrapMode: Text.NoWrap
+                    verticalAlignment: Text.AlignVCenter
+                    activeFocusOnTab: truncated
+                    Accessible.name: text
+
+                    HoverHandler {
+                        id: globalDutyWarningHover
+                    }
+
+                    ToolTip.visible: globalDutyWarningText.truncated
+                                         && (globalDutyWarningHover.hovered || globalDutyWarningText.activeFocus)
+                    ToolTip.text: globalDutyWarningText.text
+                    ToolTip.delay: 400
+                    ToolTip.timeout: 10000
+                }
+
+                AppleButton {
+                    objectName: "dismissGlobalDutyWarningButton"
+                    implicitWidth: 58
+                    implicitHeight: 30
+                    text: "關閉"
+                    tone: "warning"
+                    showFocusRing: true
+                    focusPolicy: Qt.TabFocus
+                    Accessible.name: "關閉勤務資料警示"
+                    onClicked: window.warningMessage = ""
                 }
             }
         }
