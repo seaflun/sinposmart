@@ -1244,6 +1244,7 @@ class DutyController(QObject):
                     schedule_data.update(record.get("schedule_context", {}))
                 schedule_data["target_date"] = target_date
                 schedule_data["actions"] = [preflight]
+                schedule_data["_unreturned_return_query_start_at"] = self._unreturned_query_start_at(record)
                 action_index = 0
             else:
                 schedule_actions = [dict(action) for action in self._actions]
@@ -1483,6 +1484,7 @@ class DutyController(QObject):
         status: str,
         message: str,
         _result_path: str,
+        comparison: Mapping[str, Any] | None = None,
     ) -> None:
         self._submitting_indices.discard(action_index)
         if not 0 <= action_index < len(self._actions):
@@ -1501,10 +1503,16 @@ class DutyController(QObject):
             self._blocked_indices.add(action_index)
             self._comparisons[action_index] = {"compare": "人工確認", "group": "review", "matched": []}
         elif status == "paused_external":
+            unreturned_entry_at = (
+                str(comparison.get("unreturned_entry_at") or "").strip()
+                if isinstance(comparison, Mapping)
+                else ""
+            )
             record, created = self._unreturned_return_queue.pause(
                 self._actions[action_index],
                 self._schedule_data,
                 owner_actor_no=self._actor_no,
+                unreturned_entry_at=unreturned_entry_at,
             )
             self._external_return_queue_ids_by_action_index[action_index] = str(record["queue_id"])
             self._retry_after[action_index] = datetime.now() + timedelta(minutes=5)
@@ -1539,11 +1547,12 @@ class DutyController(QObject):
         status: str,
         message: str,
         result_path: str,
+        comparison: Mapping[str, Any] | None = None,
     ) -> bool:
         action_index = self._resolve_request_action_index(request)
         if action_index is None:
             return False
-        self.handle_submission_result(action_index, status, message, result_path)
+        self.handle_submission_result(action_index, status, message, result_path, comparison)
         return True
 
     def handle_submission_request_failure(
@@ -1992,6 +2001,7 @@ class DutyController(QObject):
             schedule_data["actions"] = [action]
             schedule_data["_unreturned_return_queue_id"] = queue_id
             schedule_data["_unreturned_return_component_key"] = action_completion_key(original_action)
+            schedule_data["_unreturned_return_query_start_at"] = self._unreturned_query_start_at(record)
             requests.append(
                 self._submission_request(
                     user_id,
@@ -2003,6 +2013,24 @@ class DutyController(QObject):
                 )
             )
         return requests
+
+    @staticmethod
+    def _unreturned_query_start_at(record: Mapping[str, Any]) -> str:
+        saved_entry_at = str(record.get("unreturned_entry_at") or "").strip()
+        if saved_entry_at:
+            return saved_entry_at
+        source_target_date = str(record.get("source_target_date") or "").strip()
+        if len(source_target_date) != 7 or not source_target_date.isdigit():
+            return ""
+        try:
+            source_at = datetime(
+                int(source_target_date[:3]) + 1911,
+                int(source_target_date[3:5]),
+                int(source_target_date[5:7]),
+            )
+        except ValueError:
+            return ""
+        return source_at.isoformat(timespec="seconds")
 
     def handoff_group_submission_requests(
         self,
@@ -2107,7 +2135,11 @@ class DutyController(QObject):
         if self._handoff_preflight_groups.pop(group_id, None) is not None:
             self._refresh_due_tasks(force_emit=True)
 
-    def handle_handoff_preflight_paused(self, request: DutySubmissionRequest) -> None:
+    def handle_handoff_preflight_paused(
+        self,
+        request: DutySubmissionRequest,
+        comparison: Mapping[str, Any] | None = None,
+    ) -> None:
         if not self.request_matches_current_session(request):
             return
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
@@ -2120,6 +2152,11 @@ class DutyController(QObject):
             self._submitting_indices.discard(source_index)
         state["paused"] = True
         queue_id = str(state.get("queue_id") or "")
+        unreturned_entry_at = (
+            str(comparison.get("unreturned_entry_at") or "").strip()
+            if isinstance(comparison, Mapping)
+            else ""
+        )
         if queue_id:
             record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
         else:
@@ -2127,6 +2164,7 @@ class DutyController(QObject):
                 state.get("actions", []),
                 self._schedule_data,
                 owner_actor_no=self._actor_no,
+                unreturned_entry_at=unreturned_entry_at,
             )
             queue_id = str(record.get("queue_id") or "")
             if created:

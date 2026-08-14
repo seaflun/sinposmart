@@ -19,7 +19,11 @@ from app_core.duty_task_projection import (
     compare_submission_action,
 )
 from app_core.schedule_repository import business_roc_date
-from compare_rehearsal_records import flatten_rows, has_open_external_assignment
+from compare_rehearsal_records import (
+    find_open_external_assignment,
+    flatten_rows,
+    has_open_external_assignment,
+)
 
 
 class DutySubmissionValidationError(ValueError):
@@ -206,18 +210,39 @@ class DutySubmissionService:
             actions[request.action_index] = action
             comparison_source = dict(data)
             comparison_source["actions"] = actions
+            query_range = self._query_range(request)
             if status_callback:
                 status_callback("正在進行送出前防重複檢查…")
-            before = self._query_comparison(automation, driver, action, action_date)
+            before = self._query_comparison(
+                automation,
+                driver,
+                action,
+                action_date,
+                query_range=query_range,
+            )
             staff = self._staff(comparison_source)
-            if self._should_pause_for_open_assignment(action, action_date, before, staff, request):
+            pause_details = self._open_assignment_pause_details(
+                action,
+                action_date,
+                before,
+                staff,
+                request,
+                query_range=query_range,
+            )
+            if pause_details is not None:
+                pause_comparison = {
+                    "compare": "未返隊，暫停登打",
+                    "group": "paused",
+                    "matched": [],
+                    **pause_details,
+                }
                 return self._finish(
                     request,
                     action,
                     result_path,
                     "paused_external",
                     "人員尚未返隊，已暫停退勤登打。",
-                    {"compare": "未返隊，暫停登打", "group": "paused", "matched": []},
+                    pause_comparison,
                 )
             if action.get("kind") == "handoff_preflight":
                 return self._finish(
@@ -314,7 +339,13 @@ class DutySubmissionService:
                 status_callback("正在回查送出結果…")
             verified = {"group": "todo", "matched": []}
             for attempt in range(3):
-                after = self._query_comparison(automation, driver, action, action_date)
+                after = self._query_comparison(
+                    automation,
+                    driver,
+                    action,
+                    action_date,
+                    query_range=query_range,
+                )
                 verified = self._submission_comparison_for_action(
                     comparison_source,
                     actions,
@@ -497,6 +528,74 @@ class DutySubmissionService:
                 return latest_mapping
         return action
 
+    def _open_assignment_pause_details(
+        self,
+        action: Mapping[str, Any],
+        action_date: str,
+        comparison_data: Mapping[str, Any],
+        staff: Mapping[str, Mapping[str, Any]],
+        request: DutySubmissionRequest,
+        *,
+        query_range: Mapping[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        if request.trigger_type not in ("due", "recovery"):
+            return None
+        fields = action.get("fields", {})
+        if not isinstance(fields, Mapping):
+            return None
+        if action.get("kind") == "handoff_preflight":
+            pass
+        elif action.get("kind") == "entry_log" and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤"):
+            pass
+        else:
+            return None
+        now = self.now_factory()
+        current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
+        query_start_date = (
+            str(query_range.get("start_roc_date") or "") or None
+            if query_range
+            else None
+        )
+        query_end_date = (
+            str(query_range.get("end_roc_date") or "") or None
+            if query_range
+            else None
+        )
+        rows = flatten_rows(
+            comparison_data.get("visible_entry_rows", []) or [],
+            action_date,
+            start_date=query_start_date,
+            end_date=query_end_date,
+        )
+        checker_kwargs: dict[str, Any] = {"current_minute": current_minute}
+        if self.open_assignment_checker is has_open_external_assignment:
+            checker_kwargs.update(
+                {
+                    "current_at": now if query_range else None,
+                    "start_at": query_range.get("start_at") if query_range else None,
+                    "end_at": query_range.get("end_at") if query_range else None,
+                }
+            )
+        if not self.open_assignment_checker(
+            rows,
+            action_date,
+            staff,
+            action,
+            **checker_kwargs,
+        ):
+            return None
+        entry_at = find_open_external_assignment(
+            rows,
+            action_date,
+            staff,
+            action,
+            current_minute=current_minute,
+            current_at=now if query_range or current_minute is not None else None,
+            start_at=query_range.get("start_at") if query_range else None,
+            end_at=query_range.get("end_at") if query_range else None,
+        )
+        return {"unreturned_entry_at": entry_at} if entry_at else {}
+
     def _should_pause_for_open_assignment(
         self,
         action: Mapping[str, Any],
@@ -504,29 +603,19 @@ class DutySubmissionService:
         comparison_data: Mapping[str, Any],
         staff: Mapping[str, Mapping[str, Any]],
         request: DutySubmissionRequest,
+        *,
+        query_range: Mapping[str, Any] | None = None,
     ) -> bool:
-        if request.trigger_type not in ("due", "recovery"):
-            return False
-        fields = action.get("fields", {})
-        if not isinstance(fields, Mapping):
-            return False
-        if action.get("kind") == "handoff_preflight":
-            pass
-        elif action.get("kind") == "entry_log" and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤"):
-            pass
-        else:
-            return False
-        now = self.now_factory()
-        current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
-        rows = flatten_rows(comparison_data.get("visible_entry_rows", []) or [], action_date)
-        return bool(
-            self.open_assignment_checker(
-                rows,
-                action_date,
-                staff,
+        return (
+            self._open_assignment_pause_details(
                 action,
-                current_minute=current_minute,
+                action_date,
+                comparison_data,
+                staff,
+                request,
+                query_range=query_range,
             )
+            is not None
         )
 
     @staticmethod
@@ -571,17 +660,59 @@ class DutySubmissionService:
     def _roc_date(value: date) -> str:
         return f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}"
 
+    def _query_range(self, request: DutySubmissionRequest) -> dict[str, Any] | None:
+        raw_start = str(request.schedule_data.get("_unreturned_return_query_start_at", "") or "").strip()
+        if not raw_start:
+            return None
+        try:
+            start_at = datetime.fromisoformat(raw_start)
+        except ValueError:
+            return None
+        now = self.now_factory()
+        if start_at > now:
+            return None
+        return {
+            "start_at": start_at,
+            "start_roc_date": self._roc_date(start_at.date()),
+            "start_time": start_at.strftime("%H:%M"),
+            "end_at": now,
+            "end_roc_date": self._roc_date(now.date()),
+            "end_time": now.strftime("%H:%M"),
+        }
+
     @staticmethod
     def _query_comparison(
         automation: ModuleType,
         driver: object,
         action: Mapping[str, Any],
         action_date: str,
+        *,
+        query_range: Mapping[str, Any] | None = None,
     ) -> dict[str, list[Any]]:
+        query_kwargs = (
+            {
+                "start_roc_date": query_range["start_roc_date"],
+                "start_time": query_range["start_time"],
+                "end_roc_date": query_range["end_roc_date"],
+                "end_time": query_range["end_time"],
+            }
+            if query_range
+            else {}
+        )
         if action.get("kind") in ("entry_log", "handoff_preflight"):
-            rows = automation.query_visible_table(driver, automation.ENTRY_LOG_AP, action_date)
+            rows = automation.query_visible_table(
+                driver,
+                automation.ENTRY_LOG_AP,
+                action_date,
+                **query_kwargs,
+            )
             return {"visible_entry_rows": rows, "visible_work_rows": []}
-        rows = automation.query_visible_table(driver, automation.WORK_LOG_AP, action_date)
+        rows = automation.query_visible_table(
+            driver,
+            automation.WORK_LOG_AP,
+            action_date,
+            **query_kwargs,
+        )
         return {"visible_entry_rows": [], "visible_work_rows": rows}
 
     def _comparison_for_action(

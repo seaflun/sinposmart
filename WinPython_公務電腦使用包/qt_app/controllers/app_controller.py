@@ -1321,7 +1321,10 @@ class AppController(QObject):
         result_applied = False
         if is_handoff_preflight and request_is_current:
             if result.status == "paused_external":
-                self._duty_controller.handle_handoff_preflight_paused(request)
+                self._duty_controller.handle_handoff_preflight_paused(
+                    request,
+                    result.comparison,
+                )
             elif result.status == "handoff_preflight_ready":
                 if self._duty_controller.handle_handoff_preflight_ready(request):
                     self._enqueue_handoff_group_after_preflight(request)
@@ -1349,6 +1352,7 @@ class AppController(QObject):
                 result.status,
                 result.message,
                 str(result.result_path),
+                result.comparison,
             )
         action = self._submission_action(request, result)
         if (

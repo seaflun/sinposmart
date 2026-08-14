@@ -1799,25 +1799,75 @@ def wait_for_query_completion(driver: webdriver.Chrome, expected_page: str = "")
     WebDriverWait(driver, 8, poll_frequency=0.25).until(query_completed)
 
 
-def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date: str) -> list[list[str]]:
+def _query_datetime(roc_date: str, time_value: str) -> datetime | None:
+    try:
+        hour, minute = [int(part) for part in str(time_value).split(":", 1)]
+        return datetime(
+            int(roc_date[:3]) + 1911,
+            int(roc_date[3:5]),
+            int(roc_date[5:7]),
+            hour,
+            minute,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_query_datetime(value: str) -> datetime | None:
+    match = re.search(
+        r"(?<!\d)(\d{3})/?(\d{2})/?(\d{2})(?:[ \t]*\n[ \t]*|[ \t]+)(\d{1,2}):(\d{2})",
+        value,
+    )
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group(1)) + 1911,
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+            int(match.group(5)),
+        )
+    except ValueError:
+        return None
+
+
+def query_visible_table(
+    driver: webdriver.Chrome,
+    ap_name: str,
+    target_roc_date: str,
+    *,
+    start_roc_date: str | None = None,
+    start_time: str = "00:00",
+    end_roc_date: str | None = None,
+    end_time: str = "23:59",
+) -> list[list[str]]:
+    start_roc_date = start_roc_date or target_roc_date
+    end_roc_date = end_roc_date or target_roc_date
+    start_at = _query_datetime(start_roc_date, start_time)
+    end_at = _query_datetime(end_roc_date, end_time)
+    if start_at is None or end_at is None or start_at > end_at:
+        start_roc_date = target_roc_date
+        end_roc_date = target_roc_date
+        start_time = "00:00"
+        end_time = "23:59"
+        start_at = _query_datetime(start_roc_date, start_time)
+        end_at = _query_datetime(end_roc_date, end_time)
+    start_hour, start_minute = [f"{int(part):02d}" for part in start_time.split(":", 1)]
+    end_hour, end_minute = [f"{int(part):02d}" for part in end_time.split(":", 1)]
     open_ap(driver, ap_name)
     time.sleep(1)
     suppress_window_open_for_background_query(driver)
-    for field_id in (
-        "_txtSDATE",
-        "_txtEDATE",
-        "_txtDate",
-        "_txtTaskDate",
-        "_txtSdate",
-        "_txtEDate",
-        "_txtSDate",
-        "_txtEndDate",
-    ):
+    for field_id in ("_txtSDATE", "_txtSdate", "_txtSDate"):
+        js_set(driver, field_id, start_roc_date)
+    for field_id in ("_txtEDATE", "_txtEDate", "_txtEndDate"):
+        js_set(driver, field_id, end_roc_date)
+    for field_id in ("_txtDate", "_txtTaskDate"):
         js_set(driver, field_id, target_roc_date)
-    js_set(driver, "_selSTIMEH", "00")
-    js_set(driver, "_selSTIMEM", "00")
-    js_set(driver, "_selETIMEH", "23")
-    js_set(driver, "_selETIMEM", "59")
+    js_set(driver, "_selSTIMEH", start_hour)
+    js_set(driver, "_selSTIMEM", start_minute)
+    js_set(driver, "_selETIMEH", end_hour)
+    js_set(driver, "_selETIMEM", end_minute)
     js_set(driver, "_selQDept", "033006")
     js_set(driver, "_selDeptno", "033006")
     js_set(driver, "_txtPageNum", "200")
@@ -1832,21 +1882,24 @@ def query_visible_table(driver: webdriver.Chrome, ap_name: str, target_roc_date:
         ).filter(row => row.length);
         """
     )
-    roc_slash = f"{target_roc_date[:3]}/{target_roc_date[3:5]}/{target_roc_date[5:7]}"
-    date_pattern = re.compile(rf"^(?:{re.escape(target_roc_date)}|{re.escape(roc_slash)})\s*\n?\d{{1,2}}:\d{{2}}")
+    def row_in_query_range(row: list[str]) -> bool:
+        if not row or start_at is None or end_at is None:
+            return False
+        row_at = _row_query_datetime(str(row[0]))
+        return row_at is not None and start_at <= row_at <= end_at
 
     if ap_name == WORK_LOG_AP:
-        return [row for row in raw_rows if len(row) >= 8 and date_pattern.match(str(row[0]))]
+        return [row for row in raw_rows if len(row) >= 8 and row_in_query_range(row)]
 
     rows: list[list[str]] = []
     index = 0
     while index < len(raw_rows):
         row = raw_rows[index]
-        if len(row) >= 6 and date_pattern.match(str(row[0])):
+        if len(row) >= 6 and row_in_query_range(row):
             combined = list(row)
             if index + 1 < len(raw_rows):
                 next_row = raw_rows[index + 1]
-                if next_row and not date_pattern.match(str(next_row[0])):
+                if next_row and not row_in_query_range(next_row):
                     combined.extend(next_row)
                     index += 1
             rows.append(combined)

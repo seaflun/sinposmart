@@ -63,12 +63,14 @@ class UnreturnedReturnQueue:
         *,
         owner_actor_no: str,
         now: datetime | None = None,
+        unreturned_entry_at: str = "",
     ) -> tuple[dict[str, Any], bool]:
         """Store one paused action once and return whether it was newly created."""
 
         current = now or self.now_factory()
         completion_key = action_completion_key(action)
         source_target_date = str(schedule_data.get("target_date") or "").strip()
+        normalized_entry_at = str(unreturned_entry_at or "").strip()
         existing = next(
             (
                 record
@@ -79,6 +81,9 @@ class UnreturnedReturnQueue:
             None,
         )
         if existing is not None:
+            if normalized_entry_at and not existing.get("unreturned_entry_at"):
+                existing["unreturned_entry_at"] = normalized_entry_at
+                self._write_records()
             return dict(existing), False
         queue_id = uuid4().hex
         record = {
@@ -86,6 +91,7 @@ class UnreturnedReturnQueue:
             "record_type": "single",
             "completion_key": completion_key,
             "source_target_date": source_target_date,
+            "unreturned_entry_at": normalized_entry_at,
             "action": self._json_mapping(action),
             "schedule_context": self._schedule_context(schedule_data),
             "origin_actor_no": str(owner_actor_no or "").strip(),
@@ -107,6 +113,7 @@ class UnreturnedReturnQueue:
         *,
         owner_actor_no: str,
         now: datetime | None = None,
+        unreturned_entry_at: str = "",
     ) -> tuple[dict[str, Any], bool]:
         """Store one handoff group so every related item pauses and retries together."""
 
@@ -116,6 +123,7 @@ class UnreturnedReturnQueue:
         current = now or self.now_factory()
         completion_keys = [action_completion_key(action) for action in group_actions]
         source_target_date = str(schedule_data.get("target_date") or "").strip()
+        normalized_entry_at = str(unreturned_entry_at or "").strip()
         existing = next(
             (
                 record
@@ -127,6 +135,9 @@ class UnreturnedReturnQueue:
             None,
         )
         if existing is not None:
+            if normalized_entry_at and not existing.get("unreturned_entry_at"):
+                existing["unreturned_entry_at"] = normalized_entry_at
+                self._write_records()
             return dict(existing), False
         queue_id = uuid4().hex
         record = {
@@ -136,6 +147,7 @@ class UnreturnedReturnQueue:
             "completed_keys": [],
             "completed_statuses": {},
             "source_target_date": source_target_date,
+            "unreturned_entry_at": normalized_entry_at,
             "actions": group_actions,
             "schedule_context": self._schedule_context(schedule_data),
             "origin_actor_no": str(owner_actor_no or "").strip(),

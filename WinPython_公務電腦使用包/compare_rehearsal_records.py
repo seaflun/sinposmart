@@ -33,7 +33,39 @@ def names_for(staff: dict[str, dict[str, str]], numbers: list[str]) -> list[str]
     return [staff.get(str(no), {}).get("name", "") for no in numbers]
 
 
-def flatten_rows(rows: list[list[str] | str], target_date: str) -> list[str]:
+def _row_datetime(row: str) -> datetime | None:
+    match = re.search(
+        r"(?<!\d)(\d{3})/?(\d{2})/?(\d{2})(?:[ \t]*\n[ \t]*|[ \t]+)(\d{1,2}):(\d{2})",
+        row,
+    )
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group(1)) + 1911,
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+            int(match.group(5)),
+        )
+    except ValueError:
+        return None
+
+
+def _row_roc_date(row: str) -> str:
+    row_at = _row_datetime(row)
+    if row_at is None:
+        return ""
+    return f"{row_at.year - 1911:03d}{row_at.month:02d}{row_at.day:02d}"
+
+
+def flatten_rows(
+    rows: list[list[str] | str],
+    target_date: str,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[str]:
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     date_pattern = rf"(?:{re.escape(target_date)}|{re.escape(roc_slash)})"
     out = []
@@ -43,11 +75,25 @@ def flatten_rows(rows: list[list[str] | str], target_date: str) -> list[str]:
         else:
             text = " | ".join(str(x) for x in row if str(x).strip())
         parts = [part.strip() for part in text.replace("\xa0", " ").split("|")]
-        if len(parts) >= 2 and re.fullmatch(date_pattern, parts[0]) and re.fullmatch(r"\d{1,2}:\d{2}", parts[1]):
+        if (
+            len(parts) >= 2
+            and re.fullmatch(r"(?:\d{7}|\d{3}/\d{2}/\d{2})", parts[0])
+            and re.fullmatch(r"\d{1,2}:\d{2}", parts[1])
+        ):
             text = f"{parts[0]} {parts[1]}"
             if len(parts) > 2:
                 text = f"{text} | {' | '.join(parts[2:])}"
         normalized = text.replace("\xa0", " ").strip()
+        if start_date or end_date:
+            row_date = _row_roc_date(normalized)
+            if not row_date:
+                continue
+            if start_date and row_date < start_date:
+                continue
+            if end_date and row_date > end_date:
+                continue
+            out.append(normalized)
+            continue
         if re.match(rf"^{date_pattern}\s+\d{{1,2}}:\d{{2}}", normalized):
             out.append(normalized)
         elif re.match(rf"^{date_pattern}\s*\n\d{{1,2}}:\d{{2}}", normalized):
@@ -91,11 +137,10 @@ def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool =
 
 
 def row_minutes(row: str, target_date: str) -> int | None:
-    roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
-    match = re.search(rf"(?:{re.escape(roc_slash)}|{re.escape(target_date)})\s*(?:\n|\s+)(\d{{1,2}}):(\d{{2}})", row)
-    if not match:
+    row_at = _row_datetime(row)
+    if row_at is None or _row_roc_date(row) != target_date:
         return None
-    return int(match.group(1)) * 60 + int(match.group(2))
+    return row_at.hour * 60 + row_at.minute
 
 
 def action_minutes(action: dict[str, Any]) -> int | None:
@@ -302,34 +347,84 @@ def find_work_matches(
     return matches
 
 
+def find_open_external_assignment(
+    rows: list[str],
+    target_date: str,
+    staff: dict[str, dict[str, str]],
+    action: dict[str, Any],
+    current_minute: int | None = None,
+    *,
+    current_at: datetime | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> str | None:
+    target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
+    if not target_name:
+        return None
+    if current_at is None:
+        effective_minute = current_minute if current_minute is not None else action_minutes(action)
+        if effective_minute is None:
+            return None
+        try:
+            current_at = datetime(
+                int(target_date[:3]) + 1911,
+                int(target_date[3:5]),
+                int(target_date[5:7]),
+            ) + timedelta(minutes=effective_minute)
+        except ValueError:
+            return None
+    events: list[tuple[datetime, bool]] = []
+    for row in rows:
+        if not row_has_primary_person(row, target_name):
+            continue
+        if not any(keyword in row for keyword in ("救護", "救災", "火警", "火災", "外勤")):
+            continue
+        row_at = _row_datetime(row)
+        if row_at is None:
+            continue
+        if start_at is not None and row_at < start_at:
+            continue
+        if end_at is not None and row_at > end_at:
+            continue
+        if row_at > current_at:
+            continue
+        if row_has_outin(row, "出", external_entry=True):
+            events.append((row_at, True))
+        elif row_has_outin(row, "入", external_entry=True):
+            events.append((row_at, False))
+    active_at: datetime | None = None
+    for row_at, is_active in sorted(events, key=lambda item: item[0]):
+        if is_active:
+            active_at = row_at
+        else:
+            active_at = None
+    return active_at.isoformat(timespec="minutes") if active_at is not None else None
+
+
 def has_open_external_assignment(
     rows: list[str],
     target_date: str,
     staff: dict[str, dict[str, str]],
     action: dict[str, Any],
     current_minute: int | None = None,
+    *,
+    current_at: datetime | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
 ) -> bool:
-    target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
-    effective_minute = current_minute if current_minute is not None else action_minutes(action)
-    if not target_name or effective_minute is None:
-        return False
-    active = False
-    events: list[tuple[int, bool]] = []
-    for row in rows:
-        if not row_has_primary_person(row, target_name):
-            continue
-        if not any(keyword in row for keyword in ("救護", "救災", "火警", "火災", "外勤")):
-            continue
-        row_minute = row_minutes(row, target_date)
-        if row_minute is None or row_minute > effective_minute:
-            continue
-        if row_has_outin(row, "出", external_entry=True):
-            events.append((row_minute, True))
-        elif row_has_outin(row, "入", external_entry=True):
-            events.append((row_minute, False))
-    for _, is_active in sorted(events, key=lambda item: item[0]):
-        active = is_active
-    return active
+    return (
+        find_open_external_assignment(
+            rows,
+            target_date,
+            staff,
+            action,
+            current_minute=current_minute,
+            current_at=current_at,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        is not None
+    )
 
 
 def case_keywords(category: str) -> list[str]:

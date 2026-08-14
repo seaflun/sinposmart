@@ -1871,6 +1871,67 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(checked_minutes, [555])
             self.assertEqual(fills, [])
 
+    def test_recovery_query_uses_saved_unreturned_entry_time_across_midnight(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            query_ranges: list[dict[str, str]] = []
+
+            def query_visible_table(_driver, _ap_name, _action_date, **query_range):
+                query_ranges.append(dict(query_range))
+                return [["115/08/13", "23:50", "-", "測試員", "出", "救護"]]
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: self.fail(
+                    "未返隊時不應填寫退勤表單"
+                ),
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 14, 0, 15),
+            )
+            data = {
+                "target_date": "1150814",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "00:15",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+                    }
+                ],
+                "_unreturned_return_query_start_at": "2026-08-13T23:50:00",
+            }
+
+            result = service.execute(
+                DutySubmissionRequest("user10", "secret", 0, data, trigger_type="recovery")
+            )
+
+        self.assertEqual(result.status, "paused_external")
+        self.assertEqual(
+            query_ranges,
+            [
+                {
+                    "start_roc_date": "1150813",
+                    "start_time": "23:50",
+                    "end_roc_date": "1150814",
+                    "end_time": "00:15",
+                }
+            ],
+        )
+        self.assertEqual(result.comparison["unreturned_entry_at"], "2026-08-13T23:50")
+
     def test_handoff_preflight_checks_incoming_staff_without_writing_a_form(self) -> None:
         from datetime import datetime
 
@@ -11063,7 +11124,18 @@ if return_code != 0 or loaded:
         )
         confirmation_spy = QSignalSpy(controller.externalReturnManualSubmissionConfirmationRequested)
         requested_spy = QSignalSpy(controller.externalReturnQueueManualSubmissionRequested)
-        controller.handle_submission_result(0, "paused_external", "人員尚未返隊", "")
+        controller.handle_submission_result(
+            0,
+            "paused_external",
+            "人員尚未返隊",
+            "",
+            {"unreturned_entry_at": "2026-08-07T23:50"},
+        )
+        queue_id = controller._external_return_queue_ids_by_action_index[0]
+        self.assertEqual(
+            controller._unreturned_return_queue.get(queue_id)["unreturned_entry_at"],
+            "2026-08-07T23:50",
+        )
         controller.toggleTaskSelection(0)
 
         self.assertEqual(controller.dueTaskCount, 0)
@@ -11153,6 +11225,7 @@ if return_code != 0 or loaded:
                     "today": {"staff": {"8": {"name": "測試員"}}},
                 },
                 owner_actor_no="10",
+                unreturned_entry_at="2026-08-06T23:50",
             )
             controller = DutyController(unreturned_return_queue=queue)
             controller.set_actor_no("11")
@@ -11188,6 +11261,10 @@ if return_code != 0 or loaded:
             self.assertEqual(queued_action["fields"]["登打時間"], "01:02")
             self.assertEqual(queued_action["fields"]["系統寫入時間"], "01:02")
             self.assertEqual(queued_action["submit_target_date"], "1150807")
+            self.assertEqual(
+                request.schedule_data["_unreturned_return_query_start_at"],
+                "2026-08-06T23:50",
+            )
 
     def test_handoff_external_pause_groups_three_items_and_manual_uses_actual_time(self) -> None:
         from datetime import datetime

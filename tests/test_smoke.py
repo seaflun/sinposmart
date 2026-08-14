@@ -2829,6 +2829,74 @@ class PackageSmokeTests(unittest.TestCase):
         wait_for_completion.assert_called_once_with(mock.ANY)
         self.assertEqual(len(rows), 1)
 
+    def test_visible_table_accepts_cross_day_query_range(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(_script: str) -> list[list[str]]:
+                return [
+                    ["115/08/13 23:49", "新坡分隊", "測試人員", "隊員", "出", "救護"],
+                    ["115/08/13 23:50", "新坡分隊", "測試人員", "隊員", "出", "救護"],
+                    ["115/08/14 00:15", "新坡分隊", "測試人員", "隊員", "入", "返隊"],
+                    ["115/08/14 00:16", "新坡分隊", "測試人員", "隊員", "出", "救護"],
+                ]
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set") as set_value, mock.patch.object(
+            module, "js_click", return_value=True
+        ), mock.patch.object(module.time, "sleep"), mock.patch.object(
+            module, "wait_for_query_completion"
+        ):
+            rows = module.query_visible_table(
+                Driver(),
+                module.ENTRY_LOG_AP,
+                "1150814",
+                start_roc_date="1150813",
+                start_time="23:50",
+                end_roc_date="1150814",
+                end_time="00:15",
+            )
+
+        set_value.assert_any_call(mock.ANY, "_txtSDATE", "1150813")
+        set_value.assert_any_call(mock.ANY, "_txtEDATE", "1150814")
+        set_value.assert_any_call(mock.ANY, "_selSTIMEH", "23")
+        set_value.assert_any_call(mock.ANY, "_selSTIMEM", "50")
+        set_value.assert_any_call(mock.ANY, "_selETIMEH", "00")
+        set_value.assert_any_call(mock.ANY, "_selETIMEM", "15")
+        self.assertEqual([row[0] for row in rows], ["115/08/13 23:50", "115/08/14 00:15"])
+
+    def test_external_assignment_state_orders_rows_by_absolute_datetime(self) -> None:
+        module = package_module("compare_rehearsal_records")
+
+        rows = module.flatten_rows(
+            [
+                ["115/08/13", "23:50", "-", "測試員", "出", "救護"],
+                ["115/08/14", "00:15", "-", "測試員", "入", "救護返隊"],
+            ],
+            "1150814",
+            start_date="1150813",
+            end_date="1150814",
+        )
+        action = {
+            "target": "10",
+            "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+        }
+        staff = {"10": {"name": "測試員"}}
+
+        self.assertIsNone(
+            module.find_open_external_assignment(
+                rows,
+                "1150814",
+                staff,
+                action,
+                current_at=datetime(2026, 8, 14, 0, 15),
+                start_at=datetime(2026, 8, 13, 23, 50),
+                end_at=datetime(2026, 8, 14, 0, 15),
+            )
+        )
+
     def test_case_query_uses_silent_field_updates_and_native_query_click(self) -> None:
         module = duty_rehearsal_module()
 
