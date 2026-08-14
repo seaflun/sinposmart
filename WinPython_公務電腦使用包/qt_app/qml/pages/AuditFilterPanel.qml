@@ -143,7 +143,7 @@ ColumnLayout {
                     AppleComboBox {
                         objectName: "auditStatusFilter"
                         Layout.fillWidth: true
-                        model: ["需處理", "全部", "已登打", "手動", "尚未到點", "疑似異動", "時間近似", "人工確認"]
+                        model: ["需處理", "全部", "已登打", "手動", "尚未到點", "疑似異動", "時間近似", "人工確認", "未返隊暫停", "外勤休息手動"]
                         currentIndex: Math.max(0, model.indexOf(auditFilterPanel.backend.dutyController.auditStatusFilter))
                         onActivated: auditFilterPanel.backend.dutyController.setAuditStatusFilter(currentText)
                     }

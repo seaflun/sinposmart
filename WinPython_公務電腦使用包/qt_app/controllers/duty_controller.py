@@ -344,6 +344,8 @@ class DutyController(QObject):
             "疑似異動",
             "時間近似",
             "人工確認",
+            "未返隊暫停",
+            "外勤休息手動",
         )
         value = value if value in allowed else "全部"
         if value != self._audit_status_filter:
@@ -1547,11 +1549,17 @@ class DutyController(QObject):
         self._task_errors.pop(action_index, None)
         if status in ("submitted", "skipped_duplicate"):
             self._executed_indices.add(action_index)
-            self._comparisons[action_index] = {
-                "compare": "已登打" if status == "submitted" else "已存在",
-                "group": "done",
-                "matched": [],
-            }
+            completed_comparison = dict(comparison) if isinstance(comparison, Mapping) else {}
+            completed_comparison.update(
+                {
+                    "compare": "已登打" if status == "submitted" else "已存在",
+                    "group": "done",
+                }
+            )
+            completed_comparison.setdefault("matched", [])
+            if trigger_type:
+                completed_comparison["submission_trigger"] = trigger_type
+            self._comparisons[action_index] = completed_comparison
             self._retry_after.pop(action_index, None)
             if status == "submitted":
                 action = self._actions[action_index]
@@ -1565,7 +1573,10 @@ class DutyController(QObject):
             self._schedule_auto_logout_if_needed(action_index)
         elif status == "review_required":
             self._blocked_indices.add(action_index)
-            self._comparisons[action_index] = {"compare": "人工確認", "group": "review", "matched": []}
+            review_comparison = dict(comparison) if isinstance(comparison, Mapping) else {}
+            review_comparison.update({"compare": "人工確認", "group": "review"})
+            review_comparison.setdefault("matched", [])
+            self._comparisons[action_index] = review_comparison
         elif status == "paused_external":
             unreturned_entry_at = (
                 str(comparison.get("unreturned_entry_at") or "").strip()
@@ -1580,7 +1591,10 @@ class DutyController(QObject):
             )
             self._external_return_queue_ids_by_action_index[action_index] = str(record["queue_id"])
             self._retry_after[action_index] = datetime.now() + timedelta(minutes=5)
-            self._comparisons[action_index] = {"compare": "未返隊，暫停登打", "group": "paused", "matched": []}
+            paused_comparison = dict(comparison) if isinstance(comparison, Mapping) else {}
+            paused_comparison.update({"compare": "未返隊，暫停登打", "group": "paused"})
+            paused_comparison.setdefault("matched", [])
+            self._comparisons[action_index] = paused_comparison
             if created:
                 self._publish_unreturned_return_event("pending", record, trigger_type="due")
         else:

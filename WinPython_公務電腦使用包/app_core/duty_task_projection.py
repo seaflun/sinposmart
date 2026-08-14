@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
@@ -377,6 +378,69 @@ def _display_status(value: Any) -> str:
     }.get(text, text)
 
 
+_TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
+_RECORD_TIME_PATTERN = re.compile(
+    r"(?<!\d)(?:\d{3}/\d{2}/\d{2}|\d{7})[ \t]*\n?[ \t]+(\d{1,2}:\d{2})(?!\d)"
+)
+
+
+def _format_time_value(value: Any) -> str:
+    match = _TIME_PATTERN.search(str(value or ""))
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def actual_record_time(comparison: Mapping[str, Any]) -> str:
+    """Extract the actual time from the first matched duty-system record."""
+
+    matched = comparison.get("matched", [])
+    if not isinstance(matched, Sequence) or isinstance(matched, (str, bytes)):
+        return ""
+    mapping_keys = ("實際登打時間", "登打時間", "系統寫入時間", "工作時間", "時間")
+    for row in matched:
+        if isinstance(row, Mapping):
+            for key in mapping_keys:
+                value = _format_time_value(row.get(key))
+                if value:
+                    return value
+            continue
+        text = str(row or "")
+        record_match = _RECORD_TIME_PATTERN.search(text)
+        if record_match:
+            return _format_time_value(record_match.group(1))
+        value = _format_time_value(text)
+        if value:
+            return value
+    return ""
+
+
+def _is_external_rest_manual_submission(
+    action: Mapping[str, Any],
+    comparison: Mapping[str, Any],
+) -> bool:
+    return bool(
+        comparison.get("group") == "done"
+        and comparison.get("submission_trigger") == "manual"
+        and is_external_or_rest_entry(action)
+    )
+
+
+def audit_status_text(
+    action: Mapping[str, Any],
+    comparison: Mapping[str, Any],
+) -> str:
+    if comparison.get("group") == "paused":
+        return "未返隊暫停"
+    if _is_external_rest_manual_submission(action, comparison):
+        return "外勤休息手動"
+    return _display_status(comparison.get("compare", "未比對"))
+
+
 def _task_status(
     index: int,
     action: Mapping[str, Any],
@@ -569,11 +633,20 @@ def audit_detail_text(
     action: Mapping[str, Any],
     comparison: Mapping[str, Any],
 ) -> str:
+    detail_status = (
+        audit_status_text(action, comparison)
+        if comparison.get("group") == "paused"
+        or _is_external_rest_manual_submission(action, comparison)
+        else str(comparison.get("compare", "未比對") or "未比對")
+    )
     lines = [
-        f"比對：{comparison.get('compare', '未比對')}",
+        f"比對：{detail_status}",
         f"摘要：{action_summary(action) or '-'}",
-        "",
     ]
+    actual_time = actual_record_time(comparison)
+    if actual_time:
+        lines.append(f"實際登打：{actual_time}")
+    lines.append("")
     matched = comparison.get("matched", [])
     if isinstance(matched, Sequence) and not isinstance(matched, (str, bytes)):
         for row in matched:
@@ -617,9 +690,14 @@ def project_audit_tasks(
             continue
         comparison = comparisons.get(index, {"compare": "未比對", "group": "ready"})
         group = str(comparison.get("group", "ready") or "ready")
+        is_external_rest_manual = _is_external_rest_manual_submission(action, comparison)
         if status_filter == "需處理" and group in ("done", "future"):
             continue
         if status_filter == "已登打" and group != "done":
+            continue
+        if status_filter == "未返隊暫停" and group != "paused":
+            continue
+        if status_filter == "外勤休息手動" and not is_external_rest_manual:
             continue
         if status_filter == "人工確認" and group != "review":
             continue
@@ -631,9 +709,12 @@ def project_audit_tasks(
             continue
         if status_filter == "時間近似" and group != "near":
             continue
-        comparison_text = _display_status(comparison.get("compare", "未比對"))
-        tone = "triggered" if group == "done" else "manual" if group in ("review", "adjust", "near", "manual") else "waiting"
+        comparison_text = audit_status_text(action, comparison)
+        tone = "triggered" if group == "done" else "manual" if group in ("paused", "review", "adjust", "near", "manual") else "waiting"
         action_at = action_datetime(action, target_roc_date)
+        actual_time = actual_record_time(comparison)
+        if actual_time:
+            detail_text = f"{detail_text or action_summary(action)}｜實際登打 {actual_time}"
         rows.append(
             (
                 action_at,

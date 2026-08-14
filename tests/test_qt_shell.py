@@ -843,6 +843,85 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertIn("115/07/29 08:00 巡邏", detail)
         self.assertIn('"kind": "work_log"', detail)
 
+    def test_audit_projection_separates_paused_and_external_rest_manual_statuses_and_actual_time(self) -> None:
+        from app_core.duty_task_projection import project_audit_tasks
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "09:00",
+                "actor": "10",
+                "target": "10",
+                "source": "昨日在勤且今日未在勤",
+                "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "10:00",
+                "actor": "10",
+                "target": "10",
+                "source": "外勤簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "11:00",
+                "actor": "10",
+                "target": "10",
+                "source": "休息簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "休息"},
+            },
+        ]
+        comparisons = {
+            0: {"compare": "未返隊，暫停登打", "group": "paused", "matched": []},
+            1: {
+                "compare": "已登打",
+                "group": "done",
+                "matched": ["115/08/07 10:20 | 測試員 | 出 | 外勤支援"],
+                "submission_trigger": "manual",
+            },
+            2: {
+                "compare": "已登打",
+                "group": "done",
+                "matched": ["115/08/07 11:20 | 測試員 | 出 | 休息"],
+                "submission_trigger": "manual",
+            },
+        }
+
+        rows = project_audit_tasks(
+            actions,
+            target_roc_date="1150807",
+            staff={"10": {"name": "測試員"}},
+            comparisons=comparisons,
+        )
+        rows_by_index = {row["taskIndex"]: row for row in rows}
+
+        self.assertEqual(rows_by_index[0]["statusText"], "未返隊暫停")
+        self.assertEqual(rows_by_index[0]["statusTone"], "manual")
+        self.assertEqual(rows_by_index[1]["statusText"], "外勤休息手動")
+        self.assertEqual(rows_by_index[1]["timeText"], "10:00")
+        self.assertIn("實際登打 10:20", rows_by_index[1]["detailText"])
+        self.assertIn("實際登打：10:20", rows_by_index[1]["fullDetailText"])
+        self.assertEqual(rows_by_index[2]["statusText"], "外勤休息手動")
+        self.assertIn("實際登打 11:20", rows_by_index[2]["detailText"])
+
+        paused_rows = project_audit_tasks(
+            actions,
+            target_roc_date="1150807",
+            staff={"10": {"name": "測試員"}},
+            comparisons=comparisons,
+            status_filter="未返隊暫停",
+        )
+        manual_rows = project_audit_tasks(
+            actions,
+            target_roc_date="1150807",
+            staff={"10": {"name": "測試員"}},
+            comparisons=comparisons,
+            status_filter="外勤休息手動",
+        )
+        self.assertEqual([row["taskIndex"] for row in paused_rows], [0])
+        self.assertEqual([row["taskIndex"] for row in manual_rows], [1, 2])
+
     def test_due_selection_applies_actor_status_pause_retry_and_time_guards(self) -> None:
         from datetime import datetime, timedelta
 
@@ -5630,6 +5709,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("triggerOnly: true", audit_filter_panel)
         self.assertIn("auditDateCalendar.openForCurrentDate()", audit_filter_panel)
         self.assertIn("clickAction: function()", audit_filter_panel)
+        self.assertIn('"未返隊暫停", "外勤休息手動"', audit_filter_panel)
         for column_text in (
             "時間",
             "類型",
@@ -5655,7 +5735,7 @@ class QtShellTests(unittest.TestCase):
         ):
             self.assertIn(legacy_audit_text, source)
         self.assertIn(
-            '["需處理", "全部", "已登打", "手動", "尚未到點", "疑似異動", "時間近似", "人工確認"]',
+            '["需處理", "全部", "已登打", "手動", "尚未到點", "疑似異動", "時間近似", "人工確認", "未返隊暫停", "外勤休息手動"]',
             source,
         )
         self.assertIn('["全部", "工作", "出入", "案件工作"]', source)
@@ -12745,6 +12825,63 @@ if return_code != 0 or loaded:
                 first_controller.shutdown()
                 if second_controller is not None:
                     second_controller.shutdown()
+
+    def test_manual_external_submission_preserves_actual_match_and_audit_status(self) -> None:
+        from app_core.duty_task_projection import project_audit_tasks
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        schedule_data = {
+            "target_date": "1150809",
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "10:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "外勤簽出",
+                    "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(repository=ScheduleRepository(Path(temp_dir)))
+            try:
+                controller.set_actor_no("10")
+                controller.replace_schedule_data(schedule_data)
+                controller.handle_submission_result(
+                    0,
+                    "submitted",
+                    "完成",
+                    "",
+                    {
+                        "compare": "已存在",
+                        "group": "done",
+                        "matched": ["115/08/09 10:20 | 測試員 | 出 | 外勤支援"],
+                    },
+                    trigger_type="manual",
+                )
+
+                self.assertEqual(
+                    controller._comparisons[0]["matched"],
+                    ["115/08/09 10:20 | 測試員 | 出 | 外勤支援"],
+                )
+                self.assertEqual(controller._comparisons[0]["submission_trigger"], "manual")
+                rows = project_audit_tasks(
+                    controller._actions,
+                    target_roc_date="1150809",
+                    staff={"10": {"name": "測試員"}},
+                    comparisons=controller._comparisons,
+                )
+                self.assertEqual(rows[0]["statusText"], "外勤休息手動")
+                self.assertIn("實際登打 10:20", rows[0]["detailText"])
+
+                controller.replace_schedule_data(schedule_data)
+                self.assertEqual(controller._comparisons[0]["submission_trigger"], "manual")
+                self.assertIn("10:20", controller._comparisons[0]["matched"][0])
+            finally:
+                controller.shutdown()
 
     def test_manual_handoff_uses_preflight_and_preserves_scheduled_time(self) -> None:
         from datetime import datetime
