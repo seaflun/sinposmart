@@ -688,6 +688,105 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(comparisons[0]["group"], "done")
         self.assertEqual(comparisons[0]["compare"], "已存在")
 
+    def test_external_and_rest_entries_skip_duplicate_comparison(self) -> None:
+        from app_core.duty_task_projection import build_schedule_comparisons
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "09:00",
+                "actor": "10",
+                "target": "10",
+                "source": "外勤簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "10:00",
+                "actor": "10",
+                "target": "10",
+                "source": "外勤簽入",
+                "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "11:00",
+                "actor": "10",
+                "target": "10",
+                "source": "休息簽出",
+                "fields": {"出或入": "出", "領用事由及地點": "休息"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "12:00",
+                "actor": "10",
+                "target": "10",
+                "source": "休息結束",
+                "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+            },
+        ]
+        data = {
+            "target_date": "1150807",
+            "today": {"staff": {"10": {"name": "測試員"}}},
+            "actions": actions,
+        }
+        comparison_data = {
+            "1150807": {
+                "visible_entry_rows": [
+                    ["115/08/07", "09:00", "測試員", "出", "外勤支援"],
+                    ["115/08/07", "10:00", "測試員", "入", "返隊"],
+                    ["115/08/07", "11:00", "測試員", "出", "休息"],
+                    ["115/08/07", "12:00", "測試員", "入", "休息返隊"],
+                ]
+            }
+        }
+
+        comparisons = build_schedule_comparisons(data, actions, comparison_data)
+
+        self.assertEqual(
+            [comparisons[index]["group"] for index in range(4)],
+            ["todo", "todo", "todo", "todo"],
+        )
+        self.assertTrue(all(not comparisons[index]["matched"] for index in range(4)))
+
+    def test_armed_external_return_is_due_at_original_time_even_if_comparison_is_done(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        action = {
+            "kind": "entry_log",
+            "time": "10:00",
+            "actor": "10",
+            "target": "10",
+            "source": "外勤簽入",
+            "return_pair_key": "return-pair:external:test",
+            "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+        }
+        state = DueTaskSelectionState(
+            actor_no="10",
+            target_roc_date="1150807",
+            comparisons={0: {"compare": "已存在", "group": "done"}},
+            auto_return_indices=frozenset({0}),
+        )
+
+        self.assertEqual(
+            select_due_task_indices(
+                [action],
+                state,
+                now=datetime(2026, 8, 7, 9, 59),
+            ),
+            [],
+        )
+        self.assertEqual(
+            select_due_task_indices(
+                [action],
+                state,
+                now=datetime(2026, 8, 7, 10, 0),
+            ),
+            [0],
+        )
+
     def test_comparison_prefers_existing_scheduled_checkout_over_future_time(self) -> None:
         from unittest.mock import patch
 
@@ -1419,6 +1518,70 @@ class DutySubmissionServiceTests(unittest.TestCase):
 
             self.assertEqual(result.status, "skipped_duplicate")
             self.assertEqual(fills, [])
+
+    def test_external_return_skips_pre_submit_duplicate_check_and_verifies_after_submit(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[bool] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return (
+                    [["115/07/29", "10:00", "-", "測試員", "簽入", "返隊"]]
+                    if query_count >= 1
+                    else []
+                )
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True) or {},
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 10, 0),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "已存在", "group": "done", "matched": ["舊資料"]}
+                },
+            )
+            data = {
+                "target_date": "1150729",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "外勤簽入",
+                        "fields": {
+                            "登打時間": "10:00",
+                            "系統寫入時間": "10:00",
+                            "出或入": "入",
+                            "領用事由及地點": "返隊",
+                        },
+                    }
+                ],
+            }
+
+            result = service.execute(
+                DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
+            )
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(fills, [True])
+        self.assertEqual(query_count, 2)
 
     def test_submit_verifies_rest_return_without_checkout_within_two_minutes(self) -> None:
         from datetime import datetime
@@ -12419,10 +12582,23 @@ if return_code != 0 or loaded:
 
         self.assertTrue(controller._is_manual_submission_eligible(0, now=early))
         self.assertFalse(controller._is_manual_submission_eligible(1, now=early))
-        self.assertFalse(controller._is_manual_submission_eligible(2, now=early))
+        self.assertTrue(controller._is_manual_submission_eligible(2, now=early))
         self.assertTrue(controller._is_manual_submission_eligible(3, now=early))
-        self.assertFalse(controller._is_manual_submission_eligible(4, now=early))
+        self.assertTrue(controller._is_manual_submission_eligible(4, now=early))
         self.assertTrue(controller._is_manual_submission_eligible(5, now=early))
+
+        external_departure_request = controller.manual_submission_requests(
+            "user10", "secret", [2], submit_at=early
+        )[0]
+        external_departure = external_departure_request.schedule_data["actions"][2]
+        self.assertEqual(external_departure["fields"]["登打時間"], "07:55")
+        self.assertEqual(external_departure["fields"]["系統寫入時間"], "07:55")
+        rest_departure_request = controller.manual_submission_requests(
+            "user10", "secret", [4], submit_at=early
+        )[0]
+        rest_departure = rest_departure_request.schedule_data["actions"][4]
+        self.assertEqual(rest_departure["fields"]["登打時間"], "07:55")
+        self.assertEqual(rest_departure["fields"]["系統寫入時間"], "07:55")
 
         arrival_request = controller.manual_submission_requests(
             "user10", "secret", [0], submit_at=early
@@ -12439,6 +12615,136 @@ if return_code != 0 or loaded:
         checkout = checkout_request.schedule_data["actions"][1]
         self.assertEqual(checkout["fields"]["登打時間"], "08:00")
         self.assertEqual(checkout["fields"]["系統寫入時間"], "08:05")
+
+    def test_manual_external_departure_arms_original_time_return_and_manual_return_cancels_it(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+        from qt_app.controllers.duty_controller import DutyController
+
+        pair_key = "return-pair:external:manual-test"
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150809",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "09:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "外勤簽出",
+                        "return_pair_key": pair_key,
+                        "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "外勤簽入",
+                        "return_pair_key": pair_key,
+                        "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+                    },
+                ],
+            },
+            comparisons={
+                0: {"compare": "未找到", "group": "todo", "matched": []},
+                1: {"compare": "已存在", "group": "done", "matched": []},
+            },
+        )
+
+        controller.handle_submission_result(
+            0,
+            "submitted",
+            "完成",
+            "",
+            trigger_type="manual",
+        )
+        self.assertEqual(controller._manual_departure_pair_keys, {pair_key})
+        due_state = DueTaskSelectionState(
+            actor_no="10",
+            target_roc_date="1150809",
+            comparisons=controller._comparisons,
+            executed_indices=frozenset(controller._executed_indices),
+            submitting_indices=frozenset(controller._submitting_indices),
+            blocked_indices=frozenset(controller._blocked_indices),
+            auto_return_indices=frozenset(controller._auto_return_indices()),
+        )
+        self.assertEqual(
+            select_due_task_indices(
+                controller._actions,
+                due_state,
+                now=datetime(2026, 8, 9, 10, 0),
+            ),
+            [1],
+        )
+
+        controller.handle_submission_result(
+            1,
+            "submitted",
+            "完成",
+            "",
+            trigger_type="manual",
+        )
+        self.assertEqual(controller._manual_departure_pair_keys, set())
+        self.assertEqual(controller._auto_return_indices(), set())
+
+    def test_manual_external_departure_pair_survives_controller_reload(self) -> None:
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        pair_key = "return-pair:rest:reload-test"
+        schedule_data = {
+            "target_date": "1150809",
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "09:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "休息簽出",
+                    "return_pair_key": pair_key,
+                    "fields": {"出或入": "出", "領用事由及地點": "休息"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "10:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "休息結束",
+                    "return_pair_key": pair_key,
+                    "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = ScheduleRepository(Path(temp_dir))
+            first_controller = DutyController(repository=repository)
+            second_controller = None
+            try:
+                first_controller.set_actor_no("10")
+                first_controller.replace_schedule_data(schedule_data)
+                first_controller.handle_submission_result(
+                    0,
+                    "submitted",
+                    "完成",
+                    "",
+                    trigger_type="manual",
+                )
+
+                second_controller = DutyController(repository=repository)
+                second_controller.set_actor_no("10")
+                second_controller.replace_schedule_data(schedule_data)
+
+                self.assertEqual(second_controller._manual_departure_pair_keys, {pair_key})
+                self.assertEqual(second_controller._auto_return_indices(), {1})
+            finally:
+                first_controller.shutdown()
+                if second_controller is not None:
+                    second_controller.shutdown()
 
     def test_manual_handoff_uses_preflight_and_preserves_scheduled_time(self) -> None:
         from datetime import datetime

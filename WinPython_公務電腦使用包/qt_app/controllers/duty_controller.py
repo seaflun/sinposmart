@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -16,10 +17,14 @@ from app_core.duty_task_projection import (
     DueTaskSelectionState,
     DutyTaskProjectionState,
     action_completion_key,
+    action_return_pair_key,
     action_summary,
     action_datetime,
     build_schedule_comparisons,
     is_auto_duty_action,
+    is_external_or_rest_departure,
+    is_external_or_rest_entry,
+    is_external_or_rest_return,
     next_duty_task_text,
     project_audit_tasks,
     project_duty_tasks,
@@ -71,6 +76,11 @@ class DutyController(QObject):
         self._unreturned_return_queue = unreturned_return_queue or UnreturnedReturnQueue(
             package_root / "runtime_outputs"
         )
+        runtime_output_dir = getattr(self._repository, "runtime_output_dir", None) or (
+            package_root / "runtime_outputs"
+        )
+        self._return_policy_state_path = Path(runtime_output_dir) / "duty_return_policy.json"
+        self._manual_departure_pair_keys = self._load_manual_departure_pair_keys()
         self._current_date_text = ""
         self._current_time_text = ""
         self._observed_fire_day = business_roc_date()
@@ -386,6 +396,7 @@ class DutyController(QObject):
                 comparison.get("group") == "review"
                 and str(action.get("source", "") or "").startswith("外勤")
             )
+            is_external_or_rest_manual_entry = is_external_or_rest_entry(action)
             if (
                 action.get("kind") in ("work_log", "entry_log")
                 and index not in self._submitting_indices
@@ -393,6 +404,7 @@ class DutyController(QObject):
                 and (
                     comparison.get("group") not in ("done", "near", "review")
                     or is_manual_external_review
+                    or is_external_or_rest_manual_entry
                 )
             ):
                 ready.append(index)
@@ -546,6 +558,7 @@ class DutyController(QObject):
             comparison.get("group") == "review"
             and str(action.get("source", "") or "").startswith("外勤")
         )
+        is_external_or_rest_manual_entry = is_external_or_rest_entry(action)
         if not (
             action.get("kind") in ("work_log", "entry_log")
             and index not in self._submitting_indices
@@ -553,6 +566,7 @@ class DutyController(QObject):
             and (
                 comparison.get("group") not in ("done", "near", "review")
                 or is_manual_external_review
+                or is_external_or_rest_manual_entry
             )
         ):
             return False
@@ -586,9 +600,48 @@ class DutyController(QObject):
         action: Mapping[str, Any],
         current: datetime,
     ) -> bool:
-        if action_datetime(action, self._target_date_text, fallback_date=current.date()) <= current:
-            return False
-        return str(action.get("source", "") or "") in ("外勤簽出", "休息簽出")
+        return False
+
+    def _load_manual_departure_pair_keys(self) -> set[str]:
+        try:
+            payload = json.loads(self._return_policy_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return set()
+        if not isinstance(payload, Mapping):
+            return set()
+        values = payload.get("manual_departure_pair_keys", [])
+        if not isinstance(values, list):
+            return set()
+        return {str(value).strip() for value in values if str(value).strip()}
+
+    def _save_manual_departure_pair_keys(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "manual_departure_pair_keys": sorted(self._manual_departure_pair_keys),
+        }
+        temporary_path = self._return_policy_state_path.with_name(
+            f"{self._return_policy_state_path.name}.tmp"
+        )
+        try:
+            self._return_policy_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(self._return_policy_state_path)
+        except OSError:
+            return
+
+    def _auto_return_indices(self) -> set[int]:
+        return {
+            index
+            for index, action in enumerate(self._actions)
+            if (
+                index not in self._executed_indices
+                and is_external_or_rest_return(action)
+                and action_return_pair_key(action) in self._manual_departure_pair_keys
+            )
+        }
 
     def _manual_time_summary(self, action: Mapping[str, Any], current: datetime) -> str:
         action_at = action_datetime(
@@ -1485,6 +1538,8 @@ class DutyController(QObject):
         message: str,
         _result_path: str,
         comparison: Mapping[str, Any] | None = None,
+        *,
+        trigger_type: str = "",
     ) -> None:
         self._submitting_indices.discard(action_index)
         if not 0 <= action_index < len(self._actions):
@@ -1498,6 +1553,15 @@ class DutyController(QObject):
                 "matched": [],
             }
             self._retry_after.pop(action_index, None)
+            if status == "submitted":
+                action = self._actions[action_index]
+                pair_key = action_return_pair_key(action)
+                if trigger_type == "manual" and is_external_or_rest_departure(action) and pair_key:
+                    self._manual_departure_pair_keys.add(pair_key)
+                    self._save_manual_departure_pair_keys()
+                elif is_external_or_rest_return(action) and pair_key:
+                    self._manual_departure_pair_keys.discard(pair_key)
+                    self._save_manual_departure_pair_keys()
             self._schedule_auto_logout_if_needed(action_index)
         elif status == "review_required":
             self._blocked_indices.add(action_index)
@@ -1552,7 +1616,14 @@ class DutyController(QObject):
         action_index = self._resolve_request_action_index(request)
         if action_index is None:
             return False
-        self.handle_submission_result(action_index, status, message, result_path, comparison)
+        self.handle_submission_result(
+            action_index,
+            status,
+            message,
+            result_path,
+            comparison,
+            trigger_type=request.trigger_type,
+        )
         return True
 
     def handle_submission_request_failure(
@@ -1695,6 +1766,7 @@ class DutyController(QObject):
     ) -> None:
         next_target_date = str(data.get("target_date", "") or "")
         same_schedule_date = bool(next_target_date) and next_target_date == self._target_date_text
+        target_date_changed = bool(self._target_date_text) and next_target_date != self._target_date_text
         previous_unique_indices = self._unique_action_indices_by_key()
         previous_executed_keys = {
             key for key, index in previous_unique_indices.items() if index in self._executed_indices
@@ -1748,6 +1820,16 @@ class DutyController(QObject):
             if isinstance(info, Mapping)
         }
         self._target_date_text = next_target_date
+        if target_date_changed:
+            self._manual_departure_pair_keys.clear()
+        else:
+            current_pair_keys = {
+                action_return_pair_key(action)
+                for action in self._actions
+                if action_return_pair_key(action)
+            }
+            self._manual_departure_pair_keys.intersection_update(current_pair_keys)
+        self._save_manual_departure_pair_keys()
         if not same_schedule_date:
             self._pending_manual_indices.clear()
             self._pending_manual_action_keys = ()
@@ -1855,6 +1937,7 @@ class DutyController(QObject):
             selected_indices=frozenset(self._selected_indices),
             forced_visible_indices=frozenset(self._external_return_queue_ids_by_action_index),
             task_errors=self._task_errors,
+            auto_return_indices=frozenset(self._auto_return_indices()),
         )
 
     def _refresh_projection(self) -> None:
@@ -1909,6 +1992,7 @@ class DutyController(QObject):
                     | self._handoff_preflight_blocked_indices()
                 ),
                 retry_after=self._retry_after,
+                auto_return_indices=frozenset(self._auto_return_indices()),
             ),
         )
         if due != self._due_task_indices or force_emit:

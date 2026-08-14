@@ -21,6 +21,11 @@ from compare_rehearsal_records import (
 
 
 AUTO_DUE_CATCH_UP_WINDOW = timedelta(hours=2)
+EXTERNAL_REST_ENTRY_SOURCES = frozenset(
+    {"外勤簽出", "外勤簽入", "休息簽出", "休息結束"}
+)
+EXTERNAL_REST_DEPARTURE_SOURCES = frozenset({"外勤簽出", "休息簽出"})
+EXTERNAL_REST_RETURN_SOURCES = frozenset({"外勤簽入", "休息結束"})
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,7 @@ class DutyTaskProjectionState:
     selected_indices: frozenset[int] = frozenset()
     forced_visible_indices: frozenset[int] = frozenset()
     task_errors: Mapping[int, str] = field(default_factory=dict)
+    auto_return_indices: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,7 @@ class DueTaskSelectionState:
     submitting_indices: frozenset[int] = frozenset()
     blocked_indices: frozenset[int] = frozenset()
     retry_after: Mapping[int, datetime] = field(default_factory=dict)
+    auto_return_indices: frozenset[int] = frozenset()
 
 
 def parse_roc_date(value: str) -> date:
@@ -96,6 +103,31 @@ def action_target_roc_date(action: Mapping[str, Any], target_roc_date: str) -> s
         return submit_target_date
     target_date = action_datetime(action, target_roc_date).date()
     return f"{target_date.year - 1911:03d}{target_date.month:02d}{target_date.day:02d}"
+
+
+def action_return_pair_key(action: Mapping[str, Any]) -> str:
+    return str(action.get("return_pair_key", "") or "").strip()
+
+
+def is_external_or_rest_entry(action: Mapping[str, Any]) -> bool:
+    return bool(
+        action.get("kind") == "entry_log"
+        and str(action.get("source", "") or "") in EXTERNAL_REST_ENTRY_SOURCES
+    )
+
+
+def is_external_or_rest_departure(action: Mapping[str, Any]) -> bool:
+    return bool(
+        is_external_or_rest_entry(action)
+        and str(action.get("source", "") or "") in EXTERNAL_REST_DEPARTURE_SOURCES
+    )
+
+
+def is_external_or_rest_return(action: Mapping[str, Any]) -> bool:
+    return bool(
+        is_external_or_rest_entry(action)
+        and str(action.get("source", "") or "") in EXTERNAL_REST_RETURN_SOURCES
+    )
 
 
 def action_completion_key(action: Mapping[str, Any]) -> str:
@@ -263,9 +295,16 @@ def select_due_task_indices(
         if retry_at is not None and current < retry_at:
             continue
         comparison = state.comparisons.get(index, {})
-        if comparison.get("group") in ("done", "manual", "near", "adjust", "review", "skipped"):
+        is_auto_return = (
+            index in state.auto_return_indices
+            and is_external_or_rest_return(action)
+        )
+        if (
+            comparison.get("group") in ("done", "manual", "near", "adjust", "review", "skipped")
+            and not is_auto_return
+        ):
             continue
-        if not is_auto_duty_action(action):
+        if not (is_auto_duty_action(action) or is_auto_return):
             continue
         action_at = action_datetime(action, state.target_roc_date, fallback_date=current.date())
         if action_at <= current <= action_at + AUTO_DUE_CATCH_UP_WINDOW:
@@ -349,6 +388,16 @@ def _task_status(
 ) -> tuple[str, str]:
     if index in state.submitting_indices:
         return "正在登打", "running"
+    is_auto_return = (
+        index in state.auto_return_indices
+        and is_external_or_rest_return(action)
+        and index not in state.executed_indices
+    )
+    if is_auto_return:
+        action_at = action_datetime(action, state.target_roc_date)
+        if action_at + AUTO_DUE_CATCH_UP_WINDOW < now:
+            return "逾時未補跑", "manual"
+        return ("到點待執行", "ready") if action_at <= now else ("等待", "waiting")
     if comparison.get("group") == "done":
         return _display_status(comparison.get("compare") or "已存在"), "triggered"
     if comparison.get("group") == "skipped":
@@ -702,6 +751,8 @@ def compare_submission_action(
     action: Mapping[str, Any],
     action_date: str,
     comparison_data: Mapping[str, Any],
+    *,
+    verify_saved: bool = False,
 ) -> dict[str, Any]:
     """Match only the action being submitted, with a short write-time tolerance."""
 
@@ -711,6 +762,9 @@ def compare_submission_action(
     yesterday_staff = yesterday.get("staff", {}) if isinstance(yesterday, Mapping) else {}
     staff = {**yesterday_staff, **today_staff}
     current_action = dict(action)
+
+    if is_external_or_rest_entry(current_action) and not verify_saved:
+        return {"compare": "略過防重複比對", "group": "todo", "matched": []}
 
     if current_action.get("kind") == "entry_log":
         entry_source = comparison_data.get("visible_entry_rows", [])
@@ -799,6 +853,14 @@ def build_schedule_comparisons(
         entry_rows = comparison_cache.get(action_date, {}).get("entry_rows", [])
         work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
         if action.get("kind") == "entry_log":
+            if is_external_or_rest_entry(action):
+                future = is_future_action(target_date, dict(action))
+                result[index] = {
+                    "compare": "尚未到點" if future else "略過防重複比對",
+                    "group": "future" if future else "todo",
+                    "matched": [],
+                }
+                continue
             reason = fields.get("領用事由及地點", "")
             if reason in ("休息", "休息返隊"):
                 comparison = _compare_rest_entry(actions, action, action_date, entry_rows, target_date, staff)

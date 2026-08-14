@@ -266,6 +266,7 @@ class DutySubmissionService:
                 request.action_index,
                 action_date,
                 before,
+                verify_saved=False,
             )
             group = str(comparison.get("group", "") or "")
             allows_manual_submission = request.trigger_type == "manual" and (
@@ -352,6 +353,7 @@ class DutySubmissionService:
                     request.action_index,
                     action_date,
                     after,
+                    verify_saved=True,
                 )
                 if verified.get("group") == "done":
                     break
@@ -733,12 +735,20 @@ class DutySubmissionService:
         index: int,
         action_date: str,
         comparison_data: Mapping[str, Any],
+        *,
+        verify_saved: bool = False,
     ) -> Mapping[str, Any]:
         if not 0 <= index < len(actions):
             return {"compare": "未找到", "group": "todo", "matched": []}
         action = actions[index]
         if action.get("kind") in ("entry_log", "work_log"):
-            return compare_submission_action(data, action, action_date, comparison_data)
+            return compare_submission_action(
+                data,
+                action,
+                action_date,
+                comparison_data,
+                verify_saved=verify_saved,
+            )
         return self._comparison_for_action(data, actions, index, action_date, comparison_data)
 
     @staticmethod

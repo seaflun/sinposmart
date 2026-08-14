@@ -138,6 +138,7 @@ class PlannedAction:
     source: str
     duplicate_key: str
     date_offset: int = 0
+    return_pair_key: str = ""
 
 
 # Date, roster, and radio helpers
@@ -2661,6 +2662,11 @@ def planned_actions(
             and not has_active_assignment_at(tomorrow, no, 8)
             and (end is None or end >= 8)
         )
+        return_pair_key = (
+            f"return-pair:rest:{target.isoformat()}:{no}:{start:02d}:{end}:{start_offset}:{end_offset}"
+            if not rest_checkout and end is not None
+            else ""
+        )
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         start_reason = "休息後退勤" if rest_checkout else "休息"
         actions.append(
@@ -2680,6 +2686,7 @@ def planned_actions(
                 source="休息後退勤" if rest_checkout else "休息簽出",
                 duplicate_key=f"entry:{target}:{start}:out:{no}:{start_reason}",
                 date_offset=start_offset,
+                return_pair_key=return_pair_key,
             )
         )
         if rest_checkout:
@@ -2706,6 +2713,7 @@ def planned_actions(
                 source="休息結束",
                 duplicate_key=f"entry:{target}:{end_hour}:in:{no}:休息返隊",
                 date_offset=end_offset,
+                return_pair_key=return_pair_key,
             )
         )
 
@@ -2713,6 +2721,13 @@ def planned_actions(
     # entered by the previous duty desk, same as value handoff records.
     for duty_name, no, start, end, end_offset in external_duty_blocks(today, tomorrow):
         start_offset = 1 if start < 8 else 0
+        if end_offset == 0 and end is not None and end <= 8:
+            end_offset = 1
+        return_pair_key = (
+            f"return-pair:external:{target.isoformat()}:{no}:{duty_name}:{start}:{end}:{start_offset}:{end_offset}"
+            if end is not None
+            else ""
+        )
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
         actions.append(
             PlannedAction(
@@ -2731,12 +2746,11 @@ def planned_actions(
                 source="外勤簽出",
                 duplicate_key=f"entry:{target}:{start}:out:{no}:{duty_name}",
                 date_offset=start_offset,
+                return_pair_key=return_pair_key,
             )
         )
         if end is None:
             continue
-        if end_offset == 0 and end is not None and end <= 8:
-            end_offset = 1
         end_actor = next_morning_entry_actor(today, end) if end_offset else duty_actor_at(today, yesterday, max(end - 1, 0), 0)
         actions.append(
             PlannedAction(
@@ -2755,6 +2769,7 @@ def planned_actions(
                 source="外勤簽入",
                 duplicate_key=f"entry:{target}:{end}:in:{no}:返隊:{duty_name}",
                 date_offset=end_offset,
+                return_pair_key=return_pair_key,
             )
         )
 
