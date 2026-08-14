@@ -11,7 +11,6 @@ Window {
     id: rescueVideoWindow
     required property var hostWindow
     required property var controller
-    required property var errorHandler
     property var nativeTitleBarConfigurator: null
     objectName: "rescueVideoDialog"
     visible: false
@@ -151,10 +150,6 @@ Window {
 
         function onDeleteConfirmationRequested() {
             rescueVideoDeleteConfirmation.open()
-        }
-
-        function onErrorOccurred(message) {
-            rescueVideoWindow.errorHandler(message)
         }
     }
 
@@ -378,6 +373,31 @@ Window {
             }
         }
 
+        ToolFormCard {
+            objectName: "rescueVideoFlowGuideCard"
+            Layout.fillWidth: true
+            Layout.leftMargin: 24
+            Layout.rightMargin: 24
+            Layout.topMargin: 12
+            contentItem: ColumnLayout {
+                spacing: 4
+                Label {
+                    objectName: "rescueVideoFlowGuideTitle"
+                    text: "使用限制與流程"
+                    color: Design.text
+                    font.pixelSize: Design.bodySize
+                    font.bold: true
+                }
+                Label {
+                    objectName: "rescueVideoFlowGuideText"
+                    Layout.fillWidth: true
+                    text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 複製並刪除記憶卡中資料。不同案件資料夾會分別傳送並逐檔驗證。"
+                    color: Design.secondaryText
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+
         ColumnLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -448,6 +468,28 @@ Window {
             }
 
             ToolFormCard {
+                objectName: "rescueVideoErrorCard"
+                visible: rescueVideoWindow.controller.errorText.length > 0
+                Layout.fillWidth: true
+                contentItem: RowLayout {
+                    spacing: 8
+                    Label {
+                        text: "需要處理"
+                        color: Design.dangerStrong
+                        font.pixelSize: Design.bodySize
+                        font.bold: true
+                    }
+                    Label {
+                        objectName: "rescueVideoErrorText"
+                        Layout.fillWidth: true
+                        text: rescueVideoWindow.controller.errorText
+                        color: Design.dangerStrong
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+
+            ToolFormCard {
                 Layout.fillWidth: true
                 contentItem: ColumnLayout {
                     spacing: 8
@@ -480,8 +522,10 @@ Window {
                                     border.color: rescueVideoCheckCard.modelData.level === "ok"
                                                   ? Design.successBorder
                                                   : rescueVideoCheckCard.modelData.level === "pending"
-                                                    ? Design.warningBorder
-                                                  : Design.dangerBorder
+                                                    ? (rescueVideoCheckCard.modelData.nextStep
+                                                       ? Design.warningBorder
+                                                       : Design.border)
+                                                    : Design.dangerBorder
                                 }
 
                                 contentItem: ColumnLayout {
@@ -498,7 +542,9 @@ Window {
                                             color: rescueVideoCheckCard.modelData.level === "ok"
                                                    ? Design.successAction
                                                    : rescueVideoCheckCard.modelData.level === "pending"
-                                                     ? Design.warningStrong
+                                                     ? (rescueVideoCheckCard.modelData.nextStep
+                                                        ? Design.warningStrong
+                                                        : Design.border)
                                                    : Design.dangerFill
                                         }
 
@@ -514,7 +560,7 @@ Window {
 
                                     Label {
                                         text: rescueVideoCheckCard.modelData.level === "ok" ? "可用"
-                                              : rescueVideoCheckCard.modelData.level === "pending" ? "待重新檢查"
+                                              : rescueVideoCheckCard.modelData.level === "pending" ? (rescueVideoCheckCard.modelData.stateText || "待重新檢查")
                                               : "需處理"
                                         color: rescueVideoCheckCard.modelData.level === "ok"
                                                ? Design.successText
@@ -542,7 +588,7 @@ Window {
                                                  && rescueVideoWindow.controller.sourcePath.length === 0
                                         Layout.fillWidth: true
                                         implicitHeight: Design.toolBrowseButtonHeight
-                                        text: "選擇資料夾"
+                                        text: "選擇 DCIM\\100CAREC"
                                         tone: "neutralStrong"
                                         enabled: !rescueVideoWindow.controller.isRunning
                                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
@@ -611,13 +657,16 @@ Window {
                             }
                         }
                     }
-                    ListView {
-                        id: rescueVideoResultList
-                        objectName: "rescueVideoResultList"
+                    Item {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        clip: true
-                        model: rescueVideoWindow.controller.resultModel
+
+                        ListView {
+                            id: rescueVideoResultList
+                            objectName: "rescueVideoResultList"
+                            anchors.fill: parent
+                            clip: true
+                            model: rescueVideoWindow.controller.resultModel
 
                         delegate: Rectangle {
                             id: rescueVideoResultRow
@@ -701,6 +750,19 @@ Window {
                                     columnWidthOverride: rescueVideoWindow.resultColumnWidth("note")
                                 }
                             }
+                            }
+                        }
+                        Label {
+                            objectName: "rescueVideoResultEmptyText"
+                            anchors.centerIn: parent
+                            width: Math.min(parent.width - 48, 520)
+                            text: rescueVideoWindow.controller.hasPreview
+                                  ? "預覽完成，但目前沒有可分送的影片。請檢查記憶卡影片時間與案件資料。"
+                                  : "尚未產生分類結果；完成前置檢查後按「檢查及預覽分類」。"
+                            color: Design.secondaryText
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.Wrap
+                            visible: rescueVideoWindow.controller.resultModel.rowCount() === 0
                         }
                     }
                 }
@@ -709,8 +771,8 @@ Window {
                 Layout.fillWidth: true
                 AppleButton {
                     objectName: "rescueVideoCopyStartButton"
-                    text: "複製啟動"
-                    tone: "primary"
+                    text: "複製並刪除記憶卡中資料"
+                    tone: "dangerFilled"
                     emphasizedBorder: true
                     enabled: rescueVideoWindow.controller.isReady
                              && rescueVideoWindow.controller.hasPreview
@@ -724,6 +786,12 @@ Window {
                         rescueVideoWindow.controller.offsetText,
                         false
                     )
+                }
+                Label {
+                    text: "只刪除逐檔驗證成功的影片；失敗檔案會保留。"
+                    color: Design.dangerStrong
+                    font.pixelSize: Design.captionSize
+                    wrapMode: Text.Wrap
                 }
                 BusyIndicator {
                     running: rescueVideoWindow.controller.isRunning
@@ -747,7 +815,7 @@ Window {
         anchors.centerIn: parent
         width: Math.min(rescueVideoWindow.width - 72, 500)
         modal: true
-        title: "即將開始複製記憶卡至行車記錄器資料夾"
+        title: "即將複製並刪除記憶卡中資料"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "確定"
         rejectText: "取消"

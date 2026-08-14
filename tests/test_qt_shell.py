@@ -5587,8 +5587,8 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('text: "檢查結果"', rescue_video)
         self.assertIn('text: "檢查及預覽分類"', rescue_video)
         self.assertIn('objectName: "rescueVideoCopyStartButton"', rescue_video)
-        self.assertIn('text: "複製啟動"', rescue_video)
-        self.assertIn('title: "即將開始複製記憶卡至行車記錄器資料夾"', rescue_video)
+        self.assertIn('text: "複製並刪除記憶卡中資料"', rescue_video)
+        self.assertIn('title: "即將複製並刪除記憶卡中資料"', rescue_video)
         self.assertIn("id: updateConfirmation", source)
         self.assertIn("function onUpdateReady(_latestVersion)", source)
         self.assertIn("actionConfirmations.openUpdateConfirmation()", source)
@@ -6100,7 +6100,10 @@ class QtShellTests(unittest.TestCase):
             'text: "檢查結果"',
             'model: rescueVideoWindow.controller.checkCards',
             'objectName: "rescueVideoCheckCard_" + rescueVideoCheckCard.modelData.key',
-            'text: "選擇資料夾"',
+            'text: "選擇 DCIM\\\\100CAREC"',
+            'objectName: "rescueVideoFlowGuideText"',
+            'objectName: "rescueVideoErrorText"',
+            'objectName: "rescueVideoResultEmptyText"',
             'objectName: "rescueVideoVehicleCombo"',
             'objectName: "rescueVideoDateField"',
             'objectName: "rescueVideoCheckButton"',
@@ -6111,7 +6114,7 @@ class QtShellTests(unittest.TestCase):
             "rescueVideoWindow.controller.checkAndPreview(",
             'objectName: "rescueVideoCopyStartButton"',
             'objectName: "rescueVideoCloseButton"',
-            'text: "複製啟動"',
+            'text: "複製並刪除記憶卡中資料"',
             "emphasizedBorder: true",
             "readonly property bool interactionsLocked",
             "if (rescueVideoWindow.interactionsLocked)",
@@ -6195,7 +6198,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("DataSectionTitle {", panel)
         self.assertNotIn("section: true", panel)
         self.assertIn('title: "選擇記憶卡 DCIM\\\\100CAREC 資料夾"', source)
-        self.assertIn('title: "即將開始複製記憶卡至行車記錄器資料夾"', source)
+        self.assertIn('title: "即將複製並刪除記憶卡中資料"', source)
 
     def test_qml_rest_time_panel_preserves_finalized_legacy_contract(self) -> None:
         source = (PACKAGE_ROOT / "qt_app" / "qml" / "Main.qml").read_text(encoding="utf-8")
@@ -8673,10 +8676,10 @@ if return_code != 0 or loaded:
         self.assertEqual(success_spy.count(), first_success_count + 1)
         self.assertEqual(controller.resultModel.rowCount(), 1)
         self.assertTrue(controller.hasPreview)
-        self.assertIn("複製啟動", controller.summaryText)
+        self.assertIn("複製並刪除記憶卡中資料", controller.summaryText)
         self.assertEqual(controller.reportPath, "report.csv")
         self.assertTrue(controller.hasPreview)
-        self.assertIn("複製啟動", controller.summaryText)
+        self.assertIn("複製並刪除記憶卡中資料", controller.summaryText)
 
         controller.prepareDelete("source", "destination", "2026-07-29", "92", "", False)
         self.assertTrue(controller.isAwaitingConfirmation)
@@ -8686,7 +8689,7 @@ if return_code != 0 or loaded:
         controller.cancelDelete()
         self.assertEqual(controller.confirmationSummary, "")
         self.assertFalse(controller.isAwaitingConfirmation)
-        self.assertEqual(controller.statusText, "已完成預覽，等待複製啟動。")
+        self.assertEqual(controller.statusText, "已完成預覽，等待複製並刪除記憶卡中資料。")
 
     def test_duty_execution_controller_runs_single_entry_lane_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -14654,7 +14657,7 @@ if return_code != 0 or loaded:
                 self.assertTrue(rescue_date_field.property("enabled"))
                 self.assertEqual(rescue_check_button.property("text"), "檢查及預覽分類")
                 self.assertEqual(rescue_bottom_close_button.property("text"), "關閉")
-                self.assertEqual(rescue_copy_button.property("text"), "複製啟動")
+                self.assertEqual(rescue_copy_button.property("text"), "複製並刪除記憶卡中資料")
                 self.assertTrue(rescue_copy_button.property("emphasizedBorder"))
                 self.assertGreater(rescue_copy_button.property("contentItem").width(), 0)
                 self.assertGreater(
@@ -14666,7 +14669,7 @@ if return_code != 0 or loaded:
                     rescue_copy_button.mapToScene(QPointF(0, 0)).y(),
                 )
                 self.assertFalse(rescue_copy_button.property("enabled"))
-                self.assertIn("尚未檢查", wait_for("rescueVideoStatusBadge").property("text"))
+                self.assertIn("尚未開始", wait_for("rescueVideoStatusBadge").property("text"))
                 click(rescue_check_button, rescue_window)
                 wait_until(
                     lambda: len(rescue_video_service.requests) == 1

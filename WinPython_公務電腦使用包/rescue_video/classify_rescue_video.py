@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -755,8 +756,9 @@ def classify(
 def classify_with_work_logs(
     args: argparse.Namespace,
     transfer_callback: Callable[[Path, int, int, str], None] | None = None,
+    transfer_workers: int = 1,
 ) -> list[Result]:
-    """Classify by video interval against actual work and return times."""
+    """Classify by video interval, then transfer each matched file independently."""
     selected_date = parse_date(args.date)
     cases = discover_cases(args.destination, args.vehicle)
     work = discover_case_work(args.work_log_root, args.vehicle)
@@ -803,35 +805,46 @@ def classify_with_work_logs(
             )
             continue
 
-        destination = case.path / "車" / source.name
         work_note = ""
-        source_size = source_stat.st_size
         if case.work_start:
             work_note = f"案件工作={case.work_start:%Y-%m-%d %H:%M}; 返隊={case.return_time:%Y-%m-%d %H:%M:%S}" if case.return_time else f"案件工作={case.work_start:%Y-%m-%d %H:%M}; 無返隊時間"
+        results.append(
+            Result(
+                source,
+                source_time,
+                video_end,
+                case,
+                case.path / "車" / source.name,
+                "預計複製",
+                work_note,
+                video_start,
+                video_duration,
+            )
+        )
+    return _transfer_results(results, args, transfer_callback, transfer_workers)
 
-        if destination.exists():
-            if same_file_metadata(source, destination):
-                status = "已完成"
-            elif args.apply and args.repair_mismatch:
-                try:
-                    if transfer_callback is not None:
-                        transfer_callback(source, 0, source_size, "傳輸中")
-                    copy_preserving_time(
-                        source,
-                        destination,
-                        lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
-                        if transfer_callback is not None
-                        else None,
-                    )
-                    status = "已修復"
-                except OSError as exc:
-                    status = "錯誤"
-                    if transfer_callback is not None:
-                        transfer_callback(source, 0, source_size, "傳輸失敗")
-                    work_note = f"{work_note}; {exc}"
-            else:
-                status = "目的地不一致"
-        elif args.apply:
+
+def _transfer_result(
+    result: Result,
+    args: argparse.Namespace,
+    transfer_callback: Callable[[Path, int, int, str], None] | None,
+) -> Result:
+    """Copy, verify, and optionally clean up one matched video."""
+    if result.case is None or result.destination is None:
+        return result
+
+    source = result.source
+    destination = result.destination
+    note = result.note
+    try:
+        source_size = source.stat().st_size
+    except OSError as exc:
+        return replace(result, status="錯誤", note=f"{note}; {exc}" if note else str(exc))
+
+    if destination.exists():
+        if same_file_metadata(source, destination):
+            status = "已完成"
+        elif args.apply and args.repair_mismatch:
             try:
                 if transfer_callback is not None:
                     transfer_callback(source, 0, source_size, "傳輸中")
@@ -842,45 +855,87 @@ def classify_with_work_logs(
                     if transfer_callback is not None
                     else None,
                 )
-                status = "已複製"
+                status = "已修復"
             except OSError as exc:
-                status = "錯誤"
                 if transfer_callback is not None:
                     transfer_callback(source, 0, source_size, "傳輸失敗")
-                work_note = f"{work_note}; {exc}"
+                error_note = f"{note}; {exc}" if note else str(exc)
+                return replace(result, status="錯誤", note=error_note)
         else:
-            status = "預計複製"
-        if args.apply and transfer_callback is not None:
-            transfer_callback(source, source_size, source_size, "驗證中")
-        status, cleanup_note = finalize_source_cleanup(
-            source,
-            destination,
-            status,
-            getattr(args, "delete_source", False),
-        )
-        if args.apply and transfer_callback is not None:
-            transfer_callback(
+            status = "目的地不一致"
+    elif args.apply:
+        try:
+            if transfer_callback is not None:
+                transfer_callback(source, 0, source_size, "傳輸中")
+            copy_preserving_time(
                 source,
-                source_size,
-                source_size,
-                "驗證完成" if status != "來源刪除失敗" else "驗證完成，來源未刪除",
-            )
-        if cleanup_note:
-            work_note = f"{work_note}; {cleanup_note}" if work_note else cleanup_note
-        results.append(
-            Result(
-                source,
-                source_time,
-                video_end,
-                case,
                 destination,
-                status,
-                work_note,
-                video_start,
-                video_duration,
+                lambda copied, total: transfer_callback(source, copied, total, "傳輸中")
+                if transfer_callback is not None
+                else None,
+            )
+            status = "已複製"
+        except OSError as exc:
+            if transfer_callback is not None:
+                transfer_callback(source, 0, source_size, "傳輸失敗")
+            error_note = f"{note}; {exc}" if note else str(exc)
+            return replace(result, status="錯誤", note=error_note)
+    else:
+        status = "預計複製"
+
+    can_verify = status in {"已完成", "已修復", "已複製"}
+    if args.apply and transfer_callback is not None and can_verify:
+        transfer_callback(source, source_size, source_size, "驗證中")
+    status, cleanup_note = finalize_source_cleanup(
+        source,
+        destination,
+        status,
+        getattr(args, "delete_source", False),
+    )
+    if args.apply and transfer_callback is not None and can_verify:
+        transfer_callback(
+            source,
+            source_size,
+            source_size,
+            "驗證完成" if status != "來源刪除失敗" else "驗證完成，來源未刪除",
+        )
+    if cleanup_note:
+        note = f"{note}; {cleanup_note}" if note else cleanup_note
+    return replace(result, status=status, note=note)
+
+
+def _transfer_results(
+    results: list[Result],
+    args: argparse.Namespace,
+    transfer_callback: Callable[[Path, int, int, str], None] | None,
+    transfer_workers: int,
+) -> list[Result]:
+    try:
+        worker_count = max(1, int(transfer_workers))
+    except (TypeError, ValueError):
+        worker_count = 1
+    matched_indexes = [index for index, result in enumerate(results) if result.case is not None]
+    if not matched_indexes:
+        return results
+
+    if not getattr(args, "apply", False) or worker_count == 1 or len(matched_indexes) == 1:
+        return [
+            _transfer_result(result, args, transfer_callback) if result.case is not None else result
+            for result in results
+        ]
+
+    matched_results = [results[index] for index in matched_indexes]
+    with ThreadPoolExecutor(max_workers=min(worker_count, len(matched_results))) as executor:
+        transferred = list(
+            executor.map(
+                lambda result: _transfer_result(result, args, transfer_callback),
+                matched_results,
             )
         )
-    return results
+    completed = list(results)
+    for index, result in zip(matched_indexes, transferred):
+        completed[index] = result
+    return completed
 
 
 def write_report(results: list[Result], report: Path) -> None:

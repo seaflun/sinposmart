@@ -244,7 +244,7 @@ class RescueVideoService:
     def confirmation_summary(self, request: RescueVideoRequest) -> str:
         normalized, warnings, _values = self.validate(request)
         if normalized.mode == "delete":
-            return "複製完成後，會將確定完成內容驗證後的影片檔案刪除，確定要繼續嗎？"
+            return "不同案件資料夾會分別傳送並逐檔驗證；只有驗證成功的記憶卡影片會刪除，失敗檔案會保留。確定要繼續嗎？"
         warning_text = f"\n注意：{'；'.join(warnings)}" if warnings else ""
         action_text = (
             "確認後會複製影片並核對目的地，不會刪除來源影片。"

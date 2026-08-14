@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from io import StringIO
+import os
 import sys
+import threading
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -108,8 +110,11 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("controller.resetForNextSession()", source)
 
         controller_source = (PACKAGE_ROOT / "qt_app" / "controllers" / "rescue_video_controller.py").read_text(encoding="utf-8")
-        self.assertIn("檢查通過後會自動顯示分類結果", controller_source)
+        self.assertIn("本工具只支援單張記憶卡", controller_source)
+        self.assertIn("errorText", controller_source)
         self.assertNotIn("請先完成預覽分類", controller_source)
+        self.assertIn('text: "複製並刪除記憶卡中資料"', source)
+        self.assertIn('objectName: "rescueVideoResultEmptyText"', source)
         self.assertIn('objectName: "rescueVideoCloseButton"', source)
 
     def test_window_keeps_minimize_and_maximize_available_during_copy(self) -> None:
@@ -255,6 +260,133 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertEqual(updates, [(4, 10), (8, 10), (10, 10)])
 
+    def test_work_log_classification_uses_two_transfer_queues_for_distinct_case_folders(self) -> None:
+        classifier = self._classifier_module()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "DCIM" / "100CAREC"
+            source_root.mkdir(parents=True)
+            destination_root = root / "cases"
+            first_case = destination_root / "2026" / "8月" / "08150900-92" / "車"
+            second_case = destination_root / "2026" / "8月" / "08151000-92" / "車"
+            first_case.mkdir(parents=True)
+            second_case.mkdir(parents=True)
+
+            first_source = source_root / "V0000001.TS"
+            second_source = source_root / "V0000002.TS"
+            first_source.write_bytes(b"first video")
+            second_source.write_bytes(b"second video")
+            first_source.touch()
+            second_source.touch()
+            first_source_mtime = datetime(2026, 8, 15, 9, 0).timestamp()
+            second_source_mtime = datetime(2026, 8, 15, 10, 0).timestamp()
+            first_source.touch()
+            second_source.touch()
+            os.utime(first_source, (first_source_mtime, first_source_mtime))
+            os.utime(second_source, (second_source_mtime, second_source_mtime))
+
+            args = SimpleNamespace(
+                date="2026-08-15",
+                destination=destination_root,
+                vehicle="92",
+                source=source_root,
+                extension=".TS",
+                before_minutes=0,
+                after_minutes=0,
+                work_log_root=root / "work_logs",
+                case_folder_tolerance_minutes=10,
+                work_before_minutes=0,
+                apply=True,
+                repair_mismatch=False,
+                delete_source=True,
+                report=root / "report.csv",
+            )
+
+            active_transfers = 0
+            maximum_active_transfers = 0
+            transfer_lock = threading.Lock()
+            transfer_barrier = threading.Barrier(2)
+            transfer_states: list[tuple[str, str]] = []
+            original_copy = classifier.copy_preserving_time
+
+            def tracked_copy(source, destination, progress_callback=None):
+                nonlocal active_transfers, maximum_active_transfers
+                with transfer_lock:
+                    active_transfers += 1
+                    maximum_active_transfers = max(maximum_active_transfers, active_transfers)
+                try:
+                    transfer_barrier.wait(timeout=2)
+                    return original_copy(source, destination, progress_callback)
+                finally:
+                    with transfer_lock:
+                        active_transfers -= 1
+
+            with (
+                mock.patch.object(
+                    classifier,
+                    "read_card_duration",
+                    return_value=(first_source, timedelta(seconds=0)),
+                ),
+                mock.patch.object(classifier, "discover_case_work", return_value=[]),
+                mock.patch.object(classifier, "copy_preserving_time", side_effect=tracked_copy),
+            ):
+                results = classifier.classify_with_work_logs(
+                    args,
+                    transfer_workers=2,
+                    transfer_callback=lambda source, _copied, _total, state: transfer_states.append(
+                        (Path(source).name, state)
+                    ),
+                )
+            first_destination_exists = (first_case / first_source.name).is_file()
+            second_destination_exists = (second_case / second_source.name).is_file()
+
+        self.assertEqual(
+            [result.status for result in results],
+            ["已複製並刪除來源", "已複製並刪除來源"],
+        )
+        self.assertGreaterEqual(maximum_active_transfers, 2)
+        self.assertTrue(first_destination_exists)
+        self.assertTrue(second_destination_exists)
+        self.assertFalse(first_source.exists())
+        self.assertFalse(second_source.exists())
+        self.assertEqual(
+            {name for name, state in transfer_states if state == "驗證完成"},
+            {first_source.name, second_source.name},
+        )
+
+    def test_rescue_video_initial_state_explains_single_card_first_step_and_local_error(self) -> None:
+        if str(PACKAGE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PACKAGE_ROOT))
+        from app_core.rescue_video_service import RescueVideoCheckCard, RescueVideoDefaults
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._defaults_loaded(
+            0,
+            RescueVideoDefaults(
+                "",
+                "destination",
+                "2026-08-15",
+                (),
+                "",
+                check_cards=(
+                    RescueVideoCheckCard("source", "記憶卡來源", "來源尚未檢查", "error"),
+                    RescueVideoCheckCard("vehicle_date", "車號與日期", "車號尚未檢查", "error"),
+                ),
+                is_ready=False,
+            ),
+        )
+
+        self.assertEqual(controller.statusText, "尚未開始")
+        self.assertIn("單張記憶卡", controller.summaryText)
+        self.assertEqual(controller.checkCards[0]["stateText"], "尚未開始")
+        self.assertTrue(controller.checkCards[0]["nextStep"])
+        self.assertFalse(controller.checkCards[1]["nextStep"])
+        self.assertIn("自動尋找 DCIM", controller.checkCards[0]["detail"])
+
+        controller._set_error("請插入單張記憶卡後再檢查。")
+        self.assertEqual(controller.errorText, "請插入單張記憶卡後再檢查。")
+
     def test_cross_day_video_interval_matches_both_dates(self) -> None:
         classifier = self._classifier_module()
         video_start = datetime(2026, 8, 8, 23, 57)
@@ -358,7 +490,7 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertEqual(controller.selectedVehicle, "")
         self.assertEqual(controller.checkCards, [])
         self.assertFalse(controller.hasPreview)
-        self.assertEqual(controller.statusText, "尚未檢查")
+        self.assertEqual(controller.statusText, "尚未開始")
         self.assertEqual(controller.resultModel.rowCount(), 0)
 
     def test_windows_notification_is_limited_to_completed_rescue_video_copy(self) -> None:

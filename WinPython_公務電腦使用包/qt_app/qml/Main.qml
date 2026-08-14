@@ -420,7 +420,6 @@ ApplicationWindow {
         id: rescueVideoDialog
         hostWindow: window
         controller: window.backend.rescueVideoController
-        errorHandler: window.showAppError
         nativeTitleBarConfigurator: function () {
             window.backend.configureNativeTitleBar(rescueVideoDialog)
         }
