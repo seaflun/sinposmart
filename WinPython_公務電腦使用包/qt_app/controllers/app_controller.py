@@ -1106,10 +1106,31 @@ class AppController(QObject):
     def _external_return_queue_id(request: DutySubmissionRequest) -> str:
         return str(request.schedule_data.get("_unreturned_return_queue_id", "") or "").strip()
 
+    def _is_unreturned_recovery_request(self, request: DutySubmissionRequest) -> bool:
+        return request.trigger_type == "recovery" and bool(self._external_return_queue_id(request))
+
+    def _should_send_operational_submission_event(
+        self,
+        request: DutySubmissionRequest,
+        *,
+        status: str = "",
+    ) -> bool:
+        if not self._is_unreturned_recovery_request(request):
+            return True
+        return status in {"submitted", "skipped_duplicate"}
+
     @Slot(object)
     def _publish_unreturned_return_event(self, event: Mapping) -> None:
         record = event.get("record", {}) if isinstance(event, Mapping) else {}
         if not isinstance(record, Mapping):
+            return
+        trigger_type = str(event.get("trigger_type") or "recovery")
+        status = str(event.get("status") or "pending")
+        if (
+            trigger_type == "recovery"
+            and status in {"retrying", "pending"}
+            and str(record.get("queue_id") or "").strip()
+        ):
             return
         actions = [
             dict(item)
@@ -1194,8 +1215,8 @@ class AppController(QObject):
             }
         self._send_operational_event(
             "unreturned_return",
-            status=str(event.get("status") or "pending"),
-            trigger_type=str(event.get("trigger_type") or "recovery"),
+            status=status,
+            trigger_type=trigger_type,
             action=outgoing,
             target=operational_person_label(
                 str(outgoing.get("target") or ""),
@@ -1272,7 +1293,10 @@ class AppController(QObject):
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
         action = self._submission_action(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
-        if not is_handoff_preflight:
+        if (
+            not is_handoff_preflight
+            and self._should_send_operational_submission_event(request)
+        ):
             self._send_operational_event(
                 "action_queued",
                 status="pending_write_automation",
@@ -1293,6 +1317,8 @@ class AppController(QObject):
         error_code: str,
     ) -> None:
         if self._duty_controller.is_handoff_preflight_request(request):
+            return
+        if not self._should_send_operational_submission_event(request):
             return
         action = self._submission_action(request)
         self._send_operational_event(
@@ -1363,7 +1389,10 @@ class AppController(QObject):
             action_key = self._submission_ui_action_key(request)
             if action_key:
                 self.dutyActionRecovered.emit(action_key)
-        if not is_handoff_preflight:
+        if (
+            not is_handoff_preflight
+            and self._should_send_operational_submission_event(request, status=result.status)
+        ):
             self._send_operational_event(
                 "action_result",
                 status=result.status,
@@ -1430,7 +1459,10 @@ class AppController(QObject):
             action_key = self._submission_ui_action_key(request)
             if action_key:
                 self.dutyActionFailed.emit(action_key, str(message or "").strip())
-        if not is_handoff_preflight:
+        if (
+            not is_handoff_preflight
+            and self._should_send_operational_submission_event(request)
+        ):
             self._send_operational_event(
                 "action_result",
                 status="failed",

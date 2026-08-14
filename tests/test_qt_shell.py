@@ -9044,6 +9044,102 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_unreturned_recovery_pause_does_not_publish_backend_action(self) -> None:
+        from pathlib import Path
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.app_controller import AppController
+
+        action = {
+            "kind": "entry_log",
+            "target": "21",
+            "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+        }
+        request = DutySubmissionRequest(
+            "user17",
+            "secret",
+            0,
+            {
+                "target_date": "1150808",
+                "actions": [action],
+                "_unreturned_return_queue_id": "retrying-queue",
+            },
+            trigger_type="recovery",
+        )
+        controller = AppController()
+        events: list[tuple[str, dict[str, object]]] = []
+        controller._send_operational_event = (
+            lambda record_type, **fields: events.append((record_type, fields))
+        )
+        try:
+            controller._submission_queued(request)
+            controller._submission_finished(
+                request,
+                DutySubmissionResult(
+                    0,
+                    "paused_external",
+                    "人員尚未返隊",
+                    Path("recovery-paused.json"),
+                    {},
+                    action,
+                ),
+            )
+            controller._submission_failed(request, "人員尚未返隊", "unknown_error", "")
+            self.assertEqual(events, [])
+
+            controller._submission_finished(
+                request,
+                DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "確認返隊後完成",
+                    Path("recovery-submitted.json"),
+                    {},
+                    action,
+                ),
+            )
+            self.assertEqual([record_type for record_type, _fields in events], ["action_result"])
+            self.assertEqual(events[0][1]["status"], "submitted")
+        finally:
+            controller.shutdown()
+
+    def test_unreturned_recovery_pause_state_does_not_publish_backend_event(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeController:
+            _operational_staff = {}
+
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def _send_operational_event(self, record_type: str, **fields) -> None:
+                self.events.append((record_type, fields))
+
+        action = {
+            "kind": "entry_log",
+            "target": "21",
+            "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+        }
+        event = {
+            "trigger_type": "recovery",
+            "record": {"queue_id": "retrying-queue", "action": action},
+        }
+        controller = FakeController()
+
+        for status in ("retrying", "pending"):
+            AppController._publish_unreturned_return_event(
+                controller,
+                {**event, "status": status},
+            )
+
+        self.assertEqual(controller.events, [])
+
+        AppController._publish_unreturned_return_event(
+            controller,
+            {**event, "status": "resolved"},
+        )
+        self.assertEqual([record_type for record_type, _fields in controller.events], ["unreturned_return"])
+
     def test_duty_execution_controller_retries_work_browser_without_using_entry_channel(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
