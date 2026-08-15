@@ -2062,6 +2062,37 @@ class DutySubmissionServiceTests(unittest.TestCase):
         self.assertEqual(fill_calls, [0, 1])
         self.assertEqual(quit_calls, [driver])
 
+    def test_entry_browser_session_records_last_activity_when_opened(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        opened_at = datetime(2026, 8, 15, 17, 30)
+        driver = object()
+        automation = SimpleNamespace(
+            build_driver=lambda *, headless: driver,
+            login=lambda *_args: None,
+            quit_driver=lambda _driver: None,
+        )
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {
+                "target_date": "1150815",
+                "actions": [{"kind": "entry_log", "time": "17:30", "actor": "10"}],
+            },
+        )
+        service = DutySubmissionService(
+            Path("package"),
+            module_loader=lambda: automation,
+            now_factory=lambda: opened_at,
+        )
+
+        session = service.open_browser_session(request)
+
+        self.assertEqual(session.last_activity_at, opened_at)
+
     def test_recovery_off_duty_action_still_checks_open_external_assignment(self) -> None:
         from datetime import datetime
 
@@ -9070,6 +9101,68 @@ if return_code != 0 or loaded:
         self.assertEqual(service.calls, [(0, 0), (1, 0), (1, 1)])
         self.assertEqual(failed_spy.count(), 0)
         controller.shutdown()
+
+    def test_duty_entry_queue_reopens_session_before_web_logout(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        now = datetime(2026, 8, 15, 18, 0)
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opened = 0
+                self.closed: list[int] = []
+                self.executed: list[int] = []
+
+            def open_browser_session(self, request, *, status_callback=None):
+                self.opened += 1
+                return SimpleNamespace(
+                    user_id=request.user_id,
+                    visible=request.visible,
+                    generation=self.opened,
+                    last_activity_at=datetime(2026, 8, 15, 17, 59),
+                )
+
+            def execute_with_browser_session(self, request, session, *, status_callback=None):
+                self.executed.append(session.generation)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "submitted",
+                    Path("fresh-session.json"),
+                    {},
+                )
+
+            def close_browser_session(self, session):
+                self.closed.append(session.generation)
+
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {
+                "target_date": "1150815",
+                "actions": [{"kind": "entry_log", "time": "18:00", "actor": "2"}],
+            },
+        )
+        service = FakeService()
+        worker = DutyEntryQueueWorker(service, now_factory=lambda: now)
+        worker._browser_session = SimpleNamespace(
+            user_id="user10",
+            visible=False,
+            generation=0,
+            last_activity_at=datetime(2026, 8, 15, 17, 30),
+        )
+
+        result = worker._execute(1, request)
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(service.closed, [0])
+        self.assertEqual(service.opened, 1)
+        self.assertEqual(service.executed, [1])
+        self.assertEqual(worker._browser_session.last_activity_at, now)
 
     def test_duty_notification_identifies_the_completed_action_and_target(self) -> None:
         from qt_app.controllers.app_controller import AppController

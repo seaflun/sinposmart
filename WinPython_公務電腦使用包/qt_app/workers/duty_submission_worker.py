@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from itertools import count
 from queue import PriorityQueue
 from threading import Event, Lock
+from typing import Callable
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from app_core.duty_submission_service import (
@@ -15,6 +17,9 @@ from app_core.duty_submission_service import (
     DutySubmissionResult,
     DutySubmissionService,
 )
+
+
+ENTRY_BROWSER_SESSION_IDLE_LIMIT = timedelta(minutes=25)
 
 
 class DutySubmissionWorker(QObject):
@@ -90,9 +95,15 @@ class DutyEntryQueueWorker(QObject):
     _MANUAL_PRIORITY = 0
     _NORMAL_PRIORITY = 1
 
-    def __init__(self, service: DutySubmissionService) -> None:
+    def __init__(
+        self,
+        service: DutySubmissionService,
+        *,
+        now_factory: Callable[[], datetime] = datetime.now,
+    ) -> None:
         super().__init__()
         self._service = service
+        self._now_factory = now_factory
         self._queue: PriorityQueue[tuple[int, int, int, DutySubmissionRequest | None]] = PriorityQueue()
         self._sequence = count()
         self._sequence_lock = Lock()
@@ -186,11 +197,13 @@ class DutyEntryQueueWorker(QObject):
                     request,
                     status_callback=lambda message: self.progress.emit(request_id, message),
                 )
-            return self._service.execute_with_browser_session(
+            result = self._service.execute_with_browser_session(
                 request,
                 self._browser_session,
                 status_callback=lambda message: self.progress.emit(request_id, message),
             )
+            self._mark_browser_session_active()
+            return result
         except DutySubmissionExecutionError as exc:
             session_expired = exc.error_code == "login_failed" and had_compatible_session
             if exc.error_code != "browser_startup" and not session_expired:
@@ -207,19 +220,30 @@ class DutyEntryQueueWorker(QObject):
                 request,
                 status_callback=lambda message: self.progress.emit(request_id, message),
             )
-            return self._service.execute_with_browser_session(
+            result = self._service.execute_with_browser_session(
                 request,
                 self._browser_session,
                 status_callback=lambda message: self.progress.emit(request_id, message),
             )
+            self._mark_browser_session_active()
+            return result
 
     def _has_compatible_session(self, request: DutySubmissionRequest) -> bool:
         session = self._browser_session
-        return bool(
+        if not (
             session is not None
             and session.user_id == request.user_id
             and session.visible == request.visible
-        )
+        ):
+            return False
+        last_activity_at = getattr(session, "last_activity_at", None)
+        if not isinstance(last_activity_at, datetime):
+            return True
+        return self._now_factory() - last_activity_at < ENTRY_BROWSER_SESSION_IDLE_LIMIT
+
+    def _mark_browser_session_active(self) -> None:
+        if self._browser_session is not None:
+            self._browser_session.last_activity_at = self._now_factory()
 
     def _supports_browser_sessions(self) -> bool:
         return all(

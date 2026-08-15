@@ -77,6 +77,7 @@ class DutySubmissionBrowserSession:
     driver: object
     user_id: str
     visible: bool
+    last_activity_at: datetime
 
 
 def load_automation_module() -> ModuleType:
@@ -431,6 +432,7 @@ class DutySubmissionService:
                 driver=driver,
                 user_id=request.user_id,
                 visible=request.visible,
+                last_activity_at=self.now_factory(),
             )
         except DutySubmissionValidationError:
             raise
