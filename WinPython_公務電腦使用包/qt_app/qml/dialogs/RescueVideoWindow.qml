@@ -356,16 +356,32 @@ Window {
 
         Rectangle {
             Layout.fillWidth: true
-            implicitHeight: Design.rescueHeaderHeight
+            implicitHeight: Design.rescueHeaderHeight + 36
             color: Design.strongHeader
 
             RowLayout {
                 anchors.fill: parent
                 anchors.leftMargin: 24
                 anchors.rightMargin: 24
-                StrongHeaderTitle {
-                    objectName: "rescueVideoTitleLabel"
-                    text: "救護行車紀錄器"
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: 0
+
+                    StrongHeaderTitle {
+                        objectName: "rescueVideoTitleLabel"
+                        text: "救護行車紀錄器"
+                    }
+                    Label {
+                        objectName: "rescueVideoFlowGuideText"
+                        Layout.fillWidth: true
+                        text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 選擇分類方式（只複製，或複製及驗證成功後刪除）。不同案件資料夾會分別傳送並逐檔驗證。"
+                        color: Design.strongHeaderStatus
+                        font.pixelSize: Design.captionSize
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
+                    }
                 }
                 Label {
                     objectName: "rescueVideoStatusBadge"
@@ -373,31 +389,6 @@ Window {
                     color: Design.strongHeaderStatus
                     font.pixelSize: Design.bodySize
                     font.bold: true
-                }
-            }
-        }
-
-        ToolFormCard {
-            objectName: "rescueVideoFlowGuideCard"
-            Layout.fillWidth: true
-            Layout.leftMargin: 24
-            Layout.rightMargin: 24
-            Layout.topMargin: 12
-            contentItem: ColumnLayout {
-                spacing: 4
-                Label {
-                    objectName: "rescueVideoFlowGuideTitle"
-                    text: "使用限制與流程"
-                    color: Design.text
-                    font.pixelSize: Design.bodySize
-                    font.bold: true
-                }
-                Label {
-                    objectName: "rescueVideoFlowGuideText"
-                    Layout.fillWidth: true
-                    text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 選擇分類方式（只複製，或複製及驗證成功後刪除）。不同案件資料夾會分別傳送並逐檔驗證。"
-                    color: Design.secondaryText
-                    wrapMode: Text.Wrap
                 }
             }
         }
@@ -762,7 +753,7 @@ Window {
                             width: Math.min(parent.width - 48, 520)
                             text: rescueVideoWindow.controller.hasPreview
                                   ? "預覽完成，但目前沒有可分送的影片。請檢查記憶卡影片時間與案件資料。"
-                                  : "尚未產生分類結果；完成前置檢查後按「檢查及預覽分類」。"
+                                  : "尚未產生分類結果，請先執行檢查及預覽分類。"
                             color: Design.secondaryText
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.Wrap
@@ -809,12 +800,6 @@ Window {
                         rescueVideoWindow.controller.offsetText,
                         false
                     )
-                }
-                Label {
-                    text: "刪除模式只會刪除複製及驗證成功的記憶卡檔案；失敗檔案會保留。"
-                    color: Design.dangerStrong
-                    font.pixelSize: Design.captionSize
-                    wrapMode: Text.Wrap
                 }
                 BusyIndicator {
                     running: rescueVideoWindow.controller.isRunning

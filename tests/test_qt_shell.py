@@ -6231,6 +6231,10 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('objectName: "rescueVideoResultTitle"', panel)
         self.assertIn("DataSectionTitle {", panel)
         self.assertNotIn("section: true", panel)
+        self.assertNotIn('objectName: "rescueVideoFlowGuideCard"', panel)
+        self.assertNotIn('objectName: "rescueVideoFlowGuideTitle"', panel)
+        self.assertIn(': "尚未產生分類結果，請先執行檢查及預覽分類。"', source)
+        self.assertNotIn('text: "刪除模式只會刪除複製及驗證成功的記憶卡檔案；失敗檔案會保留。"', source)
         self.assertIn('title: "選擇記憶卡 DCIM\\\\100CAREC 資料夾"', source)
         self.assertIn('title: "確認啟動分類(只複製檔案不刪除)"', source)
         self.assertIn('title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"', source)
@@ -14677,8 +14681,10 @@ if return_code != 0 or loaded:
                 rescue_vehicle_combo = wait_for("rescueVideoVehicleCombo")
                 rescue_date_field = wait_for("rescueVideoDateField")
                 rescue_title_label = wait_for("rescueVideoTitleLabel")
+                rescue_flow_text = wait_for("rescueVideoFlowGuideText")
                 rescue_window_title = wait_for("rescueVideoWindowTitleLabel")
                 rescue_result_title = wait_for("rescueVideoResultTitle")
+                rescue_result_empty_text = wait_for("rescueVideoResultEmptyText")
                 rescue_source_card = find_rescue_visual("rescueVideoCheckCard_source")
                 rescue_videos_card = find_rescue_visual("rescueVideoCheckCard_videos")
                 rescue_check_button = wait_for("rescueVideoCheckButton")
@@ -14698,6 +14704,11 @@ if return_code != 0 or loaded:
                 self.assertEqual(rescue_date_field.width(), 140)
                 self.assertEqual(rescue_title_label.property("font").pixelSize(), 24)
                 self.assertEqual(rescue_window_title.property("text"), "SinpoSmart - 救護行車紀錄器")
+                self.assertIn("只支援單張記憶卡", rescue_flow_text.property("text"))
+                self.assertEqual(
+                    rescue_result_empty_text.property("text"),
+                    "尚未產生分類結果，請先執行檢查及預覽分類。",
+                )
                 self.assertEqual(rescue_result_title.property("font").pixelSize(), 16)
                 self.assertGreater(rescue_source_card.width(), 0)
                 self.assertGreater(rescue_videos_card.width(), 0)
