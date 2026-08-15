@@ -40,6 +40,9 @@ from qt_app.workers.schedule_load_worker import ScheduleLoadWorker
 from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 
 
+ACTUAL_HANDOFF_RETENTION = timedelta(hours=36)
+
+
 class DutyController(QObject):
     clockChanged = Signal()
     scheduleChanged = Signal()
@@ -81,6 +84,7 @@ class DutyController(QObject):
         )
         self._return_policy_state_path = Path(runtime_output_dir) / "duty_return_policy.json"
         self._manual_departure_pair_keys = self._load_manual_departure_pair_keys()
+        self._actual_handoff_times = self._load_actual_handoff_times()
         self._current_date_text = ""
         self._current_time_text = ""
         self._observed_fire_day = business_roc_date()
@@ -116,6 +120,7 @@ class DutyController(QObject):
         self._pending_external_return_schedule_generation = 0
         self._external_return_confirmation_summary = ""
         self._external_return_queue_ids_by_action_index: dict[int, str] = {}
+        self._pending_handoff_actual_times: dict[str, datetime] = {}
         self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
         self._auto_execution_enabled = False
         self._login_started_at: datetime | None = None
@@ -616,10 +621,55 @@ class DutyController(QObject):
             return set()
         return {str(value).strip() for value in values if str(value).strip()}
 
+    @staticmethod
+    def _parse_actual_handoff_time(value: Any) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed
+
+    def _load_actual_handoff_times(self) -> dict[str, str]:
+        try:
+            payload = json.loads(self._return_policy_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        values = payload.get("actual_handoff_times", {})
+        if not isinstance(values, Mapping):
+            return {}
+        current = datetime.now()
+        retained: dict[str, str] = {}
+        for key, value in values.items():
+            actual_at = self._parse_actual_handoff_time(value)
+            normalized_key = str(key or "").strip()
+            if (
+                not normalized_key
+                or actual_at is None
+                or actual_at < current - ACTUAL_HANDOFF_RETENTION
+            ):
+                continue
+            retained[normalized_key] = actual_at.isoformat(timespec="seconds")
+        return retained
+
+    def _prune_actual_handoff_times(self, now: datetime | None = None) -> None:
+        current = now or datetime.now()
+        self._actual_handoff_times = {
+            key: actual_at.isoformat(timespec="seconds")
+            for key, value in self._actual_handoff_times.items()
+            if (actual_at := self._parse_actual_handoff_time(value)) is not None
+            and actual_at >= current - ACTUAL_HANDOFF_RETENTION
+        }
+
     def _save_manual_departure_pair_keys(self) -> None:
+        self._prune_actual_handoff_times()
         payload = {
             "schema_version": 1,
             "manual_departure_pair_keys": sorted(self._manual_departure_pair_keys),
+            "actual_handoff_times": dict(sorted(self._actual_handoff_times.items())),
         }
         temporary_path = self._return_policy_state_path.with_name(
             f"{self._return_policy_state_path.name}.tmp"
@@ -1497,7 +1547,20 @@ class DutyController(QObject):
         action_index = self._queue_component_action_index(queue_id, action, completion_key)
         if action_index is not None and status in ("submitted", "skipped_duplicate"):
             self._task_errors.pop(action_index, None)
+        if (
+            record is not None
+            and status in ("submitted", "skipped_duplicate")
+            and action.get("kind") == "work_log"
+            and action.get("source") == "值班交接"
+        ):
+            actual_at = self._submission_action_datetime(action)
+            if actual_at is not None:
+                self._pending_handoff_actual_times[queue_id] = actual_at
         if record is not None and resolved:
+            actual_at = self._pending_handoff_actual_times.pop(queue_id, None)
+            if actual_at is None:
+                actual_at = self._submission_action_datetime(action)
+            self._record_resolved_handoff_time(record, actual_at)
             self._publish_unreturned_return_event("resolved", record, trigger_type=trigger_type)
             self._resume_auto_logout_after_handoff_resolution(record)
         elif record is not None and status not in ("submitted", "skipped_duplicate"):
@@ -1854,6 +1917,7 @@ class DutyController(QObject):
             self._handoff_preflight_groups.clear()
             self._cancel_auto_logout()
         self._append_active_queue_actions()
+        self._apply_actual_handoff_time_adjustments()
         self._schedule_generation += 1
         incoming_comparisons = {
             int(index): dict(comparison)
@@ -2077,6 +2141,120 @@ class DutyController(QObject):
             start = f"{start[:2]}:{start[2:]}"
         lines[0] = f"{matched.group(1)}{start}-{actual_end}"
         return "\n".join(lines)
+
+    @staticmethod
+    def _handoff_status_with_actual_start(value: Any, actual_start: str) -> str:
+        lines = str(value or "").splitlines()
+        if not lines:
+            return str(value or "")
+        matched = re.match(r"^(一、時間:)\s*.*?\s*-\s*(.+?)\s*$", lines[0])
+        if matched is None:
+            return str(value or "")
+        end = matched.group(2).strip()
+        if end.isdigit() and len(end) == 2:
+            end = f"{end}:00"
+        elif end.isdigit() and len(end) == 4:
+            end = f"{end[:2]}:{end[2:]}"
+        lines[0] = f"{matched.group(1)}{actual_start}-{end}"
+        return "\n".join(lines)
+
+    def _submission_action_datetime(self, action: Mapping[str, Any]) -> datetime:
+        target_date = str(action.get("submit_target_date") or self._target_date_text or "").strip()
+        return action_datetime(action, target_date, fallback_date=datetime.now().date())
+
+    def _record_resolved_handoff_time(
+        self,
+        record: Mapping[str, Any],
+        actual_at: datetime | None,
+    ) -> None:
+        if (
+            record.get("record_type") not in ("handoff_group", "bridge_history")
+            or actual_at is None
+        ):
+            return
+        actual_text = actual_at.isoformat(timespec="seconds")
+        work_keys = {
+            action_completion_key(action)
+            for action in self._unreturned_return_queue.record_actions(record)
+            if action.get("kind") == "work_log"
+            and action.get("source") == "值班交接"
+        }
+        if not work_keys:
+            return
+        self._actual_handoff_times.update(
+            {key: actual_text for key in work_keys if key}
+        )
+        self._save_manual_departure_pair_keys()
+        self._apply_actual_handoff_time_adjustments()
+
+    def _apply_actual_handoff_time_adjustments(self) -> None:
+        self._prune_actual_handoff_times()
+        if not self._actual_handoff_times or not self._target_date_text:
+            return
+        work_actions: list[tuple[datetime, str, dict[str, Any]]] = []
+        for action in self._actions:
+            if action.get("kind") != "work_log" or action.get("source") != "值班交接":
+                continue
+            work_actions.append(
+                (
+                    action_datetime(
+                        action,
+                        self._target_date_text,
+                        fallback_date=datetime.now().date(),
+                    ),
+                    action_completion_key(action),
+                    action,
+                )
+            )
+        actions_by_key = {
+            completion_key: (action_at, action)
+            for action_at, completion_key, action in work_actions
+            if completion_key
+        }
+        for source_key, actual_text in sorted(self._actual_handoff_times.items()):
+            actual_at = self._parse_actual_handoff_time(actual_text)
+            source_entry = actions_by_key.get(source_key)
+            if actual_at is None:
+                continue
+            if source_entry is not None:
+                _source_at, source_action = source_entry
+                source_fields = source_action.get("fields", {})
+                if isinstance(source_fields, Mapping):
+                    updated_status = self._handoff_status_with_actual_end(
+                        source_fields.get("處理情形", ""),
+                        actual_at.strftime("%H:%M"),
+                    )
+                    if updated_status != str(source_fields.get("處理情形", "") or ""):
+                        source_action["fields"] = {
+                            **dict(source_fields),
+                            "處理情形": updated_status,
+                        }
+                        source_action["_actual_handoff_adjusted"] = True
+            future_actions = [
+                item
+                for item in work_actions
+                if item[0] > actual_at
+                and (source_entry is None or item[1] != source_key)
+            ]
+            if not future_actions:
+                continue
+            next_at = min(item[0] for item in future_actions)
+            for candidate_at, _candidate_key, candidate in future_actions:
+                if candidate_at != next_at:
+                    continue
+                candidate_fields = candidate.get("fields", {})
+                if not isinstance(candidate_fields, Mapping):
+                    continue
+                updated_status = self._handoff_status_with_actual_start(
+                    candidate_fields.get("處理情形", ""),
+                    actual_at.strftime("%H:%M"),
+                )
+                if updated_status != str(candidate_fields.get("處理情形", "") or ""):
+                    candidate["fields"] = {
+                        **dict(candidate_fields),
+                        "處理情形": updated_status,
+                    }
+                    candidate["_actual_handoff_adjusted"] = True
 
     def _queue_submission_requests(
         self,

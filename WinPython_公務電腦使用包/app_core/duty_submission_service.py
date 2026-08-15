@@ -44,6 +44,10 @@ class DutySubmissionExecutionError(RuntimeError):
         self.result_path = result_path
 
 
+RECENT_HANDOFF_SCHEDULE_SNAPSHOT_MAX_AGE = timedelta(minutes=2)
+ROUTINE_WORK_LOG_QUERY_WINDOW = timedelta(minutes=2)
+
+
 @dataclass(frozen=True)
 class DutySubmissionRequest:
     user_id: str
@@ -207,11 +211,12 @@ class DutySubmissionService:
                 action,
                 action_date,
                 status_callback=status_callback,
+                prefer_recent_schedule_snapshot=request.trigger_type == "due",
             )
             actions[request.action_index] = action
             comparison_source = dict(data)
             comparison_source["actions"] = actions
-            query_range = self._query_range(request)
+            query_range = self._query_range(request, action, action_date)
             if status_callback:
                 status_callback("正在進行送出前防重複檢查…")
             before = self._query_comparison(
@@ -485,6 +490,7 @@ class DutySubmissionService:
         action_date: str,
         *,
         status_callback: Callable[[str], None] | None,
+        prefer_recent_schedule_snapshot: bool = False,
     ) -> dict[str, Any]:
         action = dict(action)
         if not (
@@ -494,6 +500,15 @@ class DutySubmissionService:
             and action_date == self._roc_date(self.now_factory().date())
         ):
             return action
+        if prefer_recent_schedule_snapshot:
+            recent_action = self._recent_handoff_action_from_schedule_snapshot(
+                action,
+                action_date,
+            )
+            if recent_action is not None:
+                if status_callback:
+                    status_callback("正在套用剛更新的值班交接資料…")
+                return recent_action
         if status_callback:
             status_callback("正在重新查詢值班交接資料…")
         target = automation.parse_roc_date(action_date)
@@ -519,18 +534,78 @@ class DutySubmissionService:
         for latest in latest_actions:
             latest_mapping = self._mapping(latest)
             if str(latest_mapping.get("duplicate_key", "") or "") == duplicate_key:
-                if action.get("submit_target_date"):
-                    latest_fields = dict(latest_mapping.get("fields", {}))
-                    original_fields = action.get("fields", {})
-                    if isinstance(original_fields, Mapping):
-                        for key in ("工作時間", "登打時間", "系統寫入時間"):
-                            if key in original_fields:
-                                latest_fields[key] = original_fields[key]
-                    latest_mapping["fields"] = latest_fields
-                    latest_mapping["time"] = action.get("time", latest_mapping.get("time", ""))
-                    latest_mapping["submit_target_date"] = action["submit_target_date"]
-                return latest_mapping
+                return self._merge_refreshed_handoff_action(action, latest_mapping)
         return action
+
+    def _recent_handoff_action_from_schedule_snapshot(
+        self,
+        action: Mapping[str, Any],
+        action_date: str,
+    ) -> dict[str, Any] | None:
+        duplicate_key = str(action.get("duplicate_key", "") or "").strip()
+        if not duplicate_key:
+            return None
+        snapshot_path = (
+            self.package_root
+            / "runtime_outputs"
+            / "schedule"
+            / f"schedule_output_{action_date}.json"
+        )
+        try:
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(snapshot, Mapping)
+            or str(snapshot.get("target_date", "") or "") != action_date
+        ):
+            return None
+        try:
+            created_at = datetime.fromisoformat(str(snapshot.get("created_at", "") or ""))
+        except ValueError:
+            return None
+        if created_at.tzinfo is not None:
+            created_at = created_at.replace(tzinfo=None)
+        age = self.now_factory() - created_at
+        if age < timedelta() or age > RECENT_HANDOFF_SCHEDULE_SNAPSHOT_MAX_AGE:
+            return None
+        latest_actions = snapshot.get("actions", [])
+        if not isinstance(latest_actions, list):
+            return None
+        for latest in latest_actions:
+            if not isinstance(latest, Mapping):
+                continue
+            latest_mapping = self._mapping(latest)
+            if str(latest_mapping.get("duplicate_key", "") or "") == duplicate_key:
+                return self._merge_refreshed_handoff_action(action, latest_mapping)
+        return None
+
+    @staticmethod
+    def _merge_refreshed_handoff_action(
+        action: Mapping[str, Any],
+        latest_mapping: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(latest_mapping)
+        if action.get("submit_target_date"):
+            latest_fields = dict(merged.get("fields", {}))
+            original_fields = action.get("fields", {})
+            if isinstance(original_fields, Mapping):
+                preserved_keys = ("工作時間", "登打時間", "系統寫入時間")
+                if action.get("submit_target_date") or action.get("_actual_handoff_adjusted"):
+                    preserved_keys += ("處理情形",)
+                for key in preserved_keys:
+                    if key in original_fields:
+                        latest_fields[key] = original_fields[key]
+            merged["fields"] = latest_fields
+            merged["time"] = action.get("time", merged.get("time", ""))
+            merged["submit_target_date"] = action["submit_target_date"]
+        elif action.get("_actual_handoff_adjusted"):
+            latest_fields = dict(merged.get("fields", {}))
+            original_fields = action.get("fields", {})
+            if isinstance(original_fields, Mapping) and "處理情形" in original_fields:
+                latest_fields["處理情形"] = original_fields["處理情形"]
+            merged["fields"] = latest_fields
+        return merged
 
     def _open_assignment_pause_details(
         self,
@@ -664,25 +739,79 @@ class DutySubmissionService:
     def _roc_date(value: date) -> str:
         return f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}"
 
-    def _query_range(self, request: DutySubmissionRequest) -> dict[str, Any] | None:
+    def _query_range(
+        self,
+        request: DutySubmissionRequest,
+        action: Mapping[str, Any],
+        action_date: str,
+    ) -> dict[str, Any] | None:
         raw_start = str(request.schedule_data.get("_unreturned_return_query_start_at", "") or "").strip()
-        if not raw_start:
+        if raw_start:
+            try:
+                start_at = datetime.fromisoformat(raw_start)
+            except ValueError:
+                return None
+            now = self.now_factory()
+            if start_at > now:
+                return None
+            return {
+                "start_at": start_at,
+                "start_roc_date": self._roc_date(start_at.date()),
+                "start_time": start_at.strftime("%H:%M"),
+                "end_at": now,
+                "end_roc_date": self._roc_date(now.date()),
+                "end_time": now.strftime("%H:%M"),
+            }
+        if (
+            action.get("kind") != "work_log"
+            or action.get("source") == "案件工作審核"
+        ):
+            return None
+        fields = action.get("fields", {})
+        work_time = (
+            fields.get("工作時間") if isinstance(fields, Mapping) else ""
+        ) or action.get("time", "")
+        work_minutes = self._clock_minutes(work_time)
+        if work_minutes is None:
             return None
         try:
-            start_at = datetime.fromisoformat(raw_start)
+            work_at = datetime(
+                int(action_date[:3]) + 1911,
+                int(action_date[3:5]),
+                int(action_date[5:7]),
+            ) + timedelta(minutes=work_minutes)
         except ValueError:
             return None
-        now = self.now_factory()
-        if start_at > now:
-            return None
+        start_at = work_at - ROUTINE_WORK_LOG_QUERY_WINDOW
+        end_at = work_at + ROUTINE_WORK_LOG_QUERY_WINDOW
         return {
             "start_at": start_at,
             "start_roc_date": self._roc_date(start_at.date()),
             "start_time": start_at.strftime("%H:%M"),
-            "end_at": now,
-            "end_roc_date": self._roc_date(now.date()),
-            "end_time": now.strftime("%H:%M"),
+            "end_at": end_at,
+            "end_roc_date": self._roc_date(end_at.date()),
+            "end_time": end_at.strftime("%H:%M"),
         }
+
+    @staticmethod
+    def _query_visible_rows(
+        automation: ModuleType,
+        driver: object,
+        ap_name: str,
+        action_date: str,
+        query_kwargs: Mapping[str, str],
+    ) -> list[Any]:
+        try:
+            return automation.query_visible_table(
+                driver,
+                ap_name,
+                action_date,
+                **query_kwargs,
+            )
+        except TypeError as exc:
+            if not query_kwargs or "unexpected keyword argument" not in str(exc):
+                raise
+            return automation.query_visible_table(driver, ap_name, action_date)
 
     @staticmethod
     def _query_comparison(
@@ -704,18 +833,20 @@ class DutySubmissionService:
             else {}
         )
         if action.get("kind") in ("entry_log", "handoff_preflight"):
-            rows = automation.query_visible_table(
+            rows = DutySubmissionService._query_visible_rows(
+                automation,
                 driver,
                 automation.ENTRY_LOG_AP,
                 action_date,
-                **query_kwargs,
+                query_kwargs,
             )
             return {"visible_entry_rows": rows, "visible_work_rows": []}
-        rows = automation.query_visible_table(
+        rows = DutySubmissionService._query_visible_rows(
+            automation,
             driver,
             automation.WORK_LOG_AP,
             action_date,
-            **query_kwargs,
+            query_kwargs,
         )
         return {"visible_entry_rows": [], "visible_work_rows": rows}
 

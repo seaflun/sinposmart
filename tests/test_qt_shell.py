@@ -1931,6 +1931,221 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "submitted")
             self.assertEqual(filled_descriptions, ["最新內容"])
 
+    def test_due_handoff_uses_recent_schedule_snapshot_before_remote_refresh(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            snapshot_path = (
+                package_root
+                / "runtime_outputs"
+                / "schedule"
+                / "schedule_output_1150729.json"
+            )
+            snapshot_path.parent.mkdir(parents=True)
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "target_date": "1150729",
+                        "created_at": "2026-07-29T08:00:40",
+                        "actions": [
+                            {
+                                "kind": "work_log",
+                                "time": "08:00",
+                                "actor": "10",
+                                "source": "值班交接",
+                                "duplicate_key": "handoff-1",
+                                "fields": {"工作概述": "即時班表內容"},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            filled_descriptions: list[str] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:00", "完成"]] if query_count > 1 else []
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda _driver, action, _staff, _date, save: filled_descriptions.append(
+                    action["fields"]["工作概述"]
+                )
+                or {},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {},
+                quit_driver=lambda _driver: None,
+                parse_roc_date=lambda *_args: self.fail("不應重抓遠端班表"),
+            )
+            service = DutySubmissionService(
+                package_root,
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 8, 0, 50),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
+            )
+            data = {
+                "target_date": "1150729",
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "source": "值班交接",
+                        "duplicate_key": "handoff-1",
+                        "fields": {"工作概述": "舊內容"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(filled_descriptions, ["即時班表內容"])
+        self.assertEqual(query_count, 2)
+
+    def test_due_routine_work_log_queries_only_the_matching_two_minute_window(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            query_ranges: list[dict[str, str]] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date, **query_range):
+                nonlocal query_count
+                query_count += 1
+                query_ranges.append(dict(query_range))
+                return [["115/07/29", "12:00", "值班"]] if query_count > 1 else []
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {},
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 12, 0),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
+            )
+            data = {
+                "target_date": "1150729",
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "12:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "12:00", "勤務項目": "值班"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(
+            query_ranges,
+            [
+                {
+                    "start_roc_date": "1150729",
+                    "start_time": "11:58",
+                    "end_roc_date": "1150729",
+                    "end_time": "12:02",
+                },
+                {
+                    "start_roc_date": "1150729",
+                    "start_time": "11:58",
+                    "end_roc_date": "1150729",
+                    "end_time": "12:02",
+                },
+            ],
+        )
+
+    def test_handoff_refresh_preserves_actual_status_after_stamped_submission(self) -> None:
+        from datetime import date, datetime
+
+        from app_core.duty_submission_service import DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            automation = SimpleNamespace(
+                parse_roc_date=lambda _value: date(2026, 7, 29),
+                roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+                query_duty_sheet=lambda *_args: object(),
+                query_cases=lambda *_args: [],
+                planned_actions=lambda *_args: [
+                    {
+                        "kind": "work_log",
+                        "time": "12:00",
+                        "actor": "10",
+                        "source": "值班交接",
+                        "duplicate_key": "handoff-actual-status",
+                        "fields": {
+                            "工作時間": "12:00",
+                            "處理情形": "一、時間:10-12",
+                        },
+                    }
+                ],
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                now_factory=lambda: datetime(2026, 7, 29, 12, 20),
+            )
+            action = {
+                "kind": "work_log",
+                "time": "12:20",
+                "actor": "10",
+                "source": "值班交接",
+                "duplicate_key": "handoff-actual-status",
+                "submit_target_date": "1150729",
+                "fields": {
+                    "工作時間": "12:20",
+                    "處理情形": "一、時間:10:00-12:20",
+                },
+            }
+
+            refreshed = service._refresh_action_before_submit(
+                automation,
+                object(),
+                action,
+                "1150729",
+                status_callback=None,
+            )
+            scheduled_action = dict(action)
+            scheduled_action.pop("submit_target_date")
+            scheduled_action["_actual_handoff_adjusted"] = True
+            refreshed_scheduled = service._refresh_action_before_submit(
+                automation,
+                object(),
+                scheduled_action,
+                "1150729",
+                status_callback=None,
+            )
+
+        self.assertEqual(refreshed["fields"]["工作時間"], "12:20")
+        self.assertEqual(refreshed["fields"]["處理情形"], "一、時間:10:00-12:20")
+        self.assertEqual(refreshed_scheduled["fields"]["處理情形"], "一、時間:10:00-12:20")
+
     def test_due_off_duty_action_pauses_when_external_assignment_is_open(self) -> None:
         from datetime import datetime
 
@@ -11864,6 +12079,171 @@ if return_code != 0 or loaded:
         work_action = stamped_actions[2]
         self.assertEqual(work_action["fields"]["工作時間"], "18:25")
         self.assertEqual(work_action["fields"]["處理情形"].splitlines()[0], "一、時間:16:00-18:25")
+
+    def test_resolved_handoff_adjusts_following_work_period_start(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        def handoff_actions(hour: int, actor: str, incoming: str, start: str) -> list[dict]:
+            return [
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150815:{hour}:值退:{actor}",
+                    "fields": {"出或入": "值退", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": incoming,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150815:{hour}:值班:{incoming}",
+                    "fields": {"出或入": "值班", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "work_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"work:1150815:{hour}:值班交接:{actor}",
+                    "fields": {
+                        "工作時間": f"{hour:02d}:00",
+                        "處理情形": f"一、時間:{start}-{hour:02d}:00",
+                    },
+                },
+            ]
+
+        old_actions = handoff_actions(12, "26", "12", "10")
+        next_actions = handoff_actions(14, "12", "13", "12")
+        schedule_data = {
+            "target_date": "1150815",
+            "today": {"staff": {"12": {"name": "接班"}, "26": {"name": "原值班"}}},
+            "actions": old_actions + next_actions,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = UnreturnedReturnQueue(Path(temp_dir))
+            controller = DutyController(
+                repository=ScheduleRepository(Path(temp_dir)),
+                unreturned_return_queue=queue,
+            )
+            self.addCleanup(controller.shutdown)
+            controller.set_actor_no("26")
+            controller.replace_schedule_data(schedule_data)
+            record, created = queue.pause_group(
+                old_actions,
+                schedule_data,
+                owner_actor_no="26",
+                now=datetime(2026, 8, 15, 12, 0),
+            )
+            self.assertTrue(created)
+            controller.replace_schedule_data(schedule_data)
+
+            submit_at = datetime(2026, 8, 15, 12, 20)
+            for original_action in record["actions"]:
+                submitted_action = controller._stamped_submission_action(original_action, submit_at)
+                self.assertIsNotNone(submitted_action)
+                self.assertTrue(
+                    controller.handle_external_return_queue_result(
+                        record["queue_id"],
+                        submitted_action,
+                        "submitted",
+                        action_completion_key(original_action),
+                    )
+                )
+
+            work_actions = [
+                action
+                for action in controller._actions
+                if action.get("kind") == "work_log"
+                and action.get("source") == "值班交接"
+            ]
+
+        self.assertEqual(work_actions[0]["fields"]["處理情形"], "一、時間:10:00-12:20")
+        self.assertEqual(work_actions[1]["fields"]["處理情形"], "一、時間:12:20-14:00")
+
+    def test_actual_handoff_adjustment_handles_multiple_slots_and_next_day(self) -> None:
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        def work_action(
+            target_date: str,
+            hour: int,
+            actor: str,
+            start: str,
+            *,
+            date_offset: int = 0,
+        ) -> dict:
+            return {
+                "kind": "work_log",
+                "time": f"{hour:02d}:00",
+                "date_offset": date_offset,
+                "actor": actor,
+                "target": actor,
+                "source": "值班交接",
+                "duplicate_key": f"work:{target_date}:{hour}:值班交接:{actor}",
+                "fields": {
+                    "工作時間": f"{hour:02d}:00",
+                    "處理情形": f"一、時間:{start}-{hour:02d}:00",
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(repository=ScheduleRepository(Path(temp_dir)))
+            self.addCleanup(controller.shutdown)
+            controller._actual_handoff_times = {
+                "work:1150815:12:值班交接:26": "2026-08-15T12:20:00",
+                "work:1150815:14:值班交接:12": "2026-08-15T14:30:00",
+            }
+            controller.replace_schedule_data(
+                {
+                    "target_date": "1150815",
+                    "actions": [
+                        work_action("1150815", 12, "26", "10"),
+                        work_action("1150815", 14, "12", "12"),
+                        work_action("1150815", 16, "13", "14"),
+                    ],
+                }
+            )
+            current_day_actions = controller._actions
+            self.assertEqual(
+                current_day_actions[0]["fields"]["處理情形"],
+                "一、時間:10:00-12:20",
+            )
+            self.assertEqual(
+                current_day_actions[1]["fields"]["處理情形"],
+                "一、時間:12:20-14:30",
+            )
+            self.assertEqual(
+                current_day_actions[2]["fields"]["處理情形"],
+                "一、時間:14:30-16:00",
+            )
+
+            controller._actual_handoff_times = {
+                "work:1150815:22:值班交接:26": "2026-08-15T22:20:00",
+            }
+            next_day_schedule = {
+                "target_date": "1150816",
+                "actions": [work_action("1150816", 8, "12", "22")],
+            }
+            controller.replace_schedule_data(next_day_schedule)
+            reloaded_controller = DutyController(
+                repository=ScheduleRepository(Path(temp_dir))
+            )
+            self.addCleanup(reloaded_controller.shutdown)
+            reloaded_controller.replace_schedule_data(next_day_schedule)
+            next_day_work = reloaded_controller._actions[0]
+
+        self.assertEqual(next_day_work["fields"]["處理情形"], "一、時間:22:20-08:00")
 
     def test_recovery_bridges_missed_handoff_to_current_scheduled_duty(self) -> None:
         from datetime import datetime
