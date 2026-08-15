@@ -148,6 +148,10 @@ Window {
     Connections {
         target: rescueVideoWindow.controller
 
+        function onCopyConfirmationRequested() {
+            rescueVideoCopyConfirmation.open()
+        }
+
         function onDeleteConfirmationRequested() {
             rescueVideoDeleteConfirmation.open()
         }
@@ -391,7 +395,7 @@ Window {
                 Label {
                     objectName: "rescueVideoFlowGuideText"
                     Layout.fillWidth: true
-                    text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 複製並刪除記憶卡中資料。不同案件資料夾會分別傳送並逐檔驗證。"
+                    text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 選擇分類方式（只複製，或複製及驗證成功後刪除）。不同案件資料夾會分別傳送並逐檔驗證。"
                     color: Design.secondaryText
                     wrapMode: Text.Wrap
                 }
@@ -769,9 +773,28 @@ Window {
             }
             RowLayout {
                 Layout.fillWidth: true
+                spacing: 8
+                AppleButton {
+                    objectName: "rescueVideoCopyOnlyButton"
+                    text: "啟動分類(只複製檔案不刪除)"
+                    tone: "primary"
+                    emphasizedBorder: true
+                    enabled: rescueVideoWindow.controller.isReady
+                             && rescueVideoWindow.controller.hasPreview
+                             && !rescueVideoWindow.controller.isRunning
+                             && !rescueVideoWindow.controller.isAwaitingConfirmation
+                    onClicked: rescueVideoWindow.controller.prepareCopy(
+                        rescueVideoWindow.controller.sourcePath,
+                        rescueVideoWindow.controller.destinationPath,
+                        rescueVideoDateField.text,
+                        rescueVideoVehicleCombo.currentText,
+                        rescueVideoWindow.controller.offsetText,
+                        false
+                    )
+                }
                 AppleButton {
                     objectName: "rescueVideoCopyStartButton"
-                    text: "複製並刪除記憶卡中資料"
+                    text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"
                     tone: "dangerFilled"
                     emphasizedBorder: true
                     enabled: rescueVideoWindow.controller.isReady
@@ -788,7 +811,7 @@ Window {
                     )
                 }
                 Label {
-                    text: "只刪除逐檔驗證成功的影片；失敗檔案會保留。"
+                    text: "刪除模式只會刪除複製及驗證成功的記憶卡檔案；失敗檔案會保留。"
                     color: Design.dangerStrong
                     font.pixelSize: Design.captionSize
                     wrapMode: Text.Wrap
@@ -810,14 +833,36 @@ Window {
     }
 
     AppleDialog {
+        id: rescueVideoCopyConfirmation
+        objectName: "rescueVideoCopyConfirmation"
+        anchors.centerIn: parent
+        width: Math.min(rescueVideoWindow.width - 72, 500)
+        modal: true
+        title: "確認啟動分類(只複製檔案不刪除)"
+        standardButtons: Dialog.Yes | Dialog.No
+        acceptText: "開始分類"
+        rejectText: "取消"
+        acceptTone: "primary"
+        onAccepted: rescueVideoWindow.controller.confirmCopy()
+        onRejected: rescueVideoWindow.controller.cancelCopy()
+
+        Label {
+            width: parent.width
+            text: rescueVideoWindow.controller.confirmationSummary
+            color: Design.text
+            wrapMode: Text.Wrap
+        }
+    }
+
+    AppleDialog {
         id: rescueVideoDeleteConfirmation
         objectName: "rescueVideoDeleteConfirmation"
         anchors.centerIn: parent
         width: Math.min(rescueVideoWindow.width - 72, 500)
         modal: true
-        title: "即將複製並刪除記憶卡中資料"
+        title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"
         standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "確定"
+        acceptText: "開始分類並刪除"
         rejectText: "取消"
         acceptTone: "dangerFilled"
         onAccepted: rescueVideoWindow.controller.confirmDelete()

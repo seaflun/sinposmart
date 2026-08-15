@@ -113,7 +113,11 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("本工具只支援單張記憶卡", controller_source)
         self.assertIn("errorText", controller_source)
         self.assertNotIn("請先完成預覽分類", controller_source)
-        self.assertIn('text: "複製並刪除記憶卡中資料"', source)
+        self.assertIn('objectName: "rescueVideoCopyOnlyButton"', source)
+        self.assertIn('text: "啟動分類(只複製檔案不刪除)"', source)
+        self.assertIn('text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"', source)
+        self.assertIn('id: rescueVideoCopyConfirmation', source)
+        self.assertNotIn("CheckBox", source)
         self.assertIn('objectName: "rescueVideoResultEmptyText"', source)
         self.assertIn('objectName: "rescueVideoCloseButton"', source)
 
@@ -353,6 +357,88 @@ class RescueVideoPackageTests(unittest.TestCase):
             {name for name, state in transfer_states if state == "驗證完成"},
             {first_source.name, second_source.name},
         )
+
+    def test_copy_only_rerun_skips_verified_existing_videos_and_copies_new_case(self) -> None:
+        classifier = self._classifier_module()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "DCIM" / "100CAREC"
+            source_root.mkdir(parents=True)
+            destination_root = root / "cases"
+            first_case = destination_root / "2026" / "8月" / "08150900-92" / "車"
+            second_case = destination_root / "2026" / "8月" / "08151000-92" / "車"
+            third_case = destination_root / "2026" / "8月" / "08151100-92" / "車"
+            first_case.mkdir(parents=True)
+            second_case.mkdir(parents=True)
+
+            sources = (
+                (source_root / "V0000001.TS", b"first video", datetime(2026, 8, 15, 9, 0)),
+                (source_root / "V0000002.TS", b"second video", datetime(2026, 8, 15, 10, 0)),
+            )
+            for source, content, modified_at in sources:
+                source.write_bytes(content)
+                timestamp = modified_at.timestamp()
+                os.utime(source, (timestamp, timestamp))
+
+            args = SimpleNamespace(
+                date="2026-08-15",
+                destination=destination_root,
+                vehicle="92",
+                source=source_root,
+                extension=".TS",
+                before_minutes=0,
+                after_minutes=0,
+                work_log_root=root / "work_logs",
+                case_folder_tolerance_minutes=10,
+                work_before_minutes=0,
+                apply=True,
+                repair_mismatch=False,
+                delete_source=False,
+                report=root / "report.csv",
+            )
+
+            with (
+                mock.patch.object(
+                    classifier,
+                    "read_card_duration",
+                    return_value=(sources[0][0], timedelta(seconds=0)),
+                ),
+                mock.patch.object(classifier, "discover_case_work", return_value=[]),
+            ):
+                first_results = classifier.classify_with_work_logs(args)
+                first_destination_mtimes = {
+                    source.name: (destination / source.name).stat().st_mtime_ns
+                    for source, destination in (
+                        (sources[0][0], first_case),
+                        (sources[1][0], second_case),
+                    )
+                }
+
+                third_source = source_root / "V0000003.TS"
+                third_source.write_bytes(b"third video")
+                third_timestamp = datetime(2026, 8, 15, 11, 0).timestamp()
+                os.utime(third_source, (third_timestamp, third_timestamp))
+                third_case.mkdir(parents=True)
+
+                second_results = classifier.classify_with_work_logs(args)
+
+            self.assertEqual([result.status for result in first_results], ["已複製", "已複製"])
+            self.assertEqual(
+                [result.status for result in second_results],
+                ["已完成", "已完成", "已複製"],
+            )
+            self.assertEqual(
+                (first_case / sources[0][0].name).stat().st_mtime_ns,
+                first_destination_mtimes[sources[0][0].name],
+            )
+            self.assertEqual(
+                (second_case / sources[1][0].name).stat().st_mtime_ns,
+                first_destination_mtimes[sources[1][0].name],
+            )
+            self.assertEqual((third_case / third_source.name).read_bytes(), b"third video")
+            self.assertTrue(sources[0][0].exists())
+            self.assertTrue(sources[1][0].exists())
+            self.assertTrue(third_source.exists())
 
     def test_rescue_video_initial_state_explains_single_card_first_step_and_local_error(self) -> None:
         if str(PACKAGE_ROOT) not in sys.path:

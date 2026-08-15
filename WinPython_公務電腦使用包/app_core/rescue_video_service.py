@@ -243,11 +243,18 @@ class RescueVideoService:
 
     def confirmation_summary(self, request: RescueVideoRequest) -> str:
         normalized, warnings, _values = self.validate(request)
-        if normalized.mode == "delete":
-            return "不同案件資料夾會分別傳送並逐檔驗證；只有驗證成功的記憶卡影片會刪除，失敗檔案會保留。確定要繼續嗎？"
         warning_text = f"\n注意：{'；'.join(warnings)}" if warnings else ""
+        if normalized.mode == "delete":
+            return (
+                f"日期：{normalized.target_date}\n車號：{normalized.vehicle}\n"
+                f"來源：{normalized.source_path or '自動偵測記憶卡'}\n\n"
+                "影片會複製到對應案件資料夾並逐檔驗證。\n"
+                "只有複製及驗證成功的記憶卡檔案會刪除；失敗檔案會保留。\n\n"
+                "確定要啟動分類嗎？"
+                f"{warning_text}"
+            )
         action_text = (
-            "確認後會複製影片並核對目的地，不會刪除來源影片。"
+            "確認後會複製影片並驗證目的地；記憶卡內檔案會保留，不會刪除。"
             if normalized.mode == "copy"
             else "確認後會先複製並核對檔案，只有核對成功的來源影片才會刪除。"
         )

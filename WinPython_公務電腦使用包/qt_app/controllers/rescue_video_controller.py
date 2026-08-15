@@ -329,7 +329,7 @@ class RescueVideoController(QObject):
         )
         if request is None:
             return
-        if self._prepare_confirmation(request, "等待確認執行影片複製。"):
+        if self._prepare_confirmation(request, "等待確認啟動分類（只複製檔案，不刪除記憶卡檔案）。"):
             self.copyConfirmationRequested.emit()
 
     @Slot(str, str, str, str, str, bool)
@@ -356,23 +356,29 @@ class RescueVideoController(QObject):
         )
         if request is None:
             return
-        if self._prepare_confirmation(request, "等待確認複製並刪除記憶卡中資料"):
+        if self._prepare_confirmation(
+            request,
+            "等待確認啟動分類（複製及驗證成功後刪除記憶卡檔案）。",
+        ):
             self.deleteConfirmationRequested.emit()
 
     @Slot()
     def confirmCopy(self) -> None:
-        self.confirmDelete()
+        self._confirm_pending()
 
     @Slot()
     def cancelCopy(self) -> None:
         self._pending_request = None
         self._confirmation_summary = ""
         self._awaiting_confirmation = False
-        self._status_text = "已完成預覽，等待複製並刪除記憶卡中資料。"
+        self._status_text = "已完成預覽，請選擇分類方式。" if self._has_preview else "等待必要資料"
         self.stateChanged.emit()
 
     @Slot()
     def confirmDelete(self) -> None:
+        self._confirm_pending()
+
+    def _confirm_pending(self) -> None:
         if self._shutting_down or self._pending_request is None or self._workers:
             return
         request = self._pending_request
@@ -388,7 +394,7 @@ class RescueVideoController(QObject):
         self._pending_request = None
         self._confirmation_summary = ""
         self._awaiting_confirmation = False
-        self._status_text = "已完成預覽，等待複製並刪除記憶卡中資料。" if self._has_preview else "等待必要資料"
+        self._status_text = "已完成預覽，請選擇分類方式。" if self._has_preview else "等待必要資料"
         self.stateChanged.emit()
 
     def _prepare_confirmation(self, request: RescueVideoRequest, status_text: str) -> bool:
@@ -599,7 +605,9 @@ class RescueVideoController(QObject):
         if mode == "preview":
             self._has_preview = True
             self._status_text = result.warning_text or "預覽完成"
-            self._summary_text = f"{result.summary_text}。下一步：確認分類結果，無誤後按「複製並刪除記憶卡中資料」。"
+            self._summary_text = (
+                f"{result.summary_text}。下一步：確認分類結果，無誤後可選擇「啟動分類(只複製檔案不刪除)」或「啟動分類(複製及驗證成功後刪除記憶卡檔案)」。"
+            )
         else:
             self._has_preview = False
             self._status_text = result.warning_text or "複製與驗證完成"
