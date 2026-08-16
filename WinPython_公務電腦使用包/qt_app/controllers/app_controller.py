@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import deque
 from collections.abc import Mapping
@@ -174,6 +175,7 @@ class AppController(QObject):
         self._pending_fire_day_refresh = ""
         self._operational_staff: dict[str, dict] = {}
         self._last_hourly_refresh_key = ""
+        self._last_schedule_snapshot_signature = ""
         self._duty_mode_active = True
         self._hourly_refresh_timer = QTimer(self)
         self._hourly_refresh_timer.setInterval(60_000)
@@ -200,6 +202,7 @@ class AppController(QObject):
         self._duty_controller.fireDayChanged.connect(self._refresh_after_fire_day_change)
         self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
+        self._duty_controller.handoffPrewarmRequested.connect(self._prewarm_handoff_entry_browser)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
@@ -862,15 +865,24 @@ class AppController(QObject):
                 }
             )
         if schedule_days:
-            self._send_operational_event(
-                "schedule_snapshot",
-                status="ok",
-                trigger_type="schedule",
-                snapshot={
-                    "paths": schedule_paths,
-                    "days": schedule_days,
-                },
+            schedule_snapshot = {
+                "paths": schedule_paths,
+                "days": schedule_days,
+            }
+            signature = json.dumps(
+                schedule_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
+            if signature != self._last_schedule_snapshot_signature:
+                self._last_schedule_snapshot_signature = signature
+                self._send_operational_event(
+                    "schedule_snapshot",
+                    status="ok",
+                    trigger_type="schedule",
+                    snapshot=schedule_snapshot,
+                )
         comparison_days = []
         for target_date, payload in sorted(snapshot.comparison_data.items()):
             if not isinstance(payload, Mapping):
@@ -1812,6 +1824,21 @@ class AppController(QObject):
         ):
             if self._duty_execution_controller.enqueue(request):
                 self._duty_controller.mark_submission_enqueued(request.action_index)
+
+    @Slot(int)
+    def _prewarm_handoff_entry_browser(self, action_index: int) -> None:
+        if self._read_only_acceptance or not self._duty_mode_active:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        request = self._duty_controller.handoff_prewarm_request(
+            session.user_id,
+            session.password,
+            action_index,
+        )
+        if request is not None:
+            self._duty_execution_controller.prewarm_entry_browser(request)
 
     @Slot(str)
     def _handle_execution_unavailable(self, message: str) -> None:

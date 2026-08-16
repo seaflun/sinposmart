@@ -41,12 +41,14 @@ from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 
 
 ACTUAL_HANDOFF_RETENTION = timedelta(hours=36)
+HANDOFF_BROWSER_PREWARM_WINDOW = timedelta(minutes=1)
 
 
 class DutyController(QObject):
     clockChanged = Signal()
     scheduleChanged = Signal()
     dueTasksAvailable = Signal(object)
+    handoffPrewarmRequested = Signal(int)
     autoLogoutRequested = Signal(str)
     reloginRequired = Signal(str)
     manualSubmissionConfirmationRequested = Signal()
@@ -122,6 +124,7 @@ class DutyController(QObject):
         self._external_return_queue_ids_by_action_index: dict[int, str] = {}
         self._pending_handoff_actual_times: dict[str, datetime] = {}
         self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
+        self._prewarmed_handoff_group_ids: set[str] = set()
         self._auto_execution_enabled = False
         self._login_started_at: datetime | None = None
         self._auto_logout_actor_no = ""
@@ -852,6 +855,7 @@ class DutyController(QObject):
         self._actor_no = actor_no
         if actor_no != previous_actor:
             self._handoff_preflight_groups.clear()
+            self._prewarmed_handoff_group_ids.clear()
         if actor_no and actor_no != previous_actor:
             self._login_started_at = datetime.now()
         if not actor_no:
@@ -1063,6 +1067,27 @@ class DutyController(QObject):
                 for group_index in group_indices
             )
         return requests
+
+    def handoff_prewarm_request(
+        self,
+        user_id: str,
+        password: str,
+        action_index: int,
+    ) -> DutySubmissionRequest | None:
+        if self._session_closing or not self._auto_execution_enabled or not user_id or not password:
+            return None
+        if not 0 <= action_index < len(self._actions):
+            return None
+        action = self._actions[action_index]
+        if action.get("kind") != "entry_log" or action.get("source") != "值班交接":
+            return None
+        return self._submission_request(
+            user_id,
+            password,
+            action_index,
+            self._schedule_data,
+            trigger_type="due",
+        )
 
     @staticmethod
     def is_handoff_preflight_request(request: DutySubmissionRequest) -> bool:
@@ -1915,6 +1940,7 @@ class DutyController(QObject):
             self._pending_external_return_action_keys = ()
             self._external_return_confirmation_summary = ""
             self._handoff_preflight_groups.clear()
+            self._prewarmed_handoff_group_ids.clear()
             self._cancel_auto_logout()
         self._append_active_queue_actions()
         self._apply_actual_handoff_time_adjustments()
@@ -2056,6 +2082,7 @@ class DutyController(QObject):
         self.scheduleChanged.emit()
 
     def _refresh_due_tasks(self, *, emit_signal: bool = True, force_emit: bool = False) -> None:
+        self._refresh_handoff_prewarm()
         due = select_due_task_indices(
             self._actions,
             DueTaskSelectionState(
@@ -2080,6 +2107,46 @@ class DutyController(QObject):
             if self._auto_execution_enabled and due:
                 self.dueTasksAvailable.emit(list(due))
         self._refresh_unreturned_return_queue()
+
+    def _refresh_handoff_prewarm(self, current: datetime | None = None) -> None:
+        if self._session_closing or not self._auto_execution_enabled or not self._actor_no:
+            return
+        current = current or datetime.now()
+        handled_group_ids: set[str] = set()
+        for index, action in enumerate(self._actions):
+            if action.get("source") != "值班交接" or str(action.get("actor") or "") != self._actor_no:
+                continue
+            group_indices = self._handoff_group_indices(index)
+            if not group_indices:
+                continue
+            group_id = self._handoff_group_id(group_indices)
+            if (
+                group_id in handled_group_ids
+                or group_id in self._prewarmed_handoff_group_ids
+                or group_id in self._handoff_preflight_groups
+            ):
+                continue
+            handled_group_ids.add(group_id)
+            action_at = action_datetime(
+                action,
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            remaining = action_at - current
+            if not timedelta() < remaining <= HANDOFF_BROWSER_PREWARM_WINDOW:
+                continue
+            entry_index = next(
+                (
+                    candidate_index
+                    for candidate_index in group_indices
+                    if self._actions[candidate_index].get("kind") == "entry_log"
+                ),
+                None,
+            )
+            if entry_index is None:
+                continue
+            self._prewarmed_handoff_group_ids.add(group_id)
+            self.handoffPrewarmRequested.emit(entry_index)
 
     def _refresh_unreturned_return_queue(self) -> None:
         self._unreturned_return_queue.prune_bridge_history()

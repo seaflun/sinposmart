@@ -2626,7 +2626,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[dict[str, object]] | list[str]]:
                 return {
                     "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
                     "rows": [
@@ -2666,7 +2666,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[dict[str, object]] | list[str]]:
                 return {
                     "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
                     "rows": [{
@@ -2700,7 +2700,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[dict[str, object]] | list[str]]:
                 return {
                     "headers": ["案件類別", "受理時間", "派遣時間", "返隊時間"],
                     "rows": [{
@@ -2733,7 +2733,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[dict[str, object]] | list[str]]:
                 return {
                     "headers": ["案件編號", "受理時間", "到達時間", "案件類別", "地點", "返隊時間"],
                     "rows": [{
@@ -2774,7 +2774,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[dict[str, object]] | list[str]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[dict[str, object]] | list[str]]:
                 return {
                     "headers": ["案件編號", "受理時間", "到達時間", "案件類別", "地點", "返隊時間"],
                     "rows": [{
@@ -2815,7 +2815,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> list[list[str]]:
+            def execute_script(_script: str, *_args: object) -> list[list[str]]:
                 return [["115/08/07 12:00", "新坡分隊", "測試人員", "隊員", "入", "到勤"]]
 
         with mock.patch.object(module, "open_ap"), mock.patch.object(
@@ -2834,7 +2834,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> list[list[str]]:
+            def execute_script(_script: str, *_args: object) -> list[list[str]]:
                 return [
                     ["115/08/13 23:49", "新坡分隊", "測試人員", "隊員", "出", "救護"],
                     ["115/08/13 23:50", "新坡分隊", "測試人員", "隊員", "出", "救護"],
@@ -2902,7 +2902,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[object]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[object]]:
                 return {"headers": ["返隊時間"], "rows": []}
 
         with mock.patch.object(module, "open_ap"), mock.patch.object(
@@ -2924,7 +2924,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         class Driver:
             @staticmethod
-            def execute_script(_script: str) -> dict[str, list[object]]:
+            def execute_script(_script: str, *_args: object) -> dict[str, list[object]]:
                 return {"headers": [], "rows": []}
 
         with mock.patch.object(module, "open_ap"), mock.patch.object(

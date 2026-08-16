@@ -3874,6 +3874,66 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
             self.assertEqual(snapshot.authenticated_actor_name, "本班")
             self.assertTrue(progress)
 
+    def test_capture_live_reuses_one_browser_without_reducing_audit_queries(self) -> None:
+        from dataclasses import dataclass
+        from datetime import datetime
+
+        from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
+
+        @dataclass
+        class Sheet:
+            date: str
+            staff: dict
+            rows: list
+
+        events: list[str] = []
+
+        def query_duty_sheet(_driver, value):
+            events.append(f"sheet:{value}")
+            return Sheet(value, {"10": {"name": "本班"}}, [])
+
+        def query_visible_table(_driver, ap_name, _target_roc_date):
+            events.append(f"query:{ap_name}")
+            return []
+
+        automation = SimpleNamespace(
+            WORK_LOG_AP="work",
+            ENTRY_LOG_AP="entry",
+            build_driver=lambda headless: events.append(f"driver:{headless}") or object(),
+            login=lambda _driver, user_id, password: events.append(f"login:{user_id}:{len(password)}"),
+            parse_roc_date=lambda _value: date(2026, 7, 29),
+            roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+            query_duty_sheet=query_duty_sheet,
+            query_cases=lambda _driver, value: events.append(f"cases:{value}") or [],
+            planned_actions=lambda *_args: [],
+            query_visible_table=query_visible_table,
+            quit_driver=lambda _driver: events.append("quit"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = ScheduleCaptureService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 9, 0),
+            )
+            request = ScheduleCaptureRequest("user10", "session-secret", "10", "1150729", "本班")
+            schedule_ready: list[object] = []
+
+            snapshot = service.capture_live(
+                request,
+                schedule_ready_callback=lambda value: events.append("schedule-ready") or schedule_ready.append(value),
+            )
+
+        self.assertTrue(snapshot.found)
+        self.assertEqual(len(schedule_ready), 1)
+        self.assertEqual(events.count("driver:True"), 1)
+        self.assertEqual(events.count("login:user10:14"), 1)
+        self.assertEqual(sum(event.startswith("sheet:") for event in events), 3)
+        self.assertEqual(sum(event.startswith("cases:") for event in events), 2)
+        self.assertEqual(events.count("query:work"), 3)
+        self.assertEqual(events.count("query:entry"), 3)
+        self.assertLess(events.index("schedule-ready"), events.index("query:work"))
+        self.assertEqual(events.count("quit"), 1)
+
     def test_capture_classifies_login_failure_and_closes_driver(self) -> None:
         from app_core.schedule_capture_service import (
             ScheduleCaptureError,
@@ -3947,6 +4007,37 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         self.assertEqual(driver.wait_checks, 2)
         self.assertEqual(sheet.roc_date, "1150808")
         self.assertEqual(sheet.rows[0].columns["值班"], ["10"])
+
+    def test_control_wait_returns_immediately_when_form_is_ready(self) -> None:
+        import duty_rehearsal
+
+        class Driver:
+            def __init__(self) -> None:
+                self.control_ids = ()
+
+            def execute_script(self, _script: str, control_ids):
+                self.control_ids = tuple(control_ids)
+                return True
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency) -> None:
+                self.driver = driver
+                self.poll_frequency = poll_frequency
+
+            def until(self, condition):
+                return condition(self.driver)
+
+        driver = Driver()
+        with patch("duty_rehearsal.WebDriverWait", ImmediateWait):
+            ready = duty_rehearsal.wait_for_form_controls(
+                driver,
+                ("_txtDATE", "_selTIMEH"),
+                timeout=2,
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(driver.control_ids, ("_txtDATE", "_selTIMEH"))
+
     def test_capture_persists_redacted_failure_stage(self) -> None:
         from app_core.schedule_capture_service import (
             ScheduleCaptureError,
@@ -4274,6 +4365,89 @@ class WorkLogSettingsControllerTests(unittest.TestCase):
 
 
 class ScheduleCaptureWorkerTests(unittest.TestCase):
+    def test_worker_uses_combined_live_capture_and_publishes_schedule_early(self) -> None:
+        from app_core.schedule_capture_service import ScheduleCaptureRequest
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
+
+        class FakeCaptureService:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def capture_live(self, request, *, status_callback=None, schedule_ready_callback=None):
+                self.calls.append("capture_live")
+                snapshot = ScheduleSnapshot(
+                    Path(f"schedule_output_{request.target_roc_date}.json"),
+                    {"target_date": request.target_roc_date, "actions": []},
+                    request.target_roc_date,
+                    schedule_data_by_date={request.target_roc_date: {"actions": []}},
+                )
+                schedule_ready_callback(snapshot)
+                return snapshot
+
+            def capture_schedule(self, *_args, **_kwargs):
+                raise AssertionError("合併擷取不應再次開啟勤務表流程")
+
+            def capture_comparisons(self, *_args, **_kwargs):
+                raise AssertionError("合併擷取不應再次開啟比對流程")
+
+        service = FakeCaptureService()
+        worker = ScheduleCaptureWorker(
+            1,
+            service,
+            ScheduleCaptureRequest("user10", "secret", "10", "1150808"),
+        )
+        schedule_ready: list[object] = []
+        succeeded: list[object] = []
+        failed: list[object] = []
+        worker.scheduleReady.connect(lambda *_args: schedule_ready.append(True))
+        worker.succeeded.connect(lambda *_args: succeeded.append(True))
+        worker.failed.connect(lambda *_args: failed.append(True))
+
+        worker.run()
+
+        self.assertEqual(service.calls, ["capture_live"])
+        self.assertEqual(schedule_ready, [True])
+        self.assertEqual(succeeded, [True])
+        self.assertEqual(failed, [])
+
+    def test_worker_keeps_schedule_usable_when_combined_audit_fails(self) -> None:
+        from app_core.schedule_capture_service import (
+            ScheduleCaptureError,
+            ScheduleCaptureRequest,
+        )
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
+
+        class FakeCaptureService:
+            def capture_live(self, request, *, status_callback=None, schedule_ready_callback=None):
+                schedule_ready_callback(
+                    ScheduleSnapshot(
+                        Path(f"schedule_output_{request.target_roc_date}.json"),
+                        {"target_date": request.target_roc_date, "actions": []},
+                        request.target_roc_date,
+                    )
+                )
+                raise ScheduleCaptureError("比對逾時", "timeout")
+
+        worker = ScheduleCaptureWorker(
+            1,
+            FakeCaptureService(),
+            ScheduleCaptureRequest("user10", "secret", "10", "1150808"),
+        )
+        schedule_ready: list[object] = []
+        succeeded: list[object] = []
+        failures: list[tuple] = []
+        worker.scheduleReady.connect(lambda *_args: schedule_ready.append(True))
+        worker.succeeded.connect(lambda *_args: succeeded.append(True))
+        worker.failed.connect(lambda *args: failures.append(args))
+
+        worker.run()
+
+        self.assertEqual(schedule_ready, [True])
+        self.assertEqual(succeeded, [])
+        self.assertEqual(failures[0][3], "comparison_timeout")
+
     def test_worker_finishes_schedule_before_starting_same_account_comparisons(self) -> None:
         from app_core.schedule_capture_service import ScheduleCaptureRequest
         from app_core.schedule_repository import ScheduleSnapshot
@@ -9130,6 +9304,196 @@ if return_code != 0 or loaded:
         self.assertFalse(controller.isBusy)
         controller.shutdown()
 
+    def test_duty_execution_controller_runs_handoff_group_before_queued_normal_entry(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        first_entry_started = threading.Event()
+        release_first_entry = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.calls.append(request.action_index)
+                if request.action_index == 0:
+                    first_entry_started.set()
+                    release_first_entry.wait(timeout=2)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "submitted",
+                    Path(f"handoff-priority-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150816",
+            "actions": [
+                {"kind": "entry_log", "time": "08:00", "actor": "10", "target": "10"},
+                {"kind": "entry_log", "time": "08:01", "actor": "10", "target": "11"},
+                {"kind": "entry_log", "time": "08:00", "actor": "10", "target": "10", "source": "值班交接"},
+                {"kind": "entry_log", "time": "08:00", "actor": "10", "target": "11", "source": "值班交接"},
+                {"kind": "work_log", "time": "08:00", "actor": "10", "target": "10", "source": "值班交接"},
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        try:
+            self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 0, data)))
+            self.assertTrue(first_entry_started.wait(timeout=2))
+            self.assertTrue(controller.enqueue(DutySubmissionRequest("user10", "secret", 1, data)))
+            for action_index in (2, 3, 4):
+                self.assertTrue(
+                    controller.enqueue(DutySubmissionRequest("user10", "secret", action_index, data))
+                )
+            release_first_entry.set()
+            for _ in range(30):
+                if finished_spy.count() == 5 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.calls, [0, 2, 3, 4, 1])
+            self.assertFalse(controller.isBusy)
+        finally:
+            controller.shutdown()
+
+    def test_duty_execution_controller_prewarm_reuses_entry_session_without_submitting(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opened = threading.Event()
+                self.open_count = 0
+                self.executed: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                self.open_count += 1
+                self.opened.set()
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.executed.append(request.action_index)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "handoff_preflight_ready",
+                    "預檢完成",
+                    Path("preflight.json"),
+                    {"group": "ready"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150816",
+            "actions": [
+                {
+                    "kind": "handoff_preflight",
+                    "time": "10:00",
+                    "actor": "10",
+                    "target": "11",
+                    "source": "值班交接",
+                }
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        request = DutySubmissionRequest("user10", "secret", 0, data)
+        try:
+            self.assertTrue(controller.prewarm_entry_browser(request))
+            self.assertTrue(service.opened.wait(timeout=2))
+            self.assertEqual(service.executed, [])
+            self.assertEqual(controller.queuedCount, 0)
+
+            self.assertTrue(controller.enqueue(request))
+            for _ in range(20):
+                if finished_spy.count() == 1 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.open_count, 1)
+            self.assertEqual(service.executed, [0])
+        finally:
+            controller.shutdown()
+
+    def test_duty_controller_requests_one_handoff_browser_prewarm_before_due_time(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150816",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值退"},
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "11",
+                        "source": "值班交接",
+                        "fields": {"出或入": "值班"},
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "10:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "值班交接",
+                    },
+                ],
+            }
+        )
+        controller._auto_execution_enabled = True
+        prewarm_spy = QSignalSpy(controller.handoffPrewarmRequested)
+        try:
+            controller._refresh_handoff_prewarm(datetime(2026, 8, 16, 9, 59))
+            controller._refresh_handoff_prewarm(datetime(2026, 8, 16, 9, 59, 30))
+
+            self.assertEqual(prewarm_spy.count(), 1)
+            self.assertEqual(prewarm_spy.at(0)[0], 0)
+            request = controller.handoff_prewarm_request("user10", "secret", 0)
+            self.assertIsNotNone(request)
+            self.assertEqual(request.action_index, 0)
+            self.assertEqual(request.schedule_data["actions"][0]["kind"], "entry_log")
+        finally:
+            controller.shutdown()
+
     def test_duty_execution_controller_runs_manual_entry_next_without_interrupting_active_one(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
@@ -9942,6 +10306,66 @@ if return_code != 0 or loaded:
             self.assertFalse(controller.isBusy)
         finally:
             controller.shutdown()
+
+    def test_app_controller_deduplicates_identical_schedule_snapshot_events(self) -> None:
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.app_controller import AppController
+
+        payload = {
+            "target_date": "1150808",
+            "actions": [
+                {
+                    "kind": "work_log",
+                    "time": "08:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "值班交接",
+                    "fields": {"勤務項目": "交接"},
+                }
+            ],
+        }
+        snapshot = ScheduleSnapshot(
+            Path("schedule_output_1150808.json"),
+            payload,
+            "1150808",
+            schedule_data_by_date={"1150808": payload},
+        )
+        controller = AppController()
+        self.addCleanup(controller.shutdown)
+
+        with patch.object(controller, "_send_operational_event") as send_event:
+            controller._live_snapshot_captured(snapshot)
+            controller._live_snapshot_captured(snapshot)
+
+        self.assertEqual(send_event.call_count, 1)
+        self.assertEqual(send_event.call_args.args, ("schedule_snapshot",))
+        self.assertEqual(send_event.call_args.kwargs["snapshot"]["days"][0]["target_date"], "1150808")
+
+        changed_payload = {
+            **payload,
+            "actions": [
+                *payload["actions"],
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "10",
+                    "target": "11",
+                    "source": "值班交接",
+                    "fields": {"出或入": "入"},
+                },
+            ],
+        }
+        changed_snapshot = ScheduleSnapshot(
+            Path("schedule_output_1150808.json"),
+            changed_payload,
+            "1150808",
+            schedule_data_by_date={"1150808": changed_payload},
+        )
+        with patch.object(controller, "_send_operational_event") as send_event:
+            controller._live_snapshot_captured(changed_snapshot)
+
+        self.assertEqual(send_event.call_count, 1)
+        self.assertEqual(send_event.call_args.kwargs["snapshot"]["days"][0]["action_count"], 2)
 
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
         from datetime import datetime
@@ -12131,7 +12555,10 @@ if return_code != 0 or loaded:
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            queue = UnreturnedReturnQueue(Path(temp_dir))
+            queue = UnreturnedReturnQueue(
+                Path(temp_dir),
+                now_factory=lambda: datetime(2026, 8, 15, 12, 20),
+            )
             controller = DutyController(
                 repository=ScheduleRepository(Path(temp_dir)),
                 unreturned_return_queue=queue,
@@ -15819,7 +16246,7 @@ if return_code != 0 or loaded:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = CredentialRepository(Path(temp_dir) / "saved_login.json", "SinpoSmart", None)
             verifier = SlowVerifier()
-            controller = SessionController(repository=repository, verifier=verifier, login_timeout_ms=20)
+            controller = SessionController(repository=repository, verifier=verifier, login_timeout_ms=250)
             self.addCleanup(controller.shutdown)
             self.addCleanup(verifier.release.set)
             error_spy = QSignalSpy(controller.errorOccurred)

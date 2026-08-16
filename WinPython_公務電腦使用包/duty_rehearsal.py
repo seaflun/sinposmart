@@ -677,6 +677,33 @@ def control_snapshot(driver: webdriver.Chrome) -> list[dict[str, Any]]:
     )
 
 
+def wait_for_form_controls(
+    driver: webdriver.Chrome,
+    control_ids: tuple[str, ...],
+    *,
+    timeout: float,
+) -> bool:
+    """Wait only until the required form controls are available."""
+    required = tuple(str(control_id) for control_id in control_ids if str(control_id))
+    if not required:
+        return True
+
+    def controls_ready(current_driver: webdriver.Chrome) -> bool:
+        return bool(
+            current_driver.execute_script(
+                """
+                return arguments[0].every(id => Boolean(document.getElementById(id)));
+                """,
+                required,
+            )
+        )
+
+    try:
+        return bool(WebDriverWait(driver, timeout, poll_frequency=0.1).until(controls_ready))
+    except (TimeoutException, WebDriverException):
+        return False
+
+
 def click_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
     return driver.execute_script(
         """
@@ -917,11 +944,12 @@ def fill_work_log_form_for_test(
 
     navigated = ensure_ap(driver, WORK_LOG_AP)
     if navigated:
-        time.sleep(1)
+        wait_for_form_controls(driver, ("_txtDATE", "_selTIMEH", "_areDescription"), timeout=1)
     before_controls = control_snapshot(driver)
     form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH') && document.getElementById('_areDescription'));")
     insert_result = {"ok": True, "skipped": True, "reason": "work form already open"} if form_ready else click_insert_control(driver)
-    time.sleep(2)
+    if not form_ready and insert_result.get("ok"):
+        wait_for_form_controls(driver, ("_txtDATE", "_selTIMEH", "_areDescription"), timeout=2)
 
     fill_result = driver.execute_script(
         """
@@ -1054,11 +1082,12 @@ def fill_entry_log_form_for_test(
 
     navigated = ensure_ap(driver, ENTRY_LOG_AP)
     if navigated:
-        time.sleep(1)
+        wait_for_form_controls(driver, ("_txtDATE", "_selTIMEH"), timeout=1)
     before_controls = control_snapshot(driver)
     form_ready = driver.execute_script("return Boolean(document.getElementById('_txtDATE') && document.getElementById('_selTIMEH'));")
     insert_result = {"ok": True, "skipped": True, "reason": "entry form already open"} if form_ready else click_insert_control(driver)
-    time.sleep(2)
+    if not form_ready and insert_result.get("ok"):
+        wait_for_form_controls(driver, ("_txtDATE", "_selTIMEH"), timeout=2)
 
     fill_result = driver.execute_script(
         """
@@ -1857,7 +1886,7 @@ def query_visible_table(
     start_hour, start_minute = [f"{int(part):02d}" for part in start_time.split(":", 1)]
     end_hour, end_minute = [f"{int(part):02d}" for part in end_time.split(":", 1)]
     open_ap(driver, ap_name)
-    time.sleep(1)
+    wait_for_form_controls(driver, ("_btnQuery",), timeout=1)
     suppress_window_open_for_background_query(driver)
     for field_id in ("_txtSDATE", "_txtSdate", "_txtSDate"):
         js_set(driver, field_id, start_roc_date)
@@ -2001,7 +2030,7 @@ def capture_case_query_table(driver: webdriver.Chrome) -> dict[str, Any]:
 
 def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
     open_ap(driver, CASE_QUERY_AP)
-    time.sleep(1)
+    wait_for_form_controls(driver, ("_btnQuery",), timeout=1)
     suppress_window_open_for_background_query(driver)
     for element_id, value in (
         ("_hidDeptno", "033006"),

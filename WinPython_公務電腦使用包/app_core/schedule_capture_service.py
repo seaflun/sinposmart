@@ -151,32 +151,86 @@ class ScheduleCaptureService:
             comparison_data = comparison_future.result()
         return self.combine_capture(schedule_snapshot, comparison_data)
 
+    def capture_live(
+        self,
+        request: ScheduleCaptureRequest,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+        schedule_ready_callback: Callable[[ScheduleSnapshot], None] | None = None,
+    ) -> ScheduleSnapshot:
+        """Capture the live schedule and audit data through one authenticated browser."""
+        request = self.validate(request)
+        stage = "load_automation"
+        automation = None
+        driver = None
+
+        def set_stage(value: str) -> None:
+            nonlocal stage
+            stage = value
+
+        try:
+            automation = self._load_automation()
+            if status_callback:
+                status_callback("正在即時查詢勤務表…")
+            driver = self._build_browser_session(automation, request, stage_callback=set_stage)
+        except (ScheduleCaptureValidationError, ScheduleCaptureError) as exc:
+            self._write_capture_failure_diagnostic(stage, request, exc)
+            raise
+        except Exception as exc:
+            self._write_capture_failure_diagnostic(stage, request, exc)
+            message, error_code = self._safe_error(exc)
+            raise ScheduleCaptureError(message, error_code) from exc
+
+        try:
+            schedule_snapshot = self.capture_schedule(
+                request,
+                status_callback=status_callback,
+                _automation=automation,
+                _driver=driver,
+                _emit_initial_status=False,
+            )
+            if schedule_ready_callback:
+                schedule_ready_callback(schedule_snapshot)
+            comparison_data = self.capture_comparisons(
+                request,
+                status_callback=status_callback,
+                _automation=automation,
+                _driver=driver,
+            )
+            return self.combine_capture(schedule_snapshot, comparison_data)
+        finally:
+            if driver is not None and automation is not None:
+                try:
+                    automation.quit_driver(driver)
+                except Exception:
+                    pass
+
     def capture_schedule(
         self,
         request: ScheduleCaptureRequest,
         *,
         status_callback: Callable[[str], None] | None = None,
+        _automation: Any | None = None,
+        _driver: Any = None,
+        _emit_initial_status: bool = True,
     ) -> ScheduleSnapshot:
         request = self.validate(request)
         stage = "load_automation"
-        automation = None
-        driver = None
-        try:
-            automation = self._load_automation()
-            if status_callback:
-                status_callback("正在即時查詢勤務表…")
-            def initialize_browser(candidate: Any) -> None:
-                nonlocal stage
-                stage = "login"
-                automation.login(candidate, request.user_id, request.password)
+        automation = _automation
+        driver = _driver
+        owns_browser = driver is None
 
-            stage = "start_browser"
-            session_builder = getattr(automation, "build_initialized_driver", None)
-            if callable(session_builder):
-                driver = session_builder(headless=True, initialize=initialize_browser)
-            else:
-                driver = automation.build_driver(headless=True)
-                initialize_browser(driver)
+        def set_stage(value: str) -> None:
+            nonlocal stage
+            stage = value
+
+        try:
+            if automation is None:
+                automation = self._load_automation()
+            if status_callback and _emit_initial_status:
+                status_callback("正在即時查詢勤務表…")
+            if owns_browser:
+                driver = self._build_browser_session(automation, request, stage_callback=set_stage)
             target = automation.parse_roc_date(request.target_roc_date)
             stage = "today_duty_sheet"
             today_sheet = automation.query_duty_sheet(driver, automation.roc_date(target))
@@ -268,7 +322,7 @@ class ScheduleCaptureService:
             message, error_code = self._safe_error(exc)
             raise ScheduleCaptureError(message, error_code) from exc
         finally:
-            if driver is not None and automation is not None:
+            if owns_browser and driver is not None and automation is not None:
                 try:
                     automation.quit_driver(driver)
                 except Exception:
@@ -279,26 +333,26 @@ class ScheduleCaptureService:
         request: ScheduleCaptureRequest,
         *,
         status_callback: Callable[[str], None] | None = None,
+        _automation: Any | None = None,
+        _driver: Any = None,
     ) -> dict[str, dict[str, Any]]:
         request = self.validate(request)
         stage = "load_automation"
-        automation = self._load_automation()
-        driver = None
+        automation = _automation
+        driver = _driver
+        owns_browser = driver is None
+
+        def set_stage(value: str) -> None:
+            nonlocal stage
+            stage = value
+
         try:
+            if automation is None:
+                automation = self._load_automation()
             if status_callback:
                 status_callback("正在背景比對已登打資料…")
-            def initialize_browser(candidate: Any) -> None:
-                nonlocal stage
-                stage = "login"
-                automation.login(candidate, request.user_id, request.password)
-
-            stage = "start_browser"
-            session_builder = getattr(automation, "build_initialized_driver", None)
-            if callable(session_builder):
-                driver = session_builder(headless=True, initialize=initialize_browser)
-            else:
-                driver = automation.build_driver(headless=True)
-                initialize_browser(driver)
+            if owns_browser:
+                driver = self._build_browser_session(automation, request, stage_callback=set_stage)
             target = automation.parse_roc_date(request.target_roc_date)
             comparison_data: dict[str, dict[str, Any]] = {}
             for action_date in [target + timedelta(days=offset) for offset in (-1, 0, 1)]:
@@ -336,7 +390,7 @@ class ScheduleCaptureService:
             message, error_code = self._safe_error(exc)
             raise ScheduleCaptureError(message, error_code) from exc
         finally:
-            if driver is not None:
+            if owns_browser and driver is not None and automation is not None:
                 try:
                     automation.quit_driver(driver)
                 except Exception:
@@ -365,6 +419,35 @@ class ScheduleCaptureService:
             authenticated_actor_no=schedule_snapshot.authenticated_actor_no,
             authenticated_actor_name=schedule_snapshot.authenticated_actor_name,
         )
+
+    @staticmethod
+    def _build_browser_session(
+        automation: Any,
+        request: ScheduleCaptureRequest,
+        *,
+        stage_callback: Callable[[str], None],
+    ) -> Any:
+        driver = None
+
+        def initialize_browser(candidate: Any) -> None:
+            stage_callback("login")
+            automation.login(candidate, request.user_id, request.password)
+
+        try:
+            stage_callback("start_browser")
+            session_builder = getattr(automation, "build_initialized_driver", None)
+            if callable(session_builder):
+                return session_builder(headless=True, initialize=initialize_browser)
+            driver = automation.build_driver(headless=True)
+            initialize_browser(driver)
+            return driver
+        except Exception:
+            if driver is not None:
+                try:
+                    automation.quit_driver(driver)
+                except Exception:
+                    pass
+            raise
 
     def _read_comparison_data(self, target_roc_date: str) -> dict[str, Any]:
         path = self.runtime_dir / "comparison" / f"comparison_output_{target_roc_date}.json"

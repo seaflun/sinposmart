@@ -136,6 +136,20 @@ class DutyExecutionController(QObject):
         self._start_available_workers()
         return True
 
+    def prewarm_entry_browser(self, request: DutySubmissionRequest) -> bool:
+        """Prepare the persistent entry browser without adding a duty action."""
+
+        if self._session_closing or not self._request_matches_current_session(request):
+            return False
+        try:
+            request = self._service.validate(request)
+        except DutySubmissionValidationError:
+            return False
+        if self._session_closing or self._queue_name(request) != "entry":
+            return False
+        worker = self._ensure_entry_worker()
+        return bool(worker and worker.prewarm_browser_session(request))
+
     @staticmethod
     def _queue_name(request: DutySubmissionRequest) -> str:
         actions = request.schedule_data.get("actions", [])

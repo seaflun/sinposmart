@@ -56,22 +56,25 @@ class ScheduleCaptureWorker(QObject):
                 )
                 self.succeeded.emit(self.request_id, actor_no, snapshot)
                 return
-            capture_schedule = getattr(self.service, "capture_schedule", None)
-            capture_comparisons = getattr(self.service, "capture_comparisons", None)
-            combine_capture = getattr(self.service, "combine_capture", None)
-            if all(callable(value) for value in (capture_schedule, capture_comparisons, combine_capture)):
+            capture_live = getattr(self.service, "capture_live", None)
+            if callable(capture_live):
                 callback = lambda message: self.progress.emit(self.request_id, message)
-                schedule_snapshot = capture_schedule(
-                    self.request,
-                    status_callback=callback,
-                )
-                self.scheduleReady.emit(self.request_id, actor_no, schedule_snapshot)
+                schedule_ready = False
+
+                def publish_schedule(snapshot: object) -> None:
+                    nonlocal schedule_ready
+                    schedule_ready = True
+                    self.scheduleReady.emit(self.request_id, actor_no, snapshot)
+
                 try:
-                    comparison_data = capture_comparisons(
+                    snapshot = capture_live(
                         self.request,
                         status_callback=callback,
+                        schedule_ready_callback=publish_schedule,
                     )
                 except ScheduleCaptureError as exc:
+                    if not schedule_ready:
+                        raise
                     message = (
                         "已登打資料比對逾時，勤務資料仍可使用。"
                         if exc.error_code == "timeout"
@@ -84,12 +87,41 @@ class ScheduleCaptureWorker(QObject):
                         f"comparison_{exc.error_code}",
                     )
                     return
-                snapshot = combine_capture(schedule_snapshot, comparison_data)
             else:
-                snapshot = self.service.capture(
-                    self.request,
-                    status_callback=lambda message: self.progress.emit(self.request_id, message),
-                )
+                capture_schedule = getattr(self.service, "capture_schedule", None)
+                capture_comparisons = getattr(self.service, "capture_comparisons", None)
+                combine_capture = getattr(self.service, "combine_capture", None)
+                if all(callable(value) for value in (capture_schedule, capture_comparisons, combine_capture)):
+                    callback = lambda message: self.progress.emit(self.request_id, message)
+                    schedule_snapshot = capture_schedule(
+                        self.request,
+                        status_callback=callback,
+                    )
+                    self.scheduleReady.emit(self.request_id, actor_no, schedule_snapshot)
+                    try:
+                        comparison_data = capture_comparisons(
+                            self.request,
+                            status_callback=callback,
+                        )
+                    except ScheduleCaptureError as exc:
+                        message = (
+                            "已登打資料比對逾時，勤務資料仍可使用。"
+                            if exc.error_code == "timeout"
+                            else "已登打資料比對失敗，勤務資料仍可使用。"
+                        )
+                        self.failed.emit(
+                            self.request_id,
+                            actor_no,
+                            message,
+                            f"comparison_{exc.error_code}",
+                        )
+                        return
+                    snapshot = combine_capture(schedule_snapshot, comparison_data)
+                else:
+                    snapshot = self.service.capture(
+                        self.request,
+                        status_callback=lambda message: self.progress.emit(self.request_id, message),
+                    )
         except ScheduleCaptureError as exc:
             self.failed.emit(self.request_id, actor_no, str(exc), exc.error_code)
         except Exception:

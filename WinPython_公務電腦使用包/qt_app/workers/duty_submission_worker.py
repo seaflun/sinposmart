@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from itertools import count
 from queue import PriorityQueue
@@ -93,7 +94,10 @@ class DutyEntryQueueWorker(QObject):
 
     _STOP_PRIORITY = -1
     _MANUAL_PRIORITY = 0
-    _NORMAL_PRIORITY = 1
+    _HANDOFF_PRIORITY = 1
+    _NORMAL_PRIORITY = 2
+    _WARM_PRIORITY = 3
+    _WARM_REQUEST_ID = -2
 
     def __init__(
         self,
@@ -115,11 +119,36 @@ class DutyEntryQueueWorker(QObject):
 
         if self._stop_requested.is_set():
             return False
-        priority = self._MANUAL_PRIORITY if request.trigger_type == "manual" else self._NORMAL_PRIORITY
+        priority = self._priority_for_request(request)
         with self._sequence_lock:
             sequence = next(self._sequence)
         self._queue.put((priority, sequence, request_id, request))
         return True
+
+    def prewarm_browser_session(self, request: DutySubmissionRequest) -> bool:
+        """Open the entry browser early without running a preflight or submission."""
+
+        if self._stop_requested.is_set() or not self._supports_browser_sessions():
+            return False
+        with self._sequence_lock:
+            sequence = next(self._sequence)
+        self._queue.put((self._WARM_PRIORITY, sequence, self._WARM_REQUEST_ID, request))
+        return True
+
+    def _priority_for_request(self, request: DutySubmissionRequest) -> int:
+        if request.trigger_type == "manual":
+            return self._MANUAL_PRIORITY
+        actions = request.schedule_data.get("actions", [])
+        action = actions[request.action_index] if isinstance(actions, list) else {}
+        if (
+            isinstance(action, Mapping)
+            and (
+                action.get("kind") == "handoff_preflight"
+                or action.get("source") == "值班交接"
+            )
+        ):
+            return self._HANDOFF_PRIORITY
+        return self._NORMAL_PRIORITY
 
     def stop(self) -> None:
         """Finish the active action, then cancel all queued entry actions."""
@@ -138,6 +167,9 @@ class DutyEntryQueueWorker(QObject):
                 _priority, _sequence, request_id, request = self._queue.get()
                 if request is None:
                     break
+                if request_id == self._WARM_REQUEST_ID:
+                    self._prewarm_browser_session(request)
+                    continue
                 if self._stop_requested.is_set():
                     self.requestCancelled.emit(
                         request_id,
@@ -204,6 +236,7 @@ class DutyEntryQueueWorker(QObject):
             )
             self._mark_browser_session_active()
             return result
+
         except DutySubmissionExecutionError as exc:
             session_expired = exc.error_code == "login_failed" and had_compatible_session
             if exc.error_code != "browser_startup" and not session_expired:
@@ -227,6 +260,17 @@ class DutyEntryQueueWorker(QObject):
             )
             self._mark_browser_session_active()
             return result
+
+    def _prewarm_browser_session(self, request: DutySubmissionRequest) -> None:
+        if self._stop_requested.is_set() or self._has_compatible_session(request):
+            return
+        self._close_browser_session()
+        try:
+            self._browser_session = self._service.open_browser_session(request)
+        except Exception:
+            self._close_browser_session()
+            return
+        self._mark_browser_session_active()
 
     def _has_compatible_session(self, request: DutySubmissionRequest) -> bool:
         session = self._browser_session
