@@ -54,6 +54,8 @@ class DutyController(QObject):
     manualSubmissionConfirmationRequested = Signal()
     externalReturnManualSubmissionConfirmationRequested = Signal()
     manualSubmissionRequested = Signal(object)
+    manualWaitingScheduled = Signal(object)
+    manualWaitingCancelled = Signal(object)
     externalReturnQueueManualSubmissionRequested = Signal(str)
     externalReturnRecoveryDue = Signal(object)
     unreturnedReturnEvent = Signal(object)
@@ -117,6 +119,8 @@ class DutyController(QObject):
         self._pending_manual_action_keys: tuple[str, ...] = ()
         self._pending_manual_schedule_generation = 0
         self._manual_confirmation_summary = ""
+        self._manual_waiting_action_keys: set[str] = set()
+        self._background_manual_waiting_action_keys: set[str] = set()
         self._pending_external_return_indices: list[int] = []
         self._pending_external_return_action_keys: tuple[str, ...] = ()
         self._pending_external_return_schedule_generation = 0
@@ -295,6 +299,22 @@ class DutyController(QObject):
         return self._manual_confirmation_summary
 
     @Property(bool, notify=scheduleChanged)
+    def hasManualWaitingSelected(self) -> bool:
+        return any(
+            0 <= index < len(self._actions)
+            and action_completion_key(self._actions[index]) in self._manual_waiting_action_keys
+            for index in self._selected_indices
+        )
+
+    @Property(bool, notify=scheduleChanged)
+    def canCancelManualWaitingSelected(self) -> bool:
+        return bool(self._selected_indices) and all(
+            0 <= index < len(self._actions)
+            and action_completion_key(self._actions[index]) in self._manual_waiting_action_keys
+            for index in self._selected_indices
+        )
+
+    @Property(bool, notify=scheduleChanged)
     def hasExternalReturnPauseSelected(self) -> bool:
         return any(
             self._comparisons.get(index, {}).get("group") == "paused"
@@ -396,33 +416,20 @@ class DutyController(QObject):
             self._schedule_status = "選取項目包含已登打或不可手動登打的勤務"
             self._refresh_projection()
             return
-        ready: list[int] = []
-        for index in sorted(self._selected_indices):
-            if not 0 <= index < len(self._actions):
-                continue
-            action = self._actions[index]
-            comparison = self._comparisons.get(index, {})
-            is_manual_external_review = (
-                comparison.get("group") == "review"
-                and str(action.get("source", "") or "").startswith("外勤")
-            )
-            is_external_or_rest_manual_entry = is_external_or_rest_entry(action)
-            if (
-                action.get("kind") in ("work_log", "entry_log")
-                and index not in self._submitting_indices
-                and index not in self._executed_indices
-                and (
-                    comparison.get("group") not in ("done", "near", "review")
-                    or is_manual_external_review
-                    or is_external_or_rest_manual_entry
-                )
-            ):
-                ready.append(index)
+        current = datetime.now()
+        ready = [
+            index
+            for index in sorted(self._selected_indices)
+            if self._is_manual_submission_available(index, now=current)
+        ]
         if not ready:
             self._schedule_status = "選取任務無法手動登打"
             self._refresh_projection()
             return
-        current = datetime.now()
+        waiting_count = sum(
+            self._is_early_manual_departure_wait_eligible(index, now=current)
+            for index in ready
+        )
         summaries = "\n".join(
             f"• {action_summary(self._actions[index])}（{self._manual_time_summary(self._actions[index], current)}）"
             for index in ready[:8]
@@ -437,8 +444,16 @@ class DutyController(QObject):
         self._pending_manual_indices = ready
         self._pending_manual_action_keys = action_keys
         self._pending_manual_schedule_generation = self._schedule_generation
+        if waiting_count == len(ready):
+            confirmation_intro = f"將安排勤務系統 {len(ready)} 筆到點後自動登打："
+        elif waiting_count:
+            confirmation_intro = (
+                f"將登打勤務系統 {len(ready)} 筆；其中 {waiting_count} 筆將到點後自動登打："
+            )
+        else:
+            confirmation_intro = f"將登打勤務系統 {len(ready)} 筆："
         self._manual_confirmation_summary = (
-            f"將登打勤務系統 {len(ready)} 筆：\n{summaries}\n\n"
+            f"{confirmation_intro}\n{summaries}\n\n"
             "時間依據如各項括號所示；確認時會再次依規則檢查。"
         )
         self.scheduleChanged.emit()
@@ -456,7 +471,10 @@ class DutyController(QObject):
             if 0 <= index < len(self._actions)
         )
         indices = self._resolve_action_keys(action_keys)
-        if indices is None or not all(self._is_manual_submission_eligible(index) for index in indices):
+        current = datetime.now()
+        if indices is None or not all(
+            self._is_manual_submission_available(index, now=current) for index in indices
+        ):
             self._pending_manual_indices.clear()
             self._pending_manual_action_keys = ()
             self._manual_confirmation_summary = ""
@@ -468,8 +486,29 @@ class DutyController(QObject):
         self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = ""
         self._selected_indices.clear()
-        self.scheduleChanged.emit()
-        self.manualSubmissionRequested.emit(indices)
+        waiting_keys = {
+            action_completion_key(self._actions[index])
+            for index in indices
+            if self._is_early_manual_departure_wait_eligible(index, now=current)
+        }
+        immediate_indices = [
+            index
+            for index in indices
+            if action_completion_key(self._actions[index]) not in waiting_keys
+        ]
+        if waiting_keys:
+            self._manual_waiting_action_keys.update(waiting_keys)
+            self._schedule_status = f"已安排 {len(waiting_keys)} 筆勤務到點自動登打"
+            self._refresh_projection()
+            self.manualWaitingScheduled.emit(sorted(
+                index
+                for index in indices
+                if action_completion_key(self._actions[index]) in waiting_keys
+            ))
+        else:
+            self.scheduleChanged.emit()
+        if immediate_indices:
+            self.manualSubmissionRequested.emit(immediate_indices)
 
     @Slot()
     def cancelManualSubmission(self) -> None:
@@ -479,6 +518,20 @@ class DutyController(QObject):
         self._manual_confirmation_summary = ""
         self._schedule_status = "已取消手動登打"
         self.scheduleChanged.emit()
+
+    @Slot()
+    def cancelManualWaitingSubmission(self) -> None:
+        if not self.canCancelManualWaitingSelected:
+            return
+        action_keys = [
+            action_completion_key(self._actions[index]) for index in self._selected_indices
+        ]
+        self._manual_waiting_action_keys.difference_update(action_keys)
+        self._background_manual_waiting_action_keys.difference_update(action_keys)
+        self._selected_indices.clear()
+        self._schedule_status = "已取消等待登打"
+        self._refresh_projection()
+        self.manualWaitingCancelled.emit(action_keys)
 
     @Slot()
     def prepareExternalReturnManualSubmission(self) -> None:
@@ -551,8 +604,19 @@ class DutyController(QObject):
         """Require all selected tasks to be manually eligible before enabling the action."""
 
         return bool(self._selected_indices) and all(
-            self._is_manual_submission_eligible(index) for index in self._selected_indices
+            self._is_manual_submission_available(index) for index in self._selected_indices
         )
+
+    def _is_manual_submission_available(
+        self,
+        index: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        return self._is_manual_submission_eligible(
+            index,
+            now=now,
+        ) or self._is_early_manual_departure_wait_eligible(index, now=now)
 
     def _is_manual_submission_eligible(
         self,
@@ -560,9 +624,32 @@ class DutyController(QObject):
         *,
         now: datetime | None = None,
     ) -> bool:
+        if not self._is_manual_submission_candidate(index):
+            return False
+        action = self._actions[index]
+        current = now or datetime.now()
+        if self._manual_submission_uses_scheduled_time(action, current):
+            return True
+        if is_auto_duty_action(action):
+            return self._entry_reason(action) == "到勤"
+        return not self._is_early_manual_departure(action, current)
+
+    def _is_early_manual_departure_wait_eligible(
+        self,
+        index: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if not self._is_manual_submission_candidate(index):
+            return False
+        return self._is_early_manual_departure(self._actions[index], now or datetime.now())
+
+    def _is_manual_submission_candidate(self, index: int) -> bool:
         if not 0 <= index < len(self._actions):
             return False
         action = self._actions[index]
+        if action_completion_key(action) in self._manual_waiting_action_keys:
+            return False
         comparison = self._comparisons.get(index, {})
         is_manual_external_review = (
             comparison.get("group") == "review"
@@ -580,12 +667,7 @@ class DutyController(QObject):
             )
         ):
             return False
-        current = now or datetime.now()
-        if self._manual_submission_uses_scheduled_time(action, current):
-            return True
-        if is_auto_duty_action(action):
-            return self._entry_reason(action) == "到勤"
-        return not self._is_early_manual_departure(action, current)
+        return True
 
     def _manual_submission_uses_scheduled_time(
         self,
@@ -610,7 +692,11 @@ class DutyController(QObject):
         action: Mapping[str, Any],
         current: datetime,
     ) -> bool:
-        return False
+        return is_external_or_rest_departure(action) and action_datetime(
+            action,
+            self._target_date_text,
+            fallback_date=current.date(),
+        ) > current
 
     def _load_manual_departure_pair_keys(self) -> set[str]:
         try:
@@ -708,6 +794,8 @@ class DutyController(QObject):
             return "表定時間（逾時未補跑）"
         if self._manual_submission_uses_scheduled_time(action, current):
             return "表定時間"
+        if self._is_early_manual_departure(action, current):
+            return "到點時的當下時間"
         if is_auto_duty_action(action):
             return "確認時的當下時間（提前到勤）"
         return "確認時的當下時間"
@@ -740,6 +828,8 @@ class DutyController(QObject):
         self._pending_manual_action_keys = ()
         self._pending_manual_schedule_generation = self._schedule_generation
         self._manual_confirmation_summary = ""
+        self._manual_waiting_action_keys.clear()
+        self._background_manual_waiting_action_keys.clear()
         self._pending_external_return_indices.clear()
         self._pending_external_return_action_keys = ()
         self._pending_external_return_schedule_generation = self._schedule_generation
@@ -765,6 +855,77 @@ class DutyController(QObject):
             for key, indices in grouped.items()
             if key and len(indices) == 1
         }
+
+    def _manual_waiting_indices(self) -> set[int]:
+        indices_by_key = self._unique_action_indices_by_key()
+        return {
+            index
+            for key, index in indices_by_key.items()
+            if key in self._manual_waiting_action_keys
+        }
+
+    def background_manual_waiting_requests(
+        self,
+        user_id: str,
+        password: str,
+        indices: list[int],
+    ) -> list[DutySubmissionRequest]:
+        """Snapshot newly confirmed waits for the app-owned background chain."""
+
+        user_id = str(user_id or "").strip()
+        if self._session_closing or not user_id or not password or user_id != self._session_user_id:
+            return []
+        requests: list[DutySubmissionRequest] = []
+        for index in sorted(set(indices)):
+            if not 0 <= index < len(self._actions):
+                continue
+            action = self._actions[index]
+            if (
+                action_completion_key(action) not in self._manual_waiting_action_keys
+                or not is_external_or_rest_departure(action)
+            ):
+                continue
+            actions = []
+            for source_action in self._actions:
+                snapshot_action = dict(source_action)
+                fields = source_action.get("fields", {})
+                snapshot_action["fields"] = dict(fields) if isinstance(fields, Mapping) else {}
+                actions.append(snapshot_action)
+            schedule_data = dict(self._schedule_data)
+            schedule_data["actions"] = actions
+            requests.append(
+                self._submission_request(
+                    user_id,
+                    password,
+                    index,
+                    schedule_data,
+                    trigger_type="manual",
+                )
+            )
+        return requests
+
+    def mark_background_manual_waiting(self, action_keys: list[str]) -> None:
+        self._background_manual_waiting_action_keys.update(
+            str(action_key).strip()
+            for action_key in action_keys
+            if str(action_key).strip() in self._manual_waiting_action_keys
+        )
+
+    def release_background_manual_waiting(self, request: DutySubmissionRequest) -> None:
+        """Remove a visible wait only while its original GUI session is still current."""
+
+        if not self.request_matches_current_session(request):
+            return
+        action_key = str(request.action_key or "").strip()
+        if not action_key or action_key not in self._manual_waiting_action_keys:
+            return
+        self._manual_waiting_action_keys.discard(action_key)
+        self._background_manual_waiting_action_keys.discard(action_key)
+        action_index = self._resolve_request_action_index(request)
+        if action_index is None:
+            self._refresh_projection()
+            return
+        self.mark_submission_enqueued(action_index)
 
     def ui_action_key_for_request(self, request: DutySubmissionRequest) -> str:
         """Build a UI error key only for a task that is still safe to identify."""
@@ -1630,6 +1791,7 @@ class DutyController(QObject):
         comparison: Mapping[str, Any] | None = None,
         *,
         trigger_type: str = "",
+        allow_manual_departure_return: bool = True,
     ) -> None:
         self._submitting_indices.discard(action_index)
         if not 0 <= action_index < len(self._actions):
@@ -1652,7 +1814,12 @@ class DutyController(QObject):
             if status == "submitted":
                 action = self._actions[action_index]
                 pair_key = action_return_pair_key(action)
-                if trigger_type == "manual" and is_external_or_rest_departure(action) and pair_key:
+                if (
+                    allow_manual_departure_return
+                    and trigger_type == "manual"
+                    and is_external_or_rest_departure(action)
+                    and pair_key
+                ):
                     self._manual_departure_pair_keys.add(pair_key)
                     self._save_manual_departure_pair_keys()
                 elif is_external_or_rest_return(action) and pair_key:
@@ -1725,6 +1892,7 @@ class DutyController(QObject):
             result_path,
             comparison,
             trigger_type=request.trigger_type,
+            allow_manual_departure_return=not request.background,
         )
         return True
 
@@ -1853,6 +2021,8 @@ class DutyController(QObject):
         self._pending_manual_indices.clear()
         self._pending_manual_action_keys = ()
         self._manual_confirmation_summary = ""
+        self._manual_waiting_action_keys.clear()
+        self._background_manual_waiting_action_keys.clear()
         self._pending_external_return_indices.clear()
         self._pending_external_return_action_keys = ()
         self._external_return_confirmation_summary = ""
@@ -1936,6 +2106,8 @@ class DutyController(QObject):
             self._pending_manual_indices.clear()
             self._pending_manual_action_keys = ()
             self._manual_confirmation_summary = ""
+            self._manual_waiting_action_keys.clear()
+            self._background_manual_waiting_action_keys.clear()
             self._pending_external_return_indices.clear()
             self._pending_external_return_action_keys = ()
             self._external_return_confirmation_summary = ""
@@ -1968,6 +2140,8 @@ class DutyController(QObject):
                 }
             )
         next_unique_indices = self._unique_action_indices_by_key()
+        if same_schedule_date:
+            self._manual_waiting_action_keys.intersection_update(next_unique_indices)
         carried_completed_indices = {
             next_unique_indices[key]
             for key in previous_executed_keys
@@ -2042,6 +2216,7 @@ class DutyController(QObject):
             forced_visible_indices=frozenset(self._external_return_queue_ids_by_action_index),
             task_errors=self._task_errors,
             auto_return_indices=frozenset(self._auto_return_indices()),
+            manual_waiting_indices=frozenset(self._manual_waiting_indices()),
         )
 
     def _refresh_projection(self) -> None:
@@ -2082,6 +2257,7 @@ class DutyController(QObject):
         self.scheduleChanged.emit()
 
     def _refresh_due_tasks(self, *, emit_signal: bool = True, force_emit: bool = False) -> None:
+        self._release_due_manual_waiting()
         self._refresh_handoff_prewarm()
         due = select_due_task_indices(
             self._actions,
@@ -2107,6 +2283,51 @@ class DutyController(QObject):
             if self._auto_execution_enabled and due:
                 self.dueTasksAvailable.emit(list(due))
         self._refresh_unreturned_return_queue()
+
+    def _release_due_manual_waiting(self, current: datetime | None = None) -> None:
+        unmanaged_waiting = self._manual_waiting_action_keys.difference(
+            self._background_manual_waiting_action_keys
+        )
+        if self._session_closing or not self._session_user_id or not unmanaged_waiting:
+            return
+        current = current or datetime.now()
+        indices_by_key = self._unique_action_indices_by_key()
+        released_indices: list[int] = []
+        discarded_waiting = False
+        for action_key in tuple(unmanaged_waiting):
+            index = indices_by_key.get(action_key)
+            if index is None:
+                self._manual_waiting_action_keys.discard(action_key)
+                discarded_waiting = True
+                continue
+            action = self._actions[index]
+            if not is_external_or_rest_departure(action):
+                self._manual_waiting_action_keys.discard(action_key)
+                discarded_waiting = True
+                continue
+            action_at = action_datetime(
+                action,
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if action_at > current:
+                continue
+            self._manual_waiting_action_keys.discard(action_key)
+            if self._is_manual_submission_eligible(index, now=current):
+                released_indices.append(index)
+            else:
+                discarded_waiting = True
+        if not released_indices and not discarded_waiting:
+            return
+        released_indices.sort()
+        self._schedule_status = (
+            "等待項目已到點，正在登打"
+            if released_indices
+            else "等待登打項目已變更，未自動送出"
+        )
+        self._refresh_projection()
+        if released_indices:
+            self.manualSubmissionRequested.emit(released_indices)
 
     def _refresh_handoff_prewarm(self, current: datetime | None = None) -> None:
         if self._session_closing or not self._auto_execution_enabled or not self._actor_no:

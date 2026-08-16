@@ -411,6 +411,7 @@ Rectangle {
                 tone: "primary"
                 emphasizedBorder: true
                 visible: !dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected
+                         && !dutyTaskArea.backend.dutyController.hasManualWaitingSelected
                 enabled: dutyTaskArea.backend.dutyController.canManualSubmitSelected
                 onClicked: dutyTaskArea.backend.dutyController.prepareManualSubmission()
             }
@@ -423,6 +424,14 @@ Rectangle {
                 visible: dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected
                 enabled: dutyTaskArea.backend.dutyController.canConfirmExternalReturnManualSubmissionSelected
                 onClicked: dutyTaskArea.backend.dutyController.prepareExternalReturnManualSubmission()
+            }
+            DutyActionButton {
+                objectName: "cancelManualWaitingButton"
+                text: "取消等待"
+                tone: "neutralStrong"
+                visible: dutyTaskArea.backend.dutyController.hasManualWaitingSelected
+                enabled: dutyTaskArea.backend.dutyController.canCancelManualWaitingSelected
+                onClicked: dutyTaskArea.backend.dutyController.cancelManualWaitingSubmission()
             }
         }
     }

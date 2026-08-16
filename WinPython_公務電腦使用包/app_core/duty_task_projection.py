@@ -44,6 +44,7 @@ class DutyTaskProjectionState:
     forced_visible_indices: frozenset[int] = frozenset()
     task_errors: Mapping[int, str] = field(default_factory=dict)
     auto_return_indices: frozenset[int] = frozenset()
+    manual_waiting_indices: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -466,6 +467,8 @@ def _task_status(
         return _display_status(comparison.get("compare") or "已存在"), "triggered"
     if comparison.get("group") == "skipped":
         return _display_status(comparison.get("compare") or "跨班接續已略過"), "manual"
+    if index in state.manual_waiting_indices:
+        return "等待", "waiting"
     if index in state.comparison_wait_statuses:
         return state.comparison_wait_statuses[index], "manual"
     if index in state.paused_indices:

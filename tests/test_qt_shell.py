@@ -620,6 +620,32 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(rows[0]["statusText"], "正在登打")
         self.assertEqual(rows[0]["statusTone"], "running")
 
+    def test_projection_marks_manual_departure_waiting_without_repeating_time(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
+
+        action = {
+            "kind": "entry_log",
+            "time": "09:00",
+            "actor": "10",
+            "target": "10",
+            "source": "外勤簽出",
+            "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+        }
+        rows = project_duty_tasks(
+            [action],
+            DutyTaskProjectionState(
+                actor_no="10",
+                target_roc_date="1150809",
+                manual_waiting_indices=frozenset({0}),
+            ),
+            now=datetime(2026, 8, 9, 7, 55),
+        )
+
+        self.assertEqual(rows[0]["statusText"], "等待")
+        self.assertEqual(rows[0]["statusTone"], "waiting")
+
     def test_next_task_text_ignores_previous_handoff_and_uses_own_candidate(self) -> None:
         from datetime import datetime
 
@@ -6477,12 +6503,21 @@ class QtShellTests(unittest.TestCase):
             "enabled: dutyTaskArea.backend.dutyController.canConfirmExternalReturnManualSubmissionSelected",
             action_row,
         )
-        self.assertEqual(
-            action_row.count("visible: !dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected"),
-            1,
+        self.assertIn(
+            "visible: !dutyTaskArea.backend.dutyController.hasExternalReturnPauseSelected",
+            action_row,
+        )
+        self.assertIn(
+            "&& !dutyTaskArea.backend.dutyController.hasManualWaitingSelected",
+            action_row,
+        )
+        self.assertIn('text: "取消等待"', action_row)
+        self.assertIn(
+            "enabled: dutyTaskArea.backend.dutyController.canCancelManualWaitingSelected",
+            action_row,
         )
         self.assertIn("emphasizedBorder: true", action_row)
-        self.assertEqual(action_row.count("DutyActionButton {"), 2)
+        self.assertEqual(action_row.count("DutyActionButton {"), 3)
 
     def test_qml_duty_sheet_panel_preserves_finalized_legacy_text_and_order(self) -> None:
         source = (
@@ -9312,10 +9347,12 @@ if return_code != 0 or loaded:
 
         first_entry_started = threading.Event()
         release_first_entry = threading.Event()
+        work_started = threading.Event()
 
         class FakeService:
             def __init__(self) -> None:
-                self.calls: list[int] = []
+                self.entry_calls: list[int] = []
+                self.work_calls: list[int] = []
 
             def validate(self, request):
                 return request
@@ -9324,7 +9361,7 @@ if return_code != 0 or loaded:
                 return SimpleNamespace(user_id=request.user_id, visible=request.visible)
 
             def execute_with_browser_session(self, request, _session, *, status_callback=None):
-                self.calls.append(request.action_index)
+                self.entry_calls.append(request.action_index)
                 if request.action_index == 0:
                     first_entry_started.set()
                     release_first_entry.wait(timeout=2)
@@ -9333,6 +9370,17 @@ if return_code != 0 or loaded:
                     "submitted",
                     "submitted",
                     Path(f"handoff-priority-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def execute(self, request, *, status_callback=None):
+                self.work_calls.append(request.action_index)
+                work_started.set()
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "submitted",
+                    Path(f"handoff-work-{request.action_index}.json"),
                     {"group": "done"},
                 )
 
@@ -9360,6 +9408,7 @@ if return_code != 0 or loaded:
                 self.assertTrue(
                     controller.enqueue(DutySubmissionRequest("user10", "secret", action_index, data))
                 )
+            self.assertTrue(work_started.wait(timeout=1))
             release_first_entry.set()
             for _ in range(30):
                 if finished_spy.count() == 5 and not controller.isBusy:
@@ -9367,9 +9416,11 @@ if return_code != 0 or loaded:
                 finished_spy.wait(250)
                 QTest.qWait(10)
 
-            self.assertEqual(service.calls, [0, 2, 3, 4, 1])
+            self.assertEqual(service.entry_calls, [0, 2, 3, 1])
+            self.assertEqual(service.work_calls, [4])
             self.assertFalse(controller.isBusy)
         finally:
+            release_first_entry.set()
             controller.shutdown()
 
     def test_duty_execution_controller_prewarm_reuses_entry_session_without_submitting(self) -> None:
@@ -10220,7 +10271,7 @@ if return_code != 0 or loaded:
         self.assertFalse(controller.isBusy)
         controller.shutdown()
 
-    def test_duty_execution_controller_serializes_handoff_before_early_checkout(self) -> None:
+    def test_duty_execution_controller_runs_handoff_work_in_parallel_before_early_checkout(self) -> None:
         from types import SimpleNamespace
 
         from PySide6.QtTest import QSignalSpy, QTest
@@ -10300,8 +10351,8 @@ if return_code != 0 or loaded:
                 QTest.qWait(10)
 
             self.assertEqual(service.opened_sessions, 1)
-            self.assertEqual(service.serialized_actions, [0, 1, 2, 3])
-            self.assertEqual(service.parallel_actions, [])
+            self.assertEqual(service.serialized_actions, [0, 1, 3])
+            self.assertEqual(service.parallel_actions, [2])
             self.assertEqual(finished_spy.count(), 4)
             self.assertFalse(controller.isBusy)
         finally:
@@ -10831,6 +10882,199 @@ if return_code != 0 or loaded:
             self.assertFalse(controller._logout_pending)
         finally:
             controller.dutyExecutionController._entry_active_request_id = None
+            controller.shutdown()
+
+    def test_background_manual_waiting_chain_keeps_original_account_after_logout_and_new_login(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from PySide6.QtTest import QTest
+
+        from app_core.duty_submission_service import DutySubmissionResult
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeSubmissionService:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def execute(self, request, **_kwargs):
+                self.requests.append(request)
+                action = request.schedule_data["actions"][request.action_index]
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "完成",
+                    Path("background-chain-result.json"),
+                    {"compare": "已登打", "group": "done", "matched": []},
+                    action,
+                )
+
+        class EarlyDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 7, 55, tzinfo=tz)
+
+        service = FakeSubmissionService()
+        controller = AppController(
+            duty_submission_service=service,
+            read_only_acceptance=False,
+        )
+        departure = {
+            "kind": "entry_log",
+            "time": "09:00",
+            "actor": "10",
+            "target": "10",
+            "source": "外勤簽出",
+            "return_pair_key": "background-chain:external",
+            "duplicate_key": "background-chain:departure",
+            "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+        }
+        returning = {
+            "kind": "entry_log",
+            "time": "10:00",
+            "actor": "10",
+            "target": "10",
+            "source": "外勤簽入",
+            "return_pair_key": "background-chain:external",
+            "duplicate_key": "background-chain:return",
+            "fields": {
+                "出或入": "入",
+                "領用事由及地點": "返隊",
+                "登打時間": "10:00",
+                "系統寫入時間": "10:00",
+            },
+        }
+        try:
+            controller._send_operational_event = lambda *_args, **_kwargs: None
+            controller.trayController.notify = lambda *_args: None
+            attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                attempt_id,
+                LoginSession("10", "user10", "secret", verified=True),
+            )
+            controller.dutyController.set_session_context(1, "user10")
+            controller.dutyController.set_actor_no("10")
+            with patch("qt_app.controllers.duty_controller.datetime", EarlyDateTime):
+                controller.dutyController.replace_schedule_data(
+                    {"target_date": "1150809", "actions": [departure, returning]}
+                )
+                controller.dutyController.toggleTaskSelection(0)
+                controller.dutyController.prepareManualSubmission()
+                controller.dutyController.confirmManualSubmission()
+
+            self.assertIn("到點自動登打", controller._stop_block_reason())
+            controller.requestLogout()
+
+            self.assertFalse(controller.sessionController.isLoggedIn)
+            self.assertEqual(len(controller._background_manual_chains), 1)
+
+            controller.dutyController.load_current_schedule = lambda: None
+            controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+            next_attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                next_attempt_id,
+                LoginSession("20", "user20", "another-secret", verified=True),
+            )
+            controller._sync_session_actor()
+            controller.dutyController.replace_schedule_data(
+                {
+                    "target_date": "1150809",
+                    "actions": [
+                        {
+                            "kind": "entry_log",
+                            "time": "09:00",
+                            "actor": "20",
+                            "target": "20",
+                            "source": "外勤簽出",
+                            "duplicate_key": "new-user-action",
+                            "fields": {"出或入": "出", "領用事由及地點": "新勤務"},
+                        }
+                    ],
+                }
+            )
+
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertEqual(controller.sessionController.userId, "user20")
+
+            controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 9, 0))
+            for _ in range(100):
+                if not controller._background_manual_workers:
+                    break
+                QTest.qWait(10)
+
+            self.assertEqual(len(service.requests), 1)
+            self.assertEqual(service.requests[0].user_id, "user10")
+            self.assertEqual(service.requests[0].trigger_type, "manual")
+            self.assertEqual(
+                service.requests[0].schedule_data["actions"][0]["fields"]["登打時間"],
+                "09:00",
+            )
+            self.assertEqual(controller.dutyController._executed_indices, set())
+
+            controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 10, 0))
+            for _ in range(100):
+                if not controller._background_manual_workers:
+                    break
+                QTest.qWait(10)
+
+            self.assertEqual(len(service.requests), 2)
+            self.assertEqual(service.requests[1].user_id, "user10")
+            self.assertEqual(service.requests[1].trigger_type, "due")
+            self.assertEqual(controller._background_manual_chains, {})
+            self.assertEqual(controller._stop_block_reason(), "")
+        finally:
+            controller.shutdown()
+
+    def test_cancelling_background_manual_waiting_clears_its_background_lease(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class EarlyDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 7, 55, tzinfo=tz)
+
+        controller = AppController()
+        try:
+            attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                attempt_id,
+                LoginSession("10", "user10", "secret", verified=True),
+            )
+            controller.dutyController.set_session_context(1, "user10")
+            controller.dutyController.set_actor_no("10")
+            with patch("qt_app.controllers.duty_controller.datetime", EarlyDateTime):
+                controller.dutyController.replace_schedule_data(
+                    {
+                        "target_date": "1150809",
+                        "actions": [
+                            {
+                                "kind": "entry_log",
+                                "time": "09:00",
+                                "actor": "10",
+                                "target": "10",
+                                "source": "休息簽出",
+                                "duplicate_key": "background-cancel:departure",
+                                "fields": {"出或入": "出", "領用事由及地點": "休息"},
+                            }
+                        ],
+                    }
+                )
+                controller.dutyController.toggleTaskSelection(0)
+                controller.dutyController.prepareManualSubmission()
+                controller.dutyController.confirmManualSubmission()
+
+            self.assertEqual(len(controller._background_manual_chains), 1)
+            controller.dutyController.toggleTaskSelection(0)
+            controller.dutyController.cancelManualWaitingSubmission()
+
+            self.assertEqual(controller._background_manual_chains, {})
+            self.assertEqual(controller._stop_block_reason(), "")
+        finally:
             controller.shutdown()
 
     def test_stale_submission_result_keeps_new_schedule_clean_and_uses_original_actor_event(self) -> None:
@@ -13546,108 +13790,216 @@ if return_code != 0 or loaded:
         self.assertEqual(action["fields"]["工作時間"], "01:02")
         self.assertEqual(action["submit_target_date"], "1150730")
 
-    def test_manual_time_rules_restrict_early_departures_and_preserve_due_auto_times(self) -> None:
-        from datetime import datetime
+    def test_early_external_and_rest_departures_wait_until_due_time(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from PySide6.QtTest import QSignalSpy
 
         from qt_app.controllers.duty_controller import DutyController
 
-        controller = DutyController()
-        controller.set_actor_no("10")
-        controller.replace_schedule_data(
-            {
-                "target_date": "1150809",
-                "actions": [
-                    {
-                        "kind": "entry_log",
-                        "time": "08:00",
-                        "actor": "10",
-                        "target": "10",
-                        "fields": {"出或入": "入", "領用事由及地點": "到勤"},
-                    },
-                    {
-                        "kind": "entry_log",
-                        "time": "08:00",
-                        "actor": "10",
-                        "target": "10",
-                        "fields": {
-                            "登打時間": "08:00",
-                            "系統寫入時間": "08:05",
-                            "出或入": "出",
-                            "領用事由及地點": "退勤",
-                        },
-                    },
-                    {
-                        "kind": "entry_log",
-                        "time": "09:00",
-                        "actor": "10",
-                        "target": "10",
-                        "source": "外勤簽出",
-                        "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
-                    },
-                    {
-                        "kind": "entry_log",
-                        "time": "09:00",
-                        "actor": "10",
-                        "target": "10",
-                        "source": "外勤簽入",
-                        "fields": {"出或入": "入", "領用事由及地點": "返隊"},
-                    },
-                    {
-                        "kind": "entry_log",
-                        "time": "09:00",
-                        "actor": "10",
-                        "target": "10",
-                        "source": "休息簽出",
-                        "fields": {"出或入": "出", "領用事由及地點": "休息"},
-                    },
-                    {
-                        "kind": "entry_log",
-                        "time": "09:00",
-                        "actor": "10",
-                        "target": "10",
-                        "source": "休息結束",
-                        "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
-                    },
-                ],
-            }
-        )
-        early = datetime(2026, 8, 9, 7, 55)
+        early = RealDateTime(2026, 8, 9, 7, 55)
+        due = RealDateTime(2026, 8, 9, 9, 0)
 
-        self.assertTrue(controller._is_manual_submission_eligible(0, now=early))
-        self.assertFalse(controller._is_manual_submission_eligible(1, now=early))
-        self.assertTrue(controller._is_manual_submission_eligible(2, now=early))
-        self.assertTrue(controller._is_manual_submission_eligible(3, now=early))
-        self.assertTrue(controller._is_manual_submission_eligible(4, now=early))
-        self.assertTrue(controller._is_manual_submission_eligible(5, now=early))
+        class EarlyDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 7, 55, tzinfo=tz)
 
-        external_departure_request = controller.manual_submission_requests(
-            "user10", "secret", [2], submit_at=early
-        )[0]
-        external_departure = external_departure_request.schedule_data["actions"][2]
-        self.assertEqual(external_departure["fields"]["登打時間"], "07:55")
-        self.assertEqual(external_departure["fields"]["系統寫入時間"], "07:55")
-        rest_departure_request = controller.manual_submission_requests(
-            "user10", "secret", [4], submit_at=early
-        )[0]
-        rest_departure = rest_departure_request.schedule_data["actions"][4]
-        self.assertEqual(rest_departure["fields"]["登打時間"], "07:55")
-        self.assertEqual(rest_departure["fields"]["系統寫入時間"], "07:55")
+        class DueDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 9, 0, tzinfo=tz)
 
-        arrival_request = controller.manual_submission_requests(
-            "user10", "secret", [0], submit_at=early
-        )[0]
-        self.assertEqual(arrival_request.schedule_data["actions"][0]["time"], "07:55")
-        self.assertEqual(
-            controller._manual_time_summary(controller._actions[0], datetime(2026, 8, 9, 10, 1)),
-            "表定時間（逾時未補跑）",
-        )
-        self.assertTrue(controller._is_manual_submission_eligible(1, now=datetime(2026, 8, 9, 8, 2)))
-        checkout_request = controller.manual_submission_requests(
-            "user10", "secret", [1], submit_at=datetime(2026, 8, 9, 8, 2)
-        )[0]
-        checkout = checkout_request.schedule_data["actions"][1]
-        self.assertEqual(checkout["fields"]["登打時間"], "08:00")
-        self.assertEqual(checkout["fields"]["系統寫入時間"], "08:05")
+        with patch("qt_app.controllers.duty_controller.datetime", EarlyDateTime):
+            controller = DutyController()
+            try:
+                controller.set_session_context(1, "user10")
+                controller.set_actor_no("10")
+                controller.replace_schedule_data(
+                    {
+                        "target_date": "1150809",
+                        "actions": [
+                            {
+                                "kind": "entry_log",
+                                "time": "09:00",
+                                "actor": "10",
+                                "target": "10",
+                                "source": "外勤簽出",
+                                "duplicate_key": "wait:external-departure",
+                                "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                            },
+                            {
+                                "kind": "entry_log",
+                                "time": "09:00",
+                                "actor": "10",
+                                "target": "10",
+                                "source": "休息簽出",
+                                "duplicate_key": "wait:rest-departure",
+                                "fields": {"出或入": "出", "領用事由及地點": "休息"},
+                            },
+                        ],
+                    }
+                )
+                confirmation_spy = QSignalSpy(controller.manualSubmissionConfirmationRequested)
+                requested_spy = QSignalSpy(controller.manualSubmissionRequested)
+                controller.toggleTaskSelection(0)
+                controller.toggleTaskSelection(1)
+
+                self.assertFalse(controller._is_manual_submission_eligible(0, now=early))
+                self.assertFalse(controller._is_manual_submission_eligible(1, now=early))
+                self.assertTrue(controller.canManualSubmitSelected)
+                controller.prepareManualSubmission()
+
+                self.assertEqual(confirmation_spy.count(), 1)
+                self.assertIn("到點後自動登打", controller.manualConfirmationSummary)
+                self.assertIn("到點時的當下時間", controller.manualConfirmationSummary)
+                controller.confirmManualSubmission()
+
+                self.assertEqual(requested_spy.count(), 0)
+                self.assertEqual(len(controller._manual_waiting_action_keys), 2)
+                self.assertEqual(
+                    controller.manual_submission_requests("user10", "secret", [0, 1], submit_at=early),
+                    [],
+                )
+
+                with patch("qt_app.controllers.duty_controller.datetime", DueDateTime):
+                    controller._refresh_due_tasks()
+
+                self.assertEqual(requested_spy.count(), 1)
+                submitted_indices = requested_spy.at(0)[0]
+                self.assertEqual(sorted(submitted_indices), [0, 1])
+                requests = controller.manual_submission_requests(
+                    "user10", "secret", submitted_indices, submit_at=due
+                )
+                submitted_actions = {
+                    request.action_index: request.schedule_data["actions"][request.action_index]
+                    for request in requests
+                }
+                self.assertEqual(submitted_actions[0]["fields"]["登打時間"], "09:00")
+                self.assertEqual(submitted_actions[0]["fields"]["系統寫入時間"], "09:00")
+                self.assertEqual(submitted_actions[1]["fields"]["登打時間"], "09:00")
+                self.assertEqual(submitted_actions[1]["fields"]["系統寫入時間"], "09:00")
+            finally:
+                controller.shutdown()
+
+    def test_cancelling_early_departure_wait_prevents_due_submission(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        class EarlyDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 7, 55, tzinfo=tz)
+
+        class DueDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 9, 0, tzinfo=tz)
+
+        with patch("qt_app.controllers.duty_controller.datetime", EarlyDateTime):
+            controller = DutyController()
+            try:
+                controller.set_session_context(1, "user10")
+                controller.set_actor_no("10")
+                controller.replace_schedule_data(
+                    {
+                        "target_date": "1150809",
+                        "actions": [
+                            {
+                                "kind": "entry_log",
+                                "time": "09:00",
+                                "actor": "10",
+                                "target": "10",
+                                "source": "外勤簽出",
+                                "duplicate_key": "wait:cancelled-departure",
+                                "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                            }
+                        ],
+                    }
+                )
+                requested_spy = QSignalSpy(controller.manualSubmissionRequested)
+                controller.toggleTaskSelection(0)
+                controller.prepareManualSubmission()
+                controller.confirmManualSubmission()
+                controller.toggleTaskSelection(0)
+
+                self.assertTrue(controller.hasManualWaitingSelected)
+                self.assertTrue(controller.canCancelManualWaitingSelected)
+                controller.cancelManualWaitingSubmission()
+
+                self.assertEqual(controller._manual_waiting_action_keys, set())
+                self.assertEqual(controller.selectedTaskCount, 0)
+                with patch("qt_app.controllers.duty_controller.datetime", DueDateTime):
+                    controller._refresh_due_tasks()
+                self.assertEqual(requested_spy.count(), 0)
+            finally:
+                controller.shutdown()
+
+    def test_waiting_departure_remaps_by_action_key_after_schedule_refresh(self) -> None:
+        from datetime import datetime as RealDateTime
+        from unittest.mock import patch
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        class EarlyDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 7, 55, tzinfo=tz)
+
+        class DueDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 9, 9, 0, tzinfo=tz)
+
+        departure = {
+            "kind": "entry_log",
+            "time": "09:00",
+            "actor": "10",
+            "target": "10",
+            "source": "外勤簽出",
+            "duplicate_key": "wait:remapped-departure",
+            "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+        }
+        other_action = {
+            "kind": "work_log",
+            "time": "10:00",
+            "actor": "10",
+            "target": "10",
+            "source": "在隊訓練",
+            "duplicate_key": "wait:other-work",
+            "fields": {"勤務項目": "器材整理"},
+        }
+        with patch("qt_app.controllers.duty_controller.datetime", EarlyDateTime):
+            controller = DutyController()
+            try:
+                controller.set_session_context(1, "user10")
+                controller.set_actor_no("10")
+                controller.replace_schedule_data(
+                    {"target_date": "1150809", "actions": [departure, other_action]}
+                )
+                requested_spy = QSignalSpy(controller.manualSubmissionRequested)
+                controller.toggleTaskSelection(0)
+                controller.prepareManualSubmission()
+                controller.confirmManualSubmission()
+
+                controller.replace_schedule_data(
+                    {"target_date": "1150809", "actions": [other_action, departure]}
+                )
+                self.assertEqual(len(controller._manual_waiting_action_keys), 1)
+                with patch("qt_app.controllers.duty_controller.datetime", DueDateTime):
+                    controller._refresh_due_tasks()
+
+                self.assertEqual(requested_spy.count(), 1)
+                self.assertEqual(requested_spy.at(0)[0], [1])
+            finally:
+                controller.shutdown()
 
     def test_manual_external_departure_arms_original_time_return_and_manual_return_cancels_it(self) -> None:
         from datetime import datetime

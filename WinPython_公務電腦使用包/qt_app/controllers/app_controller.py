@@ -7,6 +7,7 @@ import json
 import re
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -20,9 +21,13 @@ from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsServi
 from app_core.duty_sheet_service import DutySheetService
 from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult, DutySubmissionService
 from app_core.duty_task_projection import (
+    AUTO_DUE_CATCH_UP_WINDOW,
+    action_datetime,
     action_completion_key,
+    action_return_pair_key,
     action_summary,
     compact_action_snapshot,
+    is_external_or_rest_return,
     target_short_label,
 )
 from app_core.login_verifier import LoginVerifier
@@ -48,8 +53,17 @@ from qt_app.controllers.tray_controller import TrayController
 from qt_app.controllers.update_controller import UpdateController
 from qt_app.controllers.work_log_settings_controller import WorkLogSettingsController
 from qt_app.workers.operational_sync_worker import OperationalSyncWorker
+from qt_app.workers.duty_submission_worker import DutySubmissionWorker
 from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 from qt_app.workers.scheduled_folder_worker import ScheduledFolderWorker
+
+
+@dataclass
+class _BackgroundManualChain:
+    request: DutySubmissionRequest
+    return_action_index: int | None
+    phase: str = "departure_waiting"
+    active_request_id: int | None = None
 
 
 class AppController(QObject):
@@ -141,8 +155,9 @@ class AppController(QObject):
             self,
             session_state=self._session_state,
         )
+        self._duty_submission_service = duty_submission_service or DutySubmissionService(package_root)
         self._duty_execution_controller = DutyExecutionController(
-            duty_submission_service or DutySubmissionService(package_root),
+            self._duty_submission_service,
             self,
         )
         self._work_log_settings_controller = WorkLogSettingsController(
@@ -177,6 +192,16 @@ class AppController(QObject):
         self._last_hourly_refresh_key = ""
         self._last_schedule_snapshot_signature = ""
         self._duty_mode_active = True
+        self._background_manual_chains: dict[str, _BackgroundManualChain] = {}
+        self._background_manual_workers: dict[
+            int,
+            tuple[QThread, DutySubmissionWorker, str, str, DutySubmissionRequest],
+        ] = {}
+        self._background_manual_request_id = 0
+        self._background_manual_timer = QTimer(self)
+        self._background_manual_timer.setInterval(1_000)
+        self._background_manual_timer.timeout.connect(self._check_background_manual_chains)
+        self._background_manual_timer.start()
         self._hourly_refresh_timer = QTimer(self)
         self._hourly_refresh_timer.setInterval(60_000)
         self._hourly_refresh_timer.timeout.connect(self._refresh_hourly_live_schedule)
@@ -206,6 +231,8 @@ class AppController(QObject):
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
+        self._duty_controller.manualWaitingScheduled.connect(self._register_background_manual_waiting)
+        self._duty_controller.manualWaitingCancelled.connect(self._cancel_background_manual_waiting)
         self._duty_controller.externalReturnQueueManualSubmissionRequested.connect(
             self._enqueue_queued_external_return_manual_submission
         )
@@ -443,6 +470,10 @@ class AppController(QObject):
 
         if self._update_shutdown_prepared or self._worker_admissions_closed:
             return "程式正在關閉"
+        if self._background_manual_workers:
+            return "到點自動登打正在執行"
+        if self._background_manual_chains:
+            return f"尚有 {len(self._background_manual_chains)} 筆到點自動登打等待中"
         if self._duty_execution_controller.isBusy or self._logout_pending:
             return "勤務登打尚未完成"
         if self._session_controller.isBusy or self._session_controller.hasRunningWorkers:
@@ -465,6 +496,307 @@ class AppController(QObject):
         if self._update_controller.isChecking:
             return "更新檢查尚未完成"
         return ""
+
+    def _register_background_manual_waiting(self, indices: list[int]) -> None:
+        if self._read_only_acceptance or self._worker_admissions_closed:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        requests = self._duty_controller.background_manual_waiting_requests(
+            session.user_id,
+            session.password,
+            list(indices),
+        )
+        registered_keys: list[str] = []
+        for request in requests:
+            chain_id = self._background_manual_chain_id(request)
+            if chain_id in self._background_manual_chains:
+                continue
+            self._background_manual_chains[chain_id] = _BackgroundManualChain(
+                request=replace(request, background=True),
+                return_action_index=self._background_return_action_index(request),
+            )
+            registered_keys.append(str(request.action_key or "").strip())
+        if registered_keys:
+            self._duty_controller.mark_background_manual_waiting(registered_keys)
+
+    def _cancel_background_manual_waiting(self, action_keys: list[str]) -> None:
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        action_key_set = {str(action_key).strip() for action_key in action_keys if str(action_key).strip()}
+        if not action_key_set:
+            return
+        for chain_id, chain in tuple(self._background_manual_chains.items()):
+            request = chain.request
+            if (
+                chain.phase == "departure_waiting"
+                and request.session_generation == self._session_state.generation
+                and request.user_id == session.user_id
+                and request.action_key in action_key_set
+            ):
+                self._discard_background_manual_chain(chain_id)
+
+    @staticmethod
+    def _background_manual_chain_id(request: DutySubmissionRequest) -> str:
+        return ":".join(
+            (
+                str(request.session_generation),
+                str(request.user_id),
+                str(request.schedule_data.get("target_date", "") or ""),
+                str(request.action_key or ""),
+            )
+        )
+
+    @staticmethod
+    def _background_return_action_index(request: DutySubmissionRequest) -> int | None:
+        actions = request.schedule_data.get("actions", [])
+        if not isinstance(actions, list) or not 0 <= request.action_index < len(actions):
+            return None
+        departure = actions[request.action_index]
+        if not isinstance(departure, Mapping):
+            return None
+        pair_key = action_return_pair_key(departure)
+        if not pair_key:
+            return None
+        matches = [
+            index
+            for index, action in enumerate(actions)
+            if isinstance(action, Mapping)
+            and is_external_or_rest_return(action)
+            and action_return_pair_key(action) == pair_key
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _background_action_datetime(
+        request: DutySubmissionRequest,
+        action_index: int,
+        current: datetime,
+    ) -> datetime | None:
+        actions = request.schedule_data.get("actions", [])
+        if not isinstance(actions, list) or not 0 <= action_index < len(actions):
+            return None
+        action = actions[action_index]
+        if not isinstance(action, Mapping):
+            return None
+        return action_datetime(
+            action,
+            str(request.schedule_data.get("target_date", "") or ""),
+            fallback_date=current.date(),
+        )
+
+    def _check_background_manual_chains(self, current: datetime | None = None) -> None:
+        if self._worker_admissions_closed or self._background_manual_workers:
+            return
+        now = current or datetime.now()
+        for chain_id, chain in tuple(self._background_manual_chains.items()):
+            if chain.active_request_id is not None:
+                continue
+            if chain.phase == "departure_waiting":
+                phase = "departure"
+                action_index = chain.request.action_index
+            elif chain.phase == "return_waiting" and chain.return_action_index is not None:
+                phase = "return"
+                action_index = chain.return_action_index
+            else:
+                self._discard_background_manual_chain(chain_id)
+                continue
+            action_at = self._background_action_datetime(chain.request, action_index, now)
+            if action_at is None:
+                self._discard_background_manual_chain(chain_id)
+                continue
+            if action_at > now:
+                continue
+            if now > action_at + AUTO_DUE_CATCH_UP_WINDOW:
+                self._expire_background_manual_chain(chain_id, phase, now)
+                continue
+            self._start_background_manual_submission(chain_id, phase, now)
+            return
+
+    def _background_submission_request(
+        self,
+        chain: _BackgroundManualChain,
+        phase: str,
+        submit_at: datetime,
+    ) -> DutySubmissionRequest | None:
+        base_request = chain.request
+        actions = base_request.schedule_data.get("actions", [])
+        if not isinstance(actions, list):
+            return None
+        action_index = (
+            base_request.action_index
+            if phase == "departure"
+            else chain.return_action_index
+        )
+        if action_index is None or not 0 <= action_index < len(actions):
+            return None
+        snapshot_actions = []
+        for source_action in actions:
+            if not isinstance(source_action, Mapping):
+                return None
+            snapshot_action = dict(source_action)
+            fields = source_action.get("fields", {})
+            snapshot_action["fields"] = dict(fields) if isinstance(fields, Mapping) else {}
+            snapshot_actions.append(snapshot_action)
+        if phase == "departure":
+            stamped_action = DutyController._stamped_submission_action(
+                snapshot_actions[action_index],
+                submit_at,
+            )
+            if stamped_action is None:
+                return None
+            snapshot_actions[action_index] = stamped_action
+        schedule_data = dict(base_request.schedule_data)
+        schedule_data["actions"] = snapshot_actions
+        action = snapshot_actions[action_index]
+        return replace(
+            base_request,
+            action_index=action_index,
+            schedule_data=schedule_data,
+            trigger_type="manual" if phase == "departure" else "due",
+            action_key=action_completion_key(action),
+            background=True,
+        )
+
+    def _start_background_manual_submission(
+        self,
+        chain_id: str,
+        phase: str,
+        submit_at: datetime,
+    ) -> None:
+        chain = self._background_manual_chains.get(chain_id)
+        if chain is None or chain.active_request_id is not None:
+            return
+        request = self._background_submission_request(chain, phase, submit_at)
+        if request is None:
+            self._discard_background_manual_chain(chain_id)
+            return
+        self._background_manual_request_id += 1
+        request_id = self._background_manual_request_id
+        worker = DutySubmissionWorker(request_id, self._duty_submission_service, request)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._background_manual_submission_succeeded)
+        worker.failed.connect(self._background_manual_submission_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._background_manual_worker_finished)
+        self._background_manual_workers[request_id] = (
+            thread,
+            worker,
+            chain_id,
+            phase,
+            request,
+        )
+        chain.active_request_id = request_id
+        chain.phase = f"{phase}_submitting"
+        self._submission_queued(request)
+        if phase == "departure":
+            self._duty_controller.release_background_manual_waiting(request)
+        self._submission_started(request)
+        thread.start()
+
+    def _expire_background_manual_chain(
+        self,
+        chain_id: str,
+        phase: str,
+        current: datetime,
+    ) -> None:
+        chain = self._background_manual_chains.get(chain_id)
+        if chain is None:
+            return
+        request = self._background_submission_request(chain, phase, current)
+        if request is not None:
+            message = "到點自動登打逾時未執行。"
+            self._submission_cancelled(request, message, "missed_due")
+            self._tray_controller.notify(
+                "SinpoSmart",
+                self._format_duty_notification(
+                    self._submission_action(request),
+                    self._submission_staff(request),
+                    "到點逾時，未送出",
+                ),
+            )
+        self._discard_background_manual_chain(chain_id)
+
+    @Slot(int, object)
+    def _background_manual_submission_succeeded(
+        self,
+        request_id: int,
+        result: DutySubmissionResult,
+    ) -> None:
+        worker_data = self._background_manual_workers.get(request_id)
+        if worker_data is None:
+            return
+        _thread, _worker, chain_id, phase, request = worker_data
+        self._submission_finished(request, result)
+        chain = self._background_manual_chains.get(chain_id)
+        if chain is None:
+            return
+        if (
+            phase == "departure"
+            and result.status in {"submitted", "skipped_duplicate"}
+            and chain.return_action_index is not None
+        ):
+            chain.phase = "return_waiting"
+            return
+        self._discard_background_manual_chain(chain_id)
+
+    @Slot(int, int, str, str, str)
+    def _background_manual_submission_failed(
+        self,
+        request_id: int,
+        _action_index: int,
+        message: str,
+        error_code: str,
+        result_path: str,
+    ) -> None:
+        worker_data = self._background_manual_workers.get(request_id)
+        if worker_data is None:
+            return
+        _thread, _worker, chain_id, _phase, request = worker_data
+        self._submission_failed(request, message, error_code, result_path)
+        self._discard_background_manual_chain(chain_id)
+
+    @Slot(int)
+    def _background_manual_worker_finished(self, request_id: int) -> None:
+        worker_data = self._background_manual_workers.get(request_id)
+        if worker_data is None:
+            return
+        thread, _worker, _chain_id, _phase, _request = worker_data
+        thread.quit()
+        if not thread.wait(5_000):
+            QTimer.singleShot(50, lambda: self._poll_background_manual_worker_finished(request_id))
+            return
+        self._finish_background_manual_worker(request_id)
+
+    def _poll_background_manual_worker_finished(self, request_id: int) -> None:
+        worker_data = self._background_manual_workers.get(request_id)
+        if worker_data is None:
+            return
+        thread, _worker, _chain_id, _phase, _request = worker_data
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_background_manual_worker_finished(request_id))
+            return
+        self._finish_background_manual_worker(request_id)
+
+    def _finish_background_manual_worker(self, request_id: int) -> None:
+        worker_data = self._background_manual_workers.pop(request_id, None)
+        if worker_data is None:
+            return
+        thread, _worker, chain_id, _phase, _request = worker_data
+        chain = self._background_manual_chains.get(chain_id)
+        if chain is not None and chain.active_request_id == request_id:
+            chain.active_request_id = None
+        thread.deleteLater()
+
+    def _discard_background_manual_chain(self, chain_id: str) -> None:
+        chain = self._background_manual_chains.pop(chain_id, None)
+        if chain is None:
+            return
+        chain.request = DutySubmissionRequest("", "", 0, {"target_date": "", "actions": []})
 
     @Slot(int)
     def shiftAuditDate(self, days: int) -> None:
@@ -2007,8 +2339,22 @@ class AppController(QObject):
         if worker_pair is None:
             return
 
+    def _shutdown_background_manual_chains(self) -> None:
+        self._background_manual_timer.stop()
+        self._background_manual_chains.clear()
+        for request_id, (thread, _worker, _chain_id, _phase, _request) in tuple(
+            self._background_manual_workers.items()
+        ):
+            thread.requestInterruption()
+            thread.quit()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._background_manual_workers.pop(request_id, None)
+            thread.deleteLater()
+
     @Slot()
     def shutdown(self) -> None:
+        self._shutdown_background_manual_chains()
         self._close_worker_admissions()
         for request_id, (thread, _worker) in tuple(self._scheduled_folder_workers.items()):
             thread.requestInterruption()

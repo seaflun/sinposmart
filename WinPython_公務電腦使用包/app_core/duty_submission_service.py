@@ -61,6 +61,7 @@ class DutySubmissionRequest:
     schedule_generation: int = 0
     action_key: str = ""
     session_actor_no: str = ""
+    background: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,7 @@ class DutySubmissionService:
                 or action_completion_key(action)
             ),
             session_actor_no=str(request.session_actor_no or "").strip(),
+            background=bool(request.background),
         )
 
     def execute(

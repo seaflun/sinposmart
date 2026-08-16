@@ -156,7 +156,7 @@ class DutyExecutionController(QObject):
         action = actions[request.action_index]
         return (
             "work"
-            if action.get("kind") == "work_log" and action.get("source") != "值班交接"
+            if action.get("kind") == "work_log"
             else "entry"
         )
 
