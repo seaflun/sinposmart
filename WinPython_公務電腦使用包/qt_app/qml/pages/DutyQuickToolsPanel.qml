@@ -189,5 +189,14 @@ Rectangle {
                 }
             }
         }
+
+        ToolStatusBar {
+            objectName: "toolCenterStatusBar"
+            onlyShowErrors: true
+            text: dutyQuickToolsPanel.backend.toolController.statusText
+            onDetailsRequested: function(message) {
+                dutyQuickToolsPanel.hostWindow.showErrorDetails("工具中心錯誤", message)
+            }
+        }
     }
 }

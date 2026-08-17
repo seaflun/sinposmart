@@ -49,6 +49,7 @@ class DutyController(QObject):
     scheduleChanged = Signal()
     dueTasksAvailable = Signal(object)
     handoffPrewarmRequested = Signal(int)
+    handoffWorkPrewarmRequested = Signal(int)
     autoLogoutRequested = Signal(str)
     reloginRequired = Signal(str)
     manualSubmissionConfirmationRequested = Signal()
@@ -1250,6 +1251,27 @@ class DutyController(QObject):
             trigger_type="due",
         )
 
+    def handoff_work_prewarm_request(
+        self,
+        user_id: str,
+        password: str,
+        action_index: int,
+    ) -> DutySubmissionRequest | None:
+        if self._session_closing or not self._auto_execution_enabled or not user_id or not password:
+            return None
+        if not 0 <= action_index < len(self._actions):
+            return None
+        action = self._actions[action_index]
+        if action.get("kind") != "work_log" or action.get("source") != "值班交接":
+            return None
+        return self._submission_request(
+            user_id,
+            password,
+            action_index,
+            self._schedule_data,
+            trigger_type="due",
+        )
+
     @staticmethod
     def is_handoff_preflight_request(request: DutySubmissionRequest) -> bool:
         if request.schedule_data.get("_handoff_preflight_group_id"):
@@ -2364,10 +2386,21 @@ class DutyController(QObject):
                 ),
                 None,
             )
-            if entry_index is None:
+            work_index = next(
+                (
+                    candidate_index
+                    for candidate_index in group_indices
+                    if self._actions[candidate_index].get("kind") == "work_log"
+                ),
+                None,
+            )
+            if entry_index is None and work_index is None:
                 continue
             self._prewarmed_handoff_group_ids.add(group_id)
-            self.handoffPrewarmRequested.emit(entry_index)
+            if entry_index is not None:
+                self.handoffPrewarmRequested.emit(entry_index)
+            if work_index is not None:
+                self.handoffWorkPrewarmRequested.emit(work_index)
 
     def _refresh_unreturned_return_queue(self) -> None:
         self._unreturned_return_queue.prune_bridge_history()

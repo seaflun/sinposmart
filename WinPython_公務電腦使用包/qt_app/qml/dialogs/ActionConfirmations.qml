@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Layouts
 import "../components"
 
 Item {
@@ -113,11 +114,31 @@ Item {
         title: actionConfirmations.statusDialogTitle
         standardButtons: Dialog.Close
 
-        Label {
+        ColumnLayout {
             width: parent.width
-            text: actionConfirmations.updateStatusText
-            color: actionConfirmations.hostWindow.ink
-            wrapMode: Text.Wrap
+            spacing: 8
+
+            Label {
+                objectName: "updateStatusTextLabel"
+                Layout.fillWidth: true
+                visible: !updateStatusErrorBar.visible
+                text: actionConfirmations.updateStatusText
+                color: actionConfirmations.hostWindow.ink
+                wrapMode: Text.Wrap
+            }
+
+            ToolStatusBar {
+                id: updateStatusErrorBar
+                objectName: "updateStatusErrorBar"
+                onlyShowErrors: true
+                text: actionConfirmations.updateStatusText
+                onDetailsRequested: function(message) {
+                    actionConfirmations.hostWindow.showErrorDetails(
+                        actionConfirmations.statusDialogTitle + "錯誤",
+                        message
+                    )
+                }
+            }
         }
     }
 

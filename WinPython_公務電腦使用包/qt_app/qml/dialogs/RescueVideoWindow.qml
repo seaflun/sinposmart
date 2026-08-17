@@ -466,20 +466,27 @@ Window {
                 objectName: "rescueVideoErrorCard"
                 visible: rescueVideoWindow.controller.errorText.length > 0
                 Layout.fillWidth: true
-                contentItem: RowLayout {
+                contentItem: ColumnLayout {
                     spacing: 8
-                    Label {
-                        text: "需要處理"
-                        color: Design.dangerStrong
-                        font.pixelSize: Design.bodySize
-                        font.bold: true
-                    }
-                    Label {
-                        objectName: "rescueVideoErrorText"
+                    RowLayout {
                         Layout.fillWidth: true
+                        Label {
+                            text: "需要處理"
+                            color: Design.dangerStrong
+                            font.pixelSize: Design.bodySize
+                            font.bold: true
+                        }
+                        Item {
+                            Layout.fillWidth: true
+                        }
+                    }
+                    ToolStatusBar {
+                        objectName: "rescueVideoErrorText"
+                        errorState: true
                         text: rescueVideoWindow.controller.errorText
-                        color: Design.dangerStrong
-                        wrapMode: Text.Wrap
+                        onDetailsRequested: function(message) {
+                            rescueVideoWindow.hostWindow.showErrorDetails("救護行車紀錄器錯誤", message)
+                        }
                     }
                 }
             }

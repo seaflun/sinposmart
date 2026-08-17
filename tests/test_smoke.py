@@ -3654,6 +3654,7 @@ if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -R
             "qt_app\\qml\\dialogs\\AccountManagerWindow.qml",
             "qt_app\\qml\\dialogs\\RescueVideoWindow.qml",
             "qt_app\\qml\\dialogs\\ActionConfirmations.qml",
+            "qt_app\\qml\\dialogs\\ErrorDetailDialog.qml",
             "qt_app\\qml\\dialogs\\qmldir",
             "qt_app\\qml\\pages\\DutySheetToolPanel.qml",
             "qt_app\\qml\\pages\\RestTimeToolPanel.qml",

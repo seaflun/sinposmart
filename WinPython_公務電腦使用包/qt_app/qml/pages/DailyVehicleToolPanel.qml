@@ -45,6 +45,9 @@ ToolSidePanel {
         ToolStatusBar {
             objectName: "dailyVehicleStatusBar"
             text: dailyVehicleDialog.controller.statusText
+            onDetailsRequested: function(message) {
+                dailyVehicleDialog.hostWindow.showErrorDetails("車輛保養清點錯誤", message)
+            }
         }
         ToolRunButton {
             objectName: "dailyVehicleRunButton"

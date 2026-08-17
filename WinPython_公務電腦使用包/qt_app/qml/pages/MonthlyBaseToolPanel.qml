@@ -96,6 +96,9 @@ ToolSidePanel {
         ToolStatusBar {
             objectName: "monthlyBaseStatusBar"
             text: monthlyBaseDialog.controller.statusText
+            onDetailsRequested: function(message) {
+                monthlyBaseDialog.hostWindow.showErrorDetails("勤務基準表登打錯誤", message)
+            }
         }
         ToolRunButton {
             objectName: "monthlyBaseRunButton"

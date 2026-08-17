@@ -7,7 +7,6 @@ import "../styles"
 ToolSidePanel {
     id: dutySheetDialog
     required property var controller
-    required property var errorHandler
     property alias workbookPath: dutyWorkbookField.text
     signal browseWorkbookRequested
     objectName: "dutySheetDialog"
@@ -362,6 +361,9 @@ ToolSidePanel {
         ToolStatusBar {
             objectName: "dutySheetStatusBar"
             text: dutySheetDialog.controller.statusText
+            onDetailsRequested: function(message) {
+                dutySheetDialog.hostWindow.showErrorDetails("勤務表登打錯誤", message)
+            }
         }
         ToolRunButton {
             objectName: "dutySheetRunButton"
@@ -398,11 +400,6 @@ ToolSidePanel {
 
         function onConfirmationRequested() {
             dutySheetConfirmation.open();
-        }
-
-        function onErrorOccurred(message) {
-            if (dutySheetDialog.errorHandler)
-                dutySheetDialog.errorHandler(message);
         }
     }
 }

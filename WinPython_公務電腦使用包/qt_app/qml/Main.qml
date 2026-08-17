@@ -97,6 +97,13 @@ ApplicationWindow {
             window.errorMessage = normalized
     }
 
+    function showErrorDetails(title, message) {
+        const normalized = String(message || "").trim()
+        if (normalized.length === 0)
+            return
+        errorDetailDialog.openDetails(title, normalized)
+    }
+
     function showDutyStatusError(message) {
         const normalized = String(message || "").trim()
         if (!window.backend.sessionController.isLoggedIn || normalized.length === 0)
@@ -269,10 +276,6 @@ ApplicationWindow {
         function onConfirmationRequested(toolId) {
             actionConfirmations.openRestMonthlyConfirmation()
         }
-
-        function onErrorOccurred(message) {
-            window.showAppError(message)
-        }
     }
 
     Connections {
@@ -280,10 +283,6 @@ ApplicationWindow {
 
         function onConfirmationRequested() {
             actionConfirmations.openDailyVehicleConfirmation()
-        }
-
-        function onErrorOccurred(message) {
-            window.showAppError(message)
         }
     }
 
@@ -343,26 +342,17 @@ ApplicationWindow {
         }
     }
 
-    Connections {
-        target: window.backend.toolController
-
-        function onErrorOccurred(message) {
-            window.showAppError(message)
-        }
-    }
-
-    Connections {
-        target: window.backend.workLogSettingsController
-
-        function onErrorOccurred(message) {
-            window.showAppError(message)
-        }
-    }
-
     ActionConfirmations {
         id: actionConfirmations
         hostWindow: window
         backend: window.backend
+    }
+
+    ErrorDetailDialog {
+        id: errorDetailDialog
+        anchors.centerIn: parent
+        width: Math.min(window.width - 48, 620)
+        height: Math.min(window.height - 96, 560)
     }
 
     AppleDialog {
@@ -430,7 +420,6 @@ ApplicationWindow {
         objectName: "dutySheetDialog"
         hostWindow: window
         controller: window.backend.dutySheetController
-        errorHandler: window.showAppError
         onBrowseWorkbookRequested: dutyWorkbookDialog.open()
     }
     RestTimeToolPanel {
@@ -666,6 +655,7 @@ ApplicationWindow {
         SessionHeader {
             id: sessionHeader
             backend: window.backend
+            hostWindow: window
             visible: modeTabs.currentIndex === 0
             onAccountManagerRequested: accountManagerWindow.open()
             onWorkLogSettingsRequested: {
@@ -701,6 +691,9 @@ ApplicationWindow {
             onAuditDetailRequested: function(fullDetailText) {
                 window.auditDetailText = fullDetailText
                 auditDetailDialog.open()
+            }
+            onErrorDetailRequested: function(title, message) {
+                window.showErrorDetails(title, message)
             }
         }
 
@@ -760,6 +753,18 @@ ApplicationWindow {
                     ToolTip.text: globalDutyErrorText.text
                     ToolTip.delay: 400
                     ToolTip.timeout: 10000
+                }
+
+                AppleButton {
+                    objectName: "globalDutyErrorDetailsButton"
+                    implicitWidth: 76
+                    implicitHeight: 30
+                    text: "查看明細"
+                    tone: "danger"
+                    showFocusRing: true
+                    focusPolicy: Qt.TabFocus
+                    Accessible.name: "查看錯誤明細"
+                    onClicked: window.showErrorDetails("值班模式錯誤", window.errorMessage)
                 }
 
                 AppleButton {

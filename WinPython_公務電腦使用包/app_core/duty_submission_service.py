@@ -420,7 +420,7 @@ class DutySubmissionService:
         try:
             automation = self._load_automation()
             if status_callback:
-                status_callback("正在建立出入登打瀏覽器連線")
+                status_callback("正在建立勤務登打瀏覽器連線")
             def initialize_browser(candidate: Any) -> None:
                 automation.login(candidate, request.user_id, request.password)
 

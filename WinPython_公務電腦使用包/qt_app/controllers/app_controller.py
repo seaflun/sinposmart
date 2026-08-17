@@ -53,9 +53,11 @@ from qt_app.controllers.tray_controller import TrayController
 from qt_app.controllers.update_controller import UpdateController
 from qt_app.controllers.work_log_settings_controller import WorkLogSettingsController
 from qt_app.workers.operational_sync_worker import OperationalSyncWorker
-from qt_app.workers.duty_submission_worker import DutySubmissionWorker
 from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 from qt_app.workers.scheduled_folder_worker import ScheduledFolderWorker
+
+
+BACKGROUND_MANUAL_PREWARM_WINDOW = timedelta(minutes=1)
 
 
 @dataclass
@@ -64,6 +66,7 @@ class _BackgroundManualChain:
     return_action_index: int | None
     phase: str = "departure_waiting"
     active_request_id: int | None = None
+    prewarmed_phase: str = ""
 
 
 class AppController(QObject):
@@ -195,7 +198,7 @@ class AppController(QObject):
         self._background_manual_chains: dict[str, _BackgroundManualChain] = {}
         self._background_manual_workers: dict[
             int,
-            tuple[QThread, DutySubmissionWorker, str, str, DutySubmissionRequest],
+            tuple[str, str, DutySubmissionRequest],
         ] = {}
         self._background_manual_request_id = 0
         self._background_manual_timer = QTimer(self)
@@ -228,6 +231,7 @@ class AppController(QObject):
         self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
         self._duty_controller.handoffPrewarmRequested.connect(self._prewarm_handoff_entry_browser)
+        self._duty_controller.handoffWorkPrewarmRequested.connect(self._prewarm_handoff_work_browser)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
@@ -295,6 +299,9 @@ class AppController(QObject):
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
         self._duty_execution_controller.submissionFailed.connect(self._submission_failed)
         self._duty_execution_controller.submissionCancelled.connect(self._submission_cancelled)
+        self._duty_execution_controller.submissionFinished.connect(self._background_manual_submission_succeeded)
+        self._duty_execution_controller.submissionFailed.connect(self._background_manual_submission_failed)
+        self._duty_execution_controller.submissionCancelled.connect(self._background_manual_submission_cancelled)
         self._duty_execution_controller.stateChanged.connect(self._finish_pending_logout)
         self._tray_controller.setStopGuard(self._stop_block_reason)
         self._update_controller.setStopGuard(self._stop_block_reason)
@@ -608,6 +615,7 @@ class AppController(QObject):
                 self._discard_background_manual_chain(chain_id)
                 continue
             if action_at > now:
+                self._prewarm_background_manual_chain(chain, phase, action_at, now)
                 continue
             if now > action_at + AUTO_DUE_CATCH_UP_WINDOW:
                 self._expire_background_manual_chain(chain_id, phase, now)
@@ -660,6 +668,21 @@ class AppController(QObject):
             background=True,
         )
 
+    def _prewarm_background_manual_chain(
+        self,
+        chain: _BackgroundManualChain,
+        phase: str,
+        action_at: datetime,
+        current: datetime,
+    ) -> None:
+        if chain.prewarmed_phase == phase:
+            return
+        if action_at - current > BACKGROUND_MANUAL_PREWARM_WINDOW:
+            return
+        request = self._background_submission_request(chain, phase, action_at)
+        if request is not None and self._duty_execution_controller.prewarm_background_browser(request):
+            chain.prewarmed_phase = phase
+
     def _start_background_manual_submission(
         self,
         chain_id: str,
@@ -675,28 +698,20 @@ class AppController(QObject):
             return
         self._background_manual_request_id += 1
         request_id = self._background_manual_request_id
-        worker = DutySubmissionWorker(request_id, self._duty_submission_service, request)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self._background_manual_submission_succeeded)
-        worker.failed.connect(self._background_manual_submission_failed)
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(self._background_manual_worker_finished)
-        self._background_manual_workers[request_id] = (
-            thread,
-            worker,
-            chain_id,
-            phase,
-            request,
-        )
+        self._background_manual_workers[request_id] = (chain_id, phase, request)
         chain.active_request_id = request_id
         chain.phase = f"{phase}_submitting"
-        self._submission_queued(request)
+        chain.prewarmed_phase = ""
         if phase == "departure":
             self._duty_controller.release_background_manual_waiting(request)
-        self._submission_started(request)
-        thread.start()
+        if self._duty_execution_controller.enqueue_background(request):
+            return
+        if request_id in self._background_manual_workers:
+            self._background_manual_workers.pop(request_id, None)
+            if chain.active_request_id == request_id:
+                chain.active_request_id = None
+            if chain_id in self._background_manual_chains:
+                chain.phase = f"{phase}_waiting"
 
     def _expire_background_manual_chain(
         self,
@@ -721,81 +736,114 @@ class AppController(QObject):
             )
         self._discard_background_manual_chain(chain_id)
 
-    @Slot(int, object)
+    @staticmethod
+    def _background_manual_request_identity(
+        request: DutySubmissionRequest,
+    ) -> tuple[int, str, str, str, int]:
+        actions = request.schedule_data.get("actions", [])
+        action = (
+            actions[request.action_index]
+            if isinstance(actions, list) and 0 <= request.action_index < len(actions)
+            else {}
+        )
+        action_key = str(request.action_key or "").strip()
+        if not action_key and isinstance(action, Mapping):
+            action_key = action_completion_key(action)
+        return (
+            int(request.session_generation),
+            str(request.user_id or "").strip(),
+            str(request.schedule_data.get("target_date", "") or ""),
+            action_key,
+            int(request.action_index),
+        )
+
+    def _take_background_manual_execution(
+        self,
+        request: DutySubmissionRequest,
+    ) -> tuple[int, str, str, DutySubmissionRequest] | None:
+        identity = self._background_manual_request_identity(request)
+        for request_id, (chain_id, phase, tracked_request) in tuple(
+            self._background_manual_workers.items()
+        ):
+            if self._background_manual_request_identity(tracked_request) != identity:
+                continue
+            self._background_manual_workers.pop(request_id, None)
+            return request_id, chain_id, phase, tracked_request
+        return None
+
+    @Slot(object, object)
     def _background_manual_submission_succeeded(
         self,
-        request_id: int,
+        request: DutySubmissionRequest,
         result: DutySubmissionResult,
     ) -> None:
-        worker_data = self._background_manual_workers.get(request_id)
+        if not request.background:
+            return
+        worker_data = self._take_background_manual_execution(request)
         if worker_data is None:
             return
-        _thread, _worker, chain_id, phase, request = worker_data
-        self._submission_finished(request, result)
+        request_id, chain_id, phase, _tracked_request = worker_data
         chain = self._background_manual_chains.get(chain_id)
         if chain is None:
             return
+        if chain.active_request_id == request_id:
+            chain.active_request_id = None
         if (
             phase == "departure"
             and result.status in {"submitted", "skipped_duplicate"}
             and chain.return_action_index is not None
         ):
             chain.phase = "return_waiting"
+            chain.prewarmed_phase = ""
             return
         self._discard_background_manual_chain(chain_id)
 
-    @Slot(int, int, str, str, str)
+    @Slot(object, str, str, str)
     def _background_manual_submission_failed(
         self,
-        request_id: int,
-        _action_index: int,
-        message: str,
-        error_code: str,
-        result_path: str,
+        request: DutySubmissionRequest,
+        _message: str,
+        _error_code: str,
+        _result_path: str,
     ) -> None:
-        worker_data = self._background_manual_workers.get(request_id)
+        if not request.background:
+            return
+        worker_data = self._take_background_manual_execution(request)
         if worker_data is None:
             return
-        _thread, _worker, chain_id, _phase, request = worker_data
-        self._submission_failed(request, message, error_code, result_path)
-        self._discard_background_manual_chain(chain_id)
-
-    @Slot(int)
-    def _background_manual_worker_finished(self, request_id: int) -> None:
-        worker_data = self._background_manual_workers.get(request_id)
-        if worker_data is None:
-            return
-        thread, _worker, _chain_id, _phase, _request = worker_data
-        thread.quit()
-        if not thread.wait(5_000):
-            QTimer.singleShot(50, lambda: self._poll_background_manual_worker_finished(request_id))
-            return
-        self._finish_background_manual_worker(request_id)
-
-    def _poll_background_manual_worker_finished(self, request_id: int) -> None:
-        worker_data = self._background_manual_workers.get(request_id)
-        if worker_data is None:
-            return
-        thread, _worker, _chain_id, _phase, _request = worker_data
-        if not thread.isFinished():
-            QTimer.singleShot(50, lambda: self._poll_background_manual_worker_finished(request_id))
-            return
-        self._finish_background_manual_worker(request_id)
-
-    def _finish_background_manual_worker(self, request_id: int) -> None:
-        worker_data = self._background_manual_workers.pop(request_id, None)
-        if worker_data is None:
-            return
-        thread, _worker, chain_id, _phase, _request = worker_data
+        request_id, chain_id, _phase, _tracked_request = worker_data
         chain = self._background_manual_chains.get(chain_id)
         if chain is not None and chain.active_request_id == request_id:
             chain.active_request_id = None
-        thread.deleteLater()
+        self._discard_background_manual_chain(chain_id)
+
+    @Slot(object, str, str)
+    def _background_manual_submission_cancelled(
+        self,
+        request: DutySubmissionRequest,
+        _message: str,
+        _error_code: str,
+    ) -> None:
+        if not request.background:
+            return
+        worker_data = self._take_background_manual_execution(request)
+        if worker_data is None:
+            return
+        request_id, chain_id, _phase, _tracked_request = worker_data
+        chain = self._background_manual_chains.get(chain_id)
+        if chain is not None and chain.active_request_id == request_id:
+            chain.active_request_id = None
+        self._discard_background_manual_chain(chain_id)
 
     def _discard_background_manual_chain(self, chain_id: str) -> None:
         chain = self._background_manual_chains.pop(chain_id, None)
         if chain is None:
             return
+        for request_id, (candidate_chain_id, _phase, _request) in tuple(
+            self._background_manual_workers.items()
+        ):
+            if candidate_chain_id == chain_id:
+                self._background_manual_workers.pop(request_id, None)
         chain.request = DutySubmissionRequest("", "", 0, {"target_date": "", "actions": []})
 
     @Slot(int)
@@ -2172,6 +2220,21 @@ class AppController(QObject):
         if request is not None:
             self._duty_execution_controller.prewarm_entry_browser(request)
 
+    @Slot(int)
+    def _prewarm_handoff_work_browser(self, action_index: int) -> None:
+        if self._read_only_acceptance or not self._duty_mode_active:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        request = self._duty_controller.handoff_work_prewarm_request(
+            session.user_id,
+            session.password,
+            action_index,
+        )
+        if request is not None:
+            self._duty_execution_controller.prewarm_work_browser(request)
+
     @Slot(str)
     def _handle_execution_unavailable(self, message: str) -> None:
         self._duty_controller.disable_auto_execution()
@@ -2342,15 +2405,7 @@ class AppController(QObject):
     def _shutdown_background_manual_chains(self) -> None:
         self._background_manual_timer.stop()
         self._background_manual_chains.clear()
-        for request_id, (thread, _worker, _chain_id, _phase, _request) in tuple(
-            self._background_manual_workers.items()
-        ):
-            thread.requestInterruption()
-            thread.quit()
-            if not thread.wait(120_000):
-                thread.wait()
-            self._background_manual_workers.pop(request_id, None)
-            thread.deleteLater()
+        self._background_manual_workers.clear()
 
     @Slot()
     def shutdown(self) -> None:

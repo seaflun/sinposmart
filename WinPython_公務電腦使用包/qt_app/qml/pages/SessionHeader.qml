@@ -7,6 +7,7 @@ import "../styles"
 ColumnLayout {
     id: sessionHeader
     required property var backend
+    property var hostWindow: null
     property alias userIdText: userIdField.text
     property alias passwordText: passwordField.text
     signal accountManagerRequested
@@ -74,6 +75,7 @@ ColumnLayout {
                     objectName: "loggedInStatusLabel"
                     Layout.fillWidth: true
                     Layout.preferredHeight: 24
+                    visible: !loggedInErrorStatusBar.visible
                     text: sessionHeader.backend.sessionController.loginStatus
                     color: sessionHeader.backend.sessionController.loginStatusTone === "error" ? Design.dangerStrong : sessionHeader.backend.sessionController.loginStatusTone === "warning" ? Design.warningStrong : sessionHeader.backend.sessionController.loginStatusTone === "info" ? Design.infoText : sessionHeader.backend.sessionController.loginStatusTone === "neutral" ? Design.muted : Design.successText
                     font.pixelSize: Design.controlSize
@@ -93,6 +95,18 @@ ColumnLayout {
                     ToolTip.text: loggedInStatusLabel.text
                     ToolTip.delay: 400
                     ToolTip.timeout: 10000
+                }
+                ToolStatusBar {
+                    id: loggedInErrorStatusBar
+                    objectName: "loggedInErrorStatusBar"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    compact: true
+                    onlyShowErrors: true
+                    text: sessionHeader.backend.sessionController.loginStatus
+                    onDetailsRequested: function(message) {
+                        sessionHeader.hostWindow.showErrorDetails("登入錯誤", message)
+                    }
                 }
                 DangerButton {
                     implicitHeight: 30
@@ -208,6 +222,7 @@ ColumnLayout {
                     id: loginStatusLabel
                     objectName: "loginStatusLabel"
                     Layout.fillWidth: true
+                    visible: !loginErrorStatusBar.visible
                     text: sessionHeader.backend.sessionController.loginStatus
                     color: sessionHeader.backend.sessionController.loginStatusTone === "error" ? Design.dangerStrong : sessionHeader.backend.sessionController.loginStatusTone === "warning" ? Design.warningStrong : sessionHeader.backend.sessionController.loginStatusTone === "info" ? Design.infoText : sessionHeader.backend.sessionController.loginStatusTone === "neutral" ? Design.muted : Design.successText
                     font.pixelSize: Design.controlSize
@@ -225,6 +240,18 @@ ColumnLayout {
                     ToolTip.text: loginStatusLabel.text
                     ToolTip.delay: 400
                     ToolTip.timeout: 10000
+                }
+                ToolStatusBar {
+                    id: loginErrorStatusBar
+                    objectName: "loginErrorStatusBar"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    compact: true
+                    onlyShowErrors: true
+                    text: sessionHeader.backend.sessionController.loginStatus
+                    onDetailsRequested: function(message) {
+                        sessionHeader.hostWindow.showErrorDetails("登入錯誤", message)
+                    }
                 }
             }
         }

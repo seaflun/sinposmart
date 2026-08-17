@@ -163,7 +163,11 @@ ColumnLayout {
         id: auditRefreshStatusArea
         Layout.fillWidth: true
         visible: auditRefreshStatusText.text.length > 0
-        Layout.preferredHeight: visible ? auditRefreshStatusText.implicitHeight : 0
+        Layout.preferredHeight: visible
+                               ? auditRefreshErrorStatusBar.visible
+                                 ? auditRefreshErrorStatusBar.implicitHeight
+                                 : auditRefreshStatusText.implicitHeight
+                               : 0
         Layout.minimumHeight: Layout.preferredHeight
         Layout.maximumHeight: Layout.preferredHeight
 
@@ -172,6 +176,7 @@ ColumnLayout {
             objectName: "auditRefreshStatusText"
             Layout.preferredWidth: 360
             Layout.maximumWidth: 360
+            visible: !auditRefreshErrorStatusBar.visible
             text: auditFilterPanel.backend.dutyController.scheduleStatus
             color: /(失敗|錯誤|逾時|登入)/.test(text) ? Design.dangerStrong : Design.muted
             font.pixelSize: Design.captionSize
@@ -190,6 +195,18 @@ ColumnLayout {
             ToolTip.text: auditRefreshStatusText.text
             ToolTip.delay: 400
             ToolTip.timeout: 10000
+        }
+
+        ToolStatusBar {
+            id: auditRefreshErrorStatusBar
+            objectName: "auditRefreshErrorStatusBar"
+            Layout.preferredWidth: 360
+            Layout.maximumWidth: 360
+            onlyShowErrors: true
+            text: auditFilterPanel.backend.dutyController.scheduleStatus
+            onDetailsRequested: function(message) {
+                auditFilterPanel.hostWindow.showErrorDetails("審核資料錯誤", message)
+            }
         }
     }
 

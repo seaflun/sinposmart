@@ -245,10 +245,18 @@ ToolSidePanel {
                             objectName: "workLogPreviewText"
                             Layout.fillWidth: true
                             Layout.preferredHeight: implicitHeight
-                            text: workLogSettingsDialog.controller.previewText.length > 0 ? workLogSettingsDialog.controller.previewText : workLogSettingsDialog.controller.statusText
+                            text: workLogSettingsDialog.controller.previewText
                             color: Design.infoText
                             font.pixelSize: Design.captionSize
                             wrapMode: Text.WrapAnywhere
+                        }
+                        ToolStatusBar {
+                            objectName: "workLogErrorStatusBar"
+                            onlyShowErrors: true
+                            text: workLogSettingsDialog.controller.statusText
+                            onDetailsRequested: function(message) {
+                                workLogSettingsDialog.hostWindow.showErrorDetails("工作紀錄設定錯誤", message)
+                            }
                         }
                     }
                 }

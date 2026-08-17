@@ -5428,6 +5428,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('objectName: "globalDutyErrorBar"', main)
         self.assertIn("window.backend.sessionController.isLoggedIn", main)
         self.assertIn("window.errorMessage.length > 0", main)
+        self.assertIn('objectName: "globalDutyErrorDetailsButton"', main)
         self.assertIn('objectName: "dismissGlobalDutyErrorButton"', main)
         self.assertIn("property string globalDutyErrorActionKey", main)
         self.assertIn("function onDutyActionFailed(actionKey, message)", main)
@@ -5447,6 +5448,84 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn("taskList.forceActiveFocus(Qt.MouseFocusReason)", task_area)
         self.assertIn("updateDeferred", operation_bar)
         self.assertNotIn("focusPolicy: Qt.NoFocus", operation_bar)
+
+    def test_qml_routes_side_tool_errors_to_local_status_only(self) -> None:
+        qml_root = PACKAGE_ROOT / "qt_app" / "qml"
+        main = (qml_root / "Main.qml").read_text(encoding="utf-8")
+        duty_sheet_panel = (qml_root / "pages" / "DutySheetToolPanel.qml").read_text(
+            encoding="utf-8"
+        )
+        quick_tools = (qml_root / "pages" / "DutyQuickToolsPanel.qml").read_text(
+            encoding="utf-8"
+        )
+
+        def connection_body(target: str) -> str:
+            marker = f"target: {target}\n"
+            if marker not in main:
+                return ""
+            block = main.split(marker, 1)[1]
+            next_connection = block.find("\n    Connections {")
+            return block if next_connection < 0 else block[:next_connection]
+
+        for target in (
+            "window.backend.restMonthlyController",
+            "window.backend.dailyVehicleController",
+            "window.backend.toolController",
+            "window.backend.workLogSettingsController",
+        ):
+            self.assertNotIn("showAppError", connection_body(target))
+
+        self.assertIn("showAppError", connection_body("window.backend.sessionController"))
+        self.assertIn("showDutyStatusError", connection_body("window.backend.dutyController"))
+        self.assertIn("showDutyActionError", connection_body("window.backend"))
+        self.assertNotIn("errorHandler", duty_sheet_panel)
+        self.assertIn("ToolStatusBar {", quick_tools)
+        self.assertIn("toolController.statusText", quick_tools)
+
+    def test_qml_errors_share_scrollable_detail_and_close_interaction(self) -> None:
+        qml_root = PACKAGE_ROOT / "qt_app" / "qml"
+        main = (qml_root / "Main.qml").read_text(encoding="utf-8")
+        detail_dialog = (qml_root / "dialogs" / "ErrorDetailDialog.qml").read_text(
+            encoding="utf-8"
+        )
+        task_area = (qml_root / "pages" / "DutyTaskArea.qml").read_text(encoding="utf-8")
+        status_bar = (qml_root / "components" / "ToolStatusBar.qml").read_text(
+            encoding="utf-8"
+        )
+        audit_filter = (qml_root / "pages" / "AuditFilterPanel.qml").read_text(
+            encoding="utf-8"
+        )
+        action_confirmations = (qml_root / "dialogs" / "ActionConfirmations.qml").read_text(
+            encoding="utf-8"
+        )
+        work_log_panel = (qml_root / "pages" / "WorkLogSettingsPanel.qml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ErrorDetailDialog {", main)
+        self.assertIn('objectName: "errorDetailDialog"', detail_dialog)
+        self.assertIn("standardButtons: Dialog.Close", detail_dialog)
+        self.assertIn("ScrollView {", detail_dialog)
+        self.assertIn("AppleTextArea {", detail_dialog)
+        self.assertIn("function showErrorDetails(title, message)", main)
+        self.assertIn('objectName: "globalDutyErrorDetailsButton"', main)
+        self.assertIn('objectName: "dutyTaskErrorDetailsButton"', task_area)
+        self.assertIn('objectName: "dutyTaskErrorCloseButton"', task_area)
+        self.assertIn("errorDetailRequested", task_area)
+        self.assertIn("signal detailsRequested(string message)", status_bar)
+        self.assertIn('objectName: "toolStatusDetailsButton"', status_bar)
+        self.assertIn('objectName: "toolStatusCloseButton"', status_bar)
+        self.assertIn("property bool dismissed", status_bar)
+        self.assertIn("onlyShowErrors", status_bar)
+        self.assertIn('objectName: "auditRefreshErrorStatusBar"', audit_filter)
+        self.assertIn('objectName: "updateStatusErrorBar"', action_confirmations)
+        self.assertIn('objectName: "workLogErrorStatusBar"', work_log_panel)
+        session_header = (qml_root / "pages" / "SessionHeader.qml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('objectName: "loginErrorStatusBar"', session_header)
+        self.assertIn('objectName: "loggedInErrorStatusBar"', session_header)
+        self.assertIn("compact: true", session_header)
 
     def test_qml_tool_buttons_and_audit_mode_preserve_released_gui_contract(self) -> None:
         qml_root = PACKAGE_ROOT / "qt_app" / "qml"
@@ -5768,6 +5847,7 @@ class QtShellTests(unittest.TestCase):
                 "AccountManagerWindow 1.0 AccountManagerWindow.qml",
                 "RescueVideoWindow 1.0 RescueVideoWindow.qml",
                 "ActionConfirmations 1.0 ActionConfirmations.qml",
+                "ErrorDetailDialog 1.0 ErrorDetailDialog.qml",
             ],
         )
         self.assertIn('import "dialogs"', qml)
@@ -5775,6 +5855,7 @@ class QtShellTests(unittest.TestCase):
             "AccountManagerWindow",
             "RescueVideoWindow",
             "ActionConfirmations",
+            "ErrorDetailDialog",
         ):
             self.assertTrue((dialogs_path / f"{dialog_name}.qml").is_file())
             self.assertIn(f"{dialog_name} {{", qml)
@@ -6481,8 +6562,10 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("AppleButton {", (components_path / "DutyActionButton.qml").read_text(encoding="utf-8"))
         self.assertLess(source.index("DutyOperationBar {"), source.index("DutyTaskArea {"))
         self.assertIn("DutyTaskStatusPill {", task_delegate)
-        self.assertIn("errorText: taskRow.errorText", task_delegate)
+        self.assertIn("errorText: taskRow.visibleErrorText", task_delegate)
         self.assertIn('objectName: "dutyTaskErrorText"', task_area)
+        self.assertIn('objectName: "dutyTaskErrorDetailsButton"', task_area)
+        self.assertIn('objectName: "dutyTaskErrorCloseButton"', task_area)
         self.assertIn("implicitWidth: Design.externalReturnManualButtonWidth", action_row)
         self.assertIn(
             'color: taskRow.comparisonText === "尚未到點" ? Design.blueHover',
@@ -9279,8 +9362,13 @@ if return_code != 0 or loaded:
                 return session
 
             def execute_with_browser_session(self, request, _session, *, status_callback=None):
-                self.entry_calls.append(request.action_index)
-                self.entry_trigger_types.append(request.trigger_type)
+                action = request.schedule_data["actions"][request.action_index]
+                if action["kind"] == "work_log":
+                    self.work_calls.append(request.action_index)
+                    work_started.set()
+                else:
+                    self.entry_calls.append(request.action_index)
+                    self.entry_trigger_types.append(request.trigger_type)
                 if request.action_index == 0:
                     first_entry_started.set()
                     release_first_entry.wait(timeout=2)
@@ -9294,17 +9382,6 @@ if return_code != 0 or loaded:
 
             def close_browser_session(self, _session):
                 return None
-
-            def execute(self, request, *, status_callback=None):
-                self.work_calls.append(request.action_index)
-                work_started.set()
-                return DutySubmissionResult(
-                    request.action_index,
-                    "submitted",
-                    "work submitted",
-                    Path(f"work-{request.action_index}.json"),
-                    {"group": "done"},
-                )
 
         data = {
             "target_date": "1150807",
@@ -9334,7 +9411,7 @@ if return_code != 0 or loaded:
 
         self.assertEqual(service.entry_calls, [0, 1])
         self.assertEqual(service.entry_trigger_types, ["due", "recovery"])
-        self.assertEqual(len(service.entry_sessions), 1)
+        self.assertEqual(len(service.entry_sessions), 2)
         self.assertEqual(service.work_calls, [2])
         self.assertFalse(controller.isBusy)
         controller.shutdown()
@@ -9361,7 +9438,12 @@ if return_code != 0 or loaded:
                 return SimpleNamespace(user_id=request.user_id, visible=request.visible)
 
             def execute_with_browser_session(self, request, _session, *, status_callback=None):
-                self.entry_calls.append(request.action_index)
+                action = request.schedule_data["actions"][request.action_index]
+                if action["kind"] == "work_log":
+                    self.work_calls.append(request.action_index)
+                    work_started.set()
+                else:
+                    self.entry_calls.append(request.action_index)
                 if request.action_index == 0:
                     first_entry_started.set()
                     release_first_entry.wait(timeout=2)
@@ -9370,17 +9452,6 @@ if return_code != 0 or loaded:
                     "submitted",
                     "submitted",
                     Path(f"handoff-priority-{request.action_index}.json"),
-                    {"group": "done"},
-                )
-
-            def execute(self, request, *, status_callback=None):
-                self.work_calls.append(request.action_index)
-                work_started.set()
-                return DutySubmissionResult(
-                    request.action_index,
-                    "submitted",
-                    "submitted",
-                    Path(f"handoff-work-{request.action_index}.json"),
                     {"group": "done"},
                 )
 
@@ -9490,6 +9561,219 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_duty_execution_controller_prewarm_reuses_work_session_without_submitting(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opened = threading.Event()
+                self.open_count = 0
+                self.executed: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                self.open_count += 1
+                self.opened.set()
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.executed.append(request.action_index)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "工作登打完成",
+                    Path("work-prewarm.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150816",
+            "actions": [
+                {
+                    "kind": "work_log",
+                    "time": "10:00",
+                    "actor": "10",
+                    "source": "值班交接",
+                }
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        request = DutySubmissionRequest("user10", "secret", 0, data)
+        try:
+            self.assertTrue(controller.prewarm_work_browser(request))
+            self.assertTrue(service.opened.wait(timeout=2))
+            self.assertEqual(service.executed, [])
+            self.assertEqual(controller.queuedCount, 0)
+
+            self.assertTrue(controller.enqueue(request))
+            for _ in range(20):
+                if finished_spy.count() == 1 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.open_count, 1)
+            self.assertEqual(service.executed, [0])
+        finally:
+            controller.shutdown()
+
+    def test_duty_execution_controller_runs_background_entry_after_session_change(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opened = threading.Event()
+                self.executed: list[tuple[str, int]] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                self.opened.set()
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.executed.append((request.user_id, request.action_index))
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "到點登打完成",
+                    Path("background-prewarm.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150816",
+            "actions": [{"kind": "entry_log", "time": "10:00", "actor": "10"}],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        submitted_spy = QSignalSpy(controller.submissionFinished)
+        action_finished_spy = QSignalSpy(controller.actionFinished)
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            data,
+            trigger_type="manual",
+            session_generation=1,
+            background=True,
+        )
+        try:
+            controller.set_session_generation(1)
+            self.assertTrue(controller.prepare_session_end())
+            controller.set_session_generation(2)
+            self.assertTrue(controller.prewarm_background_browser(request))
+            self.assertTrue(service.opened.wait(timeout=2))
+            self.assertTrue(controller.enqueue_background(request))
+            for _ in range(20):
+                if submitted_spy.count() == 1:
+                    break
+                submitted_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.executed, [("user10", 0)])
+            self.assertEqual(action_finished_spy.count(), 0)
+            self.assertFalse(controller.isBusy)
+        finally:
+            controller.shutdown()
+
+    def test_session_change_cancels_queued_foreground_entry_but_keeps_background_chain(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.background_started = threading.Event()
+                self.release_background = threading.Event()
+                self.executed: list[str] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                if request.background:
+                    self.background_started.set()
+                    self.release_background.wait(timeout=2)
+                self.executed.append(request.action_key)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "到點登打完成",
+                    Path("session-change.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150816",
+            "actions": [{"kind": "entry_log", "time": "10:00", "actor": "10"}],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        cancelled_spy = QSignalSpy(controller.submissionCancelled)
+        background_request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            data,
+            trigger_type="manual",
+            session_generation=1,
+            action_key="background-entry",
+            background=True,
+        )
+        foreground_request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            data,
+            session_generation=1,
+            action_key="foreground-entry",
+        )
+        try:
+            controller.set_session_generation(1)
+            self.assertTrue(controller.enqueue_background(background_request))
+            self.assertTrue(service.background_started.wait(timeout=2))
+            self.assertTrue(controller.enqueue(foreground_request))
+
+            controller.set_session_generation(2)
+            service.release_background.set()
+            for _ in range(20):
+                if cancelled_spy.count() == 1:
+                    break
+                cancelled_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.executed, ["background-entry"])
+            self.assertEqual(cancelled_spy.count(), 1)
+            self.assertEqual(cancelled_spy.at(0)[0].action_key, "foreground-entry")
+        finally:
+            service.release_background.set()
+            controller.shutdown()
+
     def test_duty_controller_requests_one_handoff_browser_prewarm_before_due_time(self) -> None:
         from datetime import datetime
 
@@ -9532,16 +9816,23 @@ if return_code != 0 or loaded:
         )
         controller._auto_execution_enabled = True
         prewarm_spy = QSignalSpy(controller.handoffPrewarmRequested)
+        work_prewarm_spy = QSignalSpy(controller.handoffWorkPrewarmRequested)
         try:
             controller._refresh_handoff_prewarm(datetime(2026, 8, 16, 9, 59))
             controller._refresh_handoff_prewarm(datetime(2026, 8, 16, 9, 59, 30))
 
             self.assertEqual(prewarm_spy.count(), 1)
             self.assertEqual(prewarm_spy.at(0)[0], 0)
+            self.assertEqual(work_prewarm_spy.count(), 1)
+            self.assertEqual(work_prewarm_spy.at(0)[0], 2)
             request = controller.handoff_prewarm_request("user10", "secret", 0)
             self.assertIsNotNone(request)
             self.assertEqual(request.action_index, 0)
             self.assertEqual(request.schedule_data["actions"][0]["kind"], "entry_log")
+            work_request = controller.handoff_work_prewarm_request("user10", "secret", 2)
+            self.assertIsNotNone(work_request)
+            self.assertEqual(work_request.action_index, 2)
+            self.assertEqual(work_request.schedule_data["actions"][2]["kind"], "work_log")
         finally:
             controller.shutdown()
 
@@ -9793,6 +10084,82 @@ if return_code != 0 or loaded:
         self.assertEqual(service.opened, 1)
         self.assertEqual(service.executed, [1])
         self.assertEqual(worker._browser_session.last_activity_at, now)
+
+    def test_duty_entry_queue_closes_browser_after_idle_limit(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        now = datetime(2026, 8, 15, 18, 0)
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.closed: list[int] = []
+
+            def close_browser_session(self, session):
+                self.closed.append(session.generation)
+
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {"target_date": "1150815", "actions": [{"kind": "entry_log"}]},
+        )
+        service = FakeService()
+        worker = DutyEntryQueueWorker(service, now_factory=lambda: now)
+        worker._browser_session = SimpleNamespace(
+            user_id=request.user_id,
+            visible=request.visible,
+            generation=1,
+            last_activity_at=datetime(2026, 8, 15, 17, 35),
+        )
+
+        self.assertTrue(worker.close_idle_browser_session())
+        self.assertEqual(service.closed, [1])
+        self.assertIsNone(worker._browser_session)
+
+    def test_duty_entry_queue_background_prewarm_keeps_newer_account_session(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.opened = 0
+                self.closed: list[str] = []
+
+            def open_browser_session(self, request, *, status_callback=None):
+                self.opened += 1
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, *_args, **_kwargs):
+                raise AssertionError("prewarm must not submit")
+
+            def close_browser_session(self, session):
+                self.closed.append(session.user_id)
+
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {"target_date": "1150815", "actions": [{"kind": "entry_log"}]},
+            background=True,
+        )
+        service = FakeService()
+        worker = DutyEntryQueueWorker(service, now_factory=lambda: datetime(2026, 8, 15, 18, 0))
+        worker._browser_session = SimpleNamespace(
+            user_id="user20",
+            visible=False,
+            last_activity_at=datetime(2026, 8, 15, 17, 59),
+        )
+
+        worker._prewarm_browser_session(request, preserve_incompatible_session=True)
+
+        self.assertEqual(service.opened, 0)
+        self.assertEqual(service.closed, [])
+        self.assertEqual(worker._browser_session.user_id, "user20")
 
     def test_duty_notification_identifies_the_completed_action_and_target(self) -> None:
         from qt_app.controllers.app_controller import AppController
@@ -10293,7 +10660,11 @@ if return_code != 0 or loaded:
                 return SimpleNamespace(user_id=request.user_id, visible=request.visible)
 
             def execute_with_browser_session(self, request, _session, *, status_callback=None):
-                self.serialized_actions.append(request.action_index)
+                action = request.schedule_data["actions"][request.action_index]
+                if action["kind"] == "work_log":
+                    self.parallel_actions.append(request.action_index)
+                else:
+                    self.serialized_actions.append(request.action_index)
                 if status_callback:
                     status_callback(f"執行 {request.action_index}")
                 return DutySubmissionResult(
@@ -10306,16 +10677,6 @@ if return_code != 0 or loaded:
 
             def close_browser_session(self, _session):
                 return None
-
-            def execute(self, request, *, status_callback=None):
-                self.parallel_actions.append(request.action_index)
-                return DutySubmissionResult(
-                    request.action_index,
-                    "submitted",
-                    f"完成 {request.action_index}",
-                    Path(f"parallel-{request.action_index}.json"),
-                    {"group": "done"},
-                )
 
         data = {
             "target_date": "1150806",
@@ -10350,7 +10711,7 @@ if return_code != 0 or loaded:
                 finished_spy.wait(250)
                 QTest.qWait(10)
 
-            self.assertEqual(service.opened_sessions, 1)
+            self.assertEqual(service.opened_sessions, 2)
             self.assertEqual(service.serialized_actions, [0, 1, 3])
             self.assertEqual(service.parallel_actions, [2])
             self.assertEqual(finished_spy.count(), 4)
@@ -10897,8 +11258,18 @@ if return_code != 0 or loaded:
         class FakeSubmissionService:
             def __init__(self) -> None:
                 self.requests = []
+                self.open_requests: list[str] = []
+                self.opened = threading.Event()
 
-            def execute(self, request, **_kwargs):
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, **_kwargs):
+                self.open_requests.append(request.user_id)
+                self.opened.set()
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, **_kwargs):
                 self.requests.append(request)
                 action = request.schedule_data["actions"][request.action_index]
                 return DutySubmissionResult(
@@ -10909,6 +11280,9 @@ if return_code != 0 or loaded:
                     {"compare": "已登打", "group": "done", "matched": []},
                     action,
                 )
+
+            def close_browser_session(self, _session):
+                return None
 
         class EarlyDateTime(RealDateTime):
             @classmethod
@@ -10996,6 +11370,11 @@ if return_code != 0 or loaded:
 
             self.assertTrue(controller.sessionController.isLoggedIn)
             self.assertEqual(controller.sessionController.userId, "user20")
+
+            controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 8, 59))
+            self.assertTrue(service.opened.wait(timeout=2))
+            self.assertEqual(service.open_requests, ["user10"])
+            self.assertEqual(service.requests, [])
 
             controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 9, 0))
             for _ in range(100):
@@ -14310,7 +14689,7 @@ if return_code != 0 or loaded:
         self.assertIn(0, controller._retry_after)
 
     def test_qml_global_duty_error_respects_submission_lifecycle(self) -> None:
-        from PySide6.QtCore import QObject
+        from PySide6.QtCore import QMetaObject, QObject, Qt
         from PySide6.QtTest import QTest
 
         from app_core.credential_repository import CredentialRepository
@@ -14514,6 +14893,21 @@ if return_code != 0 or loaded:
                 controller.dutyExecutionController.submissionFinished.emit(request_a, result_a)
                 QTest.qWait(25)
                 self.assertEqual(root.property("errorMessage"), "generic schedule error")
+
+                details_button = root.findChild(QObject, "globalDutyErrorDetailsButton")
+                close_button = root.findChild(QObject, "dismissGlobalDutyErrorButton")
+                self.assertTrue(details_button.property("visible"))
+                self.assertTrue(close_button.property("visible"))
+                self.assertTrue(QMetaObject.invokeMethod(details_button, "click", Qt.DirectConnection))
+                QTest.qWait(25)
+                detail_dialog = root.findChild(QObject, "errorDetailDialog")
+                detail_text = root.findChild(QObject, "errorDetailTextArea")
+                self.assertTrue(detail_dialog.property("visible"))
+                self.assertEqual(detail_text.property("text"), "generic schedule error")
+                self.assertTrue(QMetaObject.invokeMethod(detail_dialog, "close", Qt.DirectConnection))
+                self.assertTrue(QMetaObject.invokeMethod(close_button, "click", Qt.DirectConnection))
+                QTest.qWait(25)
+                self.assertEqual(root.property("errorMessage"), "")
             finally:
                 root.close()
                 controller.shutdown()

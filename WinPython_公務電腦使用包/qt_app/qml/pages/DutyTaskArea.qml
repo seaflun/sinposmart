@@ -12,6 +12,7 @@ Rectangle {
     required property var hostWindow
     property int modeIndex: 0
     signal auditDetailRequested(string fullDetailText)
+    signal errorDetailRequested(string title, string message)
 
     objectName: "dutyTaskArea"
     Layout.fillWidth: true
@@ -160,12 +161,21 @@ Rectangle {
                 required property string fullDetailText
                 required property string errorText
                 required property bool selected
+                property string dismissedErrorText: ""
+                readonly property string visibleErrorText: taskRow.dismissedErrorText === taskRow.errorText
+                                                           ? ""
+                                                           : taskRow.errorText
+
+                onErrorTextChanged: {
+                    if (taskRow.dismissedErrorText !== taskRow.errorText)
+                        taskRow.dismissedErrorText = ""
+                }
 
                 width: taskList.width
                 dutyMode: dutyTaskArea.modeIndex === 0
                 selectedState: taskRow.selected
                 tone: taskRow.statusTone
-                errorText: taskRow.errorText
+                errorText: taskRow.visibleErrorText
                 activeFocusOnTab: true
                 Accessible.role: dutyTaskArea.modeIndex === 0 ? Accessible.CheckBox : Accessible.Button
                 Accessible.name: (dutyTaskArea.modeIndex === 0 ? "值班任務" : "審核項目")
@@ -173,7 +183,7 @@ Rectangle {
                                  + "，" + taskRow.systemText
                                  + "，" + taskRow.detailText
                                  + "，" + taskRow.statusText
-                Accessible.description: taskRow.errorText
+                Accessible.description: taskRow.visibleErrorText
                 Accessible.checked: dutyTaskArea.modeIndex === 0 && taskRow.selected
 
                 function activateRow(clearFocusOnDeselect) {
@@ -267,34 +277,67 @@ Rectangle {
                     }
                 }
 
-                Label {
-                    id: dutyTaskErrorText
-                    objectName: "dutyTaskErrorText"
-                    visible: dutyTaskArea.modeIndex === 0 && taskRow.errorText.length > 0
+                RowLayout {
+                    id: dutyTaskErrorRow
+                    objectName: "dutyTaskErrorRow"
+                    visible: dutyTaskArea.modeIndex === 0 && taskRow.visibleErrorText.length > 0
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
                     anchors.leftMargin: Design.dutyTaskGridInset
                     anchors.rightMargin: Design.dutyTaskGridInset
                     height: visible ? Design.dutyTaskErrorHeight : 0
-                    text: taskRow.errorText
-                    color: Design.dangerStrong
-                    font.pixelSize: Design.captionSize
-                    font.bold: true
-                    elide: Text.ElideRight
-                    verticalAlignment: Text.AlignVCenter
-                    activeFocusOnTab: visible && truncated
-                    Accessible.name: text
+                    spacing: 6
+                    z: 3
 
-                    HoverHandler {
-                        id: dutyTaskErrorHover
+                    Label {
+                        id: dutyTaskErrorText
+                        objectName: "dutyTaskErrorText"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        text: taskRow.visibleErrorText
+                        color: Design.dangerStrong
+                        font.pixelSize: Design.captionSize
+                        font.bold: true
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                        activeFocusOnTab: visible && truncated
+                        Accessible.name: text
+
+                        HoverHandler {
+                            id: dutyTaskErrorHover
+                        }
+
+                        ToolTip.visible: dutyTaskErrorText.truncated
+                                             && (dutyTaskErrorHover.hovered || dutyTaskErrorText.activeFocus)
+                        ToolTip.text: dutyTaskErrorText.text
+                        ToolTip.delay: 400
+                        ToolTip.timeout: 10000
                     }
 
-                    ToolTip.visible: dutyTaskErrorText.truncated
-                                         && (dutyTaskErrorHover.hovered || dutyTaskErrorText.activeFocus)
-                    ToolTip.text: dutyTaskErrorText.text
-                    ToolTip.delay: 400
-                    ToolTip.timeout: 10000
+                    AppleButton {
+                        objectName: "dutyTaskErrorDetailsButton"
+                        implicitWidth: 76
+                        implicitHeight: 28
+                        text: "查看明細"
+                        tone: "danger"
+                        showFocusRing: true
+                        focusPolicy: Qt.TabFocus
+                        Accessible.name: "查看勤務任務錯誤明細"
+                        onClicked: dutyTaskArea.errorDetailRequested("勤務任務錯誤", taskRow.errorText)
+                    }
+
+                    AppleButton {
+                        objectName: "dutyTaskErrorCloseButton"
+                        implicitWidth: 58
+                        implicitHeight: 28
+                        text: "關閉"
+                        tone: "danger"
+                        showFocusRing: true
+                        focusPolicy: Qt.TabFocus
+                        Accessible.name: "關閉勤務任務錯誤"
+                        onClicked: taskRow.dismissedErrorText = taskRow.errorText
+                    }
                 }
 
                 RowLayout {

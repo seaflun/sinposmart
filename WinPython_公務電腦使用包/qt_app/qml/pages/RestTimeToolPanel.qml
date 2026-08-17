@@ -91,6 +91,9 @@ ToolSidePanel {
         ToolStatusBar {
             objectName: "restTimeStatusBar"
             text: restTimeDialog.controller.statusText
+            onDetailsRequested: function(message) {
+                restTimeDialog.hostWindow.showErrorDetails("休息時間登打錯誤", message)
+            }
         }
         ToolRunButton {
             objectName: "restTimeRunButton"
