@@ -964,6 +964,23 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertTrue(any("13" in issue and "找不到" in issue for issue in issues))
 
+    def test_duty_number_reader_anchors_each_row_from_designation_input(self) -> None:
+        module = legacy_duty_sheet_module()
+        captured = {}
+
+        class FakeDriver:
+            def execute_script(self, script: str):
+                captured["script"] = script
+                return [{"staff_no": "1", "name": "甲", "leave_type": ""}]
+
+        self.assertEqual(
+            module.read_duty_number_leave_rows(FakeDriver()),
+            [{"staff_no": "1", "name": "甲", "leave_type": ""}],
+        )
+        self.assertIn("document.querySelectorAll('input[name^=\"_DESIGNATION\"]')", captured["script"])
+        self.assertIn("numberInput.closest('tr')", captured["script"])
+        self.assertNotIn("document.querySelectorAll('tr')", captured["script"])
+
     def test_daily_standby_members_are_read_from_daily_sheet_standby_summary(self) -> None:
         module = legacy_duty_sheet_module()
         sheet = module.openpyxl.Workbook().active

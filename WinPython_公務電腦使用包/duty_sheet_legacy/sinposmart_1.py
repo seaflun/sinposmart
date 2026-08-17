@@ -1056,9 +1056,9 @@ def read_duty_number_leave_rows(driver):
         function cellText(cell) {
             return cell ? (cell.innerText || cell.textContent || '').trim() : '';
         }
-        return Array.from(document.querySelectorAll('tr')).map(function(row) {
-            var numberInput = row.querySelector('input[name^="_DESIGNATION"]');
-            if (!numberInput) return null;
+        return Array.from(document.querySelectorAll('input[name^="_DESIGNATION"]')).map(function(numberInput) {
+            var row = numberInput.closest('tr');
+            if (!row) return null;
             var nameInput = row.querySelector('input[name^="_hidName"]');
             return {
                 staff_no: (numberInput.value || '').trim(),
