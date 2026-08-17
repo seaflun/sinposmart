@@ -391,6 +391,62 @@ def format_daily_sheet_preflight_message(issues):
         message += f"\n...另有 {len(issues) - len(shown)} 項未列出"
     return message
 
+def normalize_staff_number(value):
+    numbers = clean_to_list(value)
+    if not numbers:
+        return ""
+    try:
+        return str(int(numbers[0]))
+    except ValueError:
+        return numbers[0]
+
+def validate_daily_standby_against_duty_number_leave_types(daily_standby_numbers, website_rows, excluded_numbers):
+    """確認每日備勤人員在勤務番號維護的休假別欄位為空白。"""
+    excluded = {normalize_staff_number(number) for number in excluded_numbers}
+    expected = []
+    for number in daily_standby_numbers:
+        normalized = normalize_staff_number(number)
+        if normalized and normalized not in excluded and normalized not in expected:
+            expected.append(normalized)
+
+    website_by_number = {}
+    for row in website_rows:
+        number = normalize_staff_number(row.get("staff_no", ""))
+        if number and number not in website_by_number:
+            website_by_number[number] = row
+
+    issues = []
+    for number in expected:
+        row = website_by_number.get(number)
+        if row is None:
+            issues.append(f"勤務番號維護找不到每日備勤番號 {number}。")
+            continue
+        leave_type = str(row.get("leave_type", "") or "").strip()
+        if leave_type:
+            name = str(row.get("name", "") or "").strip()
+            person = f"{number}番 {name}".strip()
+            issues.append(f"{person}在勤務番號維護的休假別不是空白（目前：{leave_type}）。")
+    return issues
+
+def normalize_mission_cell_value(value):
+    return ",".join(clean_to_list(value))
+
+def validate_mission_cell_values(expected_values, actual_values, alert_messages=None):
+    """以儲存後欄位值判定編組是否成功；提示文字本身不直接判定失敗。"""
+    del alert_messages
+    issues = []
+    for element_id, expected in expected_values.items():
+        if element_id not in actual_values:
+            issues.append(f"找不到救災任務編組欄位：{element_id}")
+            continue
+        actual = actual_values.get(element_id, "")
+        if normalize_mission_cell_value(expected) != normalize_mission_cell_value(actual):
+            issues.append(
+                f"救災任務編組欄位 {element_id} 資料不一致："
+                f"預期 {expected!r}，實際 {actual!r}"
+            )
+    return issues
+
 def get_merged_val(sheet, row, col):
     """處理 Excel 合併儲存格讀取"""
     cell = sheet.cell(row=row, column=col)
@@ -903,6 +959,27 @@ def super_js_execute(driver, element_id, action="click", value=""):
     """
     return driver.execute_script(js_code, element_id, action, value)
 
+def accept_pending_alerts(driver, timeout=2):
+    messages = []
+    wait_seconds = max(0.1, float(timeout))
+    while True:
+        try:
+            alert = WebDriverWait(driver, wait_seconds).until(EC.alert_is_present())
+        except (NoAlertPresentException, TimeoutException):
+            break
+        try:
+            message = str(alert.text or "").strip()
+            if message:
+                messages.append(message)
+        except Exception:
+            pass
+        try:
+            alert.accept()
+        except NoAlertPresentException:
+            pass
+        wait_seconds = 0.5
+        time.sleep(0.2)
+    return messages
 
 # ==========================================
 # [區塊五] 網頁自動化動作方塊 (Web Automation Steps)
@@ -974,7 +1051,24 @@ def step_prepare_content(driver, wait):
             time.sleep(2)
     return False
 
-def step_config_popups(driver, wait, out_duty_names, daily_commander):
+def read_duty_number_leave_rows(driver):
+    return driver.execute_script(r"""
+        function cellText(cell) {
+            return cell ? (cell.innerText || cell.textContent || '').trim() : '';
+        }
+        return Array.from(document.querySelectorAll('tr')).map(function(row) {
+            var numberInput = row.querySelector('input[name^="_DESIGNATION"]');
+            if (!numberInput) return null;
+            var nameInput = row.querySelector('input[name^="_hidName"]');
+            return {
+                staff_no: (numberInput.value || '').trim(),
+                leave_type: cellText(row.cells[0]),
+                name: nameInput ? (nameInput.value || '').trim() : cellText(row.cells[4])
+            };
+        }).filter(Boolean);
+    """) or []
+
+def step_config_popups(driver, wait, out_duty_names, daily_commander, daily_standby_numbers, excluded_numbers):
     main_window = driver.current_window_handle
     
     # --- 1. 設定外勤項目 ---
@@ -1045,12 +1139,27 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
     except TimeoutException:
         log_status("   ⚠️ 勤務番號設定視窗未在時間內開啟")
     
+    settings_window_found = False
     for h in driver.window_handles:
         if h != main_window:
+            settings_window_found = True
             driver.switch_to.window(h)
+            time.sleep(1.5)
+            log_status("➡️ 輪休查找：比對每日備勤人員上班日...")
+            leave_rows = read_duty_number_leave_rows(driver)
+            leave_issues = validate_daily_standby_against_duty_number_leave_types(
+                daily_standby_numbers,
+                leave_rows,
+                excluded_numbers,
+            )
+            if leave_issues:
+                detail = "\n".join(leave_issues[:20])
+                log_status(f"❌ 輪休查找未通過，共 {len(leave_issues)} 項，已停止登打")
+                raise RuntimeError(
+                    "Excel 每日備勤與勤務番號維護休假別不一致，已停止登打。\n" + detail
+                )
+            log_status("✅ 輪休查找通過：每日備勤人員休假別均為空白")
             try:
-                time.sleep(1.5)
-                
                 js_select_v2 = f"""
                 (function() {{
                     var commanderNo = "{daily_commander}".trim();
@@ -1061,7 +1170,7 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
                     for (var i = 0; i < rows.length; i++) {{
                         var cells = rows[i].getElementsByTagName('td');
                         if (cells.length < 4) continue;
-                        var inputNo = cells[3].querySelector('input[type="text"]');
+                        var inputNo = rows[i].querySelector('input[name^="_DESIGNATION"]');
                         if (inputNo) {{
                             var currentVal = inputNo.value.trim();
                             var cbs = rows[i].querySelectorAll('input[type="checkbox"]');
@@ -1091,6 +1200,9 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander):
             except Exception as e: 
                 log_status(f"   ❌ 指揮官小視窗操作失敗: {e}")
             break
+
+    if not settings_window_found:
+        raise RuntimeError("勤務番號設定視窗未開啟，無法進行輪休查找，已停止登打。")
             
     driver.switch_to.window(main_window)
 
@@ -1183,7 +1295,7 @@ def step_fill_mission_cells(driver, mission_map):
     js_fill_and_save = """
     const data = arguments[0] || {};
     function deepProcess(win, data) {
-        var foundAny = false;
+        var foundIds = [];
         for (var id in data) {
             var el = win.document.getElementById(id);
             if (el) {
@@ -1192,21 +1304,75 @@ def step_fill_mission_cells(driver, mission_map):
                 el.dispatchEvent(new Event('change', {bubbles: true}));
                 el.dispatchEvent(new Event('blur', {bubbles: true}));
                 if(typeof el.onchange === 'function') el.onchange();
-                foundAny = true;
+                foundIds.push(id);
             }
         }
         var btn = win.document.getElementById('_btnSave');
-        if (btn) { btn.click(); return "SUCCESS_WITH_SAVE"; }
+        if (btn && foundIds.length) {
+            btn.click();
+            return {status: "saved", found_ids: foundIds, save_found: true};
+        }
         for(var i=0; i<win.frames.length; i++) {
             try { var res = deepProcess(win.frames[i], data); if (res) return res; } catch(e){}
         }
-        return foundAny ? "SUCCESS_NO_SAVE" : null;
+        return foundIds.length ? {status: "filled", found_ids: foundIds, save_found: false} : null;
     }
     return deepProcess(window.top, data);
     """
     try:
         result = driver.execute_script(js_fill_and_save, mission_map)
-    except Exception as e: log_status(f"   ❌ 任務填寫報錯: {e}")
+    except UnexpectedAlertPresentException as e:
+        alert_text = ""
+        try:
+            alert_text = str(driver.switch_to.alert.text or "").strip()
+        except Exception:
+            pass
+        log_status(f"   ⚠️ 救災任務編組表提示：{alert_text or e}")
+        return {"status": "alert", "found_ids": [], "save_found": False, "alert": alert_text}
+    except Exception as e:
+        log_status(f"   ❌ 任務填寫報錯: {e}")
+        return {"status": "error", "found_ids": [], "save_found": False, "error": str(e)}
+    if isinstance(result, dict):
+        return result
+    return {"status": str(result or "missing"), "found_ids": [], "save_found": False}
+
+def read_mission_cells(driver, mission_map):
+    values = driver.execute_script(
+        """
+        const data = arguments[0] || {};
+        function deepRead(win, data, values) {
+            for (var id in data) {
+                if (Object.prototype.hasOwnProperty.call(values, id)) continue;
+                var el = win.document.getElementById(id);
+                if (el) values[id] = String(el.value || '');
+            }
+            for (var i = 0; i < win.frames.length; i++) {
+                try { deepRead(win.frames[i], data, values); } catch(e) {}
+            }
+        }
+        var values = {};
+        deepRead(window.top, data, values);
+        return values;
+        """,
+        mission_map,
+    )
+    return values if isinstance(values, dict) else {}
+
+def verify_mission_cells(driver, mission_map, timeout=10):
+    deadline = time.monotonic() + max(1, int(timeout))
+    issues = []
+    while True:
+        try:
+            actual_values = read_mission_cells(driver, mission_map)
+        except UnexpectedAlertPresentException:
+            accept_pending_alerts(driver, timeout=0.5)
+            actual_values = {}
+        issues = validate_mission_cell_values(mission_map, actual_values)
+        if not issues:
+            return []
+        if time.monotonic() >= deadline:
+            return issues
+        time.sleep(0.5)
 
 
 # ==========================================
@@ -1251,6 +1417,7 @@ def start_automation(
         ordered_excluded = sorted(excluded_numbers, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
         log_status(f"ℹ️ 已略過實習生番號：{', '.join(ordered_excluded)}")
     sheet = wb[f"{day_int}號"]
+    daily_standby_numbers = expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
     
     ex_map = {"時間": 2, "值班": 3}
     for r in [5, 6]:
@@ -1283,6 +1450,8 @@ def start_automation(
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
     report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
+    if not daily_standby_numbers:
+        preflight_issues.append(f"{sheet.title}：找不到第 22 列「備勤」欄位人員，無法比對勤務番號維護休假別。")
     if preflight_issues:
         preflight_message = format_daily_sheet_preflight_message(preflight_issues)
         log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
@@ -1325,15 +1494,22 @@ def start_automation(
             super_js_execute(driver, "_txtTaskDate", "set", target_date)
             super_js_execute(driver, "_btnQuery", "click")
             time.sleep(2)
-            
+
             if super_js_execute(driver, "_btnDelete", "exists"):
                 super_js_execute(driver, "_btnDelete", "click")
                 wait.until(EC.alert_is_present())
                 driver.switch_to.alert.accept()
                 time.sleep(3)
                 log_status("✅ 舊資料已刪除")
-            
-            step_config_popups(driver, wait, out_names, daily_commander)
+
+            step_config_popups(
+                driver,
+                wait,
+                out_names,
+                daily_commander,
+                daily_standby_numbers,
+                excluded_numbers,
+            )
             
             log_status("➡️ 等待勤務基準表載入...")
             driver.switch_to.default_content()
@@ -1464,23 +1640,29 @@ def start_automation(
                     mission_map[f"_pln_{hour}_6"] = ",".join(amb1_members)
                     mission_map[f"_pln_{hour}_7"] = ",".join(amb2_members)
 
-            if mission_map:
-                log_status(f"✅ 救災任務編組運算完畢，共填入 {len(mission_map)} 格")
-                time.sleep(5) 
-                driver.switch_to.default_content()
-                for frame_name in ['main', 'Content', 'contents', 'ehrFrame', 'contentFrame']:
-                    try:
-                        driver.switch_to.frame(frame_name)
-                    except NoSuchFrameException:
-                        continue
-
-                report_stage("vehicle_fill")
-                step_fill_mission_cells(driver, mission_map)
-                time.sleep(1)
+            if not mission_map:
+                raise RuntimeError("救災任務編組表沒有可登打資料，已停止完成流程。")
+            log_status(f"✅ 救災任務編組運算完畢，共填入 {len(mission_map)} 格")
+            time.sleep(5)
+            driver.switch_to.default_content()
+            for frame_name in ['main', 'Content', 'contents', 'ehrFrame', 'contentFrame']:
                 try:
-                    driver.switch_to.alert.accept()
-                except NoAlertPresentException:
-                    pass
+                    driver.switch_to.frame(frame_name)
+                except NoSuchFrameException:
+                    continue
+
+            report_stage("vehicle_fill")
+            mission_result = step_fill_mission_cells(driver, mission_map)
+            alert_messages = accept_pending_alerts(driver, timeout=2)
+            for message in alert_messages:
+                log_status(f"⚠️ 救災任務編組表提示：{message}")
+            if mission_result.get("status") not in ("saved", "alert"):
+                raise RuntimeError("救災任務編組表未找到完整欄位或儲存按鈕，已停止完成流程。")
+            verification_issues = verify_mission_cells(driver, mission_map)
+            if verification_issues:
+                detail = "\n".join(verification_issues[:20])
+                raise RuntimeError(f"救災任務編組表儲存後資料驗證失敗，已停止完成流程。\n{detail}")
+            log_status("✅ 救災任務編組表儲存後資料驗證通過")
             
             report_stage("report")
             notification_status = ""

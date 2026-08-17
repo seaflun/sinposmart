@@ -932,6 +932,71 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
 
+    def test_daily_standby_members_require_blank_duty_number_leave_type(self) -> None:
+        module = legacy_duty_sheet_module()
+        website_rows = [
+            {"staff_no": "10", "name": "甲", "leave_type": ""},
+            {"staff_no": "11", "name": "乙", "leave_type": "○"},
+            {"staff_no": "12", "name": "丙", "leave_type": ""},
+        ]
+
+        self.assertEqual(
+            module.validate_daily_standby_against_duty_number_leave_types(
+                ["10"], website_rows, set()
+            ),
+            [],
+        )
+        issues = module.validate_daily_standby_against_duty_number_leave_types(
+            ["10", "11", "12"], website_rows, set()
+        )
+
+        self.assertTrue(any("11" in issue and "休假別" in issue for issue in issues))
+        self.assertFalse(any("12" in issue for issue in issues))
+
+    def test_duty_number_leave_type_check_reports_missing_staff(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        issues = module.validate_daily_standby_against_duty_number_leave_types(
+            ["10", "13"],
+            [{"staff_no": "10", "name": "甲", "leave_type": ""}],
+            set(),
+        )
+
+        self.assertTrue(any("13" in issue and "找不到" in issue for issue in issues))
+
+    def test_daily_standby_members_are_read_from_daily_sheet_standby_summary(self) -> None:
+        module = legacy_duty_sheet_module()
+        sheet = module.openpyxl.Workbook().active
+        sheet.cell(row=22, column=3).value = "備勤"
+        sheet.cell(row=22, column=4).value = "10, 11"
+
+        self.assertEqual(module.expected_on_duty_numbers_from_daily_sheet(sheet, set()), ["10", "11"])
+
+    def test_mission_fill_returns_browser_result_and_readback_ignores_non_blocking_alerts(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        class FakeDriver:
+            def execute_script(self, *_args):
+                return {"status": "saved", "found_ids": ["_pln_8_1"], "save_found": True}
+
+        result = module.step_fill_mission_cells(FakeDriver(), {"_pln_8_1": "1,2"})
+
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(
+            module.validate_mission_cell_values(
+                {"_pln_8_1": "1,2"},
+                {"_pln_8_1": "1,2"},
+                ["提示：部分資料已存在"],
+            ),
+            [],
+        )
+        issues = module.validate_mission_cell_values(
+            {"_pln_8_1": "1,2"},
+            {"_pln_8_1": "1"},
+            [],
+        )
+        self.assertTrue(any("_pln_8_1" in issue for issue in issues))
+
     def test_base_month_text_can_detect_site_month_mismatch(self) -> None:
         module = rest_time_module()
 
