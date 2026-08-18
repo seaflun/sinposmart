@@ -10787,15 +10787,20 @@ if return_code != 0 or loaded:
         from app_core.credential_repository import CredentialRepository
         from app_core.duty_submission_service import DutySubmissionResult
         from app_core.schedule_capture_service import ScheduleCaptureRequest
-        from app_core.schedule_repository import ScheduleSnapshot, business_roc_date
+        from app_core.schedule_repository import ScheduleSnapshot
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
 
-        current = datetime.now()
+        current = datetime(2026, 8, 18, 8, 5)
         target_roc_date = (
             f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
         )
         action_time = current.strftime("%H:%M")
+
+        class ScenarioDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return current if tz is None else current.replace(tzinfo=tz)
 
         class FakeScheduleRepository:
             def load_current(self):
@@ -10872,6 +10877,25 @@ if return_code != 0 or loaded:
             def sync_board_async(self, schedule_data):
                 self.boards.append(schedule_data)
                 return True
+
+        self.enterContext(
+            patch(
+                "qt_app.controllers.app_controller.business_roc_date",
+                return_value=target_roc_date,
+            )
+        )
+        self.enterContext(
+            patch(
+                "qt_app.controllers.duty_controller.business_roc_date",
+                return_value=target_roc_date,
+            )
+        )
+        self.enterContext(
+            patch("qt_app.controllers.duty_controller.datetime", ScenarioDateTime)
+        )
+        self.enterContext(
+            patch("app_core.duty_task_projection.datetime", ScenarioDateTime)
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             credentials = CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None)
@@ -13177,6 +13201,16 @@ if return_code != 0 or loaded:
             "actions": old_actions + next_actions,
         }
 
+        class ScenarioDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 8, 15, 12, 20)
+                return value if tz is None else value.replace(tzinfo=tz)
+
+        self.enterContext(
+            patch("qt_app.controllers.duty_controller.datetime", ScenarioDateTime)
+        )
+
         with tempfile.TemporaryDirectory() as temp_dir:
             queue = UnreturnedReturnQueue(
                 Path(temp_dir),
@@ -13222,6 +13256,8 @@ if return_code != 0 or loaded:
         self.assertEqual(work_actions[1]["fields"]["處理情形"], "一、時間:12:20-14:00")
 
     def test_actual_handoff_adjustment_handles_multiple_slots_and_next_day(self) -> None:
+        from datetime import datetime
+
         from app_core.schedule_repository import ScheduleRepository
         from qt_app.controllers.duty_controller import DutyController
 
@@ -13246,6 +13282,16 @@ if return_code != 0 or loaded:
                     "處理情形": f"一、時間:{start}-{hour:02d}:00",
                 },
             }
+
+        class ScenarioDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 8, 16, 8, 30)
+                return value if tz is None else value.replace(tzinfo=tz)
+
+        self.enterContext(
+            patch("qt_app.controllers.duty_controller.datetime", ScenarioDateTime)
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = DutyController(repository=ScheduleRepository(Path(temp_dir)))
@@ -14749,6 +14795,7 @@ if return_code != 0 or loaded:
                     )
                 )
                 controller.sessionController.sessionChanged.emit()
+                # 離屏 QML 需完成登入狀態的第一個畫面週期，滑鼠命中區才可用。
                 QTest.qWait(25)
                 controller.dutyController.replace_schedule_data(schedule_data)
 
@@ -15235,6 +15282,130 @@ if return_code != 0 or loaded:
             finally:
                 root.close()
                 controller.shutdown()
+
+    def test_qml_audit_task_opens_detail_in_fresh_shell(self) -> None:
+        from PySide6.QtCore import QObject, QPointF, Qt
+        from PySide6.QtTest import QTest
+
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        schedule_data = {
+            "target_date": "1150729",
+            "today": {"staff": {"10": {"name": "驗收人員"}}},
+            "actions": [
+                {
+                    "kind": "work_log",
+                    "time": "09:00",
+                    "actor": "10",
+                    "target": "10",
+                    "fields": {"工作時間": "09:00", "勤務項目": "巡邏驗收"},
+                }
+            ],
+        }
+        audit_comparisons = {
+            0: {
+                "compare": "人工確認：驗收差異",
+                "group": "review",
+                "matched": [{"勤務項目": "既有巡邏紀錄", "時間": "09:02"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(
+                    Path(temp_dir) / "saved_login.json",
+                    "SinpoSmart",
+                    None,
+                ),
+                credential_sync_service=SimpleNamespace(enabled=False),
+                read_only_acceptance=True,
+            )
+            controller.dutyController.load_current_schedule = lambda: None
+            controller.dutyController.load_audit_schedule = lambda _target_date: None
+            controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+            controller.trayController.notify = lambda *_args, **_kwargs: None
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+
+            def wait_until(predicate, failure_message: str) -> None:
+                for _ in range(80):
+                    if predicate():
+                        return
+                    QTest.qWait(25)
+                self.fail(failure_message)
+
+            def find_visible(name: str):
+                stack = [root.contentItem()]
+                while stack:
+                    item = stack.pop()
+                    if item.objectName() == name and item.isVisible():
+                        return item
+                    stack.extend(item.childItems())
+                return None
+
+            def wait_for_audit_task_row():
+                for _ in range(80):
+                    item = find_visible("auditTaskRow")
+                    if item is not None and "人工確認：驗收差異" in str(
+                        item.property("fullDetailText")
+                    ):
+                        return item
+                    QTest.qWait(25)
+                self.fail("找不到已載入完整明細的可見審核項目")
+
+            try:
+                attempt_id = controller._session_state.begin_login()
+                self.assertTrue(
+                    controller._session_state.complete_login(
+                        attempt_id,
+                        LoginSession(
+                            "10",
+                            "acceptance-user",
+                            "fake-password",
+                            verified=True,
+                            actor_name="驗收人員",
+                        ),
+                    )
+                )
+                controller.sessionController.sessionChanged.emit()
+                QTest.qWait(25)
+                controller.dutyController.set_actor_no("10")
+                controller.dutyController.replace_schedule_data(
+                    schedule_data,
+                    comparisons=audit_comparisons,
+                )
+
+                mode_tabs = root.findChild(QObject, "modeTabs")
+                self.assertIsNotNone(mode_tabs)
+                mode_tabs.setProperty("currentIndex", 1)
+                wait_until(lambda: root.title() == "審核模式", "審核模式未開啟")
+
+                audit_task_row = wait_for_audit_task_row()
+                audit_dialog = root.findChild(QObject, "auditDetailDialog")
+                detail_text = root.findChild(QObject, "auditDetailTextArea")
+                self.assertIsNotNone(audit_dialog)
+                self.assertIsNotNone(detail_text)
+                self.assertFalse(audit_dialog.property("visible"))
+
+                point = audit_task_row.mapToScene(
+                    QPointF(audit_task_row.width() / 2, audit_task_row.height() / 2)
+                )
+                QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, point.toPoint())
+                wait_until(
+                    lambda: audit_dialog.property("visible")
+                    and "人工確認：驗收差異" in str(detail_text.property("text")),
+                    "審核明細未開啟或未載入內容",
+                )
+                self.assertIn("既有巡邏紀錄", str(detail_text.property("text")))
+                self.assertIn("原始預演資料", str(detail_text.property("text")))
+            finally:
+                root.close()
+                controller.shutdown()
+                engine.deleteLater()
+                self._flush_qt_deferred_deletes()
 
     def test_qml_shell_loads_with_app_controller(self) -> None:
         from dataclasses import replace
@@ -16003,14 +16174,10 @@ if return_code != 0 or loaded:
                     "審核日期月曆未開啟",
                 )
                 self.assertTrue(QMetaObject.invokeMethod(audit_date_calendar, "closeCalendar", Qt.DirectConnection))
-                click(wait_for("auditTaskRow"))
-                detail_text = str(wait_for("auditDetailTextArea").property("text"))
-                self.assertIn("人工確認：驗收差異", detail_text)
-                self.assertIn("既有巡邏紀錄", detail_text)
-                self.assertIn("原始預演資料", detail_text)
-                audit_dialog = root.findChild(QObject, "auditDetailDialog")
-                self.assertIsNotNone(audit_dialog)
-                self.assertTrue(QMetaObject.invokeMethod(audit_dialog, "close", Qt.DirectConnection))
+                wait_until(
+                    lambda: not audit_date_calendar.property("popupVisible"),
+                    "審核日期月曆未完全關閉",
+                )
 
                 click(wait_for("modeMenuButton"))
                 click(wait_for_visible("dutyModeTab"))

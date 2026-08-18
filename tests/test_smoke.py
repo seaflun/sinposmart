@@ -2288,6 +2288,62 @@ class PackageSmokeTests(unittest.TestCase):
         )
         self.assertEqual(service.log_output, module.subprocess.DEVNULL)
 
+    def test_concurrent_chrome_start_requests_are_serialized(self) -> None:
+        module = duty_rehearsal_module()
+        first_started = threading.Event()
+        second_thread_started = threading.Event()
+        release_first = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        peak_active = 0
+        call_count = 0
+
+        def fake_chrome(**_kwargs: object) -> mock.Mock:
+            nonlocal active, peak_active, call_count
+            with state_lock:
+                call_count += 1
+                call_number = call_count
+                active += 1
+                peak_active = max(peak_active, active)
+            if call_number == 1:
+                first_started.set()
+                release_first.wait(2)
+            with state_lock:
+                active -= 1
+            return mock.Mock()
+
+        first_result: list[object] = []
+        second_result: list[object] = []
+
+        def start_first() -> None:
+            first_result.append(module.create_webdriver_chrome_with_timeout(module.Options()))
+
+        def start_second() -> None:
+            second_thread_started.set()
+            second_result.append(module.create_webdriver_chrome_with_timeout(module.Options()))
+
+        with mock.patch.object(module.webdriver, "Chrome", side_effect=fake_chrome):
+            first_thread = threading.Thread(target=start_first)
+            second_thread = threading.Thread(target=start_second)
+            first_thread.start()
+            self.assertTrue(first_started.wait(1))
+            second_thread.start()
+            self.assertTrue(second_thread_started.wait(1))
+            self.assertFalse(release_first.wait(0.2))
+            with state_lock:
+                self.assertEqual(call_count, 1)
+                self.assertEqual(peak_active, 1)
+            release_first.set()
+            first_thread.join(2)
+            second_thread.join(2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(first_result), 1)
+        self.assertEqual(len(second_result), 1)
+        self.assertEqual(call_count, 2)
+        self.assertEqual(peak_active, 1)
+
     def test_legacy_daily_vehicle_launcher_never_opens_a_console(self) -> None:
         source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
 

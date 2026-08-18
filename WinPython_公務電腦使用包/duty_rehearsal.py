@@ -3038,6 +3038,7 @@ def print_summary(today: DutySheet, yesterday: DutySheet | None, cases: list[Cas
 _DUTY_BROWSER_PROFILE_PREFIX = "duty_gui_"
 _DUTY_BROWSER_PROFILE_ATTRIBUTE = "_sinposmart_duty_browser_profile"
 _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH = Path("runtime_outputs") / "browser" / "browser_startup.jsonl"
+_CHROME_START_LOCK = threading.Lock()
 _DUTY_BROWSER_STARTUP_MESSAGE = (
     "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
     "一般 Chrome 不需關閉；若仍失敗請匯出問題包。"
@@ -3211,21 +3212,24 @@ def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
     timed_out = threading.Event()
 
     def start() -> None:
-        try:
-            service = ChromeService(
-                log_output=subprocess.DEVNULL,
-                popen_kw={"creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-            )
-            driver = webdriver.Chrome(service=service, options=options)
-        except BaseException as exc:
-            if not timed_out.is_set():
-                result_queue.put(("error", exc))
-            return
-        if timed_out.is_set():
-            with suppress(Exception):
-                driver.quit()
-            return
-        result_queue.put(("driver", driver))
+        with _CHROME_START_LOCK:
+            if timed_out.is_set():
+                return
+            try:
+                service = ChromeService(
+                    log_output=subprocess.DEVNULL,
+                    popen_kw={"creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+                )
+                driver = webdriver.Chrome(service=service, options=options)
+            except BaseException as exc:
+                if not timed_out.is_set():
+                    result_queue.put(("error", exc))
+                return
+            if timed_out.is_set():
+                with suppress(Exception):
+                    driver.quit()
+                return
+            result_queue.put(("driver", driver))
 
     thread = threading.Thread(target=start, name="sinposmart-chrome-startup", daemon=True)
     thread.start()
@@ -3233,7 +3237,10 @@ def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
     if thread.is_alive():
         timed_out.set()
         raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。")
-    kind, value = result_queue.get_nowait()
+    try:
+        kind, value = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。") from exc
     if kind == "error":
         raise value
     return value
