@@ -14556,6 +14556,244 @@ if return_code != 0 or loaded:
                 if second_controller is not None:
                     second_controller.shutdown()
 
+    def test_manual_departures_stay_done_until_paired_return_completes(self) -> None:
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        completed_pair_key = "return-pair:external:handoff-completed"
+        pending_pair_key = "return-pair:external:handoff-pending"
+        completed_rest_pair_key = "return-pair:rest:handoff-completed"
+        schedule_data = {
+            "target_date": "1150820",
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "外勤簽出",
+                    "return_pair_key": completed_pair_key,
+                    "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "外勤簽出",
+                    "return_pair_key": pending_pair_key,
+                    "fields": {"出或入": "出", "領用事由及地點": "待登打外勤"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "休息簽出",
+                    "return_pair_key": completed_rest_pair_key,
+                    "fields": {"出或入": "出", "領用事由及地點": "休息"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "08:00",
+                    "actor": "22",
+                    "target": "08",
+                    "source": "值班交接",
+                    "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "09:00",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "外勤簽入",
+                    "return_pair_key": completed_pair_key,
+                    "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "09:30",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "休息結束",
+                    "return_pair_key": completed_rest_pair_key,
+                    "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "09:45",
+                    "actor": "22",
+                    "target": "22",
+                    "source": "外勤簽入",
+                    "return_pair_key": pending_pair_key,
+                    "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(repository=ScheduleRepository(Path(temp_dir)))
+            try:
+                def task_statuses() -> dict[int, str]:
+                    return {
+                        controller.taskModel.data(
+                            controller.taskModel.index(row, 0), controller.taskModel.TaskIndexRole
+                        ): controller.taskModel.data(
+                            controller.taskModel.index(row, 0), controller.taskModel.StatusTextRole
+                        )
+                        for row in range(controller.taskModel.rowCount())
+                    }
+
+                controller.set_session_context(1, "user22")
+                controller.set_actor_no("22")
+                controller.replace_schedule_data(schedule_data)
+                controller.handle_submission_result(
+                    0,
+                    "submitted",
+                    "完成",
+                    "",
+                    trigger_type="manual",
+                )
+                controller.handle_submission_result(
+                    2,
+                    "submitted",
+                    "完成",
+                    "",
+                    trigger_type="manual",
+                )
+
+                controller.set_session_context(2, "user22-relogin")
+                controller.replace_schedule_data(schedule_data)
+                self.assertEqual(task_statuses()[0], "已登打")
+                self.assertEqual(task_statuses()[2], "已登打")
+
+                controller.set_session_context(3, "user08")
+                controller.set_actor_no("08")
+                controller.replace_schedule_data(schedule_data)
+
+                statuses = task_statuses()
+                self.assertEqual(statuses[0], "已登打")
+                self.assertEqual(statuses[1], "前班手動")
+                self.assertEqual(statuses[2], "已登打")
+                self.assertNotIn(3, statuses)
+
+                controller.handle_submission_result(4, "submitted", "完成", "", trigger_type="due")
+                controller.handle_submission_result(5, "submitted", "完成", "", trigger_type="manual")
+                controller.handle_submission_result(6, "submitted", "完成", "", trigger_type="manual")
+                controller.set_session_context(4, "user08-relogin")
+                controller.replace_schedule_data(schedule_data)
+
+                statuses = task_statuses()
+                self.assertNotIn(0, statuses)
+                self.assertEqual(statuses[1], "前班手動")
+                self.assertNotIn(2, statuses)
+                self.assertNotIn(3, statuses)
+            finally:
+                controller.shutdown()
+
+    def test_background_manual_departure_stays_done_without_duplicate_auto_return(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        pair_key = "return-pair:background-manual"
+        schedule_data = {
+            "target_date": "1150820",
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "09:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "外勤簽出",
+                    "return_pair_key": pair_key,
+                    "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "10:00",
+                    "actor": "10",
+                    "target": "10",
+                    "source": "外勤簽入",
+                    "return_pair_key": pair_key,
+                    "fields": {"出或入": "入", "領用事由及地點": "返隊"},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(repository=ScheduleRepository(Path(temp_dir)))
+            try:
+                controller.set_session_context(1, "user10")
+                controller.set_actor_no("10")
+                controller.replace_schedule_data(schedule_data)
+                departure_request = DutySubmissionRequest(
+                    "user10",
+                    "secret",
+                    0,
+                    schedule_data,
+                    trigger_type="manual",
+                    session_generation=1,
+                    schedule_generation=controller.schedule_generation,
+                    action_key=action_completion_key(schedule_data["actions"][0]),
+                    session_actor_no="10",
+                    background=True,
+                )
+                self.assertTrue(
+                    controller.handle_submission_request_result(
+                        departure_request,
+                        "submitted",
+                        "完成",
+                        "",
+                        {"compare": "已登打", "group": "done", "matched": []},
+                    )
+                )
+
+                controller.set_session_context(2, "user10")
+                controller.replace_schedule_data(schedule_data)
+                self.assertEqual(
+                    controller.taskModel.data(
+                        controller.taskModel.index(0, 0), controller.taskModel.StatusTextRole
+                    ),
+                    "已登打",
+                )
+                self.assertEqual(controller._auto_return_indices(), set())
+
+                return_request = DutySubmissionRequest(
+                    "user10",
+                    "secret",
+                    1,
+                    schedule_data,
+                    trigger_type="due",
+                    session_generation=2,
+                    schedule_generation=controller.schedule_generation,
+                    action_key=action_completion_key(schedule_data["actions"][1]),
+                    session_actor_no="10",
+                    background=True,
+                )
+                self.assertTrue(
+                    controller.handle_submission_request_result(
+                        return_request,
+                        "skipped_duplicate",
+                        "已存在",
+                        "",
+                        {"compare": "已存在", "group": "done", "matched": []},
+                    )
+                )
+                controller.set_session_context(3, "user10")
+                controller.replace_schedule_data(schedule_data)
+
+                task_indices = {
+                    controller.taskModel.data(
+                        controller.taskModel.index(row, 0), controller.taskModel.TaskIndexRole
+                    )
+                    for row in range(controller.taskModel.rowCount())
+                }
+                self.assertNotIn(0, task_indices)
+            finally:
+                controller.shutdown()
+
     def test_manual_external_submission_preserves_actual_match_and_audit_status(self) -> None:
         from app_core.duty_task_projection import project_audit_tasks
         from app_core.schedule_repository import ScheduleRepository

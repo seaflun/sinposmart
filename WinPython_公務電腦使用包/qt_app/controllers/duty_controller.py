@@ -88,7 +88,15 @@ class DutyController(QObject):
             package_root / "runtime_outputs"
         )
         self._return_policy_state_path = Path(runtime_output_dir) / "duty_return_policy.json"
-        self._manual_departure_pair_keys = self._load_manual_departure_pair_keys()
+        self._manual_departure_pair_keys = self._load_return_policy_pair_keys(
+            "manual_departure_pair_keys"
+        )
+        self._background_manual_departure_pair_keys = self._load_return_policy_pair_keys(
+            "background_manual_departure_pair_keys"
+        )
+        self._completed_return_pair_keys = self._load_return_policy_pair_keys(
+            "completed_return_pair_keys"
+        )
         self._actual_handoff_times = self._load_actual_handoff_times()
         self._current_date_text = ""
         self._current_time_text = ""
@@ -699,14 +707,14 @@ class DutyController(QObject):
             fallback_date=current.date(),
         ) > current
 
-    def _load_manual_departure_pair_keys(self) -> set[str]:
+    def _load_return_policy_pair_keys(self, field: str) -> set[str]:
         try:
             payload = json.loads(self._return_policy_state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return set()
         if not isinstance(payload, Mapping):
             return set()
-        values = payload.get("manual_departure_pair_keys", [])
+        values = payload.get(field, [])
         if not isinstance(values, list):
             return set()
         return {str(value).strip() for value in values if str(value).strip()}
@@ -759,6 +767,10 @@ class DutyController(QObject):
         payload = {
             "schema_version": 1,
             "manual_departure_pair_keys": sorted(self._manual_departure_pair_keys),
+            "background_manual_departure_pair_keys": sorted(
+                self._background_manual_departure_pair_keys
+            ),
+            "completed_return_pair_keys": sorted(self._completed_return_pair_keys),
             "actual_handoff_times": dict(sorted(self._actual_handoff_times.items())),
         }
         temporary_path = self._return_policy_state_path.with_name(
@@ -1833,19 +1845,29 @@ class DutyController(QObject):
                 completed_comparison["submission_trigger"] = trigger_type
             self._comparisons[action_index] = completed_comparison
             self._retry_after.pop(action_index, None)
-            if status == "submitted":
+            if status in ("submitted", "skipped_duplicate"):
                 action = self._actions[action_index]
                 pair_key = action_return_pair_key(action)
                 if (
-                    allow_manual_departure_return
-                    and trigger_type == "manual"
+                    trigger_type == "manual"
                     and is_external_or_rest_departure(action)
                     and pair_key
                 ):
-                    self._manual_departure_pair_keys.add(pair_key)
+                    if allow_manual_departure_return:
+                        self._manual_departure_pair_keys.add(pair_key)
+                    else:
+                        self._background_manual_departure_pair_keys.add(pair_key)
+                    self._completed_return_pair_keys.discard(pair_key)
                     self._save_manual_departure_pair_keys()
                 elif is_external_or_rest_return(action) and pair_key:
+                    was_manual_departure = (
+                        pair_key in self._manual_departure_pair_keys
+                        or pair_key in self._background_manual_departure_pair_keys
+                    )
                     self._manual_departure_pair_keys.discard(pair_key)
+                    self._background_manual_departure_pair_keys.discard(pair_key)
+                    if was_manual_departure:
+                        self._completed_return_pair_keys.add(pair_key)
                     self._save_manual_departure_pair_keys()
             self._schedule_auto_logout_if_needed(action_index)
         elif status == "review_required":
@@ -2116,6 +2138,8 @@ class DutyController(QObject):
         self._target_date_text = next_target_date
         if target_date_changed:
             self._manual_departure_pair_keys.clear()
+            self._background_manual_departure_pair_keys.clear()
+            self._completed_return_pair_keys.clear()
         else:
             current_pair_keys = {
                 action_return_pair_key(action)
@@ -2123,6 +2147,8 @@ class DutyController(QObject):
                 if action_return_pair_key(action)
             }
             self._manual_departure_pair_keys.intersection_update(current_pair_keys)
+            self._background_manual_departure_pair_keys.intersection_update(current_pair_keys)
+            self._completed_return_pair_keys.intersection_update(current_pair_keys)
         self._save_manual_departure_pair_keys()
         if not same_schedule_date:
             self._pending_manual_indices.clear()
@@ -2239,6 +2265,7 @@ class DutyController(QObject):
             task_errors=self._task_errors,
             auto_return_indices=frozenset(self._auto_return_indices()),
             manual_waiting_indices=frozenset(self._manual_waiting_indices()),
+            completed_return_pair_keys=frozenset(self._completed_return_pair_keys),
         )
 
     def _refresh_projection(self) -> None:
@@ -2886,6 +2913,37 @@ class DutyController(QObject):
                 "group": "done",
                 "matched": [],
             }
+        for index, action in enumerate(self._actions):
+            if not (
+                is_external_or_rest_departure(action)
+                and action_return_pair_key(action)
+                in (
+                    self._manual_departure_pair_keys
+                    | self._background_manual_departure_pair_keys
+                )
+            ):
+                continue
+            self._executed_indices.add(index)
+            completed_comparison = dict(self._comparisons.get(index, {}))
+            completed_comparison.update(
+                {
+                    "compare": "已登打",
+                    "group": "done",
+                    "submission_trigger": "manual",
+                }
+            )
+            completed_comparison.setdefault("matched", [])
+            self._comparisons[index] = completed_comparison
+        for index, action in enumerate(self._actions):
+            if action_return_pair_key(action) not in self._completed_return_pair_keys:
+                continue
+            self._executed_indices.add(index)
+            completed_comparison = dict(self._comparisons.get(index, {}))
+            completed_comparison.update({"compare": "已登打", "group": "done"})
+            if is_external_or_rest_departure(action):
+                completed_comparison["submission_trigger"] = "manual"
+            completed_comparison.setdefault("matched", [])
+            self._comparisons[index] = completed_comparison
         unique_indices = self._unique_action_indices_by_key()
         for record in self._unreturned_return_queue.bridge_history_records():
             for action in self._unreturned_return_queue.record_actions(record):

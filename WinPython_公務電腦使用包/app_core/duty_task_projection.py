@@ -45,6 +45,7 @@ class DutyTaskProjectionState:
     task_errors: Mapping[int, str] = field(default_factory=dict)
     auto_return_indices: frozenset[int] = frozenset()
     manual_waiting_indices: frozenset[int] = frozenset()
+    completed_return_pair_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -522,12 +523,15 @@ def project_duty_tasks(
             state.target_roc_date,
         )
         if (
+            is_external_or_rest_departure(action)
+            and action_return_pair_key(action) in state.completed_return_pair_keys
+        ):
+            continue
+        if (
             str(action.get("actor", "") or "") != actor_no
             and not is_previous_item
             and index not in state.forced_visible_indices
         ):
-            continue
-        if is_previous_item and comparison and comparison.get("group") in ("done", "near", "adjust"):
             continue
         is_external_action = str(action.get("source", "") or "").startswith("外勤")
         if comparison.get("group") == "review" and not is_previous_item and not is_external_action:
