@@ -268,30 +268,35 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertEqual(updates, [(4, 10), (8, 10), (10, 10)])
 
-    def test_work_log_classification_uses_two_transfer_queues_for_distinct_case_folders(self) -> None:
+    def test_work_log_classification_assigns_one_transfer_lane_to_each_case_folder(self) -> None:
         classifier = self._classifier_module()
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source_root = root / "DCIM" / "100CAREC"
             source_root.mkdir(parents=True)
             destination_root = root / "cases"
-            first_case = destination_root / "2026" / "8月" / "08150900-92" / "車"
-            second_case = destination_root / "2026" / "8月" / "08151000-92" / "車"
+            case_count = 20
+            first_case_time = datetime(2026, 8, 15, 8, 0)
+            first_case = destination_root / "2026" / "8月" / f"{first_case_time:%m%d%H%M}-92" / "車"
             first_case.mkdir(parents=True)
-            second_case.mkdir(parents=True)
+            sources: list[tuple[Path, Path]] = []
 
-            first_source = source_root / "V0000001.TS"
-            second_source = source_root / "V0000002.TS"
-            first_source.write_bytes(b"first video")
-            second_source.write_bytes(b"second video")
-            first_source.touch()
-            second_source.touch()
-            first_source_mtime = datetime(2026, 8, 15, 9, 0).timestamp()
-            second_source_mtime = datetime(2026, 8, 15, 10, 0).timestamp()
-            first_source.touch()
-            second_source.touch()
-            os.utime(first_source, (first_source_mtime, first_source_mtime))
-            os.utime(second_source, (second_source_mtime, second_source_mtime))
+            for source_number in (1, 2):
+                source = source_root / f"V{source_number:07d}.TS"
+                source.write_bytes(f"first case video {source_number}".encode())
+                first_case_timestamp = first_case_time.timestamp()
+                os.utime(source, (first_case_timestamp, first_case_timestamp))
+                sources.append((source, first_case))
+
+            for case_index in range(1, case_count):
+                case_time = first_case_time + timedelta(minutes=case_index)
+                case_folder = destination_root / "2026" / "8月" / f"{case_time:%m%d%H%M}-92" / "車"
+                case_folder.mkdir(parents=True)
+                source = source_root / f"V{case_index + 2:07d}.TS"
+                source.write_bytes(f"case {case_index} video".encode())
+                case_timestamp = case_time.timestamp()
+                os.utime(source, (case_timestamp, case_timestamp))
+                sources.append((source, case_folder))
 
             args = SimpleNamespace(
                 date="2026-08-15",
@@ -313,54 +318,55 @@ class RescueVideoPackageTests(unittest.TestCase):
             active_transfers = 0
             maximum_active_transfers = 0
             transfer_lock = threading.Lock()
-            transfer_barrier = threading.Barrier(2)
-            transfer_states: list[tuple[str, str]] = []
+            transfer_barrier = threading.Barrier(case_count)
+            active_by_case: dict[Path, int] = {}
+            maximum_by_case: dict[Path, int] = {}
+            barrier_cases: set[Path] = set()
             original_copy = classifier.copy_preserving_time
 
             def tracked_copy(source, destination, progress_callback=None):
                 nonlocal active_transfers, maximum_active_transfers
+                case_folder = destination.parent.parent
                 with transfer_lock:
+                    first_transfer_for_case = case_folder not in barrier_cases
+                    barrier_cases.add(case_folder)
                     active_transfers += 1
                     maximum_active_transfers = max(maximum_active_transfers, active_transfers)
+                    active_by_case[case_folder] = active_by_case.get(case_folder, 0) + 1
+                    maximum_by_case[case_folder] = max(
+                        maximum_by_case.get(case_folder, 0), active_by_case[case_folder]
+                    )
                 try:
-                    transfer_barrier.wait(timeout=2)
+                    if first_transfer_for_case:
+                        transfer_barrier.wait(timeout=2)
                     return original_copy(source, destination, progress_callback)
                 finally:
                     with transfer_lock:
                         active_transfers -= 1
+                        active_by_case[case_folder] -= 1
 
             with (
                 mock.patch.object(
                     classifier,
                     "read_card_duration",
-                    return_value=(first_source, timedelta(seconds=0)),
+                    return_value=(sources[0][0], timedelta(seconds=0)),
                 ),
                 mock.patch.object(classifier, "discover_case_work", return_value=[]),
                 mock.patch.object(classifier, "copy_preserving_time", side_effect=tracked_copy),
             ):
                 results = classifier.classify_with_work_logs(
                     args,
-                    transfer_workers=2,
-                    transfer_callback=lambda source, _copied, _total, state: transfer_states.append(
-                        (Path(source).name, state)
-                    ),
                 )
-            first_destination_exists = (first_case / first_source.name).is_file()
-            second_destination_exists = (second_case / second_source.name).is_file()
+            destination_exists = [
+                (case_folder / source.name).is_file() for source, case_folder in sources
+            ]
+            source_exists = [source.exists() for source, _case_folder in sources]
 
-        self.assertEqual(
-            [result.status for result in results],
-            ["已複製並刪除來源", "已複製並刪除來源"],
-        )
-        self.assertGreaterEqual(maximum_active_transfers, 2)
-        self.assertTrue(first_destination_exists)
-        self.assertTrue(second_destination_exists)
-        self.assertFalse(first_source.exists())
-        self.assertFalse(second_source.exists())
-        self.assertEqual(
-            {name for name, state in transfer_states if state == "驗證完成"},
-            {first_source.name, second_source.name},
-        )
+        self.assertEqual([result.status for result in results], ["已複製並刪除來源"] * len(sources))
+        self.assertGreaterEqual(maximum_active_transfers, case_count)
+        self.assertEqual(maximum_by_case[first_case.parent], 1)
+        self.assertTrue(all(destination_exists))
+        self.assertFalse(any(source_exists))
 
     def test_copy_only_rerun_skips_verified_existing_videos_and_copies_new_case(self) -> None:
         classifier = self._classifier_module()

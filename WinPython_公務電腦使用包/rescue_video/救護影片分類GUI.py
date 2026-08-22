@@ -28,7 +28,6 @@ MODES = {
     "delete": (True, True),
 }
 PUBLIC_GUI_MODES = ("preview", "delete")
-PUBLIC_TRANSFER_QUEUE_COUNT = 2
 
 
 def _load_tk_ui() -> None:
@@ -351,7 +350,6 @@ def run_classification(
     results = classifier.classify_with_work_logs(
         args,
         transfer_callback=transfer_callback,
-        transfer_workers=PUBLIC_TRANSFER_QUEUE_COUNT,
     )
     if stage_callback is not None:
         stage_callback("report_write")

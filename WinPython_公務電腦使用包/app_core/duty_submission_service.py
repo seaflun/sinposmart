@@ -344,42 +344,69 @@ class DutySubmissionService:
                     {"group": "filled", "matched": [], "form_result": form_result},
                 )
 
-            if status_callback:
-                status_callback("正在回查送出結果…")
-            verified = {"group": "todo", "matched": []}
-            for attempt in range(3):
-                after = self._query_comparison(
+            try:
+                if status_callback:
+                    status_callback("正在回查送出結果…")
+                verified = {"group": "todo", "matched": []}
+                for attempt in range(3):
+                    after = self._query_comparison(
+                        automation,
+                        driver,
+                        action,
+                        action_date,
+                        query_range=query_range,
+                    )
+                    verified = self._submission_comparison_for_action(
+                        comparison_source,
+                        actions,
+                        request.action_index,
+                        action_date,
+                        after,
+                        verify_saved=True,
+                    )
+                    if verified.get("group") == "done":
+                        break
+                    if attempt < 2:
+                        if status_callback:
+                            status_callback(f"登打後資料尚未顯示，正在第 {attempt + 2} 次確認。")
+                        self.sleeper(1.0)
+                if verified.get("group") != "done":
+                    raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料。")
+                verified = {**verified, "form_result": form_result}
+                return self._finish(
+                    request,
+                    action,
+                    result_path,
+                    "submitted",
+                    "勤務系統登打完成。",
+                    verified,
+                )
+            except DutySubmissionExecutionError:
+                raise
+            except Exception as exc:
+                if status_callback:
+                    status_callback("送出流程異常，正在以只讀查詢確認結果…")
+                reconciled = self._reconcile_after_submit_error(
                     automation,
                     driver,
-                    action,
-                    action_date,
-                    query_range=query_range,
-                )
-                verified = self._submission_comparison_for_action(
                     comparison_source,
                     actions,
                     request.action_index,
                     action_date,
-                    after,
-                    verify_saved=True,
+                    query_range,
+                    exc,
                 )
-                if verified.get("group") == "done":
-                    break
-                if attempt < 2:
-                    if status_callback:
-                        status_callback(f"登打後資料尚未顯示，正在第 {attempt + 2} 次確認。")
-                    self.sleeper(1.0)
-            if verified.get("group") != "done":
-                raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料。")
-            verified = {**verified, "form_result": form_result}
-            return self._finish(
-                request,
-                action,
-                result_path,
-                "submitted",
-                "勤務系統登打完成。",
-                verified,
-            )
+                if reconciled is None:
+                    raise
+                reconciled = {**reconciled, "form_result": form_result}
+                return self._finish(
+                    request,
+                    action,
+                    result_path,
+                    "submitted",
+                    "勤務系統登打完成；送出流程異常後已重新查詢確認資料存在。",
+                    reconciled,
+                )
         except DutySubmissionValidationError:
             raise
         except DutySubmissionExecutionError as exc:
@@ -885,6 +912,46 @@ class DutySubmissionService:
                 verify_saved=verify_saved,
             )
         return self._comparison_for_action(data, actions, index, action_date, comparison_data)
+
+    def _reconcile_after_submit_error(
+        self,
+        automation: ModuleType,
+        driver: object,
+        data: Mapping[str, Any],
+        actions: list[Mapping[str, Any]],
+        index: int,
+        action_date: str,
+        query_range: Mapping[str, Any] | None,
+        exc: Exception,
+    ) -> Mapping[str, Any] | None:
+        """Do one read-only lookup after an unexpected submission-side error."""
+
+        try:
+            after = self._query_comparison(
+                automation,
+                driver,
+                actions[index],
+                action_date,
+                query_range=query_range,
+            )
+            verified = self._submission_comparison_for_action(
+                data,
+                actions,
+                index,
+                action_date,
+                after,
+                verify_saved=True,
+            )
+        except Exception:
+            return None
+        if verified.get("group") != "done":
+            return None
+        _message, error_code = self._safe_error(exc)
+        return {
+            **verified,
+            "confirmation_state": "reconciled_after_submission_error",
+            "confirmation_error_code": error_code,
+        }
 
     @staticmethod
     def _staff(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

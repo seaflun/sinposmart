@@ -1785,16 +1785,25 @@ class AppController(QObject):
             not is_handoff_preflight
             and self._should_send_operational_submission_event(request, status=result.status)
         ):
+            result_snapshot = {
+                "action_index": request.action_index,
+                "completion_key": request.action_key or action_completion_key(action),
+            }
+            confirmation_state = str(result.comparison.get("confirmation_state", "") or "")
+            confirmation_error_code = str(
+                result.comparison.get("confirmation_error_code", "") or ""
+            )
+            if confirmation_state:
+                result_snapshot["confirmation_state"] = confirmation_state
+            if confirmation_error_code:
+                result_snapshot["confirmation_error_code"] = confirmation_error_code
             self._send_operational_event(
                 "action_result",
                 status=result.status,
                 trigger_type=request.trigger_type,
                 action=action,
                 result_ref=Path(result.result_path).name,
-                snapshot={
-                    "action_index": request.action_index,
-                    "completion_key": request.action_key or action_completion_key(action),
-                },
+                snapshot=result_snapshot,
                 **self._submission_event_fields(request, action),
             )
             if result.status == "submitted":

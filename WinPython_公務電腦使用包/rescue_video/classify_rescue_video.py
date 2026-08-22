@@ -756,9 +756,9 @@ def classify(
 def classify_with_work_logs(
     args: argparse.Namespace,
     transfer_callback: Callable[[Path, int, int, str], None] | None = None,
-    transfer_workers: int = 1,
+    transfer_workers: int | None = None,
 ) -> list[Result]:
-    """Classify by video interval, then transfer each matched file independently."""
+    """Classify by video interval, then transfer one case folder per lane."""
     selected_date = parse_date(args.date)
     cases = discover_cases(args.destination, args.vehicle)
     work = discover_case_work(args.work_log_root, args.vehicle)
@@ -908,33 +908,42 @@ def _transfer_results(
     results: list[Result],
     args: argparse.Namespace,
     transfer_callback: Callable[[Path, int, int, str], None] | None,
-    transfer_workers: int,
+    transfer_workers: int | None,
 ) -> list[Result]:
-    try:
-        worker_count = max(1, int(transfer_workers))
-    except (TypeError, ValueError):
-        worker_count = 1
     matched_indexes = [index for index, result in enumerate(results) if result.case is not None]
     if not matched_indexes:
         return results
 
-    if not getattr(args, "apply", False) or worker_count == 1 or len(matched_indexes) == 1:
+    case_groups: dict[Path, list[tuple[int, Result]]] = {}
+    for index in matched_indexes:
+        result = results[index]
+        if result.case is not None:
+            case_groups.setdefault(result.case.path, []).append((index, result))
+
+    if transfer_workers is None:
+        worker_count = len(case_groups)
+    else:
+        try:
+            worker_count = max(1, int(transfer_workers))
+        except (TypeError, ValueError):
+            worker_count = 1
+
+    def transfer_case(group: list[tuple[int, Result]]) -> list[tuple[int, Result]]:
         return [
-            _transfer_result(result, args, transfer_callback) if result.case is not None else result
-            for result in results
+            (index, _transfer_result(result, args, transfer_callback))
+            for index, result in group
         ]
 
-    matched_results = [results[index] for index in matched_indexes]
-    with ThreadPoolExecutor(max_workers=min(worker_count, len(matched_results))) as executor:
-        transferred = list(
-            executor.map(
-                lambda result: _transfer_result(result, args, transfer_callback),
-                matched_results,
-            )
-        )
+    if not getattr(args, "apply", False) or worker_count == 1 or len(case_groups) == 1:
+        transferred_groups = [transfer_case(group) for group in case_groups.values()]
+    else:
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(case_groups))) as executor:
+            transferred_groups = list(executor.map(transfer_case, case_groups.values()))
+
     completed = list(results)
-    for index, result in zip(matched_indexes, transferred):
-        completed[index] = result
+    for group in transferred_groups:
+        for index, result in group:
+            completed[index] = result
     return completed
 
 

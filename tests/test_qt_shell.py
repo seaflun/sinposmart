@@ -1574,6 +1574,136 @@ class DutySubmissionServiceTests(unittest.TestCase):
         self.assertEqual(waits, [1.0, 1.0])
         self.assertEqual(query_count, 4)
 
+    def test_submit_reconciles_saved_record_after_post_submit_query_error(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[bool] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date, **_kwargs):
+                nonlocal query_count
+                query_count += 1
+                if query_count == 2:
+                    raise RuntimeError("temporary query error")
+                return [["115/08/07", "08:00", "巡邏"]] if query_count == 3 else []
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: fills.append(True) or {"ok": True},
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                quit_driver=lambda *_args: None,
+            )
+
+            def comparison_builder(_data, _actions, comparisons):
+                rows = comparisons["1150807"]["visible_work_rows"]
+                return {
+                    0: {
+                        "compare": "已存在" if rows else "未找到",
+                        "group": "done" if rows else "todo",
+                        "matched": rows,
+                    }
+                }
+
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+                comparison_builder=comparison_builder,
+            )
+            data = {
+                "target_date": "1150807",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+                    }
+                ],
+            }
+
+            result = service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+            persisted = json.loads(result.result_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(fills, [True])
+        self.assertEqual(query_count, 3)
+        self.assertEqual(
+            result.comparison["confirmation_state"],
+            "reconciled_after_submission_error",
+        )
+        self.assertEqual(result.comparison["confirmation_error_code"], "unknown_error")
+        self.assertEqual(persisted["stage"], "submitted")
+        self.assertEqual(
+            persisted["comparison"]["confirmation_state"],
+            "reconciled_after_submission_error",
+        )
+
+    def test_submit_does_not_reconcile_when_form_fill_errors(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError,
+            DutySubmissionRequest,
+            DutySubmissionService,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date, **_kwargs):
+                nonlocal query_count
+                query_count += 1
+                return []
+
+            def fail_fill(*_args, **_kwargs):
+                raise RuntimeError("form fill error")
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=fail_fill,
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "未找到", "group": "todo", "matched": []}
+                },
+            )
+            data = {
+                "target_date": "1150807",
+                "actions": [
+                    {
+                        "kind": "work_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+                    }
+                ],
+            }
+
+            with self.assertRaises(DutySubmissionExecutionError):
+                service.execute(DutySubmissionRequest("user10", "secret", 0, data))
+
+        self.assertEqual(query_count, 1)
+
     def test_duplicate_result_skips_form_submission(self) -> None:
         from datetime import datetime
 
@@ -5216,6 +5346,10 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 user_id="user10",
                 display_name="10番 測試員",
                 target="10番 測試員（隊員）",
+                snapshot={
+                    "confirmation_state": "reconciled_after_submission_error",
+                    "confirmation_error_code": "unknown_error",
+                },
                 action={
                     "kind": "work_log",
                     "source": "值班交接",
@@ -5231,6 +5365,11 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(payload["content"], "交接完成")
         self.assertEqual(payload["target"], "10番 測試員（隊員）")
         self.assertEqual(payload["target_time"], "08:00")
+        self.assertEqual(
+            payload["snapshot"]["confirmation_state"],
+            "reconciled_after_submission_error",
+        )
+        self.assertEqual(payload["snapshot"]["confirmation_error_code"], "unknown_error")
 
     def test_arrival_event_payload_appends_target_person_to_item_title(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
@@ -10406,6 +10545,60 @@ if return_code != 0 or loaded:
             self.assertEqual(operational_events, [])
         finally:
             controller.shutdown()
+
+    def test_submission_reconciliation_is_identified_in_operational_event(self) -> None:
+        from pathlib import Path
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.app_controller import AppController
+
+        action = {
+            "kind": "work_log",
+            "time": "08:00",
+            "actor": "10",
+            "target": "10",
+            "fields": {"工作時間": "08:00", "勤務項目": "巡邏"},
+        }
+        request = DutySubmissionRequest(
+            "user10",
+            "secret",
+            0,
+            {"target_date": "1150807", "actions": [action]},
+        )
+        controller = AppController()
+        events: list[tuple[str, dict[str, object]]] = []
+        controller._send_operational_event = (
+            lambda record_type, **fields: events.append((record_type, fields))
+        )
+        try:
+            controller._submission_finished(
+                request,
+                DutySubmissionResult(
+                    0,
+                    "submitted",
+                    "勤務系統已有該筆資料；送出後的自動化確認異常，已改以重新查詢確認。",
+                    Path("reconciled.json"),
+                    {
+                        "group": "done",
+                        "matched": ["115/08/07 08:00 | 巡邏"],
+                        "confirmation_state": "reconciled_after_submission_error",
+                        "confirmation_error_code": "unknown_error",
+                    },
+                    action,
+                ),
+            )
+        finally:
+            controller.shutdown()
+
+        self.assertEqual(len(events), 1)
+        record_type, fields = events[0]
+        self.assertEqual(record_type, "action_result")
+        self.assertEqual(fields["status"], "submitted")
+        self.assertEqual(
+            fields["snapshot"]["confirmation_state"],
+            "reconciled_after_submission_error",
+        )
+        self.assertEqual(fields["snapshot"]["confirmation_error_code"], "unknown_error")
 
     def test_manual_issue_package_uses_in_app_status_without_tray_notification(self) -> None:
         from pathlib import Path
