@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -663,6 +664,22 @@ def submit_rest_entries(
         validate_workbook_year_month(workbook_path, expected_roc_year, expected_month)
     actor_name = str(actor_name or "").strip()
     target_name = actor_name or workbook_person_name(workbook_path, actor_no)
+
+    source_executor: ThreadPoolExecutor | None = None
+    entries_future = None
+    if target_name or actor_no:
+        source_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="sinposmart-rest-source",
+        )
+        entries_future = source_executor.submit(
+            parse_rest_entries,
+            workbook_path,
+            target_name=target_name,
+            target_no=actor_no,
+        )
+        status("Excel 解析與瀏覽器查詢同步進行...")
+
     def initialize_browser(driver) -> None:
         report_stage("login")
         login(driver, user_id, password)
@@ -672,12 +689,13 @@ def submit_rest_entries(
         wait_for_main_table(driver)
 
     report_stage("browser_start")
-    driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
+    driver = None
     inserted = 0
     skipped = 0
     deleted_duplicates = 0
     success = False
     try:
+        driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
         if expected_roc_year is not None and expected_month is not None:
             status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
             select_base_month(driver, expected_roc_year, expected_month)
@@ -689,7 +707,17 @@ def submit_rest_entries(
             strict_target_name=bool(actor_name),
         )
         status(f"找到個人連結：{person.name}（系統儲存列 {person.staff_no}）")
-        entries = parse_rest_entries(workbook_path, target_name=person.name, target_no=person.staff_no)
+        if entries_future is None:
+            entries = parse_rest_entries(workbook_path, target_name=person.name, target_no=person.staff_no)
+        else:
+            entries = entries_future.result()
+            if person.name.strip() != target_name.strip():
+                status("系統人員與預解析對象不同，重新依系統人員解析勤務表...")
+                entries = parse_rest_entries(
+                    workbook_path,
+                    target_name=person.name,
+                    target_no=person.staff_no,
+                )
         if not entries:
             raise RuntimeError(f"勤務表內找不到 {person.name} 的休息時間。")
         report_stage("fill")
@@ -712,7 +740,9 @@ def submit_rest_entries(
         success = True
         return f"完成：新增 {inserted} 筆，略過已存在 {skipped} 筆，刪除重複休息 {deleted_duplicates} 筆，已按個人儲存。"
     finally:
-        if not keep_browser_open or not success:
+        if source_executor is not None:
+            source_executor.shutdown(wait=True)
+        if driver is not None and (not keep_browser_open or not success):
             quit_driver(driver)
 
 
@@ -732,9 +762,18 @@ def submit_monthly_base_entries(
     report_stage = stage_callback or (lambda _stage: None)
     report_stage("source_load")
     actor_no = str(actor_no or "").strip()
-    plan = fetch_monthly_base_plan(actor_no, actor_name=actor_name)
-    if expected_roc_year is not None and expected_month is not None:
-        validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
+
+    source_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="sinposmart-monthly-source",
+    )
+    plan_future = source_executor.submit(
+        fetch_monthly_base_plan,
+        actor_no,
+        actor_name=actor_name,
+    )
+    status("輪休基準表解析與瀏覽器查詢同步進行...")
+
     def initialize_browser(driver) -> None:
         report_stage("login")
         login(driver, user_id, password)
@@ -744,11 +783,21 @@ def submit_monthly_base_entries(
         wait_for_main_table(driver)
 
     report_stage("browser_start")
-    driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
+    driver = None
     success = False
     try:
-        status(f"切換到 {plan.roc_year}年{plan.month:02d}月並查詢...")
-        select_base_month(driver, plan.roc_year, plan.month)
+        driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
+        if expected_roc_year is not None and expected_month is not None:
+            status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
+            select_base_month(driver, expected_roc_year, expected_month)
+        else:
+            plan = plan_future.result()
+            status(f"切換到 {plan.roc_year}年{plan.month:02d}月並查詢...")
+            select_base_month(driver, plan.roc_year, plan.month)
+        status("月份查詢完成，確認輪休基準表來源...")
+        plan = plan_future.result()
+        if expected_roc_year is not None and expected_month is not None:
+            validate_selected_year_month("勤務基準表", expected_roc_year, expected_month, plan.roc_year, plan.month)
         wait_for_person_name_row(driver, plan.name)
         status(f"找到本人列：{plan.name}（{plan.actor_no}番）")
         report_stage("fill")
@@ -761,7 +810,8 @@ def submit_monthly_base_entries(
         success = True
         return f"完成：{plan.roc_year}年{plan.month:02d}月 {plan.name} 已填入 {filled} 格並個人儲存。"
     finally:
-        if not keep_browser_open or not success:
+        source_executor.shutdown(wait=True)
+        if driver is not None and (not keep_browser_open or not success):
             quit_driver(driver)
 
 

@@ -3229,6 +3229,111 @@ class RestMonthlyServiceTests(unittest.TestCase):
             self.assertNotIn("secret", repr(rest_request))
             self.assertNotIn("secret", repr(monthly_request))
 
+    def test_rest_submission_parses_workbook_while_browser_opens(self) -> None:
+        import rest_time_automation as module
+
+        parse_started = threading.Event()
+        browser_started = threading.Event()
+        events: list[str] = []
+        driver = SimpleNamespace()
+        entries = [module.RestEntry(1, 1, 8, 1, 10)]
+
+        def parse_entries(*_args, **_kwargs):
+            parse_started.set()
+            if not browser_started.wait(timeout=1):
+                raise AssertionError("Excel 解析沒有和瀏覽器初始化重疊執行")
+            events.append("parse_done")
+            return entries
+
+        def build_driver(*_args, **_kwargs):
+            if not parse_started.wait(timeout=1):
+                raise AssertionError("開啟瀏覽器前沒有啟動 Excel 解析")
+            events.append("browser_started")
+            browser_started.set()
+            return driver
+
+        progress: list[str] = []
+        with patch.object(module, "validate_workbook_year_month"), \
+                patch.object(module, "parse_rest_entries", side_effect=parse_entries), \
+                patch.object(module, "build_initialized_driver", side_effect=build_driver), \
+                patch.object(module, "login"), \
+                patch.object(module, "open_ap"), \
+                patch.object(module, "wait_for_main_table"), \
+                patch.object(module, "select_base_month"), \
+                patch.object(
+                    module,
+                    "find_person_link",
+                    return_value=module.PersonLink("測試人員", "10", 0),
+                ), \
+                patch.object(module, "open_person_popup"), \
+                patch.object(module, "delete_duplicate_rest_rows", return_value=0), \
+                patch.object(module, "existing_entry_match", return_value=None), \
+                patch.object(module, "fill_and_insert_entry"), \
+                patch.object(module, "close_current_popup"), \
+                patch.object(module, "click_person_save"), \
+                patch.object(module, "quit_driver"):
+            result = module.submit_rest_entries(
+                "user10",
+                "secret",
+                Path("duty.xlsm"),
+                False,
+                status=progress.append,
+                actor_name="測試人員",
+                expected_roc_year=115,
+                expected_month=8,
+            )
+
+        self.assertEqual(result, "完成：新增 1 筆，略過已存在 0 筆，刪除重複休息 0 筆，已按個人儲存。")
+        self.assertEqual(events, ["browser_started", "parse_done"])
+        self.assertTrue(any("同步" in message for message in progress))
+
+    def test_monthly_submission_fetches_plan_while_browser_opens(self) -> None:
+        import rest_time_automation as module
+
+        source_started = threading.Event()
+        browser_started = threading.Event()
+        events: list[str] = []
+        driver = SimpleNamespace()
+        plan = module.MonthlyBasePlan(115, 8, "10", "測試人員", {1: "日"})
+
+        def fetch_plan(*_args, **_kwargs):
+            source_started.set()
+            if not browser_started.wait(timeout=1):
+                raise AssertionError("輪休基準表解析沒有和瀏覽器初始化重疊執行")
+            events.append("source_done")
+            return plan
+
+        def build_driver(*_args, **_kwargs):
+            if not source_started.wait(timeout=1):
+                raise AssertionError("開啟瀏覽器前沒有啟動輪休基準表解析")
+            events.append("browser_started")
+            browser_started.set()
+            return driver
+
+        progress: list[str] = []
+        with patch.object(module, "fetch_monthly_base_plan", side_effect=fetch_plan), \
+                patch.object(module, "validate_selected_year_month"), \
+                patch.object(module, "build_initialized_driver", side_effect=build_driver), \
+                patch.object(module, "select_base_month"), \
+                patch.object(module, "wait_for_person_name_row"), \
+                patch.object(module, "fill_monthly_base_row", return_value=1), \
+                patch.object(module, "click_person_row_save"), \
+                patch.object(module, "quit_driver"):
+            result = module.submit_monthly_base_entries(
+                "user10",
+                "secret",
+                "",
+                False,
+                status=progress.append,
+                actor_name="測試人員",
+                expected_roc_year=115,
+                expected_month=8,
+            )
+
+        self.assertEqual(result, "完成：115年08月 測試人員 已填入 1 格並個人儲存。")
+        self.assertEqual(events, ["browser_started", "source_done"])
+        self.assertTrue(any("同步" in message for message in progress))
+
     def test_qml_rest_monthly_requests_use_name_before_actor_number(self) -> None:
         from app_core.rest_monthly_service import (
             MonthlyBaseRequest,
