@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, QUrl, Signal, Slot
@@ -62,8 +63,10 @@ class RescueVideoController(QObject):
         self._failure_stage = "unknown"
         self._workers: dict[int, tuple[QThread, RescueVideoWorker]] = {}
         self._worker_modes: dict[int, str] = {}
+        self._run_started_at: dict[int, float] = {}
         self._shutting_down = False
         self._last_completed_mode = ""
+        self._last_completed_run_details: dict[str, object] = {}
         self._result_model = RescueVideoResultModel(self)
 
     @Property(str, notify=stateChanged)
@@ -150,6 +153,9 @@ class RescueVideoController(QObject):
     def resultModel(self) -> RescueVideoResultModel:
         return self._result_model
 
+    def completed_run_details(self) -> dict[str, object]:
+        return dict(self._last_completed_run_details)
+
     @Slot()
     def resetForNextSession(self) -> None:
         if self._workers:
@@ -176,6 +182,7 @@ class RescueVideoController(QObject):
         self._pending_request = None
         self._failure_stage = "unknown"
         self._last_completed_mode = ""
+        self._last_completed_run_details = {}
         self._result_model.replace_rows(())
         self.stateChanged.emit()
 
@@ -480,6 +487,8 @@ class RescueVideoController(QObject):
         mode = request.mode if operation == "execute" and request is not None else ""
         self._worker_modes[request_id] = mode
         if mode:
+            self._run_started_at[request_id] = time.monotonic()
+        if mode:
             self._status_text = "執行中，請勿拔除記憶卡或關閉視窗"
         self.stateChanged.emit()
         if mode:
@@ -602,6 +611,7 @@ class RescueVideoController(QObject):
         self._report_path = result.report_path
         mode = self._worker_modes.get(request_id, "")
         self._last_completed_mode = mode
+        self._last_completed_run_details = self._build_completed_run_details(request_id, result)
         if mode == "preview":
             self._has_preview = True
             self._status_text = result.warning_text or "預覽完成"
@@ -615,6 +625,30 @@ class RescueVideoController(QObject):
         self.stateChanged.emit()
         self.runSucceeded.emit(result.summary_text)
 
+    def _build_completed_run_details(
+        self,
+        request_id: int,
+        result: RescueVideoRunResult,
+    ) -> dict[str, object]:
+        started_at = self._run_started_at.pop(request_id, None)
+        usage_seconds = (
+            max(0, round(time.monotonic() - started_at))
+            if started_at is not None
+            else 0
+        )
+        case_names = {
+            str(row.get("caseText") or "").strip()
+            for row in result.rows
+            if str(row.get("caseText") or "").strip() not in {"", "待確認"}
+        }
+        return {
+            "target_date": self._target_date,
+            "vehicle": self._selected_vehicle,
+            "case_count": len(case_names),
+            "total_count": len(result.rows),
+            "usage_seconds": usage_seconds,
+        }
+
     @Slot(int, str)
     def _failed(self, request_id: int, message: str) -> None:
         if request_id == self._request_id:
@@ -625,6 +659,7 @@ class RescueVideoController(QObject):
             worker_pair = self._workers.get(request_id)
             worker = worker_pair[1] if worker_pair is not None else None
             self._failure_stage = str(getattr(worker, "failure_stage", "unknown") or "unknown")
+            self._run_started_at.pop(request_id, None)
             mode = self._worker_modes.get(request_id, "")
             if mode:
                 self.runFailed.emit(mode, message)
@@ -658,6 +693,7 @@ class RescueVideoController(QObject):
             return
         thread, _worker = worker_pair
         mode = self._worker_modes.pop(request_id, "")
+        self._run_started_at.pop(request_id, None)
         thread.deleteLater()
         if (
             not self._shutting_down

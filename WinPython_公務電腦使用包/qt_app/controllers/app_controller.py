@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QApplication
@@ -117,7 +118,7 @@ class AppController(QObject):
         self._operational_sync_workers: dict[int, tuple[QThread, OperationalSyncWorker]] = {}
         self._operational_sync_queue: deque[tuple[int, str, str, dict, dict]] = deque()
         self._operational_sync_shutting_down = False
-        self._active_tool_runs: dict[str, tuple[str, str]] = {}
+        self._active_tool_runs: dict[str, tuple[str, str, str]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
@@ -278,12 +279,7 @@ class AppController(QObject):
             lambda mode: self._tool_run_started("rescue_video", "救護行車紀錄器", mode=mode)
         )
         self._rescue_video_controller.runSucceeded.connect(
-            lambda message: self._tool_run_finished(
-                "rescue_video",
-                "救護行車紀錄器",
-                message,
-                notify=self._rescue_video_controller.lastCompletedMode in {"copy", "delete"},
-            )
+            self._rescue_video_run_succeeded
         )
         self._rescue_video_controller.runFailed.connect(
             lambda mode, message: self._tool_run_failed(
@@ -1907,7 +1903,8 @@ class AppController(QObject):
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
-        self._active_tool_runs[tool_name] = (tool_label, mode)
+        run_id = uuid4().hex if tool_name == "rescue_video" else ""
+        self._active_tool_runs[tool_name] = (tool_label, mode, run_id)
         self._shutdown_terminal_tool_runs.discard(tool_name)
         session = self._session_state.session
         actor_no = self._session_controller.actorNo
@@ -1929,6 +1926,8 @@ class AppController(QObject):
             user_id=self._session_controller.userId,
         )
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        if run_id:
+            snapshot["run_id"] = run_id
         if mode:
             snapshot["mode"] = mode
         self._send_operational_event(
@@ -1945,20 +1944,27 @@ class AppController(QObject):
         message: str,
         *,
         notify: bool = True,
+        snapshot_extra: Mapping[str, object] | None = None,
         allow_during_shutdown: bool = False,
     ) -> None:
         if self._operational_sync_shutting_down and not allow_during_shutdown:
             return
         if tool_name in self._shutdown_terminal_tool_runs:
             return
-        self._active_tool_runs.pop(tool_name, None)
+        active_run = self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "completed", message)
+        snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        run_id = active_run[2] if active_run is not None else ""
+        if run_id:
+            snapshot["run_id"] = run_id
+        if snapshot_extra:
+            snapshot.update(snapshot_extra)
         self._send_operational_event(
             "tool_action_finished",
             status="completed",
             trigger_type="tool_finish",
             content=message,
-            snapshot={"tool_name": tool_name, "tool_label": tool_label},
+            snapshot=snapshot,
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
@@ -1978,9 +1984,12 @@ class AppController(QObject):
             return
         if tool_name in self._shutdown_terminal_tool_runs and not force:
             return
-        self._active_tool_runs.pop(tool_name, None)
+        active_run = self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "failed", message)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        run_id = active_run[2] if active_run is not None else ""
+        if run_id:
+            snapshot["run_id"] = run_id
         failure_stage = self._failure_stage_for_tool(tool_name)
         if failure_stage:
             snapshot["failure_stage"] = failure_stage
@@ -2000,7 +2009,7 @@ class AppController(QObject):
             self._tray_controller.notify("SinpoSmart", message)
 
     def _finalize_active_tool_runs_for_shutdown(self) -> None:
-        for tool_name, (tool_label, mode) in tuple(self._active_tool_runs.items()):
+        for tool_name, (tool_label, mode, _run_id) in tuple(self._active_tool_runs.items()):
             self._shutdown_terminal_tool_runs.add(tool_name)
             self._tool_run_failed(
                 tool_name,
@@ -2011,6 +2020,15 @@ class AppController(QObject):
                 force=True,
                 allow_during_shutdown=True,
             )
+
+    def _rescue_video_run_succeeded(self, message: str) -> None:
+        self._tool_run_finished(
+            "rescue_video",
+            "救護行車紀錄器",
+            message,
+            notify=self._rescue_video_controller.lastCompletedMode in {"copy", "delete"},
+            snapshot_extra=self._rescue_video_controller.completed_run_details(),
+        )
 
     def _failure_stage_for_tool(self, tool_name: str) -> str:
         controllers = {

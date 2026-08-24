@@ -483,6 +483,45 @@ class RescueVideoPackageTests(unittest.TestCase):
         controller._set_error("請插入單張記憶卡後再檢查。")
         self.assertEqual(controller.errorText, "請插入單張記憶卡後再檢查。")
 
+    def test_completed_rescue_video_run_exposes_backend_summary(self) -> None:
+        if str(PACKAGE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PACKAGE_ROOT))
+        from app_core.rescue_video_service import RescueVideoRunResult
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._target_date = "2026-08-24"
+        controller._selected_vehicle = "92"
+        controller._request_id = 1
+        controller._worker_modes[1] = "copy"
+        controller._run_started_at[1] = 100.0
+        result = RescueVideoRunResult(
+            summary_text="複製完成",
+            warning_text="",
+            report_path="report.csv",
+            rows=(
+                {"caseText": "08240801-92"},
+                {"caseText": "08240801-92"},
+                {"caseText": "08240930-92"},
+                {"caseText": "待確認"},
+                {},
+            ),
+        )
+
+        with mock.patch("qt_app.controllers.rescue_video_controller.time.monotonic", return_value=165.4):
+            controller._run_succeeded(1, result)
+
+        self.assertEqual(
+            controller.completed_run_details(),
+            {
+                "target_date": "2026-08-24",
+                "vehicle": "92",
+                "case_count": 2,
+                "total_count": 5,
+                "usage_seconds": 65,
+            },
+        )
+
     def test_cross_day_video_interval_matches_both_dates(self) -> None:
         classifier = self._classifier_module()
         video_start = datetime(2026, 8, 8, 23, 57)

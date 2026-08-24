@@ -12516,6 +12516,85 @@ if return_code != 0 or loaded:
         self.assertEqual(operational_sync.events[1][1]["error"], "工具執行失敗")
         self.assertTrue(controller.toolController.usage("duty_sheet")["report"].endswith("勤務表失敗"))
 
+    def test_rescue_video_events_keep_each_run_and_completed_summary(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+            def sync_board_async(self, _schedule_data):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            operational_sync = FakeOperationalSyncService()
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                operational_sync_service=operational_sync,
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            try:
+                rescue_video = controller.rescueVideoController
+                rescue_video._last_completed_mode = "copy"
+
+                rescue_video.runStarted.emit("copy")
+                rescue_video._last_completed_run_details = {
+                    "target_date": "2026-08-24",
+                    "vehicle": "92",
+                    "case_count": 2,
+                    "total_count": 5,
+                    "usage_seconds": 65,
+                }
+                rescue_video.runSucceeded.emit("第一次複製完成")
+
+                rescue_video.runStarted.emit("copy")
+                rescue_video._last_completed_run_details = {
+                    "target_date": "2026-08-24",
+                    "vehicle": "92",
+                    "case_count": 1,
+                    "total_count": 2,
+                    "usage_seconds": 30,
+                }
+                rescue_video.runSucceeded.emit("第二次複製完成")
+            finally:
+                controller.shutdown()
+
+        self.assertEqual(
+            [record_type for record_type, _fields in operational_sync.events],
+            [
+                "tool_action_started",
+                "tool_action_finished",
+                "tool_action_started",
+                "tool_action_finished",
+            ],
+        )
+        first_start, first_finished, second_start, second_finished = [
+            fields for _record_type, fields in operational_sync.events
+        ]
+        self.assertEqual(first_start["snapshot"]["run_id"], first_finished["snapshot"]["run_id"])
+        self.assertEqual(second_start["snapshot"]["run_id"], second_finished["snapshot"]["run_id"])
+        self.assertNotEqual(first_start["snapshot"]["run_id"], second_start["snapshot"]["run_id"])
+        self.assertEqual(
+            first_finished["snapshot"],
+            {
+                "tool_name": "rescue_video",
+                "tool_label": "救護行車紀錄器",
+                "run_id": first_start["snapshot"]["run_id"],
+                "target_date": "2026-08-24",
+                "vehicle": "92",
+                "case_count": 2,
+                "total_count": 5,
+                "usage_seconds": 65,
+            },
+        )
+        self.assertEqual(second_finished["snapshot"]["total_count"], 2)
+
     def test_tool_failure_event_includes_browser_detail_for_nas_backend(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from qt_app.controllers.app_controller import AppController
