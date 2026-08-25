@@ -114,9 +114,7 @@ class RestEntry:
 
     @property
     def hours(self) -> int:
-        start_abs = self.start_day * 24 + self.start_hour
-        end_abs = self.end_day * 24 + self.end_hour
-        return end_abs - start_abs
+        return duty_relative_hour(self.end_hour) - duty_relative_hour(self.start_hour)
 
     def summary(self) -> str:
         return f"勤務{self.duty_day:02d}日：{self.start_day:02d}日 {self.start_hour:02d}:00-{self.end_day:02d}日 {self.end_hour:02d}:00，共 {self.hours} 小時"
@@ -943,9 +941,9 @@ def group_rest_entries(hours_by_day: dict[int, list[tuple[int, int]]], days: int
             if duty_relative_hour(next_start) == duty_relative_hour(end):
                 end = next_end
             else:
-                entries.append(build_entry(duty_day, start, end))
+                entries.append(build_entry(duty_day, start, end, days))
                 start, end = next_start, next_end
-        entries.append(build_entry(duty_day, start, end))
+        entries.append(build_entry(duty_day, start, end, days))
     return entries
 
 
@@ -953,9 +951,10 @@ def duty_relative_hour(hour: int) -> int:
     return hour if hour >= 8 else hour + 24
 
 
-def build_entry(duty_day: int, start_hour: int, end_hour: int) -> RestEntry:
-    start_day = duty_day + 1 if start_hour < 8 else duty_day
-    end_day = duty_day + 1 if end_hour <= 8 else duty_day
+def build_entry(duty_day: int, start_hour: int, end_hour: int, days: int) -> RestEntry:
+    next_day = 1 if duty_day == days else duty_day + 1
+    start_day = next_day if start_hour < 8 else duty_day
+    end_day = next_day if end_hour <= 8 else duty_day
     return RestEntry(duty_day, start_day, start_hour, end_day, end_hour)
 
 

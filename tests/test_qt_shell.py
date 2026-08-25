@@ -3287,6 +3287,22 @@ class RestMonthlyServiceTests(unittest.TestCase):
         self.assertEqual(events, ["browser_started", "parse_done"])
         self.assertTrue(any("同步" in message for message in progress))
 
+    def test_rest_entry_wraps_from_last_fire_day_to_next_month_first_day(self) -> None:
+        import rest_time_automation as module
+
+        self.assertEqual(
+            module.group_rest_entries({31: [(6, 8)]}, days=31),
+            [module.RestEntry(31, 1, 6, 1, 8)],
+        )
+
+    def test_last_fire_day_overnight_rest_keeps_duration_after_month_wrap(self) -> None:
+        import rest_time_automation as module
+
+        entries = module.group_rest_entries({31: [(22, 24), (0, 2)]}, days=31)
+
+        self.assertEqual(entries, [module.RestEntry(31, 31, 22, 1, 2)])
+        self.assertEqual(entries[0].hours, 4)
+
     def test_monthly_submission_fetches_plan_while_browser_opens(self) -> None:
         import rest_time_automation as module
 
