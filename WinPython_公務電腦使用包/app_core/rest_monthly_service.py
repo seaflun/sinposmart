@@ -161,13 +161,21 @@ class RestMonthlyService:
             workbook_path=str(workbook) if workbook else "",
         )
 
-    def load_monthly_defaults(self, today: date | None = None) -> RestMonthlyDefaults:
-        roc_year, current_month = self._current_roc_year_month(today)
-        month_options = self._nearby_months(current_month)
+    def load_monthly_defaults(self) -> RestMonthlyDefaults:
+        legacy = self._legacy()
+        try:
+            roc_year, month = legacy.fetch_monthly_base_source_month()
+            self._validate_year_month(roc_year, month)
+        except Exception as exc:
+            raise RestMonthlyExecutionError(
+                self._format_error(legacy, exc, "無法讀取 Google 試算表月份。"),
+                failure_stage="source_load",
+                failure_detail=self._failure_detail(exc),
+            ) from exc
         return RestMonthlyDefaults(
-            roc_year=roc_year,
-            month_options=tuple(f"{month:02d}" for month in month_options),
-            selected_month=f"{current_month:02d}",
+            roc_year=int(roc_year),
+            month_options=(),
+            selected_month=f"{int(month):02d}",
         )
 
     def validate_rest(self, request: RestTimeRequest) -> RestTimeRequest:

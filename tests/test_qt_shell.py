@@ -3116,26 +3116,65 @@ class RestMonthlyServiceTests(unittest.TestCase):
             self.assertEqual(defaults.workbook_path, str(workbook.resolve()))
             self.assertEqual(legacy_loads, [])
 
-    def test_monthly_defaults_offer_previous_current_next_with_current_selected(self) -> None:
+    def test_monthly_defaults_read_year_month_from_google_source(self) -> None:
         from datetime import date
+        from types import SimpleNamespace
 
         from app_core.rest_monthly_service import RestMonthlyService
 
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
-            (package_root / "rest_time_automation_config.json").write_text(
-                json.dumps({"rest_month": "07", "monthly_base_month": "09"}),
+            (package_root / "rest_time_automation.py").write_text(
+                "# placeholder\n",
                 encoding="utf-8",
             )
-            service = RestMonthlyService(package_root)
+            source_reads: list[bool] = []
+            legacy = SimpleNamespace(
+                fetch_monthly_base_source_month=lambda: (source_reads.append(True) or (115, 9)),
+            )
+            service = RestMonthlyService(
+                package_root,
+                module_loader=lambda _path: legacy,
+            )
 
             rest_defaults = service.load_rest_defaults(date(2026, 8, 5))
-            monthly_defaults = service.load_monthly_defaults(date(2026, 8, 5))
+            monthly_defaults = service.load_monthly_defaults()
 
             self.assertEqual(rest_defaults.month_options, ("07", "08", "09"))
-            self.assertEqual(monthly_defaults.month_options, ("07", "08", "09"))
             self.assertEqual(rest_defaults.selected_month, "08")
-            self.assertEqual(monthly_defaults.selected_month, "08")
+            self.assertEqual(source_reads, [True])
+            self.assertEqual(monthly_defaults.roc_year, 115)
+            self.assertEqual(monthly_defaults.month_options, ())
+            self.assertEqual(monthly_defaults.selected_month, "09")
+
+    def test_monthly_defaults_report_an_invalid_google_source_month(self) -> None:
+        from types import SimpleNamespace
+
+        from app_core.rest_monthly_service import (
+            RestMonthlyExecutionError,
+            RestMonthlyService,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            (package_root / "rest_time_automation.py").write_text(
+                "# placeholder\n",
+                encoding="utf-8",
+            )
+            legacy = SimpleNamespace(
+                fetch_monthly_base_source_month=lambda: (115, 13),
+                format_automation_error=lambda exc: str(exc),
+            )
+            service = RestMonthlyService(
+                package_root,
+                module_loader=lambda _path: legacy,
+            )
+
+            with self.assertRaises(RestMonthlyExecutionError) as raised:
+                service.load_monthly_defaults()
+
+        self.assertEqual(raised.exception.failure_stage, "source_load")
+        self.assertIn("正確的民國年月", str(raised.exception))
 
     def test_default_rest_workbook_matches_legacy_xlsm_only_fallback(self) -> None:
         from datetime import date
@@ -3422,6 +3461,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
             legacy = SimpleNamespace(
                 submit_rest_entries=lambda *_args, **_kwargs: "休息時間完成",
                 submit_monthly_base_entries=lambda *_args, **_kwargs: "勤務基準表完成",
+                fetch_monthly_base_source_month=lambda: (115, 7),
                 format_automation_error=lambda exc: str(exc),
             )
             service = RestMonthlyService(package_root, module_loader=lambda _path: legacy)
@@ -3433,7 +3473,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
             restarted = RestMonthlyService(package_root, module_loader=lambda _path: legacy)
             rest_defaults = restarted.load_rest_defaults(date(2026, 7, 29))
-            monthly_defaults = restarted.load_monthly_defaults(date(2026, 7, 29))
+            monthly_defaults = restarted.load_monthly_defaults()
             saved = json.loads(
                 (package_root / "rest_time_automation_config.json").read_text(encoding="utf-8")
             )
@@ -7097,12 +7137,12 @@ class QtShellTests(unittest.TestCase):
             'objectName: "monthlySourceOpenButton"',
             'text: "開啟試算表"',
             'Qt.openUrlExternally("https://docs.google.com/spreadsheets/d/1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0/edit#gid=1587057625")',
-            'text: "年月"',
-            'text: "年"',
-            'text: "月"',
-            'objectName: "monthlyMonthCombo"',
+            'text: "Google 試算表月份"',
+            'objectName: "monthlySourceMonthLabel"',
+            'text: monthlyBaseDialog.controller.monthlySourcePeriod',
             'objectName: "monthlyBaseRunButton"',
             'text: monthlyBaseDialog.controller.isRunning ? "啟動中..." : "啟動登打"',
+            'onClicked: monthlyBaseDialog.controller.prepareMonthlyRun()',
             'objectName: "monthlyBaseStatusBar"',
             'toolId: "monthly_base"',
             "currentOperatorOnly: true",
@@ -7114,6 +7154,9 @@ class QtShellTests(unittest.TestCase):
             "ToolUsageCard {",
             "資料來源：Google 勤務基準表",
             "人員：",
+            'objectName: "monthlyMonthCombo"',
+            "ToolMonthCombo {",
+            "prepareMonthlyRun(monthlyMonthCombo.currentText)",
         ):
             self.assertNotIn(unauthorized, panel)
         self.assertNotIn('objectName: "monthlyBaseCloseButton"', panel)
@@ -9108,7 +9151,7 @@ if return_code != 0 or loaded:
                 return RestMonthlyDefaults(115, ("06", "07", "08"), "07", "duty.xlsm")
 
             def load_monthly_defaults(self):
-                return RestMonthlyDefaults(115, ("06", "07", "08"), "07")
+                return RestMonthlyDefaults(115, (), "09")
 
             def select_rest_workbook(self, path):
                 return RestMonthlyDefaults(115, ("06", "07", "08"), "08", path)
@@ -9163,10 +9206,17 @@ if return_code != 0 or loaded:
         self.assertEqual(success_spy.at(0)[0], "rest_time")
         self.assertFalse(controller._workers)
 
-        controller.prepareMonthlyRun("06")
+        controller.loadMonthlyDefaults()
+        for _ in range(20):
+            if controller.monthlySourceReady:
+                break
+            QTest.qWait(50)
+        self.assertTrue(controller.monthlySourceReady)
+        self.assertEqual(controller.monthlySourcePeriod, "115年09月")
+        controller.prepareMonthlyRun()
         self.assertEqual(confirmation_spy.count(), 2)
         self.assertEqual(confirmation_spy.at(1)[0], "monthly_base")
-        self.assertEqual(controller.monthlyMonth, "06")
+        self.assertEqual(controller.monthlyMonth, "09")
         controller.cancelPendingRun()
 
     def test_rest_monthly_qml_rejects_a_session_without_actor_name(self) -> None:
@@ -9184,7 +9234,7 @@ if return_code != 0 or loaded:
         controller = RestMonthlyController(state, object())
         errors = QSignalSpy(controller.errorOccurred)
 
-        controller.prepareMonthlyRun("08")
+        controller.prepareMonthlyRun()
 
         self.assertEqual(errors.count(), 1)
         self.assertIn("姓名", errors.at(0)[0])
@@ -16153,7 +16203,7 @@ if return_code != 0 or loaded:
                 return RestMonthlyDefaults(115, ("06", "07", "08"), "07", "")
 
             def load_monthly_defaults(self):
-                return RestMonthlyDefaults(115, ("06", "07", "08"), "07", "")
+                return RestMonthlyDefaults(115, (), "09", "")
 
             def validate_rest(self, request):
                 return request
@@ -17037,10 +17087,14 @@ if return_code != 0 or loaded:
                 click(wait_for("quickMonthlyBaseToolButton"))
                 monthly_run_button = wait_for("monthlyBaseRunButton")
                 monthly_status_bar = wait_for("monthlyBaseStatusBar")
-                monthly_month_combo = wait_for("monthlyMonthCombo")
+                monthly_source_month_label = wait_for("monthlySourceMonthLabel")
                 monthly_source_label = wait_for("monthlySourceLabel")
                 monthly_source_title = wait_for("monthlySourceTitle")
                 monthly_source_open_button = wait_for("monthlySourceOpenButton")
+                wait_until(
+                    lambda: controller.restMonthlyController.monthlySourceReady,
+                    "勤務基準表未讀取 Google 試算表月份",
+                )
                 self.assertEqual(monthly_run_button.property("text"), "啟動登打")
                 self.assertEqual(monthly_status_bar.property("text"), "準備就緒。10番 驗收人員")
                 self.assertEqual(
@@ -17049,9 +17103,8 @@ if return_code != 0 or loaded:
                 )
                 self.assertTrue(monthly_source_open_button.isEnabled())
                 self.assertGreaterEqual(monthly_source_open_button.width(), 112)
-                self.assertEqual((monthly_month_combo.width(), monthly_month_combo.height()), (78, 30))
+                self.assertEqual(monthly_source_month_label.property("text"), "115年09月")
                 self.assertEqual(monthly_source_title.property("font").pixelSize(), 15)
-                self.assertGreater(monthly_month_combo.property("contentItem").width(), 0)
                 self.assertLess(monthly_status_bar.y(), monthly_run_button.y())
                 click(monthly_run_button)
                 monthly_confirmation = root.findChild(QObject, "restMonthlyConfirmation")
@@ -17063,6 +17116,7 @@ if return_code != 0 or loaded:
                     and not controller.restMonthlyController._workers,
                     "勤務基準表 QML 執行鍵未完成 worker 呼叫",
                 )
+                self.assertEqual(rest_monthly_service.monthly_requests[0].month, 9)
                 wait_until(
                     lambda: not monthly_confirmation.property("visible")
                     and root.findChild(QObject, "monthlyBaseDialog").property("visible")

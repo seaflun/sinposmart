@@ -13,6 +13,37 @@ from app_core.rest_monthly_service import (
 )
 
 
+class MonthlyBaseSourceWorker(QObject):
+    succeeded = Signal(int, int, str)
+    failed = Signal(int, str)
+    finished = Signal(int)
+
+    def __init__(self, request_id: int, service: RestMonthlyService) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.service = service
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            defaults = self.service.load_monthly_defaults()
+        except RestMonthlyExecutionError as exc:
+            self.failed.emit(self.request_id, str(exc))
+        except Exception:
+            self.failed.emit(
+                self.request_id,
+                "無法讀取 Google 試算表月份，請確認網路與試算表後重試。",
+            )
+        else:
+            self.succeeded.emit(
+                self.request_id,
+                int(defaults.roc_year),
+                str(defaults.selected_month),
+            )
+        finally:
+            self.finished.emit(self.request_id)
+
+
 class RestMonthlyWorker(QObject):
     progress = Signal(int, str, str)
     succeeded = Signal(int, str, str)

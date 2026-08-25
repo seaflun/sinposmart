@@ -510,7 +510,7 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)", source)
         self.assertLess(
             source.index("capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)"),
-            source.index("driver = retry_duty_browser_session_open("),
+            source.index("driver = retry_duty_number_popup_preflight("),
         )
 
     def test_external_duty_followed_by_rest_returns_before_rest_starts(self) -> None:
@@ -2202,6 +2202,101 @@ class PackageSmokeTests(unittest.TestCase):
 
         factory.assert_called_once_with()
         cleanup.assert_called_once_with(driver)
+
+    def test_duty_number_popup_preflight_rebuilds_once_before_writes(self) -> None:
+        module = legacy_duty_sheet_module()
+        first_driver = object()
+        second_driver = object()
+        opened: list[object] = []
+        cleaned: list[object] = []
+        attempts: list[object] = []
+
+        def open_browser() -> object:
+            driver = first_driver if not opened else second_driver
+            opened.append(driver)
+            return driver
+
+        def preflight(driver: object) -> None:
+            attempts.append(driver)
+            if driver is first_driver:
+                raise module.DutyNumberPopupOpenError(
+                    {"button_found": True, "window_count_before": 1, "window_count_after": 1}
+                )
+
+        result = module.retry_duty_number_popup_preflight(
+            open_browser,
+            preflight,
+            cleanup=cleaned.append,
+        )
+
+        self.assertIs(result, second_driver)
+        self.assertEqual(opened, [first_driver, second_driver])
+        self.assertEqual(attempts, [first_driver, second_driver])
+        self.assertEqual(cleaned, [first_driver])
+
+    def test_duty_number_popup_preflight_stops_after_second_failure(self) -> None:
+        module = legacy_duty_sheet_module()
+        first_driver = object()
+        second_driver = object()
+        opened: list[object] = []
+        cleaned: list[object] = []
+
+        def open_browser() -> object:
+            driver = first_driver if not opened else second_driver
+            opened.append(driver)
+            return driver
+
+        def preflight(_driver: object) -> None:
+            raise module.DutyNumberPopupOpenError(
+                {"button_found": False, "window_count_before": 1, "window_count_after": 1}
+            )
+
+        with self.assertRaises(module.DutyNumberPopupOpenError) as caught:
+            module.retry_duty_number_popup_preflight(
+                open_browser,
+                preflight,
+                cleanup=cleaned.append,
+            )
+
+        self.assertEqual(opened, [first_driver, second_driver])
+        self.assertEqual(cleaned, [first_driver, second_driver])
+        self.assertIn("預檢重試：2/2", str(caught.exception))
+        self.assertIn("未開始勤務表刪除、填寫或儲存", str(caught.exception))
+
+    def test_duty_sheet_popup_setup_happens_before_existing_data_delete(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index("def start_automation(")
+        flow = source[start:source.index("# ==========================================\n# [區塊七]", start)]
+
+        self.assertLess(flow.index("step_config_popups("), flow.index('"_btnDelete", "exists"'))
+        self.assertIn("retry_duty_number_popup_preflight(", flow)
+        self.assertIn("duty_number_popup_preflight", flow)
+
+    def test_duty_number_popup_waits_for_a_new_handle_without_double_clicking(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index("def _click_duty_number_popup_button(")
+        end = source.index("def preflight_duty_number_popup(", start)
+        popup_source = source[start:end]
+
+        self.assertIn("handle for handle in candidate.window_handles if handle not in before_handles", popup_source)
+        self.assertIn("element.click();", popup_source)
+        self.assertNotIn("element.onclick()", popup_source)
+
+    def test_external_popup_failure_stops_before_external_settings_are_written(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+
+        with mock.patch.object(module, "save_duty_number_popup"), mock.patch.object(
+            module, "step_prepare_content", return_value=True
+        ), mock.patch.object(module, "super_js_execute", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "外勤設定按鈕未就緒"):
+                module.step_config_popups(driver, mock.Mock(), ["防溺車巡"], "2", "main")
+
+        driver.find_element.assert_not_called()
 
     def test_visible_driver_is_positioned_at_top_right_without_explicit_position(self) -> None:
         module = duty_rehearsal_module()

@@ -12,7 +12,7 @@ from app_core.rest_monthly_service import (
     RestTimeRequest,
 )
 from app_core.session import SessionState
-from qt_app.workers.rest_monthly_worker import RestMonthlyWorker
+from qt_app.workers.rest_monthly_worker import MonthlyBaseSourceWorker, RestMonthlyWorker
 
 
 class RestMonthlyController(QObject):
@@ -37,6 +37,8 @@ class RestMonthlyController(QObject):
         self._month_options: list[str] = []
         self._rest_month = ""
         self._monthly_month = ""
+        self._monthly_source_loading = False
+        self._monthly_source_ready = False
         self._status_text = "尚未載入設定"
         self._confirmation_summary = ""
         self._pending_request: RestTimeRequest | MonthlyBaseRequest | None = None
@@ -45,6 +47,8 @@ class RestMonthlyController(QObject):
         self._failure_stage = "unknown"
         self._failure_detail = ""
         self._workers: dict[int, tuple[QThread, RestMonthlyWorker]] = {}
+        self._monthly_source_request_id = 0
+        self._monthly_source_workers: dict[int, tuple[QThread, MonthlyBaseSourceWorker]] = {}
         self._shutdown_admission = False
 
     @Property(str, notify=stateChanged)
@@ -66,6 +70,18 @@ class RestMonthlyController(QObject):
     @Property(str, notify=stateChanged)
     def monthlyMonth(self) -> str:
         return self._monthly_month
+
+    @Property(str, notify=stateChanged)
+    def monthlySourcePeriod(self) -> str:
+        if self._monthly_source_loading:
+            return "正在讀取 Google 試算表月份…"
+        if self._monthly_source_ready:
+            return f"{self._roc_year}年{self._monthly_month}月"
+        return "尚未讀取 Google 試算表月份"
+
+    @Property(bool, notify=stateChanged)
+    def monthlySourceReady(self) -> bool:
+        return self._monthly_source_ready
 
     @Property(str, notify=stateChanged)
     def statusText(self) -> str:
@@ -99,12 +115,26 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def loadMonthlyDefaults(self) -> None:
-        defaults = self._service.load_monthly_defaults()
-        self._roc_year = defaults.roc_year
-        self._month_options = list(defaults.month_options)
-        self._monthly_month = defaults.selected_month
-        self._status_text = self._ready_status()
+        if self._shutdown_admission or self._monthly_source_workers:
+            return
+        self._monthly_source_request_id += 1
+        request_id = self._monthly_source_request_id
+        self._monthly_source_loading = True
+        self._monthly_source_ready = False
+        self._roc_year = 0
+        self._monthly_month = ""
+        self._status_text = "正在讀取 Google 試算表月份…"
+        worker = MonthlyBaseSourceWorker(request_id, self._service)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._monthly_source_succeeded)
+        worker.failed.connect(self._monthly_source_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._monthly_source_finished)
+        self._monthly_source_workers[request_id] = (thread, worker)
         self.stateChanged.emit()
+        thread.start()
 
     @Slot(QUrl, result=str)
     def localPath(self, url: QUrl) -> str:
@@ -148,10 +178,13 @@ class RestMonthlyController(QObject):
         self._rest_month = f"{request.month:02d}"
         self._prepare_confirmation("rest_time", request)
 
-    @Slot(str)
-    def prepareMonthlyRun(self, month: str) -> None:
+    @Slot()
+    def prepareMonthlyRun(self) -> None:
         session = self._verified_session()
         if session is None:
+            return
+        if not self._monthly_source_ready:
+            self._set_error("尚未取得 Google 試算表月份，請稍候或重新開啟勤務基準表工具。")
             return
         try:
             request = self._service.validate_monthly(
@@ -160,7 +193,7 @@ class RestMonthlyController(QObject):
                     session.password,
                     session.actor_no,
                     self._roc_year,
-                    int(month),
+                    int(self._monthly_month),
                     session.actor_name,
                 )
             )
@@ -272,6 +305,55 @@ class RestMonthlyController(QObject):
             self.runFailed.emit(tool_id, message)
             self._set_error(message)
 
+    @Slot(int, int, str)
+    def _monthly_source_succeeded(self, request_id: int, roc_year: int, month: str) -> None:
+        if request_id not in self._monthly_source_workers:
+            return
+        self._roc_year = int(roc_year)
+        self._monthly_month = f"{int(month):02d}"
+        self._monthly_source_ready = True
+        self._status_text = self._ready_status()
+        self.stateChanged.emit()
+
+    @Slot(int, str)
+    def _monthly_source_failed(self, request_id: int, message: str) -> None:
+        if request_id not in self._monthly_source_workers:
+            return
+        self._monthly_source_ready = False
+        self._set_error(message or "無法讀取 Google 試算表月份。")
+
+    @Slot(int)
+    def _monthly_source_finished(self, request_id: int) -> None:
+        worker_pair = self._monthly_source_workers.get(request_id)
+        if worker_pair is None:
+            return
+        self._monthly_source_loading = False
+        thread, _worker = worker_pair
+        thread.quit()
+        if not thread.wait(5_000):
+            self._poll_monthly_source_thread_finished(request_id)
+            return
+        self._finalize_monthly_source_thread(request_id)
+
+    def _poll_monthly_source_thread_finished(self, request_id: int) -> None:
+        worker_pair = self._monthly_source_workers.get(request_id)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        if not thread.isFinished():
+            QTimer.singleShot(50, lambda: self._poll_monthly_source_thread_finished(request_id))
+            return
+        self._finalize_monthly_source_thread(request_id)
+
+    def _finalize_monthly_source_thread(self, request_id: int) -> None:
+        worker_pair = self._monthly_source_workers.pop(request_id, None)
+        if worker_pair is None:
+            return
+        thread, _worker = worker_pair
+        self._monthly_source_loading = bool(self._monthly_source_workers)
+        thread.deleteLater()
+        self.stateChanged.emit()
+
     @Slot(int)
     def _worker_finished(self, request_id: int) -> None:
         worker_pair = self._workers.get(request_id)
@@ -309,6 +391,12 @@ class RestMonthlyController(QObject):
     @Slot()
     def shutdown(self) -> None:
         self.prepare_shutdown_admission()
+        for request_id, (thread, _worker) in tuple(self._monthly_source_workers.items()):
+            thread.requestInterruption()
+            thread.quit()
+            if not thread.wait(120_000):
+                thread.wait()
+            self._finalize_monthly_source_thread(request_id)
         for request_id, (thread, _worker) in tuple(self._workers.items()):
             thread.requestInterruption()
             thread.quit()

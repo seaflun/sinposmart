@@ -1068,27 +1068,248 @@ def read_duty_number_leave_rows(driver):
         }).filter(Boolean);
     """) or []
 
-def step_config_popups(driver, wait, out_duty_names, daily_commander, daily_standby_numbers, excluded_numbers):
+class DutyNumberPopupOpenError(RuntimeError):
+    """The read-only duty-number popup preflight did not reach a usable window."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = dict(diagnostic or {})
+        super().__init__()
+
+    def __str__(self):
+        diagnostic = self.diagnostic
+        yes_no = lambda value: "是" if value is True else "否" if value is False else "未知"
+        retry_count = diagnostic.get("attempt", 1)
+        retry_total = diagnostic.get("attempts", 2)
+        return (
+            "勤務番號設定視窗未開啟，已停止登打。"
+            f"（按鈕：{yes_no(diagnostic.get('button_found'))}；"
+            f"可見：{yes_no(diagnostic.get('button_visible'))}；"
+            f"可用：{yes_no(diagnostic.get('button_enabled'))}；"
+            f"已點擊：{yes_no(diagnostic.get('click_dispatched'))}；"
+            f"視窗：{diagnostic.get('window_count_before', '?')}→{diagnostic.get('window_count_after', '?')}；"
+            f"預檢重試：{retry_count}/{retry_total}；未開始勤務表刪除、填寫或儲存。）"
+        )
+
+
+def _click_duty_number_popup_button(driver):
+    return driver.execute_script(r"""
+        const targetId = arguments[0];
+        function findById(win) {
+            let element = null;
+            try { element = win.document.getElementById(targetId); } catch (error) {}
+            if (element) return element;
+            for (let index = 0; index < win.frames.length; index += 1) {
+                try {
+                    const nested = findById(win.frames[index]);
+                    if (nested) return nested;
+                } catch (error) {}
+            }
+            return null;
+        }
+        const element = findById(window.top);
+        if (!element) {
+            return {button_found: false, button_visible: false, button_enabled: false, click_dispatched: false};
+        }
+        const style = element.ownerDocument.defaultView.getComputedStyle(element);
+        const visible = element.getClientRects().length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        const enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+        if (!visible || !enabled) {
+            return {button_found: true, button_visible: visible, button_enabled: enabled, click_dispatched: false};
+        }
+        element.click();
+        return {button_found: true, button_visible: true, button_enabled: true, click_dispatched: true};
+    """, "_btnOpenWinUserNo") or {}
+
+
+def _duty_number_popup_window_count(driver, fallback=0):
+    try:
+        return len(driver.window_handles)
+    except Exception:
+        return fallback
+
+
+def open_duty_number_popup(driver, wait):
+    diagnostic = {}
+    try:
+        before_handles = list(driver.window_handles)
+        diagnostic["window_count_before"] = len(before_handles)
+        diagnostic.update(_click_duty_number_popup_button(driver))
+    except Exception as error:
+        diagnostic["click_error"] = type(error).__name__
+        diagnostic.setdefault("window_count_before", 0)
+        diagnostic.setdefault("window_count_after", diagnostic["window_count_before"])
+        raise DutyNumberPopupOpenError(diagnostic) from error
+
+    if not all(
+        diagnostic.get(key) is True
+        for key in ("button_found", "button_visible", "button_enabled", "click_dispatched")
+    ):
+        diagnostic["window_count_after"] = _duty_number_popup_window_count(
+            driver,
+            diagnostic["window_count_before"],
+        )
+        raise DutyNumberPopupOpenError(diagnostic)
+
+    try:
+        popup_handles = wait.until(
+            lambda candidate: [
+                handle for handle in candidate.window_handles if handle not in before_handles
+            ]
+            or False
+        )
+    except Exception as error:
+        diagnostic["window_count_after"] = _duty_number_popup_window_count(
+            driver,
+            diagnostic["window_count_before"],
+        )
+        diagnostic["popup_wait_error"] = type(error).__name__
+        raise DutyNumberPopupOpenError(diagnostic) from error
+
+    popup_handle = popup_handles[0]
+    try:
+        driver.switch_to.window(popup_handle)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "_btnSave")))
+    except Exception as error:
+        diagnostic["window_count_after"] = _duty_number_popup_window_count(
+            driver,
+            diagnostic["window_count_before"],
+        )
+        diagnostic["popup_ready_error"] = type(error).__name__
+        raise DutyNumberPopupOpenError(diagnostic) from error
+
+    diagnostic["window_count_after"] = _duty_number_popup_window_count(
+        driver,
+        diagnostic["window_count_before"],
+    )
+    return popup_handle, diagnostic
+
+
+def preflight_duty_number_popup(driver, wait, daily_standby_numbers, excluded_numbers):
     main_window = driver.current_window_handle
-    
-    # --- 1. 設定外勤項目 ---
+    _popup_handle, diagnostic = open_duty_number_popup(driver, wait)
+    time.sleep(1.5)
+    log_status("➡️ 輪休查找：比對每日備勤人員上班日...")
+    try:
+        leave_rows = read_duty_number_leave_rows(driver)
+    except Exception as error:
+        diagnostic["window_count_after"] = _duty_number_popup_window_count(
+            driver,
+            diagnostic["window_count_before"],
+        )
+        diagnostic["popup_read_error"] = type(error).__name__
+        raise DutyNumberPopupOpenError(diagnostic) from error
+    leave_issues = validate_daily_standby_against_duty_number_leave_types(
+        daily_standby_numbers,
+        leave_rows,
+        excluded_numbers,
+    )
+    if leave_issues:
+        detail = "\n".join(leave_issues[:20])
+        log_status(f"❌ 輪休查找未通過，共 {len(leave_issues)} 項，已停止登打")
+        raise RuntimeError(
+            "Excel 每日備勤與勤務番號維護休假別不一致，已停止登打。\n" + detail
+        )
+    log_status("✅ 輪休查找通過：每日備勤人員休假別均為空白")
+    return main_window
+
+
+def retry_duty_number_popup_preflight(open_browser, preflight, cleanup=quit_driver, attempts=2):
+    popup_attempts = max(1, min(int(attempts), 2))
+    for attempt in range(1, popup_attempts + 1):
+        driver = None
+        try:
+            driver = open_browser()
+            preflight(driver)
+        except DutyNumberPopupOpenError as error:
+            error.diagnostic["attempt"] = attempt
+            error.diagnostic["attempts"] = popup_attempts
+            if driver is not None:
+                try:
+                    cleanup(driver)
+                except Exception:
+                    pass
+            if attempt < popup_attempts:
+                log_status("⚠️ 勤務番號小視窗預檢未通過，將以全新瀏覽器安全重試一次...")
+                continue
+            raise
+        except Exception:
+            if driver is not None:
+                try:
+                    cleanup(driver)
+                except Exception:
+                    pass
+            raise
+        if attempt > 1:
+            log_status("✅ 勤務番號小視窗預檢已在全新瀏覽器恢復")
+        return driver
+    raise RuntimeError("勤務番號小視窗預檢未取得瀏覽器。")
+
+
+def save_duty_number_popup(driver, wait, daily_commander):
+    js_select_v2 = f"""
+    (function() {{
+        var commanderNo = "{daily_commander}".trim();
+        var bossNo = "1";
+        var allCbs = document.querySelectorAll('input[type="checkbox"]');
+        for (var a = 0; a < allCbs.length; a++) {{ allCbs[a].checked = false; }}
+        var rows = document.querySelectorAll('tr');
+        for (var i = 0; i < rows.length; i++) {{
+            var cells = rows[i].getElementsByTagName('td');
+            if (cells.length < 4) continue;
+            var inputNo = rows[i].querySelector('input[name^="_DESIGNATION"]');
+            if (inputNo) {{
+                var currentVal = inputNo.value.trim();
+                var cbs = rows[i].querySelectorAll('input[type="checkbox"]');
+                if (cbs.length < 2) continue;
+                if (currentVal === bossNo || currentVal === "01") cbs[1].checked = true;
+                if (commanderNo !== "" && (currentVal === commanderNo || currentVal === ("0"+commanderNo).slice(-2))) cbs[0].checked = true;
+            }}
+        }}
+        return true;
+    }})();
+    """
+    driver.execute_script(js_select_v2)
+    time.sleep(0.5)
+    driver.find_element(By.ID, "_btnSave").click()
+
+    try:
+        WebDriverWait(driver, 3).until(EC.alert_is_present())
+        driver.switch_to.alert.accept()
+    except TimeoutException:
+        pass
+
+    try:
+        wait.until(lambda candidate: len(candidate.window_handles) == 1)
+    except TimeoutException:
+        log_status("   ⚠️ 勤務番號設定視窗未自動關閉")
+
+
+def step_config_popups(driver, wait, out_duty_names, daily_commander, main_window):
+    # --- 1. 設定勤務番號 ---
+    log_status("➡️ 正在設定勤務番號...")
+    save_duty_number_popup(driver, wait, daily_commander)
+
+    driver.switch_to.window(main_window)
+    if not step_prepare_content(driver, wait):
+        raise RuntimeError("勤務番號設定後，勤務基準表未重新載入。")
+
+    # --- 2. 設定外勤項目 ---
     log_status(f"➡️ 開始設定外勤項目 (從 Excel 讀取到 {len(out_duty_names)} 項)...")
-    
-    # 🌟 恢復使用最強 JS 點擊，避免 Selenium 找不到框架崩潰
-    super_js_execute(driver, "_btnOpenWinTaskCode", "click")
-    
+    if not super_js_execute(driver, "_btnOpenWinTaskCode", "click"):
+        raise RuntimeError("外勤設定按鈕未就緒，已停止登打。")
+
     try:
         wait.until(lambda d: len(d.window_handles) > 1)
     except TimeoutException:
-        log_status("   ⚠️ 外勤設定視窗未在時間內開啟")
-    
+        raise RuntimeError("外勤設定視窗未開啟，已停止登打。")
+
     for h in driver.window_handles:
         if h != main_window:
             driver.switch_to.window(h)
             try:
                 # 給小視窗一點時間載入，避免被系統清空
                 time.sleep(1.5)
-                
+
                 for i in range(2, 8):
                     inp = wait.until(EC.presence_of_element_located((By.ID, f"_txtNAME{i}")))
                     inp.clear()
@@ -1098,17 +1319,17 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, daily_stan
                         if task_name != str(raw_name or ""):
                             log_status(f"外勤項目超過 12 個中文字限制，已截短：{task_name}")
                         inp.send_keys(task_name)
-                
+
                 time.sleep(0.5)
                 driver.find_element(By.ID, "_btnSave").click()
-                
+
                 # 攔截存檔成功的警告窗
                 try:
                     WebDriverWait(driver, 3).until(EC.alert_is_present())
                     driver.switch_to.alert.accept()
                 except TimeoutException:
                     pass
-                
+
                 # 確保存檔後視窗真的關閉
                 try:
                     wait.until(lambda d: len(d.window_handles) == 1)
@@ -1116,95 +1337,14 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, daily_stan
                     log_status("   ⚠️ 外勤設定視窗未自動關閉")
             except Exception as e:
                 log_status(f"   ❌ 外勤設定發生錯誤: {e}")
+                raise RuntimeError("外勤設定儲存失敗，已停止登打。") from e
             break
-            
-    # 安全切回主視窗
-    driver.switch_to.window(main_window)
-    driver.switch_to.default_content()
-    
-    log_status("➡️ 等待勤務基準表載入...")
-    time.sleep(3) # 外勤存檔後主網頁會重整，給它 3 秒緩衝
-    
-    wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
-    wait.until(EC.frame_to_be_available_and_switch_to_it("contentFrame"))
-    
-    # --- 2. 設定勤務番號 ---
-    log_status("➡️ 正在設定勤務番號...")
-    
-    # 🌟 恢復使用最強 JS 點擊
-    super_js_execute(driver, "_btnOpenWinUserNo", "click")
-    
-    try:
-        wait.until(lambda d: len(d.window_handles) > 1)
-    except TimeoutException:
-        log_status("   ⚠️ 勤務番號設定視窗未在時間內開啟")
-    
-    settings_window_found = False
-    for h in driver.window_handles:
-        if h != main_window:
-            settings_window_found = True
-            driver.switch_to.window(h)
-            time.sleep(1.5)
-            log_status("➡️ 輪休查找：比對每日備勤人員上班日...")
-            leave_rows = read_duty_number_leave_rows(driver)
-            leave_issues = validate_daily_standby_against_duty_number_leave_types(
-                daily_standby_numbers,
-                leave_rows,
-                excluded_numbers,
-            )
-            if leave_issues:
-                detail = "\n".join(leave_issues[:20])
-                log_status(f"❌ 輪休查找未通過，共 {len(leave_issues)} 項，已停止登打")
-                raise RuntimeError(
-                    "Excel 每日備勤與勤務番號維護休假別不一致，已停止登打。\n" + detail
-                )
-            log_status("✅ 輪休查找通過：每日備勤人員休假別均為空白")
-            try:
-                js_select_v2 = f"""
-                (function() {{
-                    var commanderNo = "{daily_commander}".trim();
-                    var bossNo = "1";
-                    var allCbs = document.querySelectorAll('input[type="checkbox"]');
-                    for (var a = 0; a < allCbs.length; a++) {{ allCbs[a].checked = false; }}
-                    var rows = document.querySelectorAll('tr');
-                    for (var i = 0; i < rows.length; i++) {{
-                        var cells = rows[i].getElementsByTagName('td');
-                        if (cells.length < 4) continue;
-                        var inputNo = rows[i].querySelector('input[name^="_DESIGNATION"]');
-                        if (inputNo) {{
-                            var currentVal = inputNo.value.trim();
-                            var cbs = rows[i].querySelectorAll('input[type="checkbox"]');
-                            if (cbs.length < 2) continue; 
-                            if (currentVal === bossNo || currentVal === "01") cbs[1].checked = true;
-                            if (commanderNo !== "" && (currentVal === commanderNo || currentVal === ("0"+commanderNo).slice(-2))) cbs[0].checked = true;
-                        }}
-                    }}
-                    return true;
-                }})();
-                """
-                driver.execute_script(js_select_v2)
-                
-                time.sleep(0.5)
-                driver.find_element(By.ID, "_btnSave").click()
-                
-                try:
-                    WebDriverWait(driver, 3).until(EC.alert_is_present())
-                    driver.switch_to.alert.accept()
-                except TimeoutException:
-                    pass
-                
-                try:
-                    wait.until(lambda d: len(d.window_handles) == 1)
-                except TimeoutException:
-                    log_status("   ⚠️ 勤務番號設定視窗未自動關閉")
-            except Exception as e: 
-                log_status(f"   ❌ 指揮官小視窗操作失敗: {e}")
-            break
+    else:
+        raise RuntimeError("外勤設定視窗未開啟，已停止登打。")
 
-    if not settings_window_found:
-        raise RuntimeError("勤務番號設定視窗未開啟，無法進行輪休查找，已停止登打。")
-            
     driver.switch_to.window(main_window)
+    if not step_prepare_content(driver, wait):
+        raise RuntimeError("外勤設定後，勤務基準表未重新載入。")
 
 def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
     log_status("➡️ 正在鎖定車輛設定視窗...")
@@ -1484,32 +1624,62 @@ def start_automation(
         step_navigate_menu(candidate, WebDriverWait(candidate, 20))
 
     try:
-        driver = retry_duty_browser_session_open(
-            lambda: build_driver(headless=False),
-            initialize_browser,
+        popup_main_window = ""
+
+        def open_duty_browser_for_popup_preflight():
+            candidate = retry_duty_browser_session_open(
+                lambda: build_driver(headless=False),
+                initialize_browser,
+                cleanup=quit_driver,
+            )
+            candidate_wait = WebDriverWait(candidate, 20)
+            if not step_prepare_content(candidate, candidate_wait):
+                raise RuntimeError("勤務表頁面準備失敗，未執行登打。")
+            if not super_js_execute(candidate, "_txtTaskDate", "set", target_date):
+                raise RuntimeError("勤務基準表日期欄位未就緒，未執行登打。")
+            if not super_js_execute(candidate, "_btnQuery", "click"):
+                raise RuntimeError("勤務基準表查詢按鈕未就緒，未執行登打。")
+            time.sleep(2)
+            return candidate
+
+        def verify_duty_number_popup(candidate):
+            nonlocal popup_main_window
+            popup_main_window = ""
+            report_stage("duty_number_popup_preflight")
+            popup_main_window = preflight_duty_number_popup(
+                candidate,
+                WebDriverWait(candidate, 20),
+                daily_standby_numbers,
+                excluded_numbers,
+            )
+
+        driver = retry_duty_number_popup_preflight(
+            open_duty_browser_for_popup_preflight,
+            verify_duty_number_popup,
             cleanup=quit_driver,
         )
         wait = WebDriverWait(driver, 20)
-        if step_prepare_content(driver, wait):
-            super_js_execute(driver, "_txtTaskDate", "set", target_date)
-            super_js_execute(driver, "_btnQuery", "click")
-            time.sleep(2)
-
-            if super_js_execute(driver, "_btnDelete", "exists"):
-                super_js_execute(driver, "_btnDelete", "click")
-                wait.until(EC.alert_is_present())
-                driver.switch_to.alert.accept()
-                time.sleep(3)
-                log_status("✅ 舊資料已刪除")
-
+        if popup_main_window:
+            report_stage("duty_number_popup_config")
             step_config_popups(
                 driver,
                 wait,
                 out_names,
                 daily_commander,
-                daily_standby_numbers,
-                excluded_numbers,
+                popup_main_window,
             )
+
+            super_js_execute(driver, "_txtTaskDate", "set", target_date)
+            super_js_execute(driver, "_btnQuery", "click")
+            time.sleep(2)
+
+            if super_js_execute(driver, "_btnDelete", "exists"):
+                report_stage("duty_existing_data_delete")
+                super_js_execute(driver, "_btnDelete", "click")
+                wait.until(EC.alert_is_present())
+                driver.switch_to.alert.accept()
+                time.sleep(3)
+                log_status("✅ 舊資料已刪除")
             
             log_status("➡️ 等待勤務基準表載入...")
             driver.switch_to.default_content()

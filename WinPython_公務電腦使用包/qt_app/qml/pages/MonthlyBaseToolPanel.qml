@@ -66,26 +66,13 @@ ToolSidePanel {
                 RowLayout {
                     Layout.fillWidth: true
                     ToolFieldLabel {
-                        text: "年月"
+                        text: "Google 試算表月份"
                     }
                     Label {
-                        text: monthlyBaseDialog.controller.rocYear
-                    }
-                    Label {
-                        text: "年"
-                    }
-                    ToolMonthCombo {
-                        id: monthlyMonthCombo
-                        objectName: "monthlyMonthCombo"
-                        enabled: !monthlyBaseDialog.controller.isRunning
-                        model: monthlyBaseDialog.controller.monthOptions
-                        currentIndex: Math.max(0, model.indexOf(monthlyBaseDialog.controller.monthlyMonth))
-                    }
-                    Label {
-                        text: "月"
-                    }
-                    Item {
+                        objectName: "monthlySourceMonthLabel"
                         Layout.fillWidth: true
+                        text: monthlyBaseDialog.controller.monthlySourcePeriod
+                        wrapMode: Text.Wrap
                     }
                 }
             }
@@ -105,7 +92,8 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: monthlyBaseDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !monthlyBaseDialog.controller.isRunning
-            onClicked: monthlyBaseDialog.controller.prepareMonthlyRun(monthlyMonthCombo.currentText)
+                     && monthlyBaseDialog.controller.monthlySourceReady
+            onClicked: monthlyBaseDialog.controller.prepareMonthlyRun()
         }
     }
 }

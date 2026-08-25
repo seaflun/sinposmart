@@ -958,17 +958,26 @@ def build_entry(duty_day: int, start_hour: int, end_hour: int, days: int) -> Res
     return RestEntry(duty_day, start_day, start_hour, end_day, end_hour)
 
 
-def fetch_monthly_base_plan(actor_no: str, *, actor_name: str = "") -> MonthlyBasePlan:
+def fetch_monthly_base_source_month() -> tuple[int, int]:
     csv_text = download_monthly_base_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
+    return monthly_base_source_month(rows)
+
+
+def monthly_base_source_month(rows: list[list[str]]) -> tuple[int, int]:
     if len(rows) < 4:
         raise RuntimeError("輪休基準表內容不足，無法判斷月份與人員資料。")
     title = str(rows[0][0] if rows[0] else "").strip()
     month_match = re.search(r"(\d{2,3})年\s*(\d{1,2})月份", title)
     if not month_match:
         raise RuntimeError(f"輪休基準表標題無法判斷年月：{title}")
-    roc_year = int(month_match.group(1))
-    month = int(month_match.group(2))
+    return int(month_match.group(1)), int(month_match.group(2))
+
+
+def fetch_monthly_base_plan(actor_no: str, *, actor_name: str = "") -> MonthlyBasePlan:
+    csv_text = download_monthly_base_csv()
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    roc_year, month = monthly_base_source_month(rows)
     actor_row = rows[1]
     name_row = rows[2]
     actor_no = str(actor_no or "").strip()
