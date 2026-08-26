@@ -2274,7 +2274,29 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("retry_duty_number_popup_preflight(", flow)
         self.assertIn("duty_number_popup_preflight", flow)
 
-    def test_duty_query_completion_waiter_polls_until_blank_form_is_ready(self) -> None:
+    def test_duty_query_button_waiter_polls_until_button_is_visible(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = object()
+
+        class QueryButtonWait:
+            def until(self, predicate):
+                for _ in range(3):
+                    if predicate(driver):
+                        return True
+                raise AssertionError("查詢按鈕未在測試期間就緒")
+
+        with mock.patch.object(module, "super_js_execute", side_effect=[False, False, True]) as execute:
+            self.assertTrue(module.wait_for_duty_query_button_ready(driver, QueryButtonWait()))
+
+        self.assertEqual(execute.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args == (driver, "_btnQuery", "exists")
+                for call in execute.call_args_list
+            )
+        )
+
+    def test_duty_query_completion_waiter_polls_until_blank_setup_form_is_ready(self) -> None:
         module = legacy_duty_sheet_module()
         driver = mock.Mock()
 
@@ -2287,21 +2309,12 @@ class PackageSmokeTests(unittest.TestCase):
 
         driver.execute_script.side_effect = [False, False, True]
 
-        self.assertTrue(
-            module.wait_for_duty_query_completion(
-                driver,
-                QueryCompletionWait(),
-                "previous-query-document",
-            )
-        )
+        self.assertTrue(module.wait_for_duty_query_completion(driver, QueryCompletionWait()))
 
         self.assertEqual(driver.execute_script.call_count, 3)
-        self.assertTrue(
-            all(
-                call.args[-1] == "previous-query-document"
-                for call in driver.execute_script.call_args_list
-            )
-        )
+        readiness_scripts = [call.args[0] for call in driver.execute_script.call_args_list]
+        self.assertTrue(all("設定勤務項目" in script for script in readiness_scripts))
+        self.assertTrue(all("設定勤務番號" in script for script in readiness_scripts))
 
     def test_duty_query_completion_waiter_stops_before_popup_preflight_when_timed_out(self) -> None:
         module = legacy_duty_sheet_module()
@@ -2314,12 +2327,11 @@ class PackageSmokeTests(unittest.TestCase):
 
         driver.execute_script.return_value = False
 
-        with self.assertRaisesRegex(RuntimeError, "勤務基準表查詢逾時"):
-            module.wait_for_duty_query_completion(
-                driver,
-                TimedOutQueryCompletionWait(),
-                "previous-query-document",
-            )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "勤務表查詢逾時.*設定勤務項目.*設定勤務番號",
+        ):
+            module.wait_for_duty_query_completion(driver, TimedOutQueryCompletionWait())
 
     def test_duty_result_grid_waiter_polls_after_setup_is_complete(self) -> None:
         module = legacy_duty_sheet_module()
@@ -2343,7 +2355,7 @@ class PackageSmokeTests(unittest.TestCase):
             )
         )
 
-    def test_duty_query_waits_for_reloaded_setup_buttons_before_popup_preflight(self) -> None:
+    def test_duty_query_waits_for_setup_buttons_before_popup_preflight(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
             encoding="utf-8-sig"
         )
@@ -2354,15 +2366,18 @@ class PackageSmokeTests(unittest.TestCase):
         readiness_source = source[readiness_start:readiness_end]
 
         self.assertLess(
-            flow.index("mark_duty_query_document("),
+            flow.index("wait_for_duty_query_button_ready("),
             flow.index('super_js_execute(candidate, "_btnQuery", "click")'),
         )
         self.assertLess(
             flow.index('super_js_execute(candidate, "_btnQuery", "click")'),
             flow.index("wait_for_duty_query_completion("),
         )
+        self.assertNotIn("mark_duty_query_document(", flow)
         self.assertIn("_btnOpenWinTaskCode", readiness_source)
         self.assertIn("_btnOpenWinUserNo", readiness_source)
+        self.assertIn("設定勤務項目", readiness_source)
+        self.assertIn("設定勤務番號", readiness_source)
 
     def test_duty_setup_reloads_grid_without_a_second_query(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(

@@ -1052,40 +1052,22 @@ def step_prepare_content(driver, wait):
     return False
 
 
-def mark_duty_query_document(driver):
-    marker = f"sinposmart-duty-query-{time.monotonic_ns()}"
-    marked = driver.execute_script(r"""
-        const targetId = arguments[0];
-        const marker = arguments[1];
-        function findById(win) {
-            let element = null;
-            try { element = win.document.getElementById(targetId); } catch (error) {}
-            if (element) return element;
-            for (let index = 0; index < win.frames.length; index += 1) {
-                try {
-                    element = findById(win.frames[index]);
-                    if (element) return element;
-                } catch (error) {}
-            }
-            return null;
-        }
-        const element = findById(window.top);
-        if (!element) return false;
-        element.ownerDocument.documentElement.setAttribute(
-            "data-sinposmart-duty-query-marker",
-            marker,
-        );
-        return true;
-    """, "_btnQuery", marker)
-    return marker if marked else ""
+def wait_for_duty_query_button_ready(driver, wait):
+    log_status("⏳ 等待勤務基準表查詢按鈕就緒...")
+    try:
+        wait.until(lambda candidate: super_js_execute(candidate, "_btnQuery", "exists"))
+    except TimeoutException as error:
+        raise RuntimeError(
+            "勤務基準表查詢按鈕逾時，未執行登打。"
+        ) from error
+    return True
 
 
-def wait_for_duty_query_completion(driver, wait, previous_marker):
-    log_status("⏳ 等待勤務基準表查詢完成...")
+def wait_for_duty_query_completion(driver, wait):
+    log_status("⏳ 等待勤務表查詢完成，等待設定按鈕就緒...")
 
     def query_completed(candidate):
         return candidate.execute_script(r"""
-            const previousMarker = arguments[0];
             function findById(win, targetId) {
                 let element = null;
                 try { element = win.document.getElementById(targetId); } catch (error) {}
@@ -1098,33 +1080,28 @@ def wait_for_duty_query_completion(driver, wait, previous_marker):
                 }
                 return null;
             }
-            const queryButton = findById(window.top, "_btnQuery");
-            if (!queryButton) return false;
-            const queryDocument = queryButton.ownerDocument;
-            if (
-                queryDocument.readyState !== "complete" ||
-                queryDocument.documentElement.getAttribute(
-                    "data-sinposmart-duty-query-marker"
-                ) === previousMarker
-            ) {
-                return false;
-            }
-            return ["_btnOpenWinTaskCode", "_btnOpenWinUserNo"].every((targetId) => {
+            function expectedButtonReady(targetId, expectedValue) {
                 const element = findById(window.top, targetId);
                 if (!element) return false;
                 const style = element.ownerDocument.defaultView.getComputedStyle(element);
                 const visible = element.getClientRects().length > 0 &&
                     style.display !== "none" && style.visibility !== "hidden";
-                return visible && !element.disabled &&
+                const enabled = !element.disabled &&
                     element.getAttribute("aria-disabled") !== "true";
-            });
-        """, previous_marker) is True
+                const value = String(
+                    element.value || element.innerText || element.textContent || ""
+                ).trim();
+                return visible && enabled && value === expectedValue;
+            }
+            return expectedButtonReady("_btnOpenWinTaskCode", "設定勤務項目") &&
+                expectedButtonReady("_btnOpenWinUserNo", "設定勤務番號");
+        """) is True
 
     try:
         wait.until(query_completed)
     except TimeoutException as error:
         raise RuntimeError(
-            "勤務基準表查詢逾時，尚未開始勤務項目、勤務番號預檢或登打。"
+            "勤務表查詢逾時，尚未進入設定勤務項目、設定勤務番號頁面。"
         ) from error
     return True
 
@@ -1726,15 +1703,13 @@ def start_automation(
                 raise RuntimeError("勤務表頁面準備失敗，未執行登打。")
             if not super_js_execute(candidate, "_txtTaskDate", "set", target_date):
                 raise RuntimeError("勤務基準表日期欄位未就緒，未執行登打。")
-            query_marker = mark_duty_query_document(candidate)
-            if not query_marker:
-                raise RuntimeError("勤務基準表查詢按鈕未就緒，未執行登打。")
+            query_wait = WebDriverWait(candidate, 60, poll_frequency=0.5)
+            wait_for_duty_query_button_ready(candidate, query_wait)
             if not super_js_execute(candidate, "_btnQuery", "click"):
-                raise RuntimeError("勤務基準表查詢按鈕未就緒，未執行登打。")
+                raise RuntimeError("勤務基準表查詢按鈕點擊失敗，未執行登打。")
             wait_for_duty_query_completion(
                 candidate,
-                WebDriverWait(candidate, 60, poll_frequency=0.5),
-                query_marker,
+                query_wait,
             )
             return candidate
 
