@@ -17103,6 +17103,14 @@ if return_code != 0 or loaded:
                 )
                 self.assertTrue(monthly_source_open_button.isEnabled())
                 self.assertGreaterEqual(monthly_source_open_button.width(), 112)
+                self.assertGreater(
+                    monthly_source_label.width(),
+                    monthly_source_open_button.width() * 2,
+                )
+                self.assertGreater(
+                    monthly_source_open_button.mapToScene(QPointF()).y(),
+                    monthly_source_label.mapToScene(QPointF()).y(),
+                )
                 self.assertEqual(monthly_source_month_label.property("text"), "115年09月")
                 self.assertEqual(monthly_source_title.property("font").pixelSize(), 15)
                 self.assertLess(monthly_status_bar.y(), monthly_run_button.y())

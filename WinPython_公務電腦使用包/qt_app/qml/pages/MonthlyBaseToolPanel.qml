@@ -39,19 +39,27 @@ ToolSidePanel {
                     font.pixelSize: Design.captionSize
                     wrapMode: Text.Wrap
                 }
-                RowLayout {
+                ColumnLayout {
                     Layout.fillWidth: true
-                    ToolFieldLabel {
-                        text: "來源"
-                    }
-                    Label {
-                        objectName: "monthlySourceLabel"
+                    spacing: 6
+
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: "Google 試算表 / 輪休基準表"
-                        wrapMode: Text.Wrap
+
+                        ToolFieldLabel {
+                            text: "來源"
+                        }
+                        Label {
+                            objectName: "monthlySourceLabel"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            text: "Google 試算表 / 輪休基準表"
+                            wrapMode: Text.Wrap
+                        }
                     }
                     ToolBrowseButton {
                         objectName: "monthlySourceOpenButton"
+                        Layout.alignment: Qt.AlignRight
                         Layout.minimumWidth: Design.monthlySourceOpenButtonWidth
                         Layout.preferredWidth: Design.monthlySourceOpenButtonWidth
                         Layout.maximumWidth: Design.monthlySourceOpenButtonWidth
