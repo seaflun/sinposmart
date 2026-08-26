@@ -327,6 +327,8 @@ def find_work_matches(
     item = fields.get("勤務項目", "")
     source = action.get("source", "")
     is_radio_test = source in ("無線電試話", "無線電測試")
+    is_drowning_patrol = source == "防溺車巡"
+    reason = fields.get("事由", "")
     matches = []
     for row in rows:
         c = clean(row)
@@ -343,6 +345,8 @@ def find_work_matches(
         if is_radio_test:
             if "無線電" not in c:
                 continue
+        if is_drowning_patrol and reason and clean(reason) not in c:
+            continue
         matches.append(row)
     return matches
 

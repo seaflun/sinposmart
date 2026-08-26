@@ -265,6 +265,7 @@ def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
             "在隊訓練",
             "無線電試話",
             "無線電測試",
+            "防溺車巡",
         )
     if action.get("kind") != "entry_log":
         return False
@@ -273,7 +274,16 @@ def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
         fields = {}
     direction = fields.get("出或入", "")
     reason = fields.get("領用事由及地點", "")
-    return direction in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤")
+    is_drowning_patrol_entry = (
+        action.get("source") in ("外勤簽出", "外勤簽入")
+        and fields.get("勤務項目") == "車巡"
+        and fields.get("事由") == "防溺"
+        and (
+            (direction == "出" and reason == "防溺車巡")
+            or (direction == "入" and reason == "防溺車巡返隊")
+        )
+    )
+    return direction in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤") or is_drowning_patrol_entry
 
 
 def select_due_task_indices(

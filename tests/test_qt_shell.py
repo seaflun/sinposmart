@@ -1046,6 +1046,7 @@ class DutyTaskProjectionTests(unittest.TestCase):
             {"kind": "work_log", "time": "08:00", "actor": "10", "source": "無線電試話"},
             {"kind": "work_log", "time": "08:00", "actor": "10", "source": "值班交接"},
             {"kind": "work_log", "time": "08:00", "actor": "10", "source": "未分類工作"},
+            {"kind": "work_log", "time": "08:00", "actor": "10", "source": "防溺車巡"},
         ]
 
         due = select_due_task_indices(
@@ -1054,7 +1055,54 @@ class DutyTaskProjectionTests(unittest.TestCase):
             now=datetime(2026, 8, 7, 8, 0),
         )
 
-        self.assertEqual(due, [0, 1, 2])
+        self.assertEqual(due, [0, 1, 2, 4])
+
+    def test_drowning_patrol_entry_tasks_auto_submit_with_required_fields(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "10",
+                "source": "外勤簽出",
+                "fields": {"出或入": "出", "勤務項目": "車巡", "事由": "防溺", "領用事由及地點": "防溺車巡"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "10",
+                "source": "外勤簽入",
+                "fields": {"出或入": "入", "勤務項目": "車巡", "事由": "防溺", "領用事由及地點": "防溺車巡返隊"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "10",
+                "source": "外勤簽出",
+                "fields": {"出或入": "出", "勤務項目": "車巡", "事由": "防颱", "領用事由及地點": "防颱車巡"},
+            },
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "10",
+                "source": "防溺車巡",
+                "fields": {"勤務項目": "車巡", "事由": "防溺"},
+            },
+        ]
+        state = DueTaskSelectionState(actor_no="10", target_roc_date="1150807")
+
+        self.assertEqual(
+            select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 16, 0)),
+            [0],
+        )
+        state = DueTaskSelectionState(actor_no="10", target_roc_date="1150807", executed_indices=frozenset({0}))
+        self.assertEqual(
+            select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 18, 0)),
+            [1, 3],
+        )
 
     def test_1800_handoff_keeps_outgoing_incoming_and_work_for_outgoing_actor(self) -> None:
         from datetime import datetime

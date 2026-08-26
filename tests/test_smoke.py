@@ -538,8 +538,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(
             person_actions,
             [
-                ("16:00", "外勤簽出", "19", "出", "防溺車巡暨車輛駕訓"),
-                ("18:00", "外勤簽入", "27", "入", "返隊"),
+                ("16:00", "外勤簽出", "19", "出", "防溺車巡"),
+                ("18:00", "外勤簽入", "27", "入", "防溺車巡返隊"),
                 ("18:00", "休息簽出", "27", "出", "休息"),
                 ("20:00", "休息結束", "5", "入", "休息返隊"),
             ],
@@ -593,9 +593,84 @@ class PackageSmokeTests(unittest.TestCase):
                 ("17:00", "休息簽出", "17", "21", "出", "休息", 0),
                 ("18:00", "休息結束", "23", "21", "入", "休息返隊", 0),
                 ("18:00", "外勤簽出", "23", "21", "出", "防溺車巡", 0),
-                ("20:00", "外勤簽入", "5", "21", "入", "返隊", 0),
+                ("20:00", "外勤簽入", "5", "21", "入", "防溺車巡返隊", 0),
             ],
         )
+
+    def test_drowning_patrol_uses_car_patrol_fields_and_one_work_log(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1150826",
+            rows=[
+                module.DutyRow("14~16", {"值班": ["19"], "備勤": ["5", "25"]}),
+                module.DutyRow("16~17", {"值班": ["19"], "防溺車巡暨車輛駕訓": ["5", "25"]}),
+                module.DutyRow("17~18", {"值班": ["19"], "防溺車巡暨車輛駕訓": ["5", "25"]}),
+                module.DutyRow("18~20", {"值班": ["27"], "備勤": ["5", "25"]}),
+            ],
+            summary={"在勤": ["5", "19", "25", "27"]},
+            staff={
+                "5": {"role": "隊員", "name": "甲"},
+                "19": {"role": "隊員", "name": "值班員"},
+                "25": {"role": "小隊長", "name": "乙"},
+                "27": {"role": "隊員", "name": "接班員"},
+            },
+        )
+
+        actions = module.planned_actions(today, None, [], module.parse_roc_date("1150826"), [], None)
+        external_entries = [action for action in actions if action.source in ("外勤簽出", "外勤簽入")]
+        work_actions = [action for action in actions if action.kind == "work_log" and action.source == "防溺車巡"]
+
+        self.assertEqual(len(external_entries), 4)
+        for action in external_entries:
+            self.assertEqual(action.fields["勤務項目"], "車巡")
+            self.assertEqual(action.fields["事由"], "防溺")
+        self.assertEqual(
+            {(action.target, action.fields["出或入"], action.fields["領用事由及地點"]) for action in external_entries},
+            {
+                ("5", "出", "防溺車巡"),
+                ("25", "出", "防溺車巡"),
+                ("5", "入", "防溺車巡返隊"),
+                ("25", "入", "防溺車巡返隊"),
+            },
+        )
+        self.assertEqual(len(work_actions), 1)
+        work = work_actions[0]
+        self.assertEqual(work.time, "18:00")
+        self.assertEqual(work.actor, "19")
+        self.assertEqual(work.target, "5,25")
+        self.assertEqual(
+            work.fields,
+            {
+                "工作時間": "18:00",
+                "勤務項目": "車巡",
+                "事由": "防溺",
+                "工作概述": (
+                    "一、時間：1600-1800\n"
+                    "二、地點：\n"
+                    "至轄內16處危險水域沿路巡視，巡視學生埤、死囝仔埤、坡內埤埤塘、8-14號埤塘、銅鑼埤塘、崙坪埤塘、鉤漕埤塘、桃園大圳、富源里富源62-25號對面埤塘、泉州埤塘、公埤塘、大埤塘、草埤塘、豬屠埤塘、桃園大圳第八支線、龜墓埤塘。\n"
+                    "三、人車:隊員 甲，小隊長 乙，新坡15車。\n"
+                    "四、處理情形：勸導民眾勿戲水人數0人。"
+                ),
+                "處理情形": "未發現有民眾戲水之情形，發放宣導單0份。 16處危險水域易發生溺水案件處所車巡期間無事故。",
+                "服勤人員": ["5", "25"],
+            },
+        )
+
+    def test_drowning_patrol_work_duplicate_requires_drowning_reason(self) -> None:
+        from compare_rehearsal_records import find_work_matches
+
+        action = {
+            "kind": "work_log",
+            "time": "18:00",
+            "source": "防溺車巡",
+            "fields": {"工作時間": "18:00", "勤務項目": "車巡", "事由": "防溺"},
+        }
+        rows = [
+            "115/08/26 18:00 | 車巡 | 防颱",
+            "115/08/26 18:00 | 車巡 | 防溺",
+        ]
+
+        self.assertEqual(find_work_matches(rows, "1150826", {}, action), [rows[1]])
 
     def test_partial_public_leave_rest_at_0800_uses_previous_day_worker_state(self) -> None:
         module = duty_rehearsal_module()

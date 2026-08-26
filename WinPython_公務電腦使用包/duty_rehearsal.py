@@ -52,6 +52,12 @@ ENTRY_OUTIN_VALUE_MAP = {
 WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 WORK_LOG_DEFAULTS_PATH = Path(__file__).with_name("work_log_defaults.json")
+DROWNING_PATROL_KEYWORD = "防溺車巡"
+DROWNING_PATROL_ENTRY_REASON = "防溺車巡"
+DROWNING_PATROL_RETURN_REASON = "防溺車巡返隊"
+DROWNING_PATROL_DUTY_ITEM = "車巡"
+DROWNING_PATROL_DUTY_REASON = "防溺"
+DROWNING_PATROL_STATUS = "未發現有民眾戲水之情形，發放宣導單0份。 16處危險水域易發生溺水案件處所車巡期間無事故。"
 
 OFF_DUTY_SUMMARY_KEYS = {
     "公假",
@@ -981,7 +987,7 @@ def fill_work_log_form_for_test(
             el.value = value;
           }
           const originalConfirm = window.confirm;
-          if (confirmOnReplace && willReplace) {
+          if (confirmOnReplace && (willReplace || values.accept_replace_confirm)) {
             window.confirm = message => {
               result.confirms.push(String(message || ''));
               return true;
@@ -1033,12 +1039,17 @@ def fill_work_log_form_for_test(
             "hour": hour,
             "minute": minute,
             "item": fields.get("勤務項目", ""),
+            "accept_replace_confirm": action.get("source") == DROWNING_PATROL_KEYWORD,
         },
     )
     fill_result["item_alerts"] = accept_pending_alerts(driver)
     reason_result = set_work_log_reason_field(driver, fields)
     fill_result["reason"] = reason_result
     fill_result["reason_alerts"] = accept_pending_alerts(driver)
+    if action.get("source") == DROWNING_PATROL_KEYWORD:
+        missing = list(fill_result.get("missing", [])) + list(reason_result.get("missing", []))
+        if missing:
+            raise RuntimeError("drowning patrol work-log field selection failed: " + ", ".join(missing))
     time.sleep(1)
     content_result = set_work_log_content_fields(driver, fields)
     fill_result["content"] = content_result
@@ -1154,6 +1165,7 @@ def fill_entry_log_form_for_test(
         if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
         if (values.duty_item && !byIds(['_selList3'], values.duty_item)) result.missing.push('duty_item');
         if (typeof changeSelList4 === 'function') changeSelList4();
+        if (values.duty_reason && !byIds(['_selList4'], values.duty_reason) && !byOptionText(values.duty_reason)) result.missing.push('duty_reason');
         return result;
         """,
         {
@@ -1161,8 +1173,14 @@ def fill_entry_log_form_for_test(
             "hour": hour,
             "minute": minute,
             "duty_item": fields.get("勤務項目", ""),
+            "duty_reason": fields.get("事由", ""),
         },
     )
+    if fields.get("勤務項目") == DROWNING_PATROL_DUTY_ITEM and fields.get("事由") == DROWNING_PATROL_DUTY_REASON:
+        missing = set(fill_result.get("missing", []))
+        required = {"duty_item", "duty_reason"}
+        if missing & required:
+            raise RuntimeError("drowning patrol entry-log field selection failed: " + ", ".join(sorted(missing & required)))
     time.sleep(1)
     people_result = set_entry_people(driver, [person], fallback_popup=True)
     if not people_result.get("ok"):
@@ -2535,6 +2553,29 @@ def radio_test_status() -> str:
     )
 
 
+def is_drowning_patrol_duty(duty_name: str) -> bool:
+    return DROWNING_PATROL_KEYWORD in duty_name
+
+
+def drowning_patrol_description(sheet: DutySheet, personnel: list[str], start: int, end: int) -> str:
+    people = []
+    for no in personnel:
+        member = sheet.staff.get(str(no), {})
+        role = str(member.get("role", "")).strip()
+        name = str(member.get("name", no)).strip() or str(no)
+        people.append(f"{role} {name}".strip())
+    time_range = f"{clock_hour(start):02d}00-{clock_hour(end):02d}00"
+    return "\n".join(
+        [
+            f"一、時間：{time_range}",
+            "二、地點：",
+            "至轄內16處危險水域沿路巡視，巡視學生埤、死囝仔埤、坡內埤埤塘、8-14號埤塘、銅鑼埤塘、崙坪埤塘、鉤漕埤塘、桃園大圳、富源里富源62-25號對面埤塘、泉州埤塘、公埤塘、大埤塘、草埤塘、豬屠埤塘、桃園大圳第八支線、龜墓埤塘。",
+            f"三、人車:{'，'.join(people)}，新坡15車。",
+            "四、處理情形：勸導民眾勿戲水人數0人。",
+        ]
+    )
+
+
 def training_template(topic: str, time_range: str, instructor: str) -> tuple[str, str]:
     description = "\n".join(
         [
@@ -2748,30 +2789,35 @@ def planned_actions(
 
     # External duty sign-out/sign-in. Sign-out at an exact handoff hour is
     # entered by the previous duty desk, same as value handoff records.
+    drowning_patrol_groups: dict[tuple[str, int, int, int], list[str]] = {}
     for duty_name, no, start, end, end_offset in external_duty_blocks(today, tomorrow):
         start_offset = 1 if start < 8 else 0
         if end_offset == 0 and end is not None and end <= 8:
             end_offset = 1
+        is_drowning_patrol = is_drowning_patrol_duty(duty_name)
         return_pair_key = (
             f"return-pair:external:{target.isoformat()}:{no}:{duty_name}:{start}:{end}:{start_offset}:{end_offset}"
             if end is not None
             else ""
         )
         start_actor = next_morning_entry_actor(today, start) if start_offset else entry_actor_at(today, yesterday, start, 0)
+        outbound_fields = {
+            "登打時間": f"{start:02d}:00",
+            "系統寫入時間": f"{start:02d}:00",
+            "出或入": "出",
+            "領用事由及地點": DROWNING_PATROL_ENTRY_REASON if is_drowning_patrol else duty_name,
+            "手提無線電編號": "",
+            "是否歸還": "",
+        }
+        if is_drowning_patrol:
+            outbound_fields.update({"勤務項目": DROWNING_PATROL_DUTY_ITEM, "事由": DROWNING_PATROL_DUTY_REASON})
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{start:02d}:00",
                 actor=start_actor,
                 target=no,
-                fields={
-                    "登打時間": f"{start:02d}:00",
-                    "系統寫入時間": f"{start:02d}:00",
-                    "出或入": "出",
-                    "領用事由及地點": duty_name,
-                    "手提無線電編號": "",
-                    "是否歸還": "",
-                },
+                fields=outbound_fields,
                 source="外勤簽出",
                 duplicate_key=f"entry:{target}:{start}:out:{no}:{duty_name}",
                 date_offset=start_offset,
@@ -2781,24 +2827,56 @@ def planned_actions(
         if end is None:
             continue
         end_actor = next_morning_entry_actor(today, end) if end_offset else duty_actor_at(today, yesterday, max(end - 1, 0), 0)
+        inbound_fields = {
+            "登打時間": f"{end:02d}:00",
+            "系統寫入時間": f"{end:02d}:00",
+            "出或入": "入",
+            "領用事由及地點": DROWNING_PATROL_RETURN_REASON if is_drowning_patrol else "返隊",
+            "手提無線電編號": "",
+            "是否歸還": "",
+        }
+        if is_drowning_patrol:
+            inbound_fields.update({"勤務項目": DROWNING_PATROL_DUTY_ITEM, "事由": DROWNING_PATROL_DUTY_REASON})
         actions.append(
             PlannedAction(
                 kind="entry_log",
                 time=f"{end:02d}:00",
                 actor=end_actor,
                 target=no,
-                fields={
-                    "登打時間": f"{end:02d}:00",
-                    "系統寫入時間": f"{end:02d}:00",
-                    "出或入": "入",
-                    "領用事由及地點": "返隊",
-                    "手提無線電編號": "",
-                    "是否歸還": "",
-                },
+                fields=inbound_fields,
                 source="外勤簽入",
                 duplicate_key=f"entry:{target}:{end}:in:{no}:返隊:{duty_name}",
                 date_offset=end_offset,
                 return_pair_key=return_pair_key,
+            )
+        )
+        if is_drowning_patrol:
+            drowning_patrol_groups.setdefault((duty_name, start, end, end_offset), []).append(no)
+
+    for (duty_name, start, end, end_offset), grouped_personnel in drowning_patrol_groups.items():
+        personnel = sorted(set(grouped_personnel), key=int)
+        end_actor = next_morning_entry_actor(today, end) if end_offset else duty_actor_at(today, yesterday, max(end - 1, 0), 0)
+        end_time = f"{end:02d}:00"
+        actions.append(
+            PlannedAction(
+                kind="work_log",
+                time=end_time,
+                actor=end_actor,
+                target=",".join(personnel),
+                fields={
+                    "工作時間": end_time,
+                    "勤務項目": DROWNING_PATROL_DUTY_ITEM,
+                    "事由": DROWNING_PATROL_DUTY_REASON,
+                    "工作概述": drowning_patrol_description(today, personnel, start, end),
+                    "處理情形": DROWNING_PATROL_STATUS,
+                    "服勤人員": personnel,
+                },
+                source=DROWNING_PATROL_KEYWORD,
+                duplicate_key=(
+                    f"work:{target}:{end_time}:{DROWNING_PATROL_KEYWORD}:"
+                    f"{duty_name}:{start}:{','.join(personnel)}"
+                ),
+                date_offset=end_offset,
             )
         )
 
