@@ -1176,6 +1176,46 @@ def wait_for_duty_query_completion(driver, wait):
         ) from error
 
 
+def click_duty_existing_delete_and_accept_alert(driver):
+    """刪除既有勤務表，處理網站同步跳出的原生提醒。"""
+    log_status("⏳ 刪除既有勤務表，等待網站提醒...")
+
+    try:
+        clicked = driver.execute_script(r"""
+            function isVisibleAndEnabled(element) {
+                const style = element.ownerDocument.defaultView.getComputedStyle(element);
+                return element.getClientRects().length > 0 &&
+                    style.display !== "none" && style.visibility !== "hidden" &&
+                    !element.disabled && element.getAttribute("aria-disabled") !== "true";
+            }
+            function findAndClickDeleteButton(win) {
+                let document = null;
+                try { document = win.document; } catch (error) {}
+                if (document) {
+                    const deleteButton = document.getElementById("_btnDelete");
+                    if (deleteButton && isVisibleAndEnabled(deleteButton)) {
+                        deleteButton.click();
+                        return true;
+                    }
+                }
+                for (let index = 0; index < win.frames.length; index += 1) {
+                    try {
+                        if (findAndClickDeleteButton(win.frames[index])) return true;
+                    } catch (error) {}
+                }
+                return false;
+            }
+            return findAndClickDeleteButton(window.top);
+        """) is True
+    except UnexpectedAlertPresentException:
+        # 原生提醒在按鈕點擊後立即出現時，Selenium 會先回報例外。
+        clicked = True
+
+    if clicked:
+        accept_pending_alerts(driver, timeout=3)
+    return clicked
+
+
 def wait_for_duty_result_grid(driver, wait):
     log_status("⏳ 等待勤務設定後的表格載入...")
     try:
@@ -1813,9 +1853,8 @@ def start_automation(
             )
             if query_mode == "existing":
                 report_stage("duty_existing_data_delete")
-                if not super_js_execute(candidate, "_btnDelete", "click"):
+                if not click_duty_existing_delete_and_accept_alert(candidate):
                     raise RuntimeError("既有勤務表刪除按鈕未就緒，未執行登打。")
-                accept_pending_alerts(candidate, timeout=3)
                 log_status("✅ 舊資料已刪除")
                 query_mode = wait_for_duty_query_completion(
                     candidate,

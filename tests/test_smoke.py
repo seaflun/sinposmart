@@ -2449,10 +2449,10 @@ class PackageSmokeTests(unittest.TestCase):
         )
         self.assertLess(
             query_flow.index('if query_mode == "existing":'),
-            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
         )
         self.assertLess(
-            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
             query_flow.index("return candidate"),
         )
         self.assertEqual(
@@ -2460,9 +2460,32 @@ class PackageSmokeTests(unittest.TestCase):
             2,
         )
         self.assertLess(
-            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
             query_flow.rindex("query_mode = wait_for_duty_query_completion("),
         )
+        self.assertNotIn('super_js_execute(candidate, "_btnDelete", "click")', query_flow)
+
+    def test_existing_duty_delete_accepts_alert_that_interrupts_the_click(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.execute_script.side_effect = module.UnexpectedAlertPresentException(
+            "delete confirmation opened"
+        )
+
+        with mock.patch.object(
+            module,
+            "accept_pending_alerts",
+            return_value=["確定要刪除舊勤務表嗎？"],
+        ) as accept_alerts:
+            self.assertTrue(
+                module.click_duty_existing_delete_and_accept_alert(driver)
+            )
+
+        accept_alerts.assert_called_once_with(driver, timeout=3)
+        delete_script = driver.execute_script.call_args.args[0]
+        self.assertIn("_btnDelete", delete_script)
+        self.assertIn("deleteButton.click()", delete_script)
+        self.assertNotIn("onclick()", delete_script)
 
     def test_duty_number_popup_waits_for_a_new_handle_without_double_clicking(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
