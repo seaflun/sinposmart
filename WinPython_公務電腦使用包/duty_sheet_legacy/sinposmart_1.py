@@ -2049,22 +2049,28 @@ def start_automation(
                 image_path = daily_preview["image_path"]
                 log_status(f"勤務表截圖完成：{daily_preview['capture_range']}")
                 log_status(f"夜間勤務截圖完成：{night_preview['capture_range']}")
+            except Exception as capture_error:
+                notification_status = f"\n勤務表截圖保存失敗：{capture_error}"
+                log_status(f"勤務表截圖保存失敗：{capture_error}")
+            else:
                 if notification_config.get("enabled"):
                     log_status("開始上傳截圖並發送 LINE 通知...")
-                    notification_result = send_group_notification(
-                        image_path,
-                        target_date,
-                        notification_config
-                    )
-                    notification_status = "\n勤務表截圖已完成，並已發送 LINE 通知。"
-                    log_status(
-                        f"{notification_result['provider']} 通知已送出，共 {len(notification_result['image_urls'])} 張圖片"
-                    )
+                    try:
+                        notification_result = send_group_notification(
+                            image_path,
+                            target_date,
+                            notification_config
+                        )
+                    except Exception as notify_error:
+                        notification_status = f"\nLINE 截圖通知失敗：{notify_error}"
+                        log_status(f"LINE 截圖通知失敗：{notify_error}")
+                    else:
+                        notification_status = "\n勤務表截圖已完成，並已發送 LINE 通知。"
+                        log_status(
+                            f"{notification_result['provider']} 通知已送出，共 {len(notification_result['image_urls'])} 張圖片"
+                        )
                 else:
-                    notification_status = "\n勤務表截圖已完成。"
-            except Exception as notify_error:
-                notification_status = f"\n勤務表截圖或 LINE 通知失敗：{notify_error}"
-                log_status(f"勤務表通知失敗：{notify_error}")
+                    notification_status = "\n勤務表截圖已完成，未發送 LINE 通知。"
 
             # 計算總花費秒數
             end_time = time.time()

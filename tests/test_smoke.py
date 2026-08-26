@@ -2352,6 +2352,24 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("retry_duty_number_popup_preflight(", flow)
         self.assertIn("duty_number_popup_preflight", flow)
 
+    def test_duty_sheet_capture_and_line_notification_failures_are_separate(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index('report_stage("report")')
+        end = source.index("# 計算總花費秒數", start)
+        report_flow = source[start:end]
+
+        self.assertIn(
+            "capture_future = capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)",
+            source,
+        )
+        self.assertIn("except Exception as capture_error:", report_flow)
+        self.assertIn("勤務表截圖保存失敗", report_flow)
+        self.assertIn("except Exception as notify_error:", report_flow)
+        self.assertIn("LINE 截圖通知失敗", report_flow)
+        self.assertNotIn("勤務表截圖或 LINE 通知失敗", report_flow)
+
     def test_duty_query_click_waiter_retries_until_target_date_frame_is_ready(self) -> None:
         module = legacy_duty_sheet_module()
         driver = mock.Mock()

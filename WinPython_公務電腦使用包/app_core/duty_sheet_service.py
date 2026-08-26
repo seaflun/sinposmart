@@ -339,8 +339,12 @@ class DutySheetService:
                 failure_stage=stage,
             )
         legacy_result = successes[-1] if successes else ""
-        notification_warning = "勤務表截圖或 LINE 通知失敗" in legacy_result
-        suffix = "（截圖通知失敗）" if notification_warning else ""
+        if "勤務表截圖保存失敗" in legacy_result:
+            suffix = "（截圖保存失敗）"
+        elif request.notification_enabled and "LINE 截圖通知失敗" in legacy_result:
+            suffix = "（LINE 截圖通知失敗）"
+        else:
+            suffix = ""
         return f"勤務表已登打完成：{target_date}{suffix}"
 
     def _resolve_workbook(self, value: str) -> Path | None:

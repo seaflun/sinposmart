@@ -1397,9 +1397,24 @@ class DutySheetServiceTests(unittest.TestCase):
             result = service.execute(request, status_callback=progress.append)
 
             self.assertEqual(result, "勤務表已登打完成：1150730")
-            success_message[0] = "已登打並存檔完畢！\n勤務表截圖或 LINE 通知失敗：測試訊息"
-            warning_result = service.execute(request)
-            self.assertEqual(warning_result, "勤務表已登打完成：1150730（截圖通知失敗）")
+            success_message[0] = "已登打並存檔完畢！\n勤務表截圖保存失敗：測試訊息"
+            screenshot_warning_result = service.execute(request)
+            self.assertEqual(
+                screenshot_warning_result,
+                "勤務表已登打完成：1150730（截圖保存失敗）",
+            )
+            success_message[0] = "已登打並存檔完畢！\nLINE 截圖通知失敗：測試訊息"
+            disabled_notification_result = service.execute(request)
+            self.assertEqual(disabled_notification_result, "勤務表已登打完成：1150730")
+            enabled_request = DutySheetRequest(
+                "user10", "session-secret", str(workbook), "2026/07/30",
+                "A", "S", "M1", "M2", True,
+            )
+            enabled_notification_result = service.execute(enabled_request)
+            self.assertEqual(
+                enabled_notification_result,
+                "勤務表已登打完成：1150730（LINE 截圖通知失敗）",
+            )
             self.assertEqual(progress, ["執行中"])
             self.assertEqual(saved[0]["login_settings"]["user_pwd"], "preserved")
             self.assertNotIn("session-secret", repr(saved))
