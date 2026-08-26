@@ -2274,6 +2274,53 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("retry_duty_number_popup_preflight(", flow)
         self.assertIn("duty_number_popup_preflight", flow)
 
+    def test_duty_query_result_waiter_polls_until_the_grid_is_ready(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = object()
+
+        class QueryResultWait:
+            def until(self, predicate):
+                for _ in range(3):
+                    if predicate(driver):
+                        return True
+                raise AssertionError("查詢結果格未在測試期間就緒")
+
+        with mock.patch.object(module, "super_js_execute", side_effect=[False, False, True]) as execute:
+            self.assertTrue(module.wait_for_duty_query_result_grid(driver, QueryResultWait()))
+
+        self.assertEqual(execute.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args == (driver, "_pln_8_1", "exists")
+                for call in execute.call_args_list
+            )
+        )
+
+    def test_duty_query_result_waiter_stops_before_popup_preflight_when_timed_out(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = object()
+
+        class TimedOutQueryResultWait:
+            def until(self, predicate):
+                predicate(driver)
+                raise module.TimeoutException("query results did not load")
+
+        with mock.patch.object(module, "super_js_execute", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "勤務基準表查詢逾時"):
+                module.wait_for_duty_query_result_grid(driver, TimedOutQueryResultWait())
+
+    def test_duty_query_waits_for_grid_before_popup_preflight(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index("def open_duty_browser_for_popup_preflight():")
+        flow = source[start:source.index("def verify_duty_number_popup", start)]
+
+        self.assertLess(
+            flow.index('super_js_execute(candidate, "_btnQuery", "click")'),
+            flow.index("wait_for_duty_query_result_grid("),
+        )
+
     def test_duty_number_popup_waits_for_a_new_handle_without_double_clicking(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
             encoding="utf-8-sig"

@@ -1051,6 +1051,18 @@ def step_prepare_content(driver, wait):
             time.sleep(2)
     return False
 
+
+def wait_for_duty_query_result_grid(driver, wait):
+    log_status("⏳ 等待勤務基準表查詢結果...")
+    try:
+        wait.until(lambda candidate: super_js_execute(candidate, "_pln_8_1", "exists"))
+    except TimeoutException as error:
+        raise RuntimeError(
+            "勤務基準表查詢逾時，尚未開始勤務番號預檢或登打。"
+        ) from error
+    return True
+
+
 def read_duty_number_leave_rows(driver):
     return driver.execute_script(r"""
         function cellText(cell) {
@@ -1639,7 +1651,10 @@ def start_automation(
                 raise RuntimeError("勤務基準表日期欄位未就緒，未執行登打。")
             if not super_js_execute(candidate, "_btnQuery", "click"):
                 raise RuntimeError("勤務基準表查詢按鈕未就緒，未執行登打。")
-            time.sleep(2)
+            wait_for_duty_query_result_grid(
+                candidate,
+                WebDriverWait(candidate, 60, poll_frequency=0.5),
+            )
             return candidate
 
         def verify_duty_number_popup(candidate):
