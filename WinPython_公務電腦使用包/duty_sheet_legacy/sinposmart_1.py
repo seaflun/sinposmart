@@ -14,7 +14,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import quote
-from selenium.common.exceptions import NoAlertPresentException, NoSuchFrameException, TimeoutException, UnexpectedAlertPresentException
+from selenium.common.exceptions import NoAlertPresentException, NoSuchFrameException, NoSuchWindowException, TimeoutException, UnexpectedAlertPresentException
 import threading
 from pathlib import Path
 from openpyxl.utils import get_column_letter
@@ -965,7 +965,7 @@ def accept_pending_alerts(driver, timeout=2):
     while True:
         try:
             alert = WebDriverWait(driver, wait_seconds).until(EC.alert_is_present())
-        except (NoAlertPresentException, TimeoutException):
+        except (NoAlertPresentException, NoSuchWindowException, TimeoutException):
             break
         try:
             message = str(alert.text or "").strip()
@@ -975,11 +975,32 @@ def accept_pending_alerts(driver, timeout=2):
             pass
         try:
             alert.accept()
-        except NoAlertPresentException:
+        except (NoAlertPresentException, NoSuchWindowException):
             pass
         wait_seconds = 0.5
         time.sleep(0.2)
     return messages
+
+
+def wait_for_popup_close_and_return_to_main(driver, wait, main_window, popup_window):
+    """Recover from a popup closing while ChromeDriver still targets that popup."""
+    def main_window_restored(candidate):
+        try:
+            candidate.switch_to.window(main_window)
+            return popup_window not in candidate.window_handles
+        except UnexpectedAlertPresentException:
+            accept_pending_alerts(candidate, timeout=0.5)
+            return False
+        except NoSuchWindowException:
+            return False
+
+    try:
+        wait.until(main_window_restored)
+    except TimeoutException as error:
+        raise RuntimeError(
+            "勤務設定視窗儲存後未恢復主視窗，未執行後續登打。"
+        ) from error
+    return True
 
 # ==========================================
 # [區塊五] 網頁自動化動作方塊 (Web Automation Steps)
@@ -1052,19 +1073,56 @@ def step_prepare_content(driver, wait):
     return False
 
 
-def wait_for_duty_query_button_ready(driver, wait):
-    log_status("⏳ 等待勤務基準表查詢按鈕就緒...")
+def click_duty_query_button_when_ready(driver, wait, target_date):
+    log_status("⏳ 等待勤務基準表日期與查詢按鈕就緒...")
+
+    def click_query(candidate):
+        return candidate.execute_script(r"""
+            const expectedDate = String(arguments[0]).trim();
+            function isVisibleAndEnabled(element) {
+                const style = element.ownerDocument.defaultView.getComputedStyle(element);
+                return element.getClientRects().length > 0 &&
+                    style.display !== "none" && style.visibility !== "hidden" &&
+                    !element.disabled && element.getAttribute("aria-disabled") !== "true";
+            }
+            function findAndClickCurrentForm(win) {
+                let document = null;
+                try { document = win.document; } catch (error) {}
+                if (document) {
+                    const dateInput = document.getElementById("_txtTaskDate");
+                    const queryButton = document.getElementById("_btnQuery");
+                    const actualDate = String(dateInput && dateInput.value || "").trim();
+                    if (
+                        dateInput && queryButton && actualDate === expectedDate &&
+                        isVisibleAndEnabled(queryButton)
+                    ) {
+                        try {
+                            queryButton.click();
+                            return true;
+                        } catch (error) {}
+                    }
+                }
+                for (let index = 0; index < win.frames.length; index += 1) {
+                    try {
+                        if (findAndClickCurrentForm(win.frames[index])) return true;
+                    } catch (error) {}
+                }
+                return false;
+            }
+            return findAndClickCurrentForm(window.top);
+        """, target_date) is True
+
     try:
-        wait.until(lambda candidate: super_js_execute(candidate, "_btnQuery", "exists"))
+        wait.until(click_query)
     except TimeoutException as error:
         raise RuntimeError(
-            "勤務基準表查詢按鈕逾時，未執行登打。"
+            "勤務基準表日期或查詢按鈕逾時，未執行登打。"
         ) from error
     return True
 
 
 def wait_for_duty_query_completion(driver, wait):
-    log_status("⏳ 等待勤務表查詢完成，等待設定按鈕就緒...")
+    log_status("⏳ 等待勤務表查詢完成...")
 
     def query_completed(candidate):
         return candidate.execute_script(r"""
@@ -1080,30 +1138,42 @@ def wait_for_duty_query_completion(driver, wait):
                 }
                 return null;
             }
+            function isVisible(element) {
+                if (!element) return false;
+                const style = element.ownerDocument.defaultView.getComputedStyle(element);
+                return element.getClientRects().length > 0 &&
+                    style.display !== "none" && style.visibility !== "hidden";
+            }
+            function isEnabled(element) {
+                return !!element && !element.disabled &&
+                    element.getAttribute("aria-disabled") !== "true";
+            }
             function expectedButtonReady(targetId, expectedValue) {
                 const element = findById(window.top, targetId);
                 if (!element) return false;
-                const style = element.ownerDocument.defaultView.getComputedStyle(element);
-                const visible = element.getClientRects().length > 0 &&
-                    style.display !== "none" && style.visibility !== "hidden";
-                const enabled = !element.disabled &&
-                    element.getAttribute("aria-disabled") !== "true";
                 const value = String(
                     element.value || element.innerText || element.textContent || ""
                 ).trim();
-                return visible && enabled && value === expectedValue;
+                return isVisible(element) && isEnabled(element) && value === expectedValue;
             }
-            return expectedButtonReady("_btnOpenWinTaskCode", "設定勤務項目") &&
+            const setupReady = expectedButtonReady("_btnOpenWinTaskCode", "設定勤務項目") &&
                 expectedButtonReady("_btnOpenWinUserNo", "設定勤務番號");
-        """) is True
+            if (setupReady) return "setup";
+
+            const grid = findById(window.top, "_pln_8_1");
+            const deleteButton = findById(window.top, "_btnDelete");
+            if (isVisible(grid) && isVisible(deleteButton) && isEnabled(deleteButton)) {
+                return "existing";
+            }
+            return false;
+        """)
 
     try:
-        wait.until(query_completed)
+        return wait.until(query_completed)
     except TimeoutException as error:
         raise RuntimeError(
-            "勤務表查詢逾時，尚未進入設定勤務項目、設定勤務番號頁面。"
+            "勤務表查詢逾時，尚未進入設定頁或既有勤務表。"
         ) from error
-    return True
 
 
 def wait_for_duty_result_grid(driver, wait):
@@ -1113,6 +1183,50 @@ def wait_for_duty_result_grid(driver, wait):
     except TimeoutException as error:
         raise RuntimeError(
             "勤務基準表格逾時，尚未開始填寫或儲存。"
+        ) from error
+    return True
+
+
+def click_duty_external_setup_button_when_ready(driver, wait):
+    log_status("⏳ 等待設定勤務項目按鈕就緒...")
+
+    def click_button(candidate):
+        return candidate.execute_script(r"""
+            function findById(win, targetId) {
+                let element = null;
+                try { element = win.document.getElementById(targetId); } catch (error) {}
+                if (element) return element;
+                for (let index = 0; index < win.frames.length; index += 1) {
+                    try {
+                        element = findById(win.frames[index], targetId);
+                        if (element) return element;
+                    } catch (error) {}
+                }
+                return null;
+            }
+            const element = findById(window.top, "_btnOpenWinTaskCode");
+            if (!element) return false;
+            const style = element.ownerDocument.defaultView.getComputedStyle(element);
+            const visible = element.getClientRects().length > 0 &&
+                style.display !== "none" && style.visibility !== "hidden";
+            const enabled = !element.disabled && element.getAttribute("aria-disabled") !== "true";
+            const value = String(
+                element.value || element.innerText || element.textContent || ""
+            ).trim();
+            if (!visible || !enabled || value !== "設定勤務項目") return false;
+            try {
+                element.click();
+                return true;
+            } catch (error) {
+                return false;
+            }
+        """) is True
+
+    try:
+        wait.until(click_button)
+    except TimeoutException as error:
+        raise RuntimeError(
+            "設定勤務項目按鈕逾時，未執行外勤設定。"
         ) from error
     return True
 
@@ -1311,7 +1425,8 @@ def retry_duty_number_popup_preflight(open_browser, preflight, cleanup=quit_driv
     raise RuntimeError("勤務番號小視窗預檢未取得瀏覽器。")
 
 
-def save_duty_number_popup(driver, wait, daily_commander):
+def save_duty_number_popup(driver, wait, daily_commander, main_window):
+    popup_window = driver.current_window_handle
     js_select_v2 = f"""
     (function() {{
         var commanderNo = "{daily_commander}".trim();
@@ -1337,32 +1452,26 @@ def save_duty_number_popup(driver, wait, daily_commander):
     driver.execute_script(js_select_v2)
     time.sleep(0.5)
     driver.find_element(By.ID, "_btnSave").click()
-
-    try:
-        WebDriverWait(driver, 3).until(EC.alert_is_present())
-        driver.switch_to.alert.accept()
-    except TimeoutException:
-        pass
-
-    try:
-        wait.until(lambda candidate: len(candidate.window_handles) == 1)
-    except TimeoutException:
-        log_status("   ⚠️ 勤務番號設定視窗未自動關閉")
+    accept_pending_alerts(driver, timeout=3)
+    wait_for_popup_close_and_return_to_main(
+        driver,
+        wait,
+        main_window,
+        popup_window,
+    )
 
 
 def step_config_popups(driver, wait, out_duty_names, daily_commander, main_window):
     # --- 1. 設定勤務番號 ---
     log_status("➡️ 正在設定勤務番號...")
-    save_duty_number_popup(driver, wait, daily_commander)
+    save_duty_number_popup(driver, wait, daily_commander, main_window)
 
-    driver.switch_to.window(main_window)
     if not step_prepare_content(driver, wait):
         raise RuntimeError("勤務番號設定後，勤務基準表未重新載入。")
 
     # --- 2. 設定外勤項目 ---
     log_status(f"➡️ 開始設定外勤項目 (從 Excel 讀取到 {len(out_duty_names)} 項)...")
-    if not super_js_execute(driver, "_btnOpenWinTaskCode", "click"):
-        raise RuntimeError("外勤設定按鈕未就緒，已停止登打。")
+    click_duty_external_setup_button_when_ready(driver, wait)
 
     try:
         wait.until(lambda d: len(d.window_handles) > 1)
@@ -1388,19 +1497,13 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
 
                 time.sleep(0.5)
                 driver.find_element(By.ID, "_btnSave").click()
-
-                # 攔截存檔成功的警告窗
-                try:
-                    WebDriverWait(driver, 3).until(EC.alert_is_present())
-                    driver.switch_to.alert.accept()
-                except TimeoutException:
-                    pass
-
-                # 確保存檔後視窗真的關閉
-                try:
-                    wait.until(lambda d: len(d.window_handles) == 1)
-                except TimeoutException:
-                    log_status("   ⚠️ 外勤設定視窗未自動關閉")
+                accept_pending_alerts(driver, timeout=3)
+                wait_for_popup_close_and_return_to_main(
+                    driver,
+                    wait,
+                    main_window,
+                    h,
+                )
             except Exception as e:
                 log_status(f"   ❌ 外勤設定發生錯誤: {e}")
                 raise RuntimeError("外勤設定儲存失敗，已停止登打。") from e
@@ -1408,7 +1511,6 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
     else:
         raise RuntimeError("外勤設定視窗未開啟，已停止登打。")
 
-    driver.switch_to.window(main_window)
     if not step_prepare_content(driver, wait):
         raise RuntimeError("外勤設定後，勤務基準表未重新載入。")
 
@@ -1704,13 +1806,23 @@ def start_automation(
             if not super_js_execute(candidate, "_txtTaskDate", "set", target_date):
                 raise RuntimeError("勤務基準表日期欄位未就緒，未執行登打。")
             query_wait = WebDriverWait(candidate, 60, poll_frequency=0.5)
-            wait_for_duty_query_button_ready(candidate, query_wait)
-            if not super_js_execute(candidate, "_btnQuery", "click"):
-                raise RuntimeError("勤務基準表查詢按鈕點擊失敗，未執行登打。")
-            wait_for_duty_query_completion(
+            click_duty_query_button_when_ready(candidate, query_wait, target_date)
+            query_mode = wait_for_duty_query_completion(
                 candidate,
                 query_wait,
             )
+            if query_mode == "existing":
+                report_stage("duty_existing_data_delete")
+                if not super_js_execute(candidate, "_btnDelete", "click"):
+                    raise RuntimeError("既有勤務表刪除按鈕未就緒，未執行登打。")
+                accept_pending_alerts(candidate, timeout=3)
+                log_status("✅ 舊資料已刪除")
+                query_mode = wait_for_duty_query_completion(
+                    candidate,
+                    query_wait,
+                )
+            if query_mode != "setup":
+                raise RuntimeError("勤務表查詢結果無法進入設定流程，未執行登打。")
             return candidate
 
         def verify_duty_number_popup(candidate):
@@ -1744,18 +1856,6 @@ def start_automation(
                 driver,
                 WebDriverWait(driver, 60, poll_frequency=0.5),
             )
-
-            if super_js_execute(driver, "_btnDelete", "exists"):
-                report_stage("duty_existing_data_delete")
-                super_js_execute(driver, "_btnDelete", "click")
-                wait.until(EC.alert_is_present())
-                driver.switch_to.alert.accept()
-                time.sleep(3)
-                log_status("✅ 舊資料已刪除")
-                wait_for_duty_result_grid(
-                    driver,
-                    WebDriverWait(driver, 60, poll_frequency=0.5),
-                )
             
             log_status("🧠 勤務基準表計算中...")
             

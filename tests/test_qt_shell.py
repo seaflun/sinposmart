@@ -9093,8 +9093,8 @@ if return_code != 0 or loaded:
         class FakeService:
             def load_defaults(self):
                 return DutySheetDefaults(
-                    "duty.xlsm", "2026/07/30", "A", "S", "M1", "M2",
-                    ("A",), ("S",), ("M1", "M2"), False,
+                    "duty.xlsm", "2026/07/30", "OLD-A", "OLD-S", "OLD-1", "OLD-2",
+                    ("OLD-A", "NEW-A"), ("OLD-S", "NEW-S"), ("OLD-1", "NEW-1", "OLD-2", "NEW-2"), False,
                 )
 
             def validate(self, request):
@@ -9121,10 +9121,23 @@ if return_code != 0 or loaded:
         controller.setNotificationEnabled(True)
         self.assertTrue(controller.notificationEnabled)
         controller.setNotificationEnabled(False)
-        controller.prepareRun("duty.xlsm", "2026/07/30", "A", "S", "M1", "M2", False)
+        controller.prepareRun("duty.xlsm", "2026/07/30", "NEW-A", "NEW-S", "NEW-1", "NEW-2", False)
         self.assertEqual(confirmation_spy.count(), 1)
         self.assertIn("確認 2026/07/30", controller.confirmationSummary)
         self.assertFalse(controller._pending_request.notification_enabled)
+        self.assertEqual(
+            (controller.attack, controller.stop, controller.amb1, controller.amb2),
+            ("NEW-A", "NEW-S", "NEW-1", "NEW-2"),
+        )
+        self.assertEqual(
+            (
+                controller._pending_request.attack,
+                controller._pending_request.stop,
+                controller._pending_request.amb1,
+                controller._pending_request.amb2,
+            ),
+            ("NEW-A", "NEW-S", "NEW-1", "NEW-2"),
+        )
 
         controller.confirmRun()
         for _ in range(20):

@@ -2263,20 +2263,23 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("預檢重試：2/2", str(caught.exception))
         self.assertIn("未開始勤務表刪除、填寫或儲存", str(caught.exception))
 
-    def test_duty_sheet_popup_setup_happens_before_existing_data_delete(self) -> None:
+    def test_duty_sheet_popup_setup_never_deletes_after_configuration(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
             encoding="utf-8-sig"
         )
         start = source.index("def start_automation(")
         flow = source[start:source.index("# ==========================================\n# [區塊七]", start)]
+        post_setup_flow = flow[flow.index("step_config_popups("):]
 
-        self.assertLess(flow.index("step_config_popups("), flow.index('"_btnDelete", "exists"'))
+        self.assertLess(post_setup_flow.index("step_config_popups("), post_setup_flow.index("wait_for_duty_result_grid("))
+        self.assertLess(post_setup_flow.index("wait_for_duty_result_grid("), post_setup_flow.index('report_stage("duty_fill")'))
+        self.assertNotIn('"_btnDelete"', post_setup_flow)
         self.assertIn("retry_duty_number_popup_preflight(", flow)
         self.assertIn("duty_number_popup_preflight", flow)
 
-    def test_duty_query_button_waiter_polls_until_button_is_visible(self) -> None:
+    def test_duty_query_click_waiter_retries_until_target_date_frame_is_ready(self) -> None:
         module = legacy_duty_sheet_module()
-        driver = object()
+        driver = mock.Mock()
 
         class QueryButtonWait:
             def until(self, predicate):
@@ -2285,15 +2288,26 @@ class PackageSmokeTests(unittest.TestCase):
                         return True
                 raise AssertionError("查詢按鈕未在測試期間就緒")
 
-        with mock.patch.object(module, "super_js_execute", side_effect=[False, False, True]) as execute:
-            self.assertTrue(module.wait_for_duty_query_button_ready(driver, QueryButtonWait()))
+        driver.execute_script.side_effect = [False, False, True]
 
-        self.assertEqual(execute.call_count, 3)
+        self.assertTrue(
+            module.click_duty_query_button_when_ready(
+                driver,
+                QueryButtonWait(),
+                "1150827",
+            )
+        )
+
+        self.assertEqual(driver.execute_script.call_count, 3)
+        click_scripts = [call.args[0] for call in driver.execute_script.call_args_list]
         self.assertTrue(
             all(
-                call.args == (driver, "_btnQuery", "exists")
-                for call in execute.call_args_list
+                "_txtTaskDate" in script and "_btnQuery" in script
+                for script in click_scripts
             )
+        )
+        self.assertTrue(
+            all(call.args[1] == "1150827" for call in driver.execute_script.call_args_list)
         )
 
     def test_duty_query_completion_waiter_polls_until_blank_setup_form_is_ready(self) -> None:
@@ -2303,18 +2317,40 @@ class PackageSmokeTests(unittest.TestCase):
         class QueryCompletionWait:
             def until(self, predicate):
                 for _ in range(3):
-                    if predicate(driver):
-                        return True
+                    result = predicate(driver)
+                    if result:
+                        return result
                 raise AssertionError("查詢後的空白勤務表未在測試期間就緒")
 
-        driver.execute_script.side_effect = [False, False, True]
+        driver.execute_script.side_effect = [False, False, "setup"]
 
-        self.assertTrue(module.wait_for_duty_query_completion(driver, QueryCompletionWait()))
+        self.assertEqual(
+            module.wait_for_duty_query_completion(driver, QueryCompletionWait()),
+            "setup",
+        )
 
         self.assertEqual(driver.execute_script.call_count, 3)
         readiness_scripts = [call.args[0] for call in driver.execute_script.call_args_list]
         self.assertTrue(all("設定勤務項目" in script for script in readiness_scripts))
         self.assertTrue(all("設定勤務番號" in script for script in readiness_scripts))
+
+    def test_duty_query_completion_returns_existing_for_existing_grid(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+
+        class QueryCompletionWait:
+            def until(self, predicate):
+                result = predicate(driver)
+                if result:
+                    return result
+                raise AssertionError("既有勤務表未在測試期間辨識")
+
+        driver.execute_script.return_value = "existing"
+
+        self.assertEqual(
+            module.wait_for_duty_query_completion(driver, QueryCompletionWait()),
+            "existing",
+        )
 
     def test_duty_query_completion_waiter_stops_before_popup_preflight_when_timed_out(self) -> None:
         module = legacy_duty_sheet_module()
@@ -2329,7 +2365,7 @@ class PackageSmokeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "勤務表查詢逾時.*設定勤務項目.*設定勤務番號",
+            "勤務表查詢逾時.*設定頁.*既有勤務表",
         ):
             module.wait_for_duty_query_completion(driver, TimedOutQueryCompletionWait())
 
@@ -2355,7 +2391,7 @@ class PackageSmokeTests(unittest.TestCase):
             )
         )
 
-    def test_duty_query_waits_for_setup_buttons_before_popup_preflight(self) -> None:
+    def test_duty_query_waits_for_current_date_frame_before_popup_preflight(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
             encoding="utf-8-sig"
         )
@@ -2366,20 +2402,22 @@ class PackageSmokeTests(unittest.TestCase):
         readiness_source = source[readiness_start:readiness_end]
 
         self.assertLess(
-            flow.index("wait_for_duty_query_button_ready("),
-            flow.index('super_js_execute(candidate, "_btnQuery", "click")'),
+            flow.index('super_js_execute(candidate, "_txtTaskDate", "set", target_date)'),
+            flow.index("click_duty_query_button_when_ready("),
         )
         self.assertLess(
-            flow.index('super_js_execute(candidate, "_btnQuery", "click")'),
+            flow.index("click_duty_query_button_when_ready("),
             flow.index("wait_for_duty_query_completion("),
         )
+        self.assertNotIn("wait_for_duty_query_button_ready(", flow)
+        self.assertNotIn('super_js_execute(candidate, "_btnQuery", "click")', flow)
         self.assertNotIn("mark_duty_query_document(", flow)
         self.assertIn("_btnOpenWinTaskCode", readiness_source)
         self.assertIn("_btnOpenWinUserNo", readiness_source)
         self.assertIn("設定勤務項目", readiness_source)
         self.assertIn("設定勤務番號", readiness_source)
 
-    def test_duty_setup_reloads_grid_without_a_second_query(self) -> None:
+    def test_duty_setup_reloads_grid_without_a_second_query_or_delete(self) -> None:
         source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
             encoding="utf-8-sig"
         )
@@ -2388,13 +2426,42 @@ class PackageSmokeTests(unittest.TestCase):
         duty_flow = source[start:end]
 
         self.assertNotIn('super_js_execute(driver, "_btnQuery", "click")', duty_flow)
+        self.assertNotIn('"_btnDelete"', duty_flow)
         self.assertLess(
             duty_flow.index("step_config_popups("),
             duty_flow.index("wait_for_duty_result_grid("),
         )
         self.assertLess(
             duty_flow.index("wait_for_duty_result_grid("),
-            duty_flow.index('super_js_execute(driver, "_btnDelete", "exists")'),
+            duty_flow.index('report_stage("duty_fill")'),
+        )
+
+    def test_existing_duty_query_deletes_before_popup_setup(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index("def open_duty_browser_for_popup_preflight():")
+        query_flow = source[start:source.index("def verify_duty_number_popup", start)]
+
+        self.assertLess(
+            query_flow.index('query_mode = wait_for_duty_query_completion('),
+            query_flow.index('if query_mode == "existing":'),
+        )
+        self.assertLess(
+            query_flow.index('if query_mode == "existing":'),
+            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+        )
+        self.assertLess(
+            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+            query_flow.index("return candidate"),
+        )
+        self.assertEqual(
+            query_flow.count("query_mode = wait_for_duty_query_completion("),
+            2,
+        )
+        self.assertLess(
+            query_flow.index('super_js_execute(candidate, "_btnDelete", "click")'),
+            query_flow.rindex("query_mode = wait_for_duty_query_completion("),
         )
 
     def test_duty_number_popup_waits_for_a_new_handle_without_double_clicking(self) -> None:
@@ -2409,14 +2476,91 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn("element.click();", popup_source)
         self.assertNotIn("element.onclick()", popup_source)
 
+    def test_popup_save_recovers_when_current_popup_window_has_closed(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.window_handles = ["main-window"]
+        driver.switch_to.window.side_effect = [
+            module.NoSuchWindowException("popup already closed"),
+            None,
+        ]
+
+        class PopupCloseWait:
+            def until(self, predicate):
+                for _ in range(2):
+                    if predicate(driver):
+                        return True
+                raise AssertionError("主視窗未在測試期間恢復")
+
+        self.assertTrue(
+            module.wait_for_popup_close_and_return_to_main(
+                driver,
+                PopupCloseWait(),
+                "main-window",
+                "popup-window",
+            )
+        )
+
+        self.assertEqual(
+            driver.switch_to.window.call_args_list,
+            [mock.call("main-window"), mock.call("main-window")],
+        )
+
+    def test_duty_number_and_external_popups_share_main_window_recovery(self) -> None:
+        source = (package_dir() / "duty_sheet_legacy" / "sinposmart_1.py").read_text(
+            encoding="utf-8-sig"
+        )
+        start = source.index("def save_duty_number_popup(")
+        popup_flow = source[start:source.index("def step_select_vehicles_popup(", start)]
+
+        self.assertIn(
+            "save_duty_number_popup(driver, wait, daily_commander, main_window)",
+            popup_flow,
+        )
+        self.assertEqual(
+            popup_flow.count("wait_for_popup_close_and_return_to_main("),
+            2,
+        )
+
+    def test_external_setup_button_waits_for_its_named_button_before_clicking(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+
+        class ExternalButtonWait:
+            def until(self, predicate):
+                for _ in range(3):
+                    if predicate(driver):
+                        return True
+                raise AssertionError("設定勤務項目按鈕未在測試期間就緒")
+
+        driver.execute_script.side_effect = [False, False, True]
+
+        self.assertTrue(
+            module.click_duty_external_setup_button_when_ready(driver, ExternalButtonWait())
+        )
+
+        self.assertEqual(driver.execute_script.call_count, 3)
+        button_scripts = [call.args[0] for call in driver.execute_script.call_args_list]
+        self.assertTrue(
+            all(
+                "_btnOpenWinTaskCode" in script and "設定勤務項目" in script and
+                "element.click()" in script
+                for script in button_scripts
+            )
+        )
+
     def test_external_popup_failure_stops_before_external_settings_are_written(self) -> None:
         module = legacy_duty_sheet_module()
         driver = mock.Mock()
 
         with mock.patch.object(module, "save_duty_number_popup"), mock.patch.object(
             module, "step_prepare_content", return_value=True
-        ), mock.patch.object(module, "super_js_execute", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "外勤設定按鈕未就緒"):
+        ), mock.patch.object(
+            module,
+            "click_duty_external_setup_button_when_ready",
+            side_effect=RuntimeError("設定勤務項目按鈕逾時"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "設定勤務項目按鈕逾時"):
                 module.step_config_popups(driver, mock.Mock(), ["防溺車巡"], "2", "main")
 
         driver.find_element.assert_not_called()

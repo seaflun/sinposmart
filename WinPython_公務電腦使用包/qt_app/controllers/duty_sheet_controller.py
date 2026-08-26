@@ -205,6 +205,10 @@ class DutySheetController(QObject):
         except DutySheetValidationError as exc:
             self._set_error(str(exc))
             return
+        self._attack = request.attack
+        self._stop = request.stop
+        self._amb1 = request.amb1
+        self._amb2 = request.amb2
         self._pending_request = request
         self._confirmation_summary = self._service.confirmation_summary(request)
         self._status_text = "等待使用者確認正式登打。"
