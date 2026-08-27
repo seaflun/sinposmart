@@ -3507,6 +3507,24 @@ class RestMonthlyServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "唯一"):
                 module.fetch_monthly_base_plan("", actor_name="王小明")
 
+    def test_monthly_base_fire_holiday_code_keeps_sheet_symbol_for_system_entry(self) -> None:
+        import rest_time_automation as module
+
+        source = "115年8月份輪休基準表\n,,10\n,,王小明\n1,,消\n"
+        with patch.object(module, "download_monthly_base_csv", return_value=source):
+            plan = module.fetch_monthly_base_plan("10")
+
+        payloads: list[dict[str, str]] = []
+        driver = SimpleNamespace(
+            execute_script=lambda _script, _name, payload: payloads.append(payload) or {"missing": []}
+        )
+
+        filled = module.fill_monthly_base_row(driver, plan.name, plan.day_symbols, 1)
+
+        self.assertEqual(plan.day_symbols, {1: "消"})
+        self.assertEqual(payloads, [{"1": "消"}])
+        self.assertEqual(filled, 1)
+
     def test_rest_and_monthly_save_last_confirmed_month_without_reusing_as_default(self) -> None:
         from datetime import date
 
