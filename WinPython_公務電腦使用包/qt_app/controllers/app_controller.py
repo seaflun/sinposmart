@@ -231,6 +231,7 @@ class AppController(QObject):
         self._duty_controller.fireDayChanged.connect(self._refresh_after_fire_day_change)
         self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
+        self._duty_controller.dueExistingTasksAvailable.connect(self._report_due_existing_tasks)
         self._duty_controller.handoffPrewarmRequested.connect(self._prewarm_handoff_entry_browser)
         self._duty_controller.handoffWorkPrewarmRequested.connect(self._prewarm_handoff_work_browser)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
@@ -2231,6 +2232,34 @@ class AppController(QObject):
         ):
             if self._duty_execution_controller.enqueue(request):
                 self._duty_controller.mark_submission_enqueued(request.action_index)
+
+    @Slot(object)
+    def _report_due_existing_tasks(self, indices: list[int]) -> None:
+        if self._read_only_acceptance or not self._duty_mode_active:
+            return
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return
+        for request in self._duty_controller.due_existing_submission_requests(
+            session.user_id,
+            session.password,
+            list(indices),
+        ):
+            action = self._submission_action(request)
+            if not self._duty_controller.report_due_existing_submission(request):
+                continue
+            self._send_operational_event(
+                "action_result",
+                status="skipped_duplicate",
+                trigger_type=request.trigger_type,
+                action=action,
+                snapshot={
+                    "action_index": request.action_index,
+                    "completion_key": request.action_key or action_completion_key(action),
+                    "comparison_source": "existing_schedule_comparison",
+                },
+                **self._submission_event_fields(request, action),
+            )
 
     @Slot(int)
     def _prewarm_handoff_entry_browser(self, action_index: int) -> None:

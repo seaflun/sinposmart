@@ -714,6 +714,54 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(comparisons[0]["group"], "done")
         self.assertEqual(comparisons[0]["compare"], "已存在")
 
+    def test_drowning_patrol_comparison_requires_matching_overview_time(self) -> None:
+        from app_core.duty_task_projection import build_schedule_comparisons
+
+        action = {
+            "kind": "work_log",
+            "time": "20:00",
+            "actor": "10",
+            "target": "10",
+            "source": "防溺車巡",
+            "fields": {
+                "工作時間": "20:00",
+                "勤務項目": "車巡",
+                "事由": "防溺",
+                "工作概述": "一、時間：1800-2000\n二、地點：固定文字",
+            },
+        }
+        data = {
+            "target_date": "1150827",
+            "today": {"staff": {"10": {"name": "測試員"}}},
+            "actions": [action],
+        }
+
+        wrong_time = build_schedule_comparisons(
+            data,
+            [action],
+            {
+                "1150827": {
+                    "visible_work_rows": [
+                        ["115/08/27", "20:00", "車巡", "防溺", "一、時間：1000-1200"]
+                    ]
+                }
+            },
+        )
+        matching_time = build_schedule_comparisons(
+            data,
+            [action],
+            {
+                "1150827": {
+                    "visible_work_rows": [
+                        ["115/08/27", "20:00", "車巡", "防溺", "一、時間：1800-2000"]
+                    ]
+                }
+            },
+        )
+
+        self.assertEqual(wrong_time[0]["group"], "todo")
+        self.assertEqual(matching_time[0]["group"], "done")
+
     def test_external_and_rest_entries_skip_duplicate_comparison(self) -> None:
         from app_core.duty_task_projection import build_schedule_comparisons
 
@@ -970,6 +1018,35 @@ class DutyTaskProjectionTests(unittest.TestCase):
         )
 
         self.assertEqual(select_due_task_indices(actions, state, now=now), [0, 2])
+
+    def test_due_existing_selection_reports_done_automatic_work(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import (
+            DueTaskSelectionState,
+            select_due_existing_task_indices,
+            select_due_task_indices,
+        )
+
+        action = {
+            "kind": "work_log",
+            "time": "20:00",
+            "actor": "10",
+            "target": "10",
+            "source": "防溺車巡",
+            "fields": {"工作時間": "20:00", "勤務項目": "車巡", "事由": "防溺"},
+        }
+        state = DueTaskSelectionState(
+            actor_no="10",
+            target_roc_date="1150827",
+            comparisons={0: {"compare": "已存在", "group": "done"}},
+        )
+
+        self.assertEqual(select_due_task_indices([action], state, now=datetime(2026, 8, 27, 20, 0)), [])
+        self.assertEqual(
+            select_due_existing_task_indices([action], state, now=datetime(2026, 8, 27, 20, 0)),
+            [0],
+        )
 
     def test_due_selection_starts_0805_checkout_at_0800(self) -> None:
         from datetime import datetime
@@ -11432,6 +11509,73 @@ if return_code != 0 or loaded:
                 controller.workLogSettingsController._schedule_data.get("target_date"),
                 target_roc_date,
             )
+
+    def test_app_controller_reports_due_existing_task_to_nas(self) -> None:
+        from datetime import datetime
+
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        current = datetime(2026, 8, 27, 20, 0)
+        target_roc_date = "1150827"
+
+        class ScenarioDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return current if tz is None else current.replace(tzinfo=tz)
+
+        action = {
+            "kind": "work_log",
+            "time": "20:00",
+            "actor": "10",
+            "target": "10",
+            "source": "防溺車巡",
+            "fields": {
+                "工作時間": "20:00",
+                "勤務項目": "車巡",
+                "事由": "防溺",
+                "工作概述": "一、時間：1800-2000",
+            },
+        }
+        schedule_data = {
+            "target_date": target_roc_date,
+            "today": {"staff": {"10": {"name": "本班", "role": "隊員"}}},
+            "actions": [action],
+        }
+
+        with patch("qt_app.controllers.duty_controller.datetime", ScenarioDateTime), patch(
+            "app_core.duty_task_projection.datetime",
+            ScenarioDateTime,
+        ), tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None)
+            )
+            try:
+                attempt_id = controller._session_state.begin_login()
+                controller._session_state.complete_login(
+                    attempt_id,
+                    LoginSession("10", "user10", "secret", verified=True, actor_name="本班"),
+                )
+                controller.dutyController.set_session_context(1, "user10")
+                controller.dutyController.set_actor_no("10")
+                controller.dutyController.replace_schedule_data(
+                    schedule_data,
+                    comparisons={0: {"compare": "已存在", "group": "done", "matched": []}},
+                )
+
+                with patch.object(controller, "_send_operational_event") as send_event:
+                    controller.dutyController.enable_auto_execution()
+
+                self.assertEqual(send_event.call_count, 1)
+                self.assertEqual(send_event.call_args.args, ("action_result",))
+                self.assertEqual(send_event.call_args.kwargs["status"], "skipped_duplicate")
+                self.assertEqual(send_event.call_args.kwargs["trigger_type"], "due")
+                self.assertEqual(send_event.call_args.kwargs["action"]["source"], "防溺車巡")
+                self.assertTrue(send_event.call_args.kwargs["snapshot"]["completion_key"])
+                self.assertEqual(controller.dutyController._executed_indices, {0})
+            finally:
+                controller.shutdown()
 
     def test_operational_person_label_omits_roles_for_multiple_targets(self) -> None:
         from qt_app.controllers.app_controller import operational_person_label

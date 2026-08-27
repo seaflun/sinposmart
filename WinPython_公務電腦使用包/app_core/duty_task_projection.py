@@ -286,13 +286,15 @@ def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
     return direction in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤") or is_drowning_patrol_entry
 
 
-def select_due_task_indices(
+def _select_due_task_indices(
     actions: Sequence[Mapping[str, Any]],
     state: DueTaskSelectionState,
     *,
     now: datetime | None = None,
+    existing_only: bool = False,
 ) -> list[int]:
-    """Return due, auto-eligible task indexes without causing side effects."""
+    """Return due auto-task indexes, optionally limited to confirmed existing work."""
+
     current = now or datetime.now()
     due: list[int] = []
     for index, action in enumerate(actions):
@@ -312,7 +314,10 @@ def select_due_task_indices(
             index in state.auto_return_indices
             and is_external_or_rest_return(action)
         )
-        if (
+        existing_match = comparison.get("group") == "done" and not is_auto_return
+        if existing_only and not existing_match:
+            continue
+        if not existing_only and (
             comparison.get("group") in ("done", "manual", "near", "adjust", "review", "skipped")
             and not is_auto_return
         ):
@@ -323,6 +328,28 @@ def select_due_task_indices(
         if action_at <= current <= action_at + AUTO_DUE_CATCH_UP_WINDOW:
             due.append(index)
     return sorted(due, key=lambda index: (action_datetime(actions[index], state.target_roc_date), index))
+
+
+def select_due_task_indices(
+    actions: Sequence[Mapping[str, Any]],
+    state: DueTaskSelectionState,
+    *,
+    now: datetime | None = None,
+) -> list[int]:
+    """Return due, auto-eligible task indexes without causing side effects."""
+
+    return _select_due_task_indices(actions, state, now=now)
+
+
+def select_due_existing_task_indices(
+    actions: Sequence[Mapping[str, Any]],
+    state: DueTaskSelectionState,
+    *,
+    now: datetime | None = None,
+) -> list[int]:
+    """Return due automatic tasks confirmed as existing without replaying them."""
+
+    return _select_due_task_indices(actions, state, now=now, existing_only=True)
 
 
 def previous_duty_actor_nos(actions: Sequence[Mapping[str, Any]], actor_no: str) -> set[str]:

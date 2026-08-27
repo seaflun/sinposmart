@@ -28,6 +28,7 @@ from app_core.duty_task_projection import (
     next_duty_task_text,
     project_audit_tasks,
     project_duty_tasks,
+    select_due_existing_task_indices,
     select_due_task_indices,
     target_short_label,
 )
@@ -48,6 +49,7 @@ class DutyController(QObject):
     clockChanged = Signal()
     scheduleChanged = Signal()
     dueTasksAvailable = Signal(object)
+    dueExistingTasksAvailable = Signal(object)
     handoffPrewarmRequested = Signal(int)
     handoffWorkPrewarmRequested = Signal(int)
     autoLogoutRequested = Signal(str)
@@ -118,6 +120,7 @@ class DutyController(QObject):
         self._audit_only_actor = False
         self._audit_summary_counts = {"todo": 0, "review": 0, "ready": 0, "done": 0}
         self._due_task_indices: list[int] = []
+        self._due_existing_task_indices: list[int] = []
         self._executed_indices: set[int] = set()
         self._submitting_indices: set[int] = set()
         self._blocked_indices: set[int] = set()
@@ -831,6 +834,8 @@ class DutyController(QObject):
         self._session_user_id = user_id
         self._session_closing = not bool(user_id)
         self._auto_execution_enabled = False
+        self._due_task_indices.clear()
+        self._due_existing_task_indices.clear()
         self._executed_indices.clear()
         self._submitting_indices.clear()
         self._blocked_indices.clear()
@@ -1241,6 +1246,52 @@ class DutyController(QObject):
                 for group_index in group_indices
             )
         return requests
+
+    def due_existing_submission_requests(
+        self,
+        user_id: str,
+        password: str,
+        indices: list[int],
+    ) -> list[DutySubmissionRequest]:
+        if self._session_closing or not self._auto_execution_enabled or not user_id or not password:
+            return []
+        requests: list[DutySubmissionRequest] = []
+        current = datetime.now()
+        for index in indices:
+            if index not in self._due_existing_task_indices or not 0 <= index < len(self._actions):
+                continue
+            action_at = action_datetime(
+                self._actions[index],
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if not action_at <= current <= action_at + AUTO_DUE_CATCH_UP_WINDOW:
+                continue
+            requests.append(
+                self._submission_request(
+                    user_id,
+                    password,
+                    index,
+                    self._schedule_data,
+                    trigger_type="due",
+                )
+            )
+        return requests
+
+    def report_due_existing_submission(self, request: DutySubmissionRequest) -> bool:
+        action_index = self._resolve_request_action_index(request)
+        if action_index is None or action_index not in self._due_existing_task_indices:
+            return False
+        comparison = self._comparisons.get(action_index, {})
+        if comparison.get("group") != "done":
+            return False
+        return self.handle_submission_request_result(
+            request,
+            "skipped_duplicate",
+            "已有資料，略過自動登打。",
+            "",
+            comparison,
+        )
 
     def handoff_prewarm_request(
         self,
@@ -2308,29 +2359,39 @@ class DutyController(QObject):
     def _refresh_due_tasks(self, *, emit_signal: bool = True, force_emit: bool = False) -> None:
         self._release_due_manual_waiting()
         self._refresh_handoff_prewarm()
+        state = DueTaskSelectionState(
+            actor_no=self._actor_no,
+            target_roc_date=self._target_date_text,
+            comparisons=self._comparisons,
+            executed_indices=frozenset(self._executed_indices),
+            submitting_indices=frozenset(self._submitting_indices),
+            blocked_indices=frozenset(
+                set(self._blocked_indices)
+                | set(self._external_return_queue_ids_by_action_index)
+                | self._handoff_preflight_blocked_indices()
+            ),
+            retry_after=self._retry_after,
+            auto_return_indices=frozenset(self._auto_return_indices()),
+        )
         due = select_due_task_indices(
             self._actions,
-            DueTaskSelectionState(
-                actor_no=self._actor_no,
-                target_roc_date=self._target_date_text,
-                comparisons=self._comparisons,
-                executed_indices=frozenset(self._executed_indices),
-                submitting_indices=frozenset(self._submitting_indices),
-                blocked_indices=frozenset(
-                    set(self._blocked_indices)
-                    | set(self._external_return_queue_ids_by_action_index)
-                    | self._handoff_preflight_blocked_indices()
-                ),
-                retry_after=self._retry_after,
-                auto_return_indices=frozenset(self._auto_return_indices()),
-            ),
+            state,
         )
-        if due != self._due_task_indices or force_emit:
-            self._due_task_indices = due
+        existing_due = select_due_existing_task_indices(
+            self._actions,
+            state,
+        )
+        due_changed = due != self._due_task_indices or force_emit
+        existing_due_changed = existing_due != self._due_existing_task_indices or force_emit
+        self._due_task_indices = due
+        self._due_existing_task_indices = existing_due
+        if due_changed or existing_due_changed:
             if emit_signal:
                 self.scheduleChanged.emit()
-            if self._auto_execution_enabled and due:
+            if self._auto_execution_enabled and due and due_changed:
                 self.dueTasksAvailable.emit(list(due))
+        if self._auto_execution_enabled and existing_due:
+            self.dueExistingTasksAvailable.emit(list(existing_due))
         self._refresh_unreturned_return_queue()
 
     def _release_due_manual_waiting(self, current: datetime | None = None) -> None:

@@ -345,8 +345,18 @@ def find_work_matches(
         if is_radio_test:
             if "無線電" not in c:
                 continue
-        if is_drowning_patrol and reason and clean(reason) not in c:
-            continue
+        if is_drowning_patrol:
+            expected_overview_time = re.search(
+                r"一、時間[：:](\d{4})-(\d{4})",
+                clean(str(fields.get("工作概述", "") or "")),
+            )
+            if (
+                expected_overview_time is None
+                or expected_overview_time.group(0).replace("：", ":") not in c.replace("：", ":")
+            ):
+                continue
+            if reason and clean(reason) not in c:
+                continue
         matches.append(row)
     return matches
 
