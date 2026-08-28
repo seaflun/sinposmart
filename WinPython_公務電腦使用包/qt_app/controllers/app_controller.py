@@ -1506,7 +1506,7 @@ class AppController(QObject):
     ) -> bool:
         if not self._is_unreturned_recovery_request(request):
             return True
-        return status in {"submitted", "skipped_duplicate"}
+        return status in {"submitted", "skipped_duplicate", "cancelled"}
 
     @Slot(object)
     def _publish_unreturned_return_event(self, event: Mapping) -> None:
@@ -1705,9 +1705,12 @@ class AppController(QObject):
         message: str,
         error_code: str,
     ) -> None:
+        queue_id = self._external_return_queue_id(request)
+        if queue_id:
+            self._duty_controller.release_external_return_recovery(queue_id)
         if self._duty_controller.is_handoff_preflight_request(request):
             return
-        if not self._should_send_operational_submission_event(request):
+        if not self._should_send_operational_submission_event(request, status="cancelled"):
             return
         action = self._submission_action(request)
         self._send_operational_event(

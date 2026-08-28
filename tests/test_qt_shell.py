@@ -12240,6 +12240,84 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_cancelled_return_recovery_releases_its_queue_claim(self) -> None:
+        from datetime import datetime, timedelta
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.app_controller import AppController
+
+        paused_at = datetime(2026, 8, 28, 8, 1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = UnreturnedReturnQueue(
+                Path(temp_dir),
+                now_factory=lambda: paused_at,
+            )
+            action = {
+                "kind": "entry_log",
+                "time": "08:05",
+                "actor": "6",
+                "target": "19",
+                "source": "外勤返隊",
+                "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+                "duplicate_key": "entry:1150828:805:out:19:退勤",
+            }
+            record, created = queue.pause(
+                action,
+                {"target_date": "1150828", "today": {"staff": {"19": {"name": "測試員"}}}},
+                owner_actor_no="6",
+                now=paused_at,
+            )
+            self.assertTrue(created)
+            self.assertIsNotNone(
+                queue.claim_due("23", now=paused_at + timedelta(minutes=5))
+            )
+
+            with patch(
+                "qt_app.controllers.duty_controller.UnreturnedReturnQueue",
+                return_value=queue,
+            ):
+                controller = AppController(read_only_acceptance=True)
+            events: list[tuple[str, dict[str, object]]] = []
+            controller._send_operational_event = (
+                lambda record_type, **fields: events.append((record_type, fields))
+            )
+            try:
+                controller.dutyController.set_actor_no("21")
+                request = DutySubmissionRequest(
+                    "user23",
+                    "secret",
+                    0,
+                    {
+                        "target_date": "1150828",
+                        "actions": [action],
+                        "_unreturned_return_queue_id": record["queue_id"],
+                    },
+                    trigger_type="recovery",
+                    action_key=action["duplicate_key"],
+                    session_actor_no="23",
+                )
+
+                controller._submission_cancelled(
+                    request,
+                    "登入階段結束，取消尚未開始的恢復登打。",
+                    "session_ended",
+                )
+
+                self.assertIsNotNone(
+                    queue.claim_manual(
+                        record["queue_id"],
+                        "21",
+                        now=paused_at + timedelta(minutes=6),
+                    )
+                )
+                self.assertEqual(
+                    [(record_type, fields["status"]) for record_type, fields in events],
+                    [("action_result", "cancelled")],
+                )
+            finally:
+                controller.shutdown()
+
     def test_current_session_login_failure_survives_action_removal(self) -> None:
         from app_core.duty_submission_service import DutySubmissionRequest
         from qt_app.controllers.app_controller import AppController

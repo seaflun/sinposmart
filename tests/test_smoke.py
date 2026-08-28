@@ -657,17 +657,22 @@ class PackageSmokeTests(unittest.TestCase):
         )
 
     def test_drowning_patrol_work_duplicate_requires_drowning_reason(self) -> None:
-        from compare_rehearsal_records import find_work_matches
+        find_work_matches = package_module("compare_rehearsal_records").find_work_matches
 
         action = {
             "kind": "work_log",
             "time": "18:00",
             "source": "防溺車巡",
-            "fields": {"工作時間": "18:00", "勤務項目": "車巡", "事由": "防溺"},
+            "fields": {
+                "工作時間": "18:00",
+                "勤務項目": "車巡",
+                "事由": "防溺",
+                "工作概述": "一、時間：1600-1800",
+            },
         }
         rows = [
             "115/08/26 18:00 | 車巡 | 防颱",
-            "115/08/26 18:00 | 車巡 | 防溺",
+            "115/08/26 18:00 | 車巡 | 防溺 | 一、時間：1600-1800",
         ]
 
         self.assertEqual(find_work_matches(rows, "1150826", {}, action), [rows[1]])
@@ -2309,6 +2314,66 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(attempts, [first_driver, second_driver])
         self.assertEqual(cleaned, [first_driver])
 
+    def test_duty_number_popup_preflight_rebuilds_once_after_prewrite_query_timeout(self) -> None:
+        module = legacy_duty_sheet_module()
+        first_driver = object()
+        second_driver = object()
+        opened: list[object] = []
+        cleaned: list[object] = []
+        attempts: list[object] = []
+
+        def open_browser() -> object:
+            driver = first_driver if not opened else second_driver
+            opened.append(driver)
+            return driver
+
+        def preflight(driver: object) -> None:
+            attempts.append(driver)
+            if driver is first_driver:
+                raise module.DutyQueryPrewriteTimeout("勤務表查詢逾時")
+
+        result = module.retry_duty_number_popup_preflight(
+            open_browser,
+            preflight,
+            cleanup=cleaned.append,
+        )
+
+        self.assertIs(result, second_driver)
+        self.assertEqual(opened, [first_driver, second_driver])
+        self.assertEqual(attempts, [first_driver, second_driver])
+        self.assertEqual(cleaned, [first_driver])
+
+    def test_duty_number_popup_preflight_rebuilds_once_after_prewrite_delete_unavailable(self) -> None:
+        module = legacy_duty_sheet_module()
+        first_driver = object()
+        second_driver = object()
+        opened: list[object] = []
+        cleaned: list[object] = []
+        attempts: list[object] = []
+
+        def open_browser() -> object:
+            driver = first_driver if not opened else second_driver
+            opened.append(driver)
+            return driver
+
+        def preflight(driver: object) -> None:
+            attempts.append(driver)
+            if driver is first_driver:
+                raise module.DutyExistingDeletePrewriteUnavailable(
+                    "既有勤務表刪除按鈕未就緒"
+                )
+
+        result = module.retry_duty_number_popup_preflight(
+            open_browser,
+            preflight,
+            cleanup=cleaned.append,
+        )
+
+        self.assertIs(result, second_driver)
+        self.assertEqual(opened, [first_driver, second_driver])
+        self.assertEqual(attempts, [first_driver, second_driver])
+        self.assertEqual(cleaned, [first_driver])
+
     def test_duty_number_popup_preflight_stops_after_second_failure(self) -> None:
         module = legacy_duty_sheet_module()
         first_driver = object()
@@ -2462,6 +2527,54 @@ class PackageSmokeTests(unittest.TestCase):
         ):
             module.wait_for_duty_query_completion(driver, TimedOutQueryCompletionWait())
 
+    def test_duty_query_completion_marks_prewrite_timeout_for_safe_retry(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+
+        class TimedOutQueryCompletionWait:
+            def until(self, predicate):
+                predicate(driver)
+                raise module.TimeoutException("query document did not reload")
+
+        driver.execute_script.return_value = False
+
+        with self.assertRaises(module.DutyQueryPrewriteTimeout):
+            module.wait_for_duty_query_completion(
+                driver,
+                TimedOutQueryCompletionWait(),
+                prewrite=True,
+            )
+
+    def test_duty_query_click_marks_prewrite_timeout_for_safe_retry(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+
+        class TimedOutQueryClickWait:
+            def until(self, predicate):
+                predicate(driver)
+                raise module.TimeoutException("query button was not ready")
+
+        driver.execute_script.return_value = False
+
+        with self.assertRaises(module.DutyQueryPrewriteTimeout):
+            module.click_duty_query_button_when_ready(
+                driver,
+                TimedOutQueryClickWait(),
+                "1150828",
+                prewrite=True,
+            )
+
+    def test_duty_existing_delete_marks_unavailable_button_for_safe_retry(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        with mock.patch.object(
+            module,
+            "click_duty_existing_delete_and_accept_alert",
+            return_value=False,
+        ):
+            with self.assertRaises(module.DutyExistingDeletePrewriteUnavailable):
+                module.ensure_existing_duty_delete(object())
+
     def test_duty_result_grid_waiter_polls_after_setup_is_complete(self) -> None:
         module = legacy_duty_sheet_module()
         driver = object()
@@ -2542,10 +2655,10 @@ class PackageSmokeTests(unittest.TestCase):
         )
         self.assertLess(
             query_flow.index('if query_mode == "existing":'),
-            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
+            query_flow.index("ensure_existing_duty_delete(candidate)"),
         )
         self.assertLess(
-            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
+            query_flow.index("ensure_existing_duty_delete(candidate)"),
             query_flow.index("return candidate"),
         )
         self.assertEqual(
@@ -2553,7 +2666,7 @@ class PackageSmokeTests(unittest.TestCase):
             2,
         )
         self.assertLess(
-            query_flow.index("click_duty_existing_delete_and_accept_alert(candidate)"),
+            query_flow.index("ensure_existing_duty_delete(candidate)"),
             query_flow.rindex("query_mode = wait_for_duty_query_completion("),
         )
         self.assertNotIn('super_js_execute(candidate, "_btnDelete", "click")', query_flow)

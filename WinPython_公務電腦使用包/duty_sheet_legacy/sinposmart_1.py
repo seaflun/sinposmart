@@ -1073,7 +1073,7 @@ def step_prepare_content(driver, wait):
     return False
 
 
-def click_duty_query_button_when_ready(driver, wait, target_date):
+def click_duty_query_button_when_ready(driver, wait, target_date, *, prewrite=False):
     log_status("⏳ 等待勤務基準表日期與查詢按鈕就緒...")
 
     def click_query(candidate):
@@ -1115,13 +1115,22 @@ def click_duty_query_button_when_ready(driver, wait, target_date):
     try:
         wait.until(click_query)
     except TimeoutException as error:
-        raise RuntimeError(
-            "勤務基準表日期或查詢按鈕逾時，未執行登打。"
-        ) from error
+        message = "勤務基準表日期或查詢按鈕逾時，未執行登打。"
+        if prewrite:
+            raise DutyQueryPrewriteTimeout(message) from error
+        raise RuntimeError(message) from error
     return True
 
 
-def wait_for_duty_query_completion(driver, wait):
+class DutyQueryPrewriteTimeout(RuntimeError):
+    """The first read-only duty query may be retried with a new browser."""
+
+
+class DutyExistingDeletePrewriteUnavailable(RuntimeError):
+    """No existing-duty delete click was sent, so a fresh-browser retry is safe."""
+
+
+def wait_for_duty_query_completion(driver, wait, *, prewrite=False):
     log_status("⏳ 等待勤務表查詢完成...")
 
     def query_completed(candidate):
@@ -1171,9 +1180,10 @@ def wait_for_duty_query_completion(driver, wait):
     try:
         return wait.until(query_completed)
     except TimeoutException as error:
-        raise RuntimeError(
-            "勤務表查詢逾時，尚未進入設定頁或既有勤務表。"
-        ) from error
+        message = "勤務表查詢逾時，尚未進入設定頁或既有勤務表。"
+        if prewrite:
+            raise DutyQueryPrewriteTimeout(message) from error
+        raise RuntimeError(message) from error
 
 
 def click_duty_existing_delete_and_accept_alert(driver):
@@ -1214,6 +1224,14 @@ def click_duty_existing_delete_and_accept_alert(driver):
     if clicked:
         accept_pending_alerts(driver, timeout=3)
     return clicked
+
+
+def ensure_existing_duty_delete(driver):
+    if click_duty_existing_delete_and_accept_alert(driver):
+        return
+    raise DutyExistingDeletePrewriteUnavailable(
+        "既有勤務表刪除按鈕未就緒，未執行登打。"
+    )
 
 
 def wait_for_duty_result_grid(driver, wait):
@@ -1440,16 +1458,26 @@ def retry_duty_number_popup_preflight(open_browser, preflight, cleanup=quit_driv
         try:
             driver = open_browser()
             preflight(driver)
-        except DutyNumberPopupOpenError as error:
-            error.diagnostic["attempt"] = attempt
-            error.diagnostic["attempts"] = popup_attempts
+        except (
+            DutyNumberPopupOpenError,
+            DutyQueryPrewriteTimeout,
+            DutyExistingDeletePrewriteUnavailable,
+        ) as error:
+            if isinstance(error, DutyNumberPopupOpenError):
+                error.diagnostic["attempt"] = attempt
+                error.diagnostic["attempts"] = popup_attempts
             if driver is not None:
                 try:
                     cleanup(driver)
                 except Exception:
                     pass
             if attempt < popup_attempts:
-                log_status("⚠️ 勤務番號小視窗預檢未通過，將以全新瀏覽器安全重試一次...")
+                if isinstance(error, DutyQueryPrewriteTimeout):
+                    log_status("⚠️ 勤務表首次查詢逾時，將以全新瀏覽器安全重試一次...")
+                elif isinstance(error, DutyExistingDeletePrewriteUnavailable):
+                    log_status("⚠️ 既有勤務表尚未刪除，將以全新瀏覽器安全重試一次...")
+                else:
+                    log_status("⚠️ 勤務番號小視窗預檢未通過，將以全新瀏覽器安全重試一次...")
                 continue
             raise
         except Exception:
@@ -1846,15 +1874,20 @@ def start_automation(
             if not super_js_execute(candidate, "_txtTaskDate", "set", target_date):
                 raise RuntimeError("勤務基準表日期欄位未就緒，未執行登打。")
             query_wait = WebDriverWait(candidate, 60, poll_frequency=0.5)
-            click_duty_query_button_when_ready(candidate, query_wait, target_date)
+            click_duty_query_button_when_ready(
+                candidate,
+                query_wait,
+                target_date,
+                prewrite=True,
+            )
             query_mode = wait_for_duty_query_completion(
                 candidate,
                 query_wait,
+                prewrite=True,
             )
             if query_mode == "existing":
                 report_stage("duty_existing_data_delete")
-                if not click_duty_existing_delete_and_accept_alert(candidate):
-                    raise RuntimeError("既有勤務表刪除按鈕未就緒，未執行登打。")
+                ensure_existing_duty_delete(candidate)
                 log_status("✅ 舊資料已刪除")
                 query_mode = wait_for_duty_query_completion(
                     candidate,
