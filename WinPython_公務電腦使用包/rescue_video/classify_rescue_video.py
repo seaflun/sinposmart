@@ -37,6 +37,7 @@ TS_PTS_CLOCK_HZ = 90_000
 TS_PTS_WRAP = 1 << 33
 TS_DURATION_SAMPLE_BYTES = 2 * 1024 * 1024
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
+CASE_TRANSFER_WORKERS = 2
 
 
 @dataclass(frozen=True)
@@ -758,7 +759,7 @@ def classify_with_work_logs(
     transfer_callback: Callable[[Path, int, int, str], None] | None = None,
     transfer_workers: int | None = None,
 ) -> list[Result]:
-    """Classify by video interval, then transfer one case folder per lane."""
+    """Classify by video interval, then transfer each case folder with up to two lanes."""
     selected_date = parse_date(args.date)
     cases = discover_cases(args.destination, args.vehicle)
     work = discover_case_work(args.work_log_root, args.vehicle)
@@ -929,10 +930,14 @@ def _transfer_results(
             worker_count = 1
 
     def transfer_case(group: list[tuple[int, Result]]) -> list[tuple[int, Result]]:
-        return [
-            (index, _transfer_result(result, args, transfer_callback))
-            for index, result in group
-        ]
+        def transfer_item(item: tuple[int, Result]) -> tuple[int, Result]:
+            index, result = item
+            return index, _transfer_result(result, args, transfer_callback)
+
+        if not getattr(args, "apply", False) or len(group) == 1:
+            return [transfer_item(item) for item in group]
+        with ThreadPoolExecutor(max_workers=min(CASE_TRANSFER_WORKERS, len(group))) as executor:
+            return list(executor.map(transfer_item, group))
 
     if not getattr(args, "apply", False) or worker_count == 1 or len(case_groups) == 1:
         transferred_groups = [transfer_case(group) for group in case_groups.values()]

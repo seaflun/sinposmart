@@ -268,7 +268,7 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertEqual(updates, [(4, 10), (8, 10), (10, 10)])
 
-    def test_work_log_classification_assigns_one_transfer_lane_to_each_case_folder(self) -> None:
+    def test_work_log_classification_assigns_two_transfer_lanes_to_each_case_folder(self) -> None:
         classifier = self._classifier_module()
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -364,7 +364,7 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertEqual([result.status for result in results], ["已複製並刪除來源"] * len(sources))
         self.assertGreaterEqual(maximum_active_transfers, case_count)
-        self.assertEqual(maximum_by_case[first_case.parent], 1)
+        self.assertEqual(maximum_by_case[first_case.parent], 2)
         self.assertTrue(all(destination_exists))
         self.assertFalse(any(source_exists))
 
@@ -500,11 +500,38 @@ class RescueVideoPackageTests(unittest.TestCase):
             warning_text="",
             report_path="report.csv",
             rows=(
-                {"caseText": "08240801-92"},
-                {"caseText": "08240801-92"},
-                {"caseText": "08240930-92"},
-                {"caseText": "待確認"},
-                {},
+                {
+                    "sourcePath": r"C:\\private\\V0000001.TS",
+                    "timeText": "08/24 08:01:00",
+                    "caseText": "08240801-92",
+                    "statusText": "已複製",
+                    "noteText": "案件工作=2026-08-24 08:00；返隊=2026-08-24 08:20:00",
+                },
+                {
+                    "sourcePath": r"C:\\private\\V0000002.TS",
+                    "timeText": "08/24 08:05:00",
+                    "caseText": "08240801-92",
+                    "statusText": "已複製",
+                },
+                {
+                    "sourcePath": r"C:\\private\\V0000003.TS",
+                    "timeText": "08/24 09:30:00",
+                    "caseText": "08240930-92",
+                    "statusText": "已複製",
+                },
+                {
+                    "sourcePath": r"C:\\private\\V0000004.TS",
+                    "timeText": "08/24 10:00:00",
+                    "caseText": "待確認",
+                    "statusText": "待確認",
+                    "noteText": "沒有符合工作／返隊時間的案件",
+                },
+                {
+                    "sourcePath": r"C:\\private\\V0000005.TS",
+                    "timeText": "08/24 10:05:00",
+                    "caseText": "待確認",
+                    "statusText": "目的地不一致",
+                },
             ),
         )
 
@@ -516,9 +543,47 @@ class RescueVideoPackageTests(unittest.TestCase):
             {
                 "target_date": "2026-08-24",
                 "vehicle": "92",
+                "mode": "copy",
                 "case_count": 2,
                 "total_count": 5,
                 "usage_seconds": 65,
+                "classification_rows": [
+                    {
+                        "video_time": "08/24 08:01:00",
+                        "source_file": "V0000001.TS",
+                        "case": "08240801-92",
+                        "status": "已複製",
+                        "reason": "",
+                    },
+                    {
+                        "video_time": "08/24 08:05:00",
+                        "source_file": "V0000002.TS",
+                        "case": "08240801-92",
+                        "status": "已複製",
+                        "reason": "",
+                    },
+                    {
+                        "video_time": "08/24 09:30:00",
+                        "source_file": "V0000003.TS",
+                        "case": "08240930-92",
+                        "status": "已複製",
+                        "reason": "",
+                    },
+                    {
+                        "video_time": "08/24 10:00:00",
+                        "source_file": "V0000004.TS",
+                        "case": "待確認",
+                        "status": "待確認",
+                        "reason": "no_matching_work_or_return_time",
+                    },
+                    {
+                        "video_time": "08/24 10:05:00",
+                        "source_file": "V0000005.TS",
+                        "case": "待確認",
+                        "status": "目的地不一致",
+                        "reason": "destination_mismatch",
+                    },
+                ],
             },
         )
 

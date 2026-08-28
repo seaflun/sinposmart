@@ -7295,12 +7295,12 @@ class QtShellTests(unittest.TestCase):
             'objectName: "monthlySourceOpenButton"',
             'text: "開啟試算表"',
             'Qt.openUrlExternally("https://docs.google.com/spreadsheets/d/1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0/edit#gid=1587057625")',
-            'text: "Google 試算表月份"',
+            'text: "年月"',
             'objectName: "monthlySourceMonthLabel"',
             'text: monthlyBaseDialog.controller.monthlySourcePeriod',
             'objectName: "monthlyBaseRunButton"',
             'text: monthlyBaseDialog.controller.isRunning ? "啟動中..." : "啟動登打"',
-            'onClicked: monthlyBaseDialog.controller.prepareMonthlyRun()',
+            'monthlyBaseDialog.controller.prepareMonthlyRun()',
             'objectName: "monthlyBaseStatusBar"',
             'toolId: "monthly_base"',
             "currentOperatorOnly: true",
@@ -9351,44 +9351,51 @@ if return_code != 0 or loaded:
             LoginSession("10", "user10", "secret", verified=True, actor_name="王小明隊員"),
         )
         controller = RestMonthlyController(state, FakeService())
-        confirmation_spy = QSignalSpy(controller.confirmationRequested)
-        success_spy = QSignalSpy(controller.runSucceeded)
+        try:
+            confirmation_spy = QSignalSpy(controller.confirmationRequested)
+            success_spy = QSignalSpy(controller.runSucceeded)
 
-        controller.loadRestDefaults()
-        self.assertEqual(controller.statusText, "準備就緒。10番 王小明隊員")
-        from PySide6.QtCore import QUrl
+            controller.loadRestDefaults()
+            self.assertEqual(controller.statusText, "準備就緒。10番 王小明隊員")
+            from PySide6.QtCore import QUrl
 
-        controller.selectRestWorkbook(QUrl.fromLocalFile("selected.xlsm"))
-        self.assertEqual(controller.restWorkbookPath, "selected.xlsm")
-        self.assertEqual(controller.restMonth, "08")
-        self.assertEqual(controller.statusText, "已選擇勤務表 Excel。")
-        controller.prepareRestRun("selected.xlsm", "08")
-        self.assertEqual(confirmation_spy.count(), 1)
-        self.assertEqual(confirmation_spy.at(0)[0], "rest_time")
-        self.assertIn("確認 115/08", controller.confirmationSummary)
+            controller.selectRestWorkbook(QUrl.fromLocalFile("selected.xlsm"))
+            self.assertEqual(controller.restWorkbookPath, "selected.xlsm")
+            self.assertEqual(controller.restMonth, "08")
+            self.assertEqual(controller.statusText, "已選擇勤務表 Excel。")
+            controller.prepareRestRun("selected.xlsm", "08")
+            self.assertEqual(confirmation_spy.count(), 1)
+            self.assertEqual(confirmation_spy.at(0)[0], "rest_time")
+            self.assertIn("確認 115/08", controller.confirmationSummary)
 
-        controller.confirmRun()
-        for _ in range(20):
-            if success_spy.count() and not controller._workers:
-                break
-            success_spy.wait(250)
-            QTest.qWait(10)
-        self.assertEqual(success_spy.count(), 1)
-        self.assertEqual(success_spy.at(0)[0], "rest_time")
-        self.assertFalse(controller._workers)
+            controller.confirmRun()
+            for _ in range(20):
+                if success_spy.count() and not controller._workers:
+                    break
+                success_spy.wait(250)
+                QTest.qWait(10)
+            self.assertEqual(success_spy.count(), 1)
+            self.assertEqual(success_spy.at(0)[0], "rest_time")
+            self.assertFalse(controller._workers)
 
-        controller.loadMonthlyDefaults()
-        for _ in range(20):
-            if controller.monthlySourceReady:
-                break
-            QTest.qWait(50)
-        self.assertTrue(controller.monthlySourceReady)
-        self.assertEqual(controller.monthlySourcePeriod, "115年09月")
-        controller.prepareMonthlyRun()
-        self.assertEqual(confirmation_spy.count(), 2)
-        self.assertEqual(confirmation_spy.at(1)[0], "monthly_base")
-        self.assertEqual(controller.monthlyMonth, "09")
-        controller.cancelPendingRun()
+            controller.loadMonthlyDefaults()
+            for _ in range(20):
+                if (
+                    controller.monthlySourceReady
+                    and controller.monthlySourcePeriod == "115年9月"
+                ):
+                    break
+                QTest.qWait(50)
+            self.assertTrue(controller.monthlySourceReady)
+            self.assertEqual(controller.monthlySourcePeriod, "115年9月")
+            controller.prepareMonthlyRun()
+            self.assertEqual(confirmation_spy.count(), 2)
+            self.assertEqual(confirmation_spy.at(1)[0], "monthly_base")
+            self.assertEqual(controller.monthlyMonth, "09")
+            controller.cancelPendingRun()
+        finally:
+            controller.shutdown()
+            self._flush_qt_deferred_deletes()
 
     def test_rest_monthly_qml_rejects_a_session_without_actor_name(self) -> None:
         from PySide6.QtTest import QSignalSpy
@@ -17421,13 +17428,20 @@ if return_code != 0 or loaded:
                 self.assertGreaterEqual(monthly_source_open_button.width(), 112)
                 self.assertGreater(
                     monthly_source_label.width(),
-                    monthly_source_open_button.width() * 2,
+                    monthly_source_open_button.width(),
                 )
                 self.assertGreater(
-                    monthly_source_open_button.mapToScene(QPointF()).y(),
-                    monthly_source_label.mapToScene(QPointF()).y(),
+                    monthly_source_open_button.mapToScene(QPointF()).x(),
+                    monthly_source_label.mapToScene(QPointF()).x(),
                 )
-                self.assertEqual(monthly_source_month_label.property("text"), "115年09月")
+                self.assertAlmostEqual(
+                    monthly_source_open_button.mapToScene(QPointF()).y()
+                    + monthly_source_open_button.height() / 2,
+                    monthly_source_label.mapToScene(QPointF()).y()
+                    + monthly_source_label.height() / 2,
+                    delta=1.0,
+                )
+                self.assertEqual(monthly_source_month_label.property("text"), "115年9月")
                 self.assertEqual(monthly_source_title.property("font").pixelSize(), 15)
                 self.assertLess(monthly_status_bar.y(), monthly_run_button.y())
                 click(monthly_run_button)

@@ -28,6 +28,8 @@ class RestMonthlyController(QObject):
         session_state: SessionState,
         service: RestMonthlyService,
         parent: QObject | None = None,
+        *,
+        read_only_acceptance: bool = False,
     ) -> None:
         super().__init__(parent)
         self._session_state = session_state
@@ -50,6 +52,7 @@ class RestMonthlyController(QObject):
         self._monthly_source_request_id = 0
         self._monthly_source_workers: dict[int, tuple[QThread, MonthlyBaseSourceWorker]] = {}
         self._shutdown_admission = False
+        self._read_only_acceptance = bool(read_only_acceptance)
 
     @Property(str, notify=stateChanged)
     def restWorkbookPath(self) -> str:
@@ -76,7 +79,7 @@ class RestMonthlyController(QObject):
         if self._monthly_source_loading:
             return "正在讀取 Google 試算表月份…"
         if self._monthly_source_ready:
-            return f"{self._roc_year}年{self._monthly_month}月"
+            return f"{self._roc_year}年{int(self._monthly_month)}月"
         return "尚未讀取 Google 試算表月份"
 
     @Property(bool, notify=stateChanged)
@@ -105,6 +108,8 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def loadRestDefaults(self) -> None:
+        if self._reject_read_only_execution():
+            return
         defaults = self._service.load_rest_defaults()
         self._rest_workbook_path = defaults.workbook_path
         self._roc_year = defaults.roc_year
@@ -115,6 +120,8 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def loadMonthlyDefaults(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutdown_admission or self._monthly_source_workers:
             return
         self._monthly_source_request_id += 1
@@ -142,6 +149,8 @@ class RestMonthlyController(QObject):
 
     @Slot(QUrl)
     def selectRestWorkbook(self, url: QUrl) -> None:
+        if self._reject_read_only_execution():
+            return
         path = self.localPath(url)
         try:
             defaults = self._service.select_rest_workbook(path)
@@ -157,6 +166,8 @@ class RestMonthlyController(QObject):
 
     @Slot(str, str)
     def prepareRestRun(self, workbook_path: str, month: str) -> None:
+        if self._reject_read_only_execution():
+            return
         session = self._verified_session()
         if session is None:
             return
@@ -180,6 +191,8 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def prepareMonthlyRun(self) -> None:
+        if self._reject_read_only_execution():
+            return
         session = self._verified_session()
         if session is None:
             return
@@ -205,6 +218,8 @@ class RestMonthlyController(QObject):
 
     @Slot()
     def confirmRun(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if (
             self._shutdown_admission
             or self._pending_request is None
@@ -243,6 +258,16 @@ class RestMonthlyController(QObject):
         self._confirmation_summary = ""
         self._status_text = "已取消登打。"
         self.stateChanged.emit()
+
+    def _reject_read_only_execution(self) -> bool:
+        if not self._read_only_acceptance:
+            return False
+        self._pending_request = None
+        self._pending_tool_id = ""
+        self._confirmation_summary = ""
+        self._status_text = "唯讀驗收模式，不執行或變更設定。"
+        self.stateChanged.emit()
+        return True
 
     def _verified_session(self):
         session = self._session_state.session

@@ -56,31 +56,36 @@ ToolSidePanel {
                             text: "Google 試算表 / 輪休基準表"
                             wrapMode: Text.Wrap
                         }
+                        ToolBrowseButton {
+                            objectName: "monthlySourceOpenButton"
+                            Layout.minimumWidth: Design.monthlySourceOpenButtonWidth
+                            Layout.preferredWidth: Design.monthlySourceOpenButtonWidth
+                            Layout.maximumWidth: Design.monthlySourceOpenButtonWidth
+                            implicitHeight: Design.toolBrowseButtonHeight
+                            leftPadding: 10
+                            rightPadding: 10
+                            enabled: !monthlyBaseDialog.controller.isRunning
+                                     && !monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance
+                            text: "開啟試算表"
+                            onClicked: {
+                                if (!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance) {
+                                    Qt.openUrlExternally("https://docs.google.com/spreadsheets/d/1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0/edit#gid=1587057625")
+                                }
+                            }
+                        }
                     }
-                    ToolBrowseButton {
-                        objectName: "monthlySourceOpenButton"
-                        Layout.alignment: Qt.AlignRight
-                        Layout.minimumWidth: Design.monthlySourceOpenButtonWidth
-                        Layout.preferredWidth: Design.monthlySourceOpenButtonWidth
-                        Layout.maximumWidth: Design.monthlySourceOpenButtonWidth
-                        implicitHeight: Design.toolBrowseButtonHeight
-                        leftPadding: 10
-                        rightPadding: 10
-                        enabled: !monthlyBaseDialog.controller.isRunning
-                        text: "開啟試算表"
-                        onClicked: Qt.openUrlExternally("https://docs.google.com/spreadsheets/d/1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0/edit#gid=1587057625")
-                    }
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    ToolFieldLabel {
-                        text: "Google 試算表月份"
-                    }
-                    Label {
-                        objectName: "monthlySourceMonthLabel"
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: monthlyBaseDialog.controller.monthlySourcePeriod
-                        wrapMode: Text.Wrap
+                        ToolFieldLabel {
+                            text: "年月"
+                        }
+                        Label {
+                            objectName: "monthlySourceMonthLabel"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            text: monthlyBaseDialog.controller.monthlySourcePeriod
+                            elide: Text.ElideRight
+                        }
                     }
                 }
             }
@@ -100,8 +105,13 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: monthlyBaseDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !monthlyBaseDialog.controller.isRunning
-                     && monthlyBaseDialog.controller.monthlySourceReady
-            onClicked: monthlyBaseDialog.controller.prepareMonthlyRun()
+                      && monthlyBaseDialog.controller.monthlySourceReady
+                      && !monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance
+            onClicked: {
+                if (!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance) {
+                    monthlyBaseDialog.controller.prepareMonthlyRun()
+                }
+            }
         }
     }
 }

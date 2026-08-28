@@ -20,6 +20,9 @@ from qt_app.models.rescue_video_result_model import RescueVideoResultModel
 from qt_app.workers.rescue_video_worker import RescueVideoWorker
 
 
+MAX_NAS_CLASSIFICATION_ROWS = 200
+
+
 class RescueVideoController(QObject):
     stateChanged = Signal()
     copyConfirmationRequested = Signal()
@@ -35,6 +38,7 @@ class RescueVideoController(QObject):
         parent: QObject | None = None,
         *,
         session_state: SessionState | None = None,
+        read_only_acceptance: bool = False,
     ) -> None:
         super().__init__(parent)
         self._service = service
@@ -68,6 +72,7 @@ class RescueVideoController(QObject):
         self._last_completed_mode = ""
         self._last_completed_run_details: dict[str, object] = {}
         self._result_model = RescueVideoResultModel(self)
+        self._read_only_acceptance = bool(read_only_acceptance)
 
     @Property(str, notify=stateChanged)
     def sourcePath(self) -> str:
@@ -188,6 +193,8 @@ class RescueVideoController(QObject):
 
     @Slot()
     def loadDefaults(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutting_down or self._workers:
             return
         self._is_ready = False
@@ -204,10 +211,14 @@ class RescueVideoController(QObject):
 
     @Slot(str, str, str)
     def refreshAutomaticState(self, source_path: str, target_date: str, vehicle: str) -> None:
+        if self._reject_read_only_execution():
+            return
         self._begin_check(source_path, target_date, vehicle, preview_after_check=False)
 
     @Slot(str, str, str)
     def checkAndPreview(self, source_path: str, target_date: str, vehicle: str) -> None:
+        if self._reject_read_only_execution():
+            return
         self._begin_check(source_path, target_date, vehicle, preview_after_check=True)
 
     def _begin_check(
@@ -238,6 +249,8 @@ class RescueVideoController(QObject):
 
     @Slot(str, str)
     def refreshVehicleOptions(self, source_path: str, target_date: str) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutting_down or self._workers or self._awaiting_confirmation:
             return
         self._source_path = source_path
@@ -263,6 +276,8 @@ class RescueVideoController(QObject):
 
     @Slot(str, str, str)
     def updateInputs(self, source_path: str, target_date: str, vehicle: str) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._workers or self._awaiting_confirmation:
             return
         self._source_path = source_path
@@ -294,6 +309,8 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutting_down:
             return
         if not self._is_ready or self._awaiting_confirmation:
@@ -322,6 +339,8 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if self._reject_read_only_execution():
+            return
         if not self._is_ready or not self._has_preview or self._awaiting_confirmation:
             self._set_error("請先按「檢查及預覽分類」並等待完成，才能啟動複製。")
             return
@@ -349,6 +368,8 @@ class RescueVideoController(QObject):
         offset_text: str,
         repair_mismatch: bool,
     ) -> None:
+        if self._reject_read_only_execution():
+            return
         if not self._is_ready or not self._has_preview or self._awaiting_confirmation:
             self._set_error("請先按「檢查及預覽分類」並等待完成，才能啟動複製。")
             return
@@ -386,6 +407,8 @@ class RescueVideoController(QObject):
         self._confirm_pending()
 
     def _confirm_pending(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutting_down or self._pending_request is None or self._workers:
             return
         request = self._pending_request
@@ -403,6 +426,16 @@ class RescueVideoController(QObject):
         self._awaiting_confirmation = False
         self._status_text = "已完成預覽，請選擇分類方式。" if self._has_preview else "等待必要資料"
         self.stateChanged.emit()
+
+    def _reject_read_only_execution(self) -> bool:
+        if not self._read_only_acceptance:
+            return False
+        self._pending_request = None
+        self._confirmation_summary = ""
+        self._awaiting_confirmation = False
+        self._status_text = "唯讀驗收模式，不執行分類、複製或刪除。"
+        self.stateChanged.emit()
+        return True
 
     def _prepare_confirmation(self, request: RescueVideoRequest, status_text: str) -> bool:
         try:
@@ -641,12 +674,41 @@ class RescueVideoController(QObject):
             for row in result.rows
             if str(row.get("caseText") or "").strip() not in {"", "待確認"}
         }
+        classification_rows = [
+            self._nas_classification_row(row)
+            for row in result.rows[:MAX_NAS_CLASSIFICATION_ROWS]
+        ]
         return {
             "target_date": self._target_date,
             "vehicle": self._selected_vehicle,
+            "mode": self._worker_modes.get(request_id, ""),
             "case_count": len(case_names),
             "total_count": len(result.rows),
             "usage_seconds": usage_seconds,
+            "classification_rows": classification_rows,
+        }
+
+    @staticmethod
+    def _nas_classification_row(row: dict[str, object]) -> dict[str, str]:
+        source_file = Path(str(row.get("sourcePath") or row.get("sourceText") or "")).name
+        case_text = str(row.get("caseText") or "待確認").strip() or "待確認"
+        status_text = str(row.get("statusText") or "").strip()
+        note_text = str(row.get("noteText") or "").strip()
+        reason = ""
+        if "沒有符合工作／返隊時間的案件" in note_text:
+            reason = "no_matching_work_or_return_time"
+        elif status_text == "目的地不一致":
+            reason = "destination_mismatch"
+        elif status_text == "無法讀取":
+            reason = "source_unreadable"
+        elif "錯誤" in status_text or "失敗" in status_text:
+            reason = "classification_error"
+        return {
+            "video_time": str(row.get("timeText") or "").strip()[:40],
+            "source_file": source_file[:160],
+            "case": case_text[:160],
+            "status": status_text[:80],
+            "reason": reason,
         }
 
     @Slot(int, str)
