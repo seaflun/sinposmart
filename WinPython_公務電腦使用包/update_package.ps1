@@ -278,30 +278,36 @@ function Stop-RunningDutyGui {
 }
 
 function Start-DutyGui {
-    $entrypoint = Join-Path $packageDir "duty_gui.pyw"
-    if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
-        Write-Warning "Could not restart app because the PySide6/QML entrypoint duty_gui.pyw was not found."
-        return
-    }
+    try {
+        $entrypoint = Join-Path $packageDir "duty_gui.pyw"
+        if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
+            Write-Warning "Could not restart app because the PySide6/QML entrypoint duty_gui.pyw was not found."
+            return $false
+        }
 
-    $finder = Join-Path $packageDir "find_winpython.ps1"
-    $python = ""
-    if (Test-Path -LiteralPath $finder -PathType Leaf) {
-        $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
-    }
-    if (-not $python) {
-        Write-Warning "Could not restart app because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
-        return
-    }
+        $finder = Join-Path $packageDir "find_winpython.ps1"
+        $python = ""
+        if (Test-Path -LiteralPath $finder -PathType Leaf) {
+            $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
+        }
+        if (-not $python) {
+            Write-Warning "Could not restart app because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
+            return $false
+        }
 
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $python
-    $startInfo.Arguments = [char]34 + $entrypoint + [char]34
-    $startInfo.WorkingDirectory = $packageDir
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
-    Write-Host "Restarted SinpoSmart app."
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $python
+        $startInfo.Arguments = [char]34 + $entrypoint + [char]34
+        $startInfo.WorkingDirectory = $packageDir
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        [System.Diagnostics.Process]::Start($startInfo) | Out-Null
+        Write-Host "Restarted SinpoSmart app."
+        return $true
+    } catch {
+        Write-Warning "Could not restart SinpoSmart app: $_"
+        return $false
+    }
 }
 
 function Restart-DutyGuiIfRunning {
@@ -312,8 +318,7 @@ function Restart-DutyGuiIfRunning {
     )
 
     if (Stop-RunningDutyGui -Processes $Processes -ExpectedProcessId $ExpectedProcessId -Ready:$Ready) {
-        Start-DutyGui
-        return $true
+        return [bool](Start-DutyGui)
     }
     return $false
 }
@@ -510,6 +515,9 @@ if (-not $AssumeYes) {
     }
 }
 
+$wasRunning = $false
+$guiStoppedForUpdate = $false
+$guiRestarted = $false
 try {
     New-Item -ItemType Directory -Path $tempDir | Out-Null
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
@@ -640,16 +648,24 @@ try {
         if (-not (Stop-RunningDutyGui -Processes $runningDutyGuiProcesses -Ready -ExpectedProcessId $handshakenProcessId)) {
             throw "Update postponed because the running SinpoSmart app could not be closed safely."
         }
+        $guiStoppedForUpdate = $true
     }
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
     Invoke-SetupAfterUpdate
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
     if ($wasRunning) {
-        Start-DutyGui
+        $guiRestarted = [bool](Start-DutyGui)
     }
 
     Write-Host "Update completed."
 } finally {
+    if ($guiStoppedForUpdate -and -not $guiRestarted) {
+        Write-Warning "Update did not complete after closing SinpoSmart; attempting to restart it."
+        $guiRestarted = [bool](Start-DutyGui)
+        if (-not $guiRestarted) {
+            Write-Warning "SinpoSmart could not be restarted automatically."
+        }
+    }
     try {
         if (Test-Path -LiteralPath $tempDir) {
             Remove-Item -LiteralPath $tempDir -Recurse -Force

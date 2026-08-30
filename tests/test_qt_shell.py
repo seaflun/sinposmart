@@ -426,6 +426,81 @@ class LoginVerifierTests(unittest.TestCase):
 
 
 class DutyTaskProjectionTests(unittest.TestCase):
+    def test_projection_keeps_drowning_patrol_groups_contiguous(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import DutyTaskProjectionState, project_duty_tasks
+
+        def patrol_entry(time: str, direction: str, target: str) -> dict:
+            reason = "防溺車巡" if direction == "出" else "防溺車巡返隊"
+            return {
+                "kind": "entry_log",
+                "time": time,
+                "actor": "19",
+                "target": target,
+                "source": "外勤簽出" if direction == "出" else "外勤簽入",
+                "fields": {
+                    "登打時間": time,
+                    "出或入": direction,
+                    "領用事由及地點": reason,
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            }
+
+        def ordinary_entry(time: str, reason: str) -> dict:
+            return {
+                "kind": "entry_log",
+                "time": time,
+                "actor": "19",
+                "target": "19",
+                "source": "休息簽出",
+                "fields": {
+                    "登打時間": time,
+                    "出或入": "出",
+                    "領用事由及地點": reason,
+                },
+            }
+
+        actions = [
+            patrol_entry("16:00", "出", "5"),
+            ordinary_entry("16:00", "休息"),
+            patrol_entry("16:00", "出", "25"),
+            {
+                "kind": "work_log",
+                "time": "17:00",
+                "actor": "19",
+                "target": "19",
+                "source": "在隊訓練",
+                "fields": {"工作時間": "17:00", "勤務項目": "在隊訓練"},
+            },
+            patrol_entry("18:00", "入", "5"),
+            ordinary_entry("18:00", "休息"),
+            patrol_entry("18:00", "入", "25"),
+            ordinary_entry("18:00", "休息"),
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "5,25",
+                "source": "防溺車巡",
+                "fields": {
+                    "工作時間": "18:00",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                    "服勤人員": ["5", "25"],
+                },
+            },
+        ]
+
+        rows = project_duty_tasks(
+            actions,
+            DutyTaskProjectionState(actor_no="19", target_roc_date="1150807"),
+            now=datetime(2026, 8, 7, 18, 1),
+        )
+
+        self.assertEqual([row["taskIndex"] for row in rows], [0, 2, 1, 3, 4, 6, 8, 5, 7])
+
     def test_projection_keeps_handoff_work_next_to_entry_records(self) -> None:
         from datetime import datetime, timedelta
 

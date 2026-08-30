@@ -3967,6 +3967,25 @@ class PackageSmokeTests(unittest.TestCase):
             install_section.index('$prepareResult -ne "ready"'),
             install_section.index("Stop-RunningDutyGui"),
         )
+    def test_update_package_restarts_gui_when_installation_fails_after_shutdown(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+
+        install_start = script.index("$runningDutyGuiProcesses")
+        finally_start = script.index("} finally {", install_start)
+        install_section = script[install_start:finally_start]
+        finally_section = script[finally_start:]
+
+        self.assertIn("$guiStoppedForUpdate = $false", script)
+        self.assertIn("$guiRestarted = $false", script)
+        self.assertIn("$guiStoppedForUpdate = $true", install_section)
+        self.assertIn("$guiRestarted = [bool](Start-DutyGui)", install_section)
+        self.assertIn("if ($guiStoppedForUpdate -and -not $guiRestarted)", finally_section)
+        self.assertIn("$guiRestarted = [bool](Start-DutyGui)", finally_section)
+        self.assertLess(
+            finally_section.index("$guiRestarted = [bool](Start-DutyGui)"),
+            finally_section.index("if (Test-Path -LiteralPath $tempDir)"),
+        )
+
 
     def test_update_package_detects_relative_entrypoints_fail_closed(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")

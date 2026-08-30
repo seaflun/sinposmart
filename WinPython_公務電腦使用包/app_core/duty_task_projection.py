@@ -655,6 +655,16 @@ def project_duty_tasks(
             index,
         )
 
+    drowning_patrol_group_by_index: dict[int, tuple[int, ...]] = {}
+    for index in range(len(actions)):
+        group_indices = drowning_patrol_group_indices(
+            actions,
+            index,
+            state.target_roc_date,
+        )
+        for group_index in group_indices:
+            drowning_patrol_group_by_index[group_index] = group_indices
+
     projected: list[tuple[tuple[datetime, int, int, int, int], dict[str, Any]]] = []
     for index, action in enumerate(actions):
         comparison = state.comparisons.get(index, {})
@@ -699,7 +709,17 @@ def project_duty_tasks(
                 index,
             )
         else:
-            sort_key = (action_at, index, 1, 0, index)
+            drowning_group = drowning_patrol_group_by_index.get(index)
+            if drowning_group:
+                sort_key = (
+                    action_at,
+                    drowning_group[0],
+                    0,
+                    drowning_group.index(index),
+                    index,
+                )
+            else:
+                sort_key = (action_at, index, 1, 0, index)
         projected.append(
             (
                 sort_key,
