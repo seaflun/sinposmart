@@ -595,6 +595,78 @@ class DutyTaskProjectionTests(unittest.TestCase):
         external_row = next(row for row in outgoing_rows if row["taskIndex"] == 3)
         self.assertEqual(external_row["statusText"], "外勤確認")
 
+    def test_previous_auto_drowning_patrol_entry_is_done_for_incoming_actor(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_task_projection import (
+            DutyTaskProjectionState,
+            build_schedule_comparisons,
+            project_duty_tasks,
+        )
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "27",
+                "source": "值班交接",
+                "fields": {"出或入": "值班", "領用事由及地點": "接班"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "5",
+                "source": "外勤簽出",
+                "fields": {
+                    "登打時間": "16:00",
+                    "出或入": "出",
+                    "領用事由及地點": "防溺車巡",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            },
+        ]
+        data = {
+            "target_date": "1150807",
+            "today": {
+                "staff": {
+                    "5": {"name": "巡邏員"},
+                    "19": {"name": "前班"},
+                    "27": {"name": "接班"},
+                }
+            },
+            "actions": actions,
+        }
+        comparisons = build_schedule_comparisons(
+            data,
+            actions,
+            {
+                "1150807": {
+                    "visible_entry_rows": [
+                        ["115/08/07", "16:00", "-", "巡邏員", "出", "防溺車巡"]
+                    ]
+                }
+            },
+        )
+
+        self.assertEqual(comparisons[1]["group"], "done")
+        rows = project_duty_tasks(
+            actions,
+            DutyTaskProjectionState(
+                actor_no="27",
+                target_roc_date="1150807",
+                staff=data["today"]["staff"],
+                comparisons=comparisons,
+            ),
+            now=datetime(2026, 8, 7, 16, 1),
+        )
+
+        patrol_row = next(row for row in rows if row["taskIndex"] == 1)
+        self.assertEqual(patrol_row["statusText"], "已登打")
+        self.assertEqual(patrol_row["statusTone"], "triggered")
+
     def test_projection_formats_cross_day_time_and_status_precedence(self) -> None:
         from datetime import datetime
 
@@ -11261,6 +11333,228 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_duty_execution_controller_keeps_drowning_patrol_work_on_separate_lane(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        lock = threading.Lock()
+        started = threading.Event()
+        both_started = threading.Event()
+        release = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.active = 0
+                self.max_active = 0
+                self.entry_calls: list[int] = []
+                self.work_calls: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def execute(self, request, *, status_callback=None):
+                with lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    if self.active >= 2:
+                        both_started.set()
+                    actions = request.schedule_data["actions"]
+                    if actions[request.action_index]["kind"] == "work_log":
+                        self.work_calls.append(request.action_index)
+                    else:
+                        self.entry_calls.append(request.action_index)
+                    started.set()
+                release.wait(timeout=2)
+                with lock:
+                    self.active -= 1
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    f"完成 {request.action_index}",
+                    Path(f"drowning-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+        data = {
+            "target_date": "1150807",
+            "actions": [
+                {
+                    "kind": "entry_log",
+                    "time": "16:00",
+                    "actor": "19",
+                    "target": "5",
+                    "source": "外勤簽出",
+                    "fields": {
+                        "登打時間": "16:00",
+                        "出或入": "出",
+                        "領用事由及地點": "防溺車巡",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                    },
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "16:00",
+                    "actor": "19",
+                    "target": "25",
+                    "source": "外勤簽出",
+                    "fields": {
+                        "登打時間": "16:00",
+                        "出或入": "出",
+                        "領用事由及地點": "防溺車巡",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                    },
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "19",
+                    "target": "5",
+                    "source": "外勤簽入",
+                    "fields": {
+                        "登打時間": "18:00",
+                        "出或入": "入",
+                        "領用事由及地點": "防溺車巡返隊",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                    },
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "19",
+                    "target": "25",
+                    "source": "外勤簽入",
+                    "fields": {
+                        "登打時間": "18:00",
+                        "出或入": "入",
+                        "領用事由及地點": "防溺車巡返隊",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                    },
+                },
+                {
+                    "kind": "work_log",
+                    "time": "18:00",
+                    "actor": "19",
+                    "target": "5,25",
+                    "source": "防溺車巡",
+                    "fields": {
+                        "工作時間": "18:00",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                        "服勤人員": ["5", "25"],
+                    },
+                },
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        try:
+            for index in range(5):
+                self.assertTrue(
+                    controller.enqueue(
+                        DutySubmissionRequest("user19", "secret", index, data, trigger_type="due")
+                    )
+                )
+
+            self.assertTrue(started.wait(timeout=2))
+            self.assertTrue(both_started.wait(timeout=2))
+            release.set()
+            for _ in range(40):
+                if finished_spy.count() == 5 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.max_active, 2)
+            self.assertEqual(service.entry_calls, [0, 1, 2, 3])
+            self.assertEqual(service.work_calls, [4])
+            self.assertEqual(finished_spy.count(), 5)
+            self.assertFalse(controller.isBusy)
+        finally:
+            controller.shutdown()
+
+    def test_duty_execution_controller_keeps_patrol_entry_group_before_later_handoff(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        first_entry_started = threading.Event()
+        release_first_entry = threading.Event()
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, *, status_callback=None):
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, _session, *, status_callback=None):
+                self.calls.append(request.action_index)
+                if request.action_index == 0:
+                    first_entry_started.set()
+                    release_first_entry.wait(timeout=2)
+                return DutySubmissionResult(
+                    request.action_index,
+                    "submitted",
+                    "完成",
+                    Path(f"patrol-entry-{request.action_index}.json"),
+                    {"group": "done"},
+                )
+
+            def close_browser_session(self, _session):
+                return None
+
+        data = {
+            "target_date": "1150806",
+            "actions": [
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
+                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5", "source": "值班交接"},
+                {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
+                {
+                    "kind": "entry_log",
+                    "time": "18:00",
+                    "actor": "17",
+                    "target": "17",
+                    "source": "昨日在勤且今日未在勤",
+                    "fields": {
+                        "登打時間": "18:00",
+                        "系統寫入時間": "18:05",
+                        "出或入": "出",
+                        "領用事由及地點": "退勤",
+                    },
+                },
+            ],
+        }
+        service = FakeService()
+        controller = DutyExecutionController(service)
+        finished_spy = QSignalSpy(controller.actionFinished)
+        try:
+            for index in (0, 1, 2, 3):
+                self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", index, data)))
+            for _ in range(30):
+                if finished_spy.count() == 4 and not controller.isBusy:
+                    break
+                finished_spy.wait(250)
+                QTest.qWait(10)
+
+            self.assertEqual(service.opened_sessions, 2)
+            self.assertEqual(service.serialized_actions, [0, 1, 3])
+            self.assertEqual(service.parallel_actions, [2])
+            self.assertEqual(finished_spy.count(), 4)
+            self.assertFalse(controller.isBusy)
+        finally:
+            controller.shutdown()
+
     def test_app_controller_deduplicates_identical_schedule_snapshot_events(self) -> None:
         from app_core.schedule_repository import ScheduleSnapshot
         from qt_app.controllers.app_controller import AppController
@@ -14590,6 +14884,178 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.selectedTaskCount, 3)
         controller.toggleTaskSelection(0)
         self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_drowning_patrol_selection_groups_outbound_and_inbound_with_work(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("19")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "16:00",
+                        "actor": "19",
+                        "target": "5",
+                        "source": "外勤簽出",
+                        "fields": {
+                            "登打時間": "16:00",
+                            "出或入": "出",
+                            "領用事由及地點": "防溺車巡",
+                            "勤務項目": "車巡",
+                            "事由": "防溺",
+                        },
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "16:00",
+                        "actor": "19",
+                        "target": "25",
+                        "source": "外勤簽出",
+                        "fields": {
+                            "登打時間": "16:00",
+                            "出或入": "出",
+                            "領用事由及地點": "防溺車巡",
+                            "勤務項目": "車巡",
+                            "事由": "防溺",
+                        },
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "18:00",
+                        "actor": "19",
+                        "target": "5",
+                        "source": "外勤簽入",
+                        "fields": {
+                            "登打時間": "18:00",
+                            "出或入": "入",
+                            "領用事由及地點": "防溺車巡返隊",
+                            "勤務項目": "車巡",
+                            "事由": "防溺",
+                        },
+                    },
+                    {
+                        "kind": "entry_log",
+                        "time": "18:00",
+                        "actor": "19",
+                        "target": "25",
+                        "source": "外勤簽入",
+                        "fields": {
+                            "登打時間": "18:00",
+                            "出或入": "入",
+                            "領用事由及地點": "防溺車巡返隊",
+                            "勤務項目": "車巡",
+                            "事由": "防溺",
+                        },
+                    },
+                    {
+                        "kind": "work_log",
+                        "time": "18:00",
+                        "actor": "19",
+                        "target": "5,25",
+                        "source": "防溺車巡",
+                        "fields": {
+                            "工作時間": "18:00",
+                            "勤務項目": "車巡",
+                            "事由": "防溺",
+                            "服勤人員": ["5", "25"],
+                        },
+                    },
+                ],
+            }
+        )
+
+        controller.toggleTaskSelection(0)
+        self.assertEqual(controller.selectedTaskCount, 2)
+        controller.toggleTaskSelection(0)
+        self.assertEqual(controller.selectedTaskCount, 0)
+
+        controller.toggleTaskSelection(2)
+        self.assertEqual(controller.selectedTaskCount, 3)
+        controller.toggleTaskSelection(4)
+        self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_submission_requests_keep_drowning_patrol_groups_contiguous(self) -> None:
+        from datetime import datetime
+        from unittest.mock import patch
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        def patrol_entry(time: str, target: str, source: str, direction: str, reason: str) -> dict:
+            return {
+                "kind": "entry_log",
+                "time": time,
+                "actor": "19",
+                "target": target,
+                "source": source,
+                "fields": {
+                    "登打時間": time,
+                    "出或入": direction,
+                    "領用事由及地點": reason,
+                    "勤務項目": "車巡" if reason.startswith("防溺") else "",
+                    "事由": "防溺" if reason.startswith("防溺") else "",
+                },
+            }
+
+        actions = [
+            patrol_entry("16:00", "5", "外勤簽出", "出", "防溺車巡"),
+            patrol_entry("16:00", "30", "到勤", "入", "到勤"),
+            patrol_entry("16:00", "25", "外勤簽出", "出", "防溺車巡"),
+            patrol_entry("18:00", "5", "外勤簽入", "入", "防溺車巡返隊"),
+            patrol_entry("18:00", "30", "到勤", "入", "到勤"),
+            patrol_entry("18:00", "25", "外勤簽入", "入", "防溺車巡返隊"),
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "5,25",
+                "source": "防溺車巡",
+                "fields": {
+                    "工作時間": "18:00",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                    "服勤人員": ["5", "25"],
+                },
+            },
+        ]
+        controller = DutyController()
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("19")
+        controller.replace_schedule_data({"target_date": "1150807", "actions": actions})
+
+        requests = controller.manual_submission_requests(
+            "user19",
+            "secret",
+            list(range(len(actions))),
+            submit_at=datetime(2026, 8, 7, 18, 1),
+        )
+
+        self.assertEqual(
+            [request.action_index for request in requests],
+            [0, 2, 1, 3, 5, 6, 4],
+        )
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 7, 16, 1, tzinfo=tz)
+
+        controller._due_task_indices = [0, 1, 2]
+        controller._auto_execution_enabled = True
+        with patch("qt_app.controllers.duty_controller.datetime", FixedDateTime):
+            due_requests = controller.due_submission_requests(
+                "user19",
+                "secret",
+                [0, 1, 2],
+            )
+
+        self.assertEqual(
+            [request.action_index for request in due_requests],
+            [0, 2, 1],
+        )
 
     def test_due_submission_rejects_stale_future_handoff_index(self) -> None:
         from qt_app.controllers.duty_controller import DutyController

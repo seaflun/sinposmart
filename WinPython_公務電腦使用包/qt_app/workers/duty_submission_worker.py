@@ -18,6 +18,7 @@ from app_core.duty_submission_service import (
     DutySubmissionResult,
     DutySubmissionService,
 )
+from app_core.duty_task_projection import is_drowning_patrol_action
 
 
 ENTRY_BROWSER_SESSION_IDLE_LIMIT = timedelta(minutes=25)
@@ -193,6 +194,7 @@ class DutyEntryQueueWorker(QObject):
             and (
                 action.get("kind") == "handoff_preflight"
                 or action.get("source") == "值班交接"
+                or is_drowning_patrol_action(action)
             )
         ):
             return self._HANDOFF_PRIORITY

@@ -21,6 +21,7 @@ from app_core.duty_task_projection import (
     action_summary,
     action_datetime,
     build_schedule_comparisons,
+    drowning_patrol_group_indices,
     is_auto_duty_action,
     is_external_or_rest_departure,
     is_external_or_rest_entry,
@@ -404,11 +405,17 @@ class DutyController(QObject):
         if not 0 <= action_index < len(self._actions):
             return
         queue_id = self._external_return_queue_ids_by_action_index.get(action_index, "")
-        group_indices = set(
-            self._queue_action_indices(queue_id)
-            if queue_id
-            else self._handoff_group_indices(action_index)
-        )
+        if queue_id:
+            group_indices = set(self._queue_action_indices(queue_id))
+        else:
+            group_indices = set(
+                drowning_patrol_group_indices(
+                    self._actions,
+                    action_index,
+                    self._target_date_text,
+                )
+                or self._handoff_group_indices(action_index)
+            )
         if group_indices:
             if group_indices.issubset(self._selected_indices):
                 self._selected_indices.difference_update(group_indices)
@@ -1191,8 +1198,9 @@ class DutyController(QObject):
         requests: list[DutySubmissionRequest] = []
         handled_group_ids: set[str] = set()
         current = datetime.now()
-        handoff_priority_times = self._due_handoff_priority_times(indices, current)
-        for index in indices:
+        ordered_indices = self._ordered_drowning_patrol_indices(indices)
+        handoff_priority_times = self._due_handoff_priority_times(ordered_indices, current)
+        for index in ordered_indices:
             if index not in self._due_task_indices or not 0 <= index < len(self._actions):
                 continue
             action_at = action_datetime(
@@ -1441,6 +1449,33 @@ class DutyController(QObject):
             sorted(action_completion_key(self._actions[index]) for index in indices)
         )
 
+    def _ordered_drowning_patrol_indices(self, indices: list[int]) -> list[int]:
+        pending = {
+            index
+            for index in indices
+            if 0 <= index < len(self._actions)
+        }
+        ordered: list[int] = []
+        for index in indices:
+            if index not in pending:
+                continue
+            group_indices = drowning_patrol_group_indices(
+                self._actions,
+                index,
+                self._target_date_text,
+            )
+            if group_indices:
+                ordered.extend(
+                    group_index
+                    for group_index in group_indices
+                    if group_index in pending
+                )
+                pending.difference_update(group_indices)
+                continue
+            ordered.append(index)
+            pending.discard(index)
+        return ordered
+
     def _handoff_state_indices(self, state: Mapping[str, Any]) -> tuple[int, ...]:
         action_keys = tuple(str(key or "") for key in state.get("action_keys", ()))
         if action_keys:
@@ -1663,7 +1698,7 @@ class DutyController(QObject):
         current = submit_at or datetime.now()
         requests: list[DutySubmissionRequest] = []
         handled_handoff_group_ids: set[str] = set()
-        for index in indices:
+        for index in self._ordered_drowning_patrol_indices(indices):
             if not 0 <= index < len(self._actions):
                 continue
             if not self._is_manual_submission_eligible(index, now=current):

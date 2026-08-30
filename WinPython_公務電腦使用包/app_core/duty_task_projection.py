@@ -258,6 +258,118 @@ def duty_task_columns(
     return "工作", "工作", detail, duty_people_label(action, staff)
 
 
+def is_drowning_patrol_action(action: Mapping[str, Any]) -> bool:
+    fields = action.get("fields", {})
+    source = str(action.get("source", "") or "")
+    if action.get("kind") == "work_log":
+        return source == "防溺車巡"
+    if action.get("kind") != "entry_log":
+        return False
+    if not isinstance(fields, Mapping):
+        return False
+    if fields.get("勤務項目") != "車巡" or fields.get("事由") != "防溺":
+        return False
+    direction = fields.get("出或入")
+    reason = fields.get("領用事由及地點")
+    return (
+        (source == "外勤簽出" and direction == "出" and reason == "防溺車巡")
+        or (source == "外勤簽入" and direction == "入" and reason == "防溺車巡返隊")
+    )
+
+
+def _drowning_patrol_people(action: Mapping[str, Any]) -> frozenset[str]:
+    fields = action.get("fields", {})
+    if not isinstance(fields, Mapping):
+        fields = {}
+    people = fields.get("服勤人員", ())
+    if isinstance(people, (list, tuple, set, frozenset)):
+        normalized = frozenset(str(person).strip() for person in people if str(person).strip())
+        if normalized:
+            return normalized
+    return frozenset(
+        person.strip()
+        for person in str(action.get("target", "") or "").split(",")
+        if person.strip()
+    )
+
+
+def drowning_patrol_group_indices(
+    actions: Sequence[Mapping[str, Any]],
+    action_index: int,
+    target_roc_date: str,
+) -> tuple[int, ...]:
+    """Return the linked task indexes for one drowning-patrol operation."""
+
+    if not 0 <= action_index < len(actions):
+        return ()
+    action = actions[action_index]
+    if not is_drowning_patrol_action(action):
+        return ()
+    action_at = action_datetime(action, target_roc_date)
+    same_time_actions = [
+        (index, candidate)
+        for index, candidate in enumerate(actions)
+        if is_drowning_patrol_action(candidate)
+        and action_datetime(candidate, target_roc_date) == action_at
+    ]
+    fields = action.get("fields", {})
+    if not isinstance(fields, Mapping):
+        fields = {}
+    if action.get("kind") == "entry_log" and fields.get("出或入") == "出":
+        actor = str(action.get("actor", "") or "")
+        return tuple(
+            index
+            for index, candidate in same_time_actions
+            if candidate.get("kind") == "entry_log"
+            and candidate.get("source") == "外勤簽出"
+            and str(candidate.get("actor", "") or "") == actor
+            and isinstance(candidate.get("fields", {}), Mapping)
+            and candidate["fields"].get("出或入") == "出"
+        )
+
+    inbound = tuple(
+        (index, candidate)
+        for index, candidate in same_time_actions
+        if candidate.get("kind") == "entry_log"
+        and candidate.get("source") == "外勤簽入"
+        and isinstance(candidate.get("fields", {}), Mapping)
+        and candidate["fields"].get("出或入") == "入"
+    )
+    work = tuple(
+        (index, candidate)
+        for index, candidate in same_time_actions
+        if candidate.get("kind") == "work_log"
+    )
+    if not inbound:
+        return ()
+
+    selected_people = _drowning_patrol_people(action)
+    matching_work = tuple(
+        (index, candidate)
+        for index, candidate in work
+        if selected_people and selected_people.issubset(_drowning_patrol_people(candidate))
+    )
+    if not matching_work:
+        group_people = frozenset(
+            person
+            for _index, candidate in inbound
+            for person in _drowning_patrol_people(candidate)
+        )
+    else:
+        group_people = _drowning_patrol_people(matching_work[0][1])
+    group_inbound = tuple(
+        index
+        for index, candidate in inbound
+        if _drowning_patrol_people(candidate).issubset(group_people)
+    )
+    group_work = tuple(
+        index
+        for index, candidate in work
+        if _drowning_patrol_people(candidate) == group_people
+    )
+    return group_inbound + group_work
+
+
 def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
     if action.get("kind") == "work_log":
         return action.get("source") in (
@@ -274,15 +386,7 @@ def is_auto_duty_action(action: Mapping[str, Any]) -> bool:
         fields = {}
     direction = fields.get("出或入", "")
     reason = fields.get("領用事由及地點", "")
-    is_drowning_patrol_entry = (
-        action.get("source") in ("外勤簽出", "外勤簽入")
-        and fields.get("勤務項目") == "車巡"
-        and fields.get("事由") == "防溺"
-        and (
-            (direction == "出" and reason == "防溺車巡")
-            or (direction == "入" and reason == "防溺車巡返隊")
-        )
-    )
+    is_drowning_patrol_entry = is_drowning_patrol_action(action)
     return direction in ("值班", "值退") or reason in ("到勤", "退勤", "休息後退勤") or is_drowning_patrol_entry
 
 
@@ -979,6 +1083,21 @@ def build_schedule_comparisons(
         work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
         if action.get("kind") == "entry_log":
             if is_external_or_rest_entry(action):
+                if is_drowning_patrol_action(action):
+                    exact = find_entry_matches(
+                        entry_rows,
+                        action_date,
+                        staff,
+                        action,
+                        allow_near=False,
+                    )
+                    if exact:
+                        result[index] = {
+                            "compare": "已存在",
+                            "group": "done",
+                            "matched": exact[:1],
+                        }
+                        continue
                 future = is_future_action(target_date, dict(action))
                 result[index] = {
                     "compare": "尚未到點" if future else "略過防重複比對",
