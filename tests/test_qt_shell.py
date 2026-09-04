@@ -3616,10 +3616,53 @@ class RestMonthlyServiceTests(unittest.TestCase):
     def test_rest_entry_wraps_from_last_fire_day_to_next_month_first_day(self) -> None:
         import rest_time_automation as module
 
+        entries = module.group_rest_entries({31: [(6, 8)]}, days=31)
+
         self.assertEqual(
-            module.group_rest_entries({31: [(6, 8)]}, days=31),
+            entries,
             [module.RestEntry(31, 1, 6, 1, 8)],
         )
+        self.assertEqual(entries[0].hours, 2)
+
+    def test_next_day_morning_rest_keeps_two_hour_duration(self) -> None:
+        import rest_time_automation as module
+
+        entries = module.group_rest_entries({7: [(6, 8)]}, days=30)
+
+        self.assertEqual(entries, [module.RestEntry(7, 8, 6, 8, 8)])
+        self.assertEqual(entries[0].hours, 2)
+
+    def test_rest_form_waits_for_expected_options_and_rejects_bad_readback(self) -> None:
+        import rest_time_automation as module
+
+        class Driver:
+            def __init__(self) -> None:
+                self.readiness_args: tuple[str, ...] = ()
+
+            def execute_script(self, script: str, *args):
+                if "function setByOptionText" in script:
+                    return []
+                if "function hasOption" in script:
+                    self.readiness_args = tuple(args)
+                    return True
+                if "function selectedMatches" in script:
+                    return ["起始日期讀回不符"]
+                raise AssertionError("未預期的瀏覽器腳本")
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout) -> None:
+                self.driver = driver
+
+            def until(self, condition):
+                return condition(self.driver)
+
+        driver = Driver()
+        entry = module.RestEntry(7, 8, 6, 8, 8)
+        with patch.object(module, "WebDriverWait", ImmediateWait):
+            with self.assertRaisesRegex(RuntimeError, "起始日期讀回不符"):
+                module.set_form_values(driver, entry)
+
+        self.assertEqual(driver.readiness_args, ("08", "06", "08", "08"))
 
     def test_last_fire_day_overnight_rest_keeps_duration_after_month_wrap(self) -> None:
         import rest_time_automation as module
@@ -9913,6 +9956,26 @@ if return_code != 0 or loaded:
         self.assertEqual(controller.confirmationSummary, "")
         self.assertFalse(controller.isAwaitingConfirmation)
         self.assertEqual(controller.statusText, "已完成預覽，請選擇分類方式。")
+
+    def test_rescue_video_controller_clears_previous_results_when_a_new_check_starts(self) -> None:
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        self.addCleanup(controller.shutdown)
+        controller.resultModel.replace_rows(
+            ({"sourceText": "deleted-video.TS", "statusText": "預計複製"},)
+        )
+
+        with patch.object(controller, "_start_worker") as start_worker:
+            controller.checkAndPreview("source", "2026-09-04", "93")
+
+        self.assertEqual(controller.resultModel.rowCount(), 0)
+        start_worker.assert_called_once_with(
+            "defaults",
+            defaults_source="source",
+            defaults_date="2026-09-04",
+            defaults_vehicle="93",
+        )
 
     def test_duty_execution_controller_runs_single_entry_lane_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -18114,6 +18177,7 @@ if return_code != 0 or loaded:
                     "救護影片檢查及預覽鍵未完成 worker 呼叫",
                 )
                 self.assertEqual(controller.rescueVideoController.resultModel.rowCount(), 1)
+                self.assertFalse(rescue_result_empty_text.property("visible"))
                 rescue_result_model = controller.rescueVideoController.resultModel
                 rescue_result_index = rescue_result_model.index(0, 0)
                 self.assertEqual(

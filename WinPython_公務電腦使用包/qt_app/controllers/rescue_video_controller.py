@@ -239,6 +239,7 @@ class RescueVideoController(QObject):
         self._status_text = "檢查中"
         self._error_text = ""
         self._summary_text = "正在檢查資料；通過後會自動預覽分類結果。" if preview_after_check else "正在檢查資料。"
+        self._result_model.replace_rows(())
         self.stateChanged.emit()
         self._start_worker(
             "defaults",

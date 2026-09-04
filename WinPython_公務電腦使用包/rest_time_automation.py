@@ -115,7 +115,7 @@ class RestEntry:
 
     @property
     def hours(self) -> int:
-        return duty_relative_hour(self.end_hour) - duty_relative_hour(self.start_hour)
+        return self.end_hour - self.start_hour + (24 if self.end_day != self.start_day else 0)
 
     def summary(self) -> str:
         return f"勤務{self.duty_day:02d}日：{self.start_day:02d}日 {self.start_hour:02d}:00-{self.end_day:02d}日 {self.end_hour:02d}:00，共 {self.hours} 小時"
@@ -1588,25 +1588,42 @@ def set_form_values(driver, entry: RestEntry) -> None:
     WebDriverWait(driver, 10).until(
         lambda d: d.execute_script(
             """
-            const ids = ['_selDATES', '_selTASKHOURS', '_selDATEE', '_selTASKHOURE'];
-            return ids.every((id) => {
+            function optionMatches(option, value) {
+              const want = String(value).padStart(2, '0');
+              const text = (option.text || '').trim();
+              return option.value == value || option.value == want
+                || text == value || text == want || text.includes(want);
+            }
+            function hasOption(id, value) {
               const el = document.getElementById(id);
-              return el && !el.disabled && el.options && el.options.length > 0;
-            });
-            """
+              return Boolean(el && !el.disabled && el.options
+                && Array.from(el.options).some((option) => optionMatches(option, value)));
+            }
+            return hasOption('_selDATES', arguments[0])
+              && hasOption('_selTASKHOURS', arguments[1])
+              && hasOption('_selDATEE', arguments[2])
+              && hasOption('_selTASKHOURE', arguments[3]);
+            """,
+            f"{entry.start_day:02d}",
+            f"{entry.start_hour:02d}",
+            f"{entry.end_day:02d}",
+            f"{entry.end_hour:02d}",
         )
     )
-    time.sleep(0.4)
 
     result = driver.execute_script(
         """
+        function optionMatches(option, value) {
+          const want = String(value).padStart(2, '0');
+          const text = (option.text || '').trim();
+          return option.value == value || option.value == want
+            || text == value || text == want || text.includes(want);
+        }
         function setByTextOrValue(id, value) {
           const el = document.getElementById(id);
           if (!el) return false;
-          const want = String(value).padStart(2, '0');
           for (const option of el.options) {
-            const text = (option.text || '').trim();
-            if (option.value == value || option.value == want || text == value || text == want || text.includes(want)) {
+            if (optionMatches(option, value)) {
               el.value = option.value;
               el.dispatchEvent(new Event('change', {bubbles: true}));
               return true;
@@ -1623,9 +1640,18 @@ def set_form_values(driver, entry: RestEntry) -> None:
         if (sum) {
           sum.value = arguments[4];
           sum.dispatchEvent(new Event('change', {bubbles: true}));
+          if (String(sum.value).trim() !== String(arguments[4])) missing.push('時數讀回不符');
         } else {
           missing.push('時數');
         }
+        function selectedMatches(id, value) {
+          const el = document.getElementById(id);
+          return Boolean(el && el.selectedIndex >= 0 && optionMatches(el.options[el.selectedIndex], value));
+        }
+        if (!selectedMatches('_selDATES', arguments[0])) missing.push('起始日期讀回不符');
+        if (!selectedMatches('_selTASKHOURS', arguments[1])) missing.push('起始小時讀回不符');
+        if (!selectedMatches('_selDATEE', arguments[2])) missing.push('結束日期讀回不符');
+        if (!selectedMatches('_selTASKHOURE', arguments[3])) missing.push('結束小時讀回不符');
         return missing;
         """,
         f"{entry.start_day:02d}",

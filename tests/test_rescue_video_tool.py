@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from io import StringIO
+import json
 import os
 import sys
 import threading
@@ -123,6 +124,10 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn('id: rescueVideoCopyConfirmation', source)
         self.assertNotIn("CheckBox", source)
         self.assertIn('objectName: "rescueVideoResultEmptyText"', source)
+        self.assertIn(
+            "visible: rescueVideoResultList.count === 0 && !rescueVideoWindow.controller.isRunning",
+            source,
+        )
         self.assertIn('objectName: "rescueVideoCloseButton"', source)
 
     def test_window_keeps_minimize_and_maximize_available_during_copy(self) -> None:
@@ -596,15 +601,52 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertTrue(classifier.video_overlaps_selected_date(video_start, video_end, date(2026, 8, 9)))
         self.assertFalse(classifier.video_overlaps_selected_date(video_start, video_end, date(2026, 8, 10)))
 
-    def test_vehicle_lookup_includes_previous_day_for_cross_day_case(self) -> None:
+    def test_vehicle_lookup_keeps_only_work_log_confirmed_previous_day_cross_day_case(self) -> None:
         classifier = self._classifier_module()
         with TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir)
             (destination / "2026" / "8月" / "08082350-93").mkdir(parents=True)
+            (destination / "2026" / "8月" / "08082340-94").mkdir(parents=True)
+            (destination / "2026" / "8月" / "08082330-95").mkdir(parents=True)
+            (destination / "2026" / "8月" / "08090030-92").mkdir(parents=True)
+            work_log_root = destination / "comparison"
+            work_log_root.mkdir()
+            (work_log_root / "comparison_output_1150808.json").write_text(
+                json.dumps(
+                    {
+                        "visible_work_rows": [
+                            [
+                                "1150808\n23:50",
+                                "",
+                                "",
+                                "",
+                                "救護",
+                                "2026/8/9 00:10:00",
+                                "119案件 93:",
+                            ],
+                            [
+                                "1150808\n23:40",
+                                "",
+                                "",
+                                "",
+                                "救護",
+                                "2026/8/8 23:59:00",
+                                "119案件 94:",
+                            ],
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
-            vehicles = classifier.discover_vehicles(destination, date(2026, 8, 9))
+            vehicles = classifier.discover_vehicles(
+                destination,
+                date(2026, 8, 9),
+                work_log_root=work_log_root,
+            )
 
-        self.assertEqual(vehicles, ["93"])
+        self.assertEqual(vehicles, ["92", "93"])
 
     def test_result_table_displays_only_corrected_video_start_time(self) -> None:
         service = self._service_module()

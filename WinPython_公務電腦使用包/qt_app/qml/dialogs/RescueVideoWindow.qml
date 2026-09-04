@@ -764,7 +764,7 @@ Window {
                             color: Design.secondaryText
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.Wrap
-                            visible: rescueVideoWindow.controller.resultModel.rowCount() === 0
+                            visible: rescueVideoResultList.count === 0 && !rescueVideoWindow.controller.isRunning
                         }
                     }
                 }

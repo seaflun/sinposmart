@@ -38,6 +38,9 @@ TS_PTS_WRAP = 1 << 33
 TS_DURATION_SAMPLE_BYTES = 2 * 1024 * 1024
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
 CASE_TRANSFER_WORKERS = 2
+DEFAULT_WORK_LOG_ROOT = Path(
+    r"E:\SINPOSMART\WinPython_公務電腦使用包\runtime_outputs\comparison"
+)
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--work-log-root",
         type=Path,
-        default=Path(r"E:\SINPOSMART\WinPython_公務電腦使用包\runtime_outputs\comparison"),
+        default=DEFAULT_WORK_LOG_ROOT,
         help="案件工作／返隊紀錄 JSON 資料夾",
     )
     parser.add_argument("--work-before-minutes", type=float, default=15, help="工作時間前允許分鐘數")
@@ -219,15 +222,22 @@ def discover_cases(destination: Path, vehicle: str) -> list[CaseFolder]:
     return sorted(cases, key=lambda item: item.start)
 
 
-def discover_vehicles(destination: Path, selected_date: date) -> list[str]:
+def discover_vehicles(
+    destination: Path,
+    selected_date: date,
+    *,
+    work_log_root: Path | None = None,
+    case_folder_tolerance: timedelta = timedelta(minutes=10),
+) -> list[str]:
+    """Find same-day vehicles and only work-log-confirmed prior-day vehicles."""
     if not destination.is_dir():
         return []
 
     vehicles: set[str] = set()
-    case_dates = {
-        (str(candidate.year), candidate.month, candidate.strftime("%m%d"))
-        for candidate in (selected_date, selected_date - timedelta(days=1))
-    }
+    previous_date = selected_date - timedelta(days=1)
+    selected_key = (str(selected_date.year), selected_date.month, selected_date.strftime("%m%d"))
+    previous_key = (str(previous_date.year), previous_date.month, previous_date.strftime("%m%d"))
+    previous_vehicles: set[str] = set()
     for year_dir in destination.iterdir():
         if not year_dir.is_dir() or not YEAR_RE.match(year_dir.name):
             continue
@@ -239,8 +249,32 @@ def discover_vehicles(destination: Path, selected_date: date) -> list[str]:
                 if not case_dir.is_dir():
                     continue
                 match = CASE_RE.match(case_dir.name)
-                if match and (year_dir.name, folder_month, match.group("md")) in case_dates:
+                if not match:
+                    continue
+                case_key = (year_dir.name, folder_month, match.group("md"))
+                if case_key == selected_key:
                     vehicles.add(match.group("vehicle"))
+                elif case_key == previous_key:
+                    previous_vehicles.add(match.group("vehicle"))
+
+    selected_day_start = datetime.combine(selected_date, datetime.min.time())
+    effective_work_log_root = Path(work_log_root or DEFAULT_WORK_LOG_ROOT)
+    for vehicle in previous_vehicles:
+        previous_cases = [
+            case
+            for case in discover_cases(destination, vehicle)
+            if case.start.date() == previous_date
+        ]
+        attached_cases = attach_case_work(
+            previous_cases,
+            discover_case_work(effective_work_log_root, vehicle),
+            case_folder_tolerance,
+        )
+        if any(
+            case.return_time is not None and case.return_time >= selected_day_start
+            for case in attached_cases
+        ):
+            vehicles.add(vehicle)
     return sorted(vehicles, key=lambda vehicle: (int(vehicle), vehicle))
 
 
