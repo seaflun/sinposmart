@@ -998,6 +998,7 @@ class AppController(QObject):
         self._duty_controller.set_actor_no(provisional_actor_no)
         session = self._session_state.session
         if session is not None and session.verified:
+            self._duty_controller.resume_unreturned_return_recovery_after_verified_login()
             if actor_no and not self._actor_identity_pending:
                 self._send_operational_event("login", status="ok", trigger_type="login")
             self._duty_controller.load_current_schedule()

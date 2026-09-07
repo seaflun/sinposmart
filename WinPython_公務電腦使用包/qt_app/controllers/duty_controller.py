@@ -143,6 +143,7 @@ class DutyController(QObject):
         self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
         self._prewarmed_handoff_group_ids: set[str] = set()
         self._auto_execution_enabled = False
+        self._retry_unreturned_return_after_verified_login = False
         self._login_started_at: datetime | None = None
         self._auto_logout_actor_no = ""
         self._auto_logout_handoff_at: datetime | None = None
@@ -840,6 +841,8 @@ class DutyController(QObject):
         self._session_generation = generation
         self._session_user_id = user_id
         self._session_closing = not bool(user_id)
+        if not user_id:
+            self._retry_unreturned_return_after_verified_login = False
         self._auto_execution_enabled = False
         self._due_task_indices.clear()
         self._due_existing_task_indices.clear()
@@ -1080,6 +1083,7 @@ class DutyController(QObject):
         if self._auto_execution_enabled:
             return
         self._auto_execution_enabled = True
+        self._make_unreturned_return_due_after_verified_login()
         self._refresh_due_tasks(force_emit=True)
         self.scheduleChanged.emit()
 
@@ -1088,6 +1092,26 @@ class DutyController(QObject):
             return
         self._auto_execution_enabled = False
         self.scheduleChanged.emit()
+
+    def resume_unreturned_return_recovery_after_verified_login(self) -> None:
+        """Retry paused return records only after the current verified login is safe to execute."""
+
+        self._retry_unreturned_return_after_verified_login = True
+        if not self._auto_execution_enabled or not self._actor_no:
+            return
+        self._make_unreturned_return_due_after_verified_login()
+        self._refresh_due_tasks(force_emit=True)
+        self.scheduleChanged.emit()
+
+    def _make_unreturned_return_due_after_verified_login(self) -> None:
+        if (
+            not self._retry_unreturned_return_after_verified_login
+            or not self._auto_execution_enabled
+            or not self._actor_no
+        ):
+            return
+        self._unreturned_return_queue.make_active_records_due()
+        self._retry_unreturned_return_after_verified_login = False
 
     def refresh_live_schedule(
         self,

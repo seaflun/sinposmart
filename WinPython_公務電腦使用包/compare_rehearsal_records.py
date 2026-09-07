@@ -391,7 +391,7 @@ def find_open_external_assignment(
     for row in rows:
         if not row_has_primary_person(row, target_name):
             continue
-        if not any(keyword in row for keyword in ("救護", "救災", "火警", "火災", "外勤")):
+        if not any(keyword in row for keyword in ("救護", "救災", "災害搶救", "火警", "火災", "外勤")):
             continue
         row_at = _row_datetime(row)
         if row_at is None:

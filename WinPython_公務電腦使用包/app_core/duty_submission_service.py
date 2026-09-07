@@ -277,11 +277,17 @@ class DutySubmissionService:
                 verify_saved=False,
             )
             group = str(comparison.get("group", "") or "")
+            is_manual_unreturned_return_recovery = request.trigger_type == "manual" and bool(
+                str(request.schedule_data.get("_unreturned_return_queue_id", "") or "").strip()
+            )
             allows_manual_submission = request.trigger_type == "manual" and (
                 group in ("manual", "adjust")
                 or (
                     group == "review"
-                    and str(action.get("source", "") or "").startswith("外勤")
+                    and (
+                        str(action.get("source", "") or "").startswith("外勤")
+                        or is_manual_unreturned_return_recovery
+                    )
                 )
             )
             if submission_comparison.get("group") == "done":

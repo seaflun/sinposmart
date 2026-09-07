@@ -3167,6 +3167,63 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "submitted")
             self.assertEqual(fills, ["外勤支援"])
 
+    def test_manual_unreturned_return_review_action_can_submit_after_return_confirmation(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills: list[str] = []
+            query_count = 0
+
+            def query_visible_table(_driver, _ap_name, _target_date):
+                nonlocal query_count
+                query_count += 1
+                return [["115/07/29", "08:01", "-", "測試員", "出", "退勤"]] if query_count > 1 else []
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda headless: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: {},
+                fill_entry_log_form_for_test=lambda _driver, action, *_args, **_kwargs: fills.append(
+                    action["source"]
+                ) or {},
+                quit_driver=lambda _driver: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 7, 29, 8, 1),
+                comparison_builder=lambda *_args, **_kwargs: {
+                    0: {"compare": "返隊後人工確認", "group": "review", "matched": []}
+                },
+            )
+            data = {
+                "target_date": "1150729",
+                "today": {"staff": {"10": {"name": "測試員"}}},
+                "_unreturned_return_queue_id": "returned-queue",
+                "actions": [
+                    {
+                        "kind": "entry_log",
+                        "time": "08:00",
+                        "actor": "10",
+                        "target": "10",
+                        "source": "昨日在勤且今日未在勤",
+                        "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+                    }
+                ],
+            }
+
+            result = service.execute(
+                DutySubmissionRequest("user10", "test-secret", 0, data, trigger_type="manual")
+            )
+
+            self.assertEqual(result.status, "submitted")
+            self.assertEqual(fills, ["昨日在勤且今日未在勤"])
+
     def test_manual_group_action_can_submit_after_confirmation(self) -> None:
         from datetime import datetime
 
@@ -13631,6 +13688,60 @@ if return_code != 0 or loaded:
         self.assertFalse(controller._auto_execution_enabled)
         self.assertEqual(due_spy.count(), 0)
 
+    def test_verified_relogin_retries_unreturned_return_only_after_auto_execution_is_enabled(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        retry_at = datetime(2026, 9, 7, 8, 30)
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(
+            Path(temporary_queue_dir.name),
+            now_factory=lambda: retry_at,
+        )
+        action = {
+            "kind": "entry_log",
+            "time": "08:00",
+            "actor": "12",
+            "target": "12",
+            "source": "值班交接",
+            "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+        }
+        record, created = queue.pause(
+            action,
+            {"target_date": "1150907", "today": {"staff": {}}},
+            owner_actor_no="12",
+            now=datetime(2026, 9, 7, 8, 0),
+        )
+        self.assertTrue(created)
+        queue.defer(record["queue_id"], "12", now=retry_at)
+
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.set_session_context(3, "user27")
+        controller.set_actor_no("27")
+        recovery_spy = QSignalSpy(controller.externalReturnRecoveryDue)
+
+        controller.resume_unreturned_return_recovery_after_verified_login()
+
+        self.assertEqual(recovery_spy.count(), 0)
+        self.assertEqual(
+            queue.get(record["queue_id"])["next_retry_at"],
+            "2026-09-07T08:35:00",
+        )
+
+        controller.enable_auto_execution()
+
+        self.assertEqual(recovery_spy.count(), 1)
+        retried = queue.get(record["queue_id"])
+        self.assertEqual(retried["last_attempt_at"], "2026-09-07T08:30:00")
+        self.assertEqual(retried["next_retry_at"], "2026-09-07T08:40:00")
+        self.assertEqual(retried["retry_interval_minutes"], 10)
+
     def test_new_session_retries_live_capture_after_old_lane_releases(self) -> None:
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
@@ -13662,6 +13773,30 @@ if return_code != 0 or loaded:
 
             self.assertEqual(refresh_calls, [("user-b", "20"), ("user-b", "20")])
             self.assertIsNone(controller._pending_live_refresh_generation)
+        finally:
+            controller.shutdown()
+
+    def test_verified_login_marks_unreturned_return_for_safe_retry(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        retry_marks: list[bool] = []
+        controller.dutyController.load_current_schedule = lambda: None
+        controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+        controller.dutyController.resume_unreturned_return_recovery_after_verified_login = (
+            lambda: retry_marks.append(True)
+        )
+        try:
+            attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                attempt_id,
+                LoginSession("27", "user27", "secret", verified=True),
+            )
+
+            controller._sync_session_actor()
+
+            self.assertEqual(retry_marks, [True])
         finally:
             controller.shutdown()
 

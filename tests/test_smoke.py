@@ -3626,6 +3626,30 @@ class PackageSmokeTests(unittest.TestCase):
             )
         )
 
+    def test_external_assignment_state_includes_disaster_rescue_departure(self) -> None:
+        module = package_module("compare_rehearsal_records")
+
+        rows = module.flatten_rows(
+            [["115/09/07", "08:00", "-", "測試員", "出", "災害搶救"]],
+            "1150907",
+        )
+        action = {
+            "target": "10",
+            "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+        }
+        staff = {"10": {"name": "測試員"}}
+
+        self.assertEqual(
+            module.find_open_external_assignment(
+                rows,
+                "1150907",
+                staff,
+                action,
+                current_at=datetime(2026, 9, 7, 8, 10),
+            ),
+            "2026-09-07T08:00",
+        )
+
     def test_case_query_uses_silent_field_updates_and_native_query_click(self) -> None:
         module = duty_rehearsal_module()
 

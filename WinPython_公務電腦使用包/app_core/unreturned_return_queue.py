@@ -284,6 +284,23 @@ class UnreturnedReturnQueue:
         self._write_records()
         return dict(record)
 
+    def make_active_records_due(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Make non-inflight records eligible for a later safe claim without executing them."""
+
+        current = now or self.now_factory()
+        records = [
+            record
+            for record in self._records.values()
+            if record.get("record_type") in ("single", "handoff_group")
+            and record.get("queue_id") not in self._inflight_ids
+        ]
+        if not records:
+            return []
+        for record in records:
+            record["next_retry_at"] = self._timestamp(current)
+        self._write_records()
+        return [dict(record) for record in records]
+
     def claim_manual(self, queue_id: str, actor_no: str, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Claim a human-confirmed record without changing its fixed expiry point."""
 
