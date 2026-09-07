@@ -1907,7 +1907,7 @@ class AppController(QObject):
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
-        run_id = uuid4().hex if tool_name == "rescue_video" else ""
+        run_id = uuid4().hex
         self._active_tool_runs[tool_name] = (tool_label, mode, run_id)
         self._shutdown_terminal_tool_runs.discard(tool_name)
         session = self._session_state.session

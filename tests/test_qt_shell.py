@@ -13416,6 +13416,53 @@ if return_code != 0 or loaded:
         )
         self.assertEqual(second_finished["snapshot"]["total_count"], 2)
 
+    def test_each_tool_run_has_distinct_run_id_for_backend_history(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+            def sync_board_async(self, _schedule_data):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            operational_sync = FakeOperationalSyncService()
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                operational_sync_service=operational_sync,
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            try:
+                duty_sheet = controller.dutySheetController
+                duty_sheet.runStarted.emit()
+                duty_sheet.runFailed.emit("第一次執行失敗")
+                duty_sheet.runStarted.emit()
+                duty_sheet.runSucceeded.emit("第二次執行完成")
+            finally:
+                controller.shutdown()
+
+        tool_events = [
+            fields
+            for record_type, fields in operational_sync.events
+            if record_type in {"tool_action_started", "tool_action_finished"}
+        ]
+        self.assertEqual(len(tool_events), 4)
+        first_start, first_finished, second_start, second_finished = tool_events
+        first_run_id = first_start["snapshot"]["run_id"]
+        second_run_id = second_start["snapshot"]["run_id"]
+        self.assertTrue(first_run_id)
+        self.assertTrue(second_run_id)
+        self.assertEqual(first_run_id, first_finished["snapshot"]["run_id"])
+        self.assertEqual(second_run_id, second_finished["snapshot"]["run_id"])
+        self.assertNotEqual(first_run_id, second_run_id)
+
     def test_tool_failure_event_includes_browser_detail_for_nas_backend(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from qt_app.controllers.app_controller import AppController
