@@ -21,7 +21,7 @@ from urllib.request import urlopen
 from urllib.error import HTTPError, URLError
 
 import openpyxl
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, WebDriverException
+from selenium.common.exceptions import NoAlertPresentException, TimeoutException, UnexpectedAlertPresentException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -778,8 +778,11 @@ def submit_monthly_base_entries(
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
         report_stage("form_open")
-        open_ap(driver, DUTY_BASE_AP)
-        wait_for_main_table(driver)
+        try:
+            open_ap(driver, DUTY_BASE_AP)
+        except UnexpectedAlertPresentException as exc:
+            acknowledge_base_page_alert(driver, exc)
+        wait_for_main_table(driver, acknowledge_alerts=True)
 
     report_stage("browser_start")
     driver = None
@@ -788,11 +791,11 @@ def submit_monthly_base_entries(
         driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
         if expected_roc_year is not None and expected_month is not None:
             status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
-            select_base_month(driver, expected_roc_year, expected_month)
+            select_base_month(driver, expected_roc_year, expected_month, acknowledge_alerts=True)
         else:
             plan = plan_future.result()
             status(f"切換到 {plan.roc_year}年{plan.month:02d}月並查詢...")
-            select_base_month(driver, plan.roc_year, plan.month)
+            select_base_month(driver, plan.roc_year, plan.month, acknowledge_alerts=True)
         status("月份查詢完成，確認輪休基準表來源...")
         plan = plan_future.result()
         if expected_roc_year is not None and expected_month is not None:
@@ -1047,8 +1050,19 @@ def translate_monthly_base_code(code: str, day: int, person_name: str) -> str:
     return MONTHLY_BASE_SYMBOLS[normalized]
 
 
-def select_base_month(driver, roc_year: int, month: int) -> None:
-    result = driver.execute_script(
+def select_base_month(driver, roc_year: int, month: int, *, acknowledge_alerts: bool = False) -> None:
+    def select_and_query(script, *args):
+        try:
+            return driver.execute_script(script, *args)
+        except UnexpectedAlertPresentException as exc:
+            if not acknowledge_alerts:
+                raise
+            acknowledge_base_page_alert(driver, exc)
+            # The query may have opened a notice before returning its result.
+            # Only the loaded target month below can establish success.
+            return {"notice_acknowledged": True}
+
+    result = select_and_query(
         """
         function deepFindControls(win) {
           try {
@@ -1088,13 +1102,25 @@ def select_base_month(driver, roc_year: int, month: int) -> None:
         str(roc_year),
         f"{month:02d}",
     )
-    if not result or not result.get("ok"):
+    notice_acknowledged = bool(result and result.get("notice_acknowledged"))
+    if not notice_acknowledged and (not result or not result.get("ok")):
         raise RuntimeError("勤務基準表找不到年月與查詢欄位。")
-    if not result.get("okYear") or not result.get("okMonth"):
+    if not notice_acknowledged and (not result.get("okYear") or not result.get("okMonth")):
         raise RuntimeError(f"勤務基準表無法切換到 {roc_year}年{month:02d}月。")
+
+    def month_ready(candidate):
+        if acknowledge_alerts and acknowledge_base_page_alert(candidate):
+            return False
+        actual = extract_base_month_from_text(current_page_text(candidate))
+        if acknowledge_alerts:
+            return actual == (int(roc_year), int(month))
+        return actual is not None
+
     try:
-        WebDriverWait(driver, 20).until(lambda d: extract_base_month_from_text(current_page_text(d)) is not None)
+        WebDriverWait(driver, 20).until(month_ready)
     except TimeoutException as exc:
+        if acknowledge_alerts:
+            raise RuntimeError(f"網站尚未載入 {roc_year}年{month:02d}月，無法確認年月。") from exc
         raise RuntimeError("網站沒有顯示目前編輯月份，無法確認年月。") from exc
     actual = extract_base_month_from_text(current_page_text(driver))
     if not actual:
@@ -1294,8 +1320,29 @@ def click_person_row_save(driver, person_name: str) -> None:
     time.sleep(1)
 
 
-def wait_for_main_table(driver) -> None:
-    WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.body && document.body.innerText.includes('勤務基準表');"))
+def acknowledge_base_page_alert(driver, error: UnexpectedAlertPresentException | None = None) -> bool:
+    """Acknowledge a notice during base-table navigation, never during saving."""
+    try:
+        driver.switch_to.alert.accept()
+        return True
+    except NoAlertPresentException:
+        # Chrome may already have dismissed the notice before notifying Selenium.
+        return error is not None
+
+
+def wait_for_main_table(driver, *, acknowledge_alerts: bool = False) -> None:
+    def page_ready(candidate):
+        if acknowledge_alerts and acknowledge_base_page_alert(candidate):
+            return False
+        try:
+            return candidate.execute_script("return document.body && document.body.innerText.includes('勤務基準表');")
+        except UnexpectedAlertPresentException as exc:
+            if not acknowledge_alerts:
+                raise
+            acknowledge_base_page_alert(candidate, exc)
+            return False
+
+    WebDriverWait(driver, 20).until(page_ready)
 
 
 def current_page_text(driver) -> str:

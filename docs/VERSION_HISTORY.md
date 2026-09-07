@@ -8,6 +8,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.09.07.2203` | 2026-09-07 22:03（台北時間） | 勤務基準表開頁及月份查詢的網站提示自動確認後繼續，避免彈窗被誤判為瀏覽器中斷。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.07.2203) |
 | `2026.08.27.1655` | 2026-08-27 16:55（台北時間） | 勤務基準表新增消防節假「消」：Google Sheet 標記「消」時，系統也登打「消」。新增完整版本紀錄索引。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.08.27.1655) |
 | `2026.08.27.0009` | 2026-08-27 00:09（台北時間） | 未提供可安全摘要的變更說明；請開啟 Release 查看完整內容。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.08.27.0009) |
 | `2026.08.26.2353` | 2026-08-26 23:53（台北時間） | 未提供可安全摘要的變更說明；請開啟 Release 查看完整內容。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.08.26.2353) |

@@ -3729,6 +3729,174 @@ class RestMonthlyServiceTests(unittest.TestCase):
         self.assertEqual(entries, [module.RestEntry(31, 31, 22, 1, 2)])
         self.assertEqual(entries[0].hours, 4)
 
+    def test_monthly_submission_continues_after_rest_hours_notice(self) -> None:
+        import rest_time_automation as module
+        from selenium.common.exceptions import NoAlertPresentException
+
+        for alert_stage in ("navigation", "page_read"):
+            for auto_dismissed in (False, True):
+                with self.subTest(stage=alert_stage, auto_dismissed=auto_dismissed):
+                    notice = "Error:休息時數未達標準" if alert_stage == "navigation" else "其他網站提示，請確認"
+                    events = []
+
+                    class Alert:
+                        text = notice
+
+                        def accept(self):
+                            events.append("accept_notice")
+                            driver.pending_alert = False
+
+                    class Driver:
+                        pending_alert = False
+                        raised = False
+
+                        @property
+                        def switch_to(self):
+                            return self
+
+                        @property
+                        def alert(self):
+                            if not self.pending_alert:
+                                raise NoAlertPresentException()
+                            return Alert()
+
+                        def show_notice(self):
+                            self.pending_alert = not auto_dismissed
+                            self.raised = True
+                            raise module.UnexpectedAlertPresentException(
+                                "unexpected alert open", alert_text=notice,
+                            )
+
+                        def execute_script(self, *_args):
+                            if alert_stage == "page_read" and not self.raised:
+                                self.show_notice()
+                            self.assert_no_pending_alert()
+                            events.append("page_ready")
+                            return True
+
+                        def assert_no_pending_alert(self):
+                            if self.pending_alert:
+                                raise AssertionError("提示尚未確認")
+
+                    driver = Driver()
+
+                    def open_page(*_args):
+                        if alert_stage == "navigation":
+                            driver.show_notice()
+
+                    def build_driver(*_args, initialize, **_kwargs):
+                        events.append("browser_created")
+                        initialize(driver)
+                        return driver
+
+                    plan = module.MonthlyBasePlan(115, 9, "25", "測試人員", {1: "○"})
+                    with patch.object(module, "fetch_monthly_base_plan", return_value=plan), \
+                            patch.object(module, "build_initialized_driver", side_effect=build_driver), \
+                            patch.object(module, "login"), \
+                            patch.object(module, "open_ap", side_effect=open_page), \
+                            patch.object(module, "select_base_month"), \
+                            patch.object(module, "wait_for_person_name_row"), \
+                            patch.object(module, "fill_monthly_base_row", return_value=1) as fill, \
+                            patch.object(module, "click_person_row_save") as save, \
+                            patch.object(module, "quit_driver"):
+                        result = module.submit_monthly_base_entries(
+                            "test25", "fake", "25", False,
+                            expected_roc_year=115, expected_month=9,
+                        )
+                    self.assertIn("已填入 1 格並個人儲存", result)
+                    self.assertEqual(events.count("browser_created"), 1)
+                    self.assertEqual(events.count("accept_notice"), 0 if auto_dismissed else 1)
+                    self.assertIn("page_ready", events)
+                    fill.assert_called_once()
+                    save.assert_called_once()
+
+    def test_monthly_query_acknowledges_notice_and_waits_for_target_month(self) -> None:
+        import rest_time_automation as module
+        from selenium.common.exceptions import NoAlertPresentException
+
+        class Driver:
+            def __init__(self):
+                self.accepted = 0
+                self.pending = False
+                self.months = iter(["目前編輯月份為:115年08月", "目前編輯月份為:115年09月"])
+
+            @property
+            def switch_to(self):
+                return self
+
+            @property
+            def alert(self):
+                if not self.pending:
+                    raise NoAlertPresentException()
+                return self
+
+            def accept(self):
+                self.accepted += 1
+                self.pending = False
+
+            def execute_script(self, script, *_args):
+                if "deepFindControls" in script:
+                    self.pending = True
+                    raise module.UnexpectedAlertPresentException("notice", alert_text="其他月份查詢提示")
+                return next(self.months, "目前編輯月份為:115年09月")
+
+        driver = Driver()
+        with patch.object(module.time, "sleep"):
+            module.select_base_month(driver, 115, 9, acknowledge_alerts=True)
+        self.assertEqual(driver.accepted, 1)
+
+    def test_base_page_notice_handling_does_not_swallow_browser_failure(self) -> None:
+        import rest_time_automation as module
+        from selenium.common.exceptions import NoAlertPresentException
+
+        class Driver:
+            @property
+            def switch_to(self):
+                return self
+
+            @property
+            def alert(self):
+                raise NoAlertPresentException()
+
+            def execute_script(self, *_args):
+                raise module.WebDriverException("disconnected")
+
+        with self.assertRaisesRegex(module.WebDriverException, "disconnected"):
+            module.wait_for_main_table(Driver(), acknowledge_alerts=True)
+
+    def test_base_page_repeated_notices_still_time_out(self) -> None:
+        import rest_time_automation as module
+
+        class Driver:
+            accepted = 0
+
+            @property
+            def switch_to(self):
+                return self
+
+            @property
+            def alert(self):
+                return self
+
+            def accept(self):
+                self.accepted += 1
+
+        class BoundedWait:
+            def __init__(self, driver, timeout):
+                self.driver = driver
+
+            def until(self, condition):
+                for _ in range(3):
+                    if condition(self.driver):
+                        return True
+                raise module.TimeoutException()
+
+        driver = Driver()
+        with patch.object(module, "WebDriverWait", BoundedWait):
+            with self.assertRaises(module.TimeoutException):
+                module.wait_for_main_table(driver, acknowledge_alerts=True)
+        self.assertEqual(driver.accepted, 3)
+
     def test_monthly_submission_fetches_plan_while_browser_opens(self) -> None:
         import rest_time_automation as module
 
