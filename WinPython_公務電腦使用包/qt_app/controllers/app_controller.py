@@ -1516,12 +1516,6 @@ class AppController(QObject):
             return
         trigger_type = str(event.get("trigger_type") or "recovery")
         status = str(event.get("status") or "pending")
-        if (
-            trigger_type == "recovery"
-            and status in {"retrying", "pending"}
-            and str(record.get("queue_id") or "").strip()
-        ):
-            return
         actions = [
             dict(item)
             for item in record.get("actions", [])

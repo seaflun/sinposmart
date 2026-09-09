@@ -11466,7 +11466,7 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
-    def test_unreturned_recovery_pause_state_does_not_publish_backend_event(self) -> None:
+    def test_unreturned_recovery_publishes_each_check_with_updated_retry_times(self) -> None:
         from qt_app.controllers.app_controller import AppController
 
         class FakeController:
@@ -11489,13 +11489,29 @@ if return_code != 0 or loaded:
         }
         controller = FakeController()
 
-        for status in ("retrying", "pending"):
+        for status, attempt, next_retry in (
+            ("retrying", "2026-09-09T08:05:20", "2026-09-09T08:10:20"),
+            ("pending", "2026-09-09T08:05:28", "2026-09-09T08:10:28"),
+            ("retrying", "2026-09-09T08:10:28", "2026-09-09T08:15:28"),
+        ):
+            event["record"].update(
+                last_attempt_at=attempt,
+                next_retry_at=next_retry,
+                retry_interval_minutes=5,
+            )
             AppController._publish_unreturned_return_event(
                 controller,
                 {**event, "status": status},
             )
-
-        self.assertEqual(controller.events, [])
+            self.assertEqual(len(controller.events), 1)
+            record_type, fields = controller.events.pop()
+            self.assertEqual(record_type, "unreturned_return")
+            self.assertEqual(fields["status"], status)
+            self.assertEqual(fields["trigger_type"], "recovery")
+            self.assertEqual(fields["snapshot"]["queue_id"], "retrying-queue")
+            self.assertEqual(fields["snapshot"]["last_attempt_at"], attempt)
+            self.assertEqual(fields["snapshot"]["next_retry_at"], next_retry)
+            self.assertEqual(fields["snapshot"]["retry_interval_minutes"], 5)
 
         AppController._publish_unreturned_return_event(
             controller,
@@ -12977,7 +12993,7 @@ if return_code != 0 or loaded:
                 )
                 self.assertEqual(
                     [(record_type, fields["status"]) for record_type, fields in events],
-                    [("action_result", "cancelled")],
+                    [("unreturned_return", "pending"), ("action_result", "cancelled")],
                 )
             finally:
                 controller.shutdown()
