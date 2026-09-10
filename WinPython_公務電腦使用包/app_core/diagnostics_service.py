@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import time
+import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -27,6 +31,129 @@ class DiagnosticSnapshot:
 class DiagnosticsService:
     def __init__(self, package_root: Path) -> None:
         self.package_root = Path(package_root)
+
+    def cleanup_retained_files(self, *, now: float | None = None, backup_dir: Path | None = None) -> None:
+        """Remove only expired output files; preserve references in live state."""
+        cutoff = (time.time() if now is None else now) - 30 * 86400
+        root = self.package_root.resolve()
+
+        def owned(path: Path, boundary: Path) -> bool:
+            try:
+                if not path.resolve().is_relative_to(boundary.resolve()):
+                    return False
+                for part in (path, *path.parents):
+                    info = part.lstat()
+                    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+                        return False
+                    if part == boundary:
+                        break
+                return path.is_file()
+            except OSError:
+                return False
+
+        references: set[str] = set()
+        def collect(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, str):
+                references.add(value.replace('\\', '/').rsplit('/', 1)[-1])
+
+        runtime_roots = [root / 'runtime_outputs', root / 'duty_sheet_legacy/runtime_outputs']
+        try:
+            for runtime in runtime_roots:
+                for path in runtime.glob('*.json*'):
+                    if not owned(path, root):
+                        continue
+                    if path.suffix == '.jsonl':
+                        with path.open(encoding='utf-8-sig') as handle:
+                            for line in handle:
+                                if line.strip():
+                                    collect(json.loads(line))
+                    elif path.suffix == '.json':
+                        collect(json.loads(path.read_text(encoding='utf-8-sig')))
+        except (OSError, ValueError):
+            # Unreadable live state must never cause loss of referenced output.
+            return
+
+        folders = [(runtime / name, extensions) for runtime in runtime_roots
+                   for name, extensions in [('form_tests', {'.json'}), ('snapshots', {'.json', '.txt'}),
+                                             ('schedule', {'.json'}), ('comparison', {'.json'}),
+                                             ('browser', {'.json', '.jsonl'})]]
+        folders += [(base / name, {'.png'}) for base in (root, root / 'duty_sheet_legacy')
+                    for name in ('screenshots', '每日勤務表', '夜間勤務', '夜間勤務表')]
+        for runtime in runtime_roots:
+            legacy_log = runtime / 'browser/browser_startup.jsonl'
+            if not owned(legacy_log, root):
+                continue
+            temporary = None
+            try:
+                before = legacy_log.stat()
+                changed = False
+                with legacy_log.open(encoding='utf-8') as source, tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=legacy_log.parent, suffix='.tmp', delete=False
+                ) as output:
+                    temporary = Path(output.name)
+                    for line in source:
+                        try:
+                            stamp = datetime.fromisoformat(json.loads(line)['timestamp']).timestamp()
+                        except (ValueError, KeyError, TypeError):
+                            stamp = cutoff  # Preserve entries whose age cannot be established.
+                        if stamp < cutoff:
+                            changed = True
+                        else:
+                            output.write(line)
+                after = legacy_log.stat()
+                if changed and (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size):
+                    temporary.replace(legacy_log)
+            except (OSError, UnicodeError):
+                pass
+            finally:
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        for folder, extensions in folders:
+            for current, directories, files in os.walk(folder, followlinks=False):
+                safe_directories = []
+                for name in directories:
+                    try:
+                        child = Path(current) / name
+                        if not child.is_symlink() and not getattr(child.lstat(), 'st_file_attributes', 0) & 1024:
+                            safe_directories.append(name)
+                    except OSError:
+                        pass
+                directories[:] = safe_directories
+                for name in files:
+                    path = Path(current) / name
+                    if name == 'browser_startup.jsonl' or path.suffix.lower() not in extensions or not owned(path, root):
+                        continue
+                    if name in references or any(ref and ref in name for ref in references if len(ref) == 7 and ref.isdigit()):
+                        continue
+                    try:
+                        if path.stat().st_mtime < cutoff:
+                            path.unlink()
+                    except OSError:
+                        pass  # Locked files can be retried on the next run.
+
+        backups = backup_dir or Path(os.environ.get('LOCALAPPDATA') or '') / 'SinpoSmart/update_backups'
+        if backup_dir is None and not os.environ.get('LOCALAPPDATA'):
+            return
+        candidates = [path for path in backups.glob('SinpoSmart-package-backup-*.zip') if owned(path, backups)]
+        try:
+            candidates.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+            for path in candidates[1:]:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     def export(self, snapshot: DiagnosticSnapshot) -> Path:
         issue_dir = self.package_root / "issue_reports"

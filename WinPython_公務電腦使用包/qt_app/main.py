@@ -7,6 +7,7 @@ import os
 import json
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
@@ -26,6 +27,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication
 
+from app_core.diagnostics_service import DiagnosticsService
 from app_core.credential_repository import CredentialRepository
 from app_core.login_verifier import (
     LoginVerifier,
@@ -290,6 +292,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     instance_server = create_instance_server(server_name)
     if instance_server is None:
         return 0
+
+    if not isolated_startup:
+        retention = DiagnosticsService(PACKAGE_ROOT)
+        retention_worker = None
+
+        def cleanup_retention() -> None:
+            nonlocal retention_worker
+            if retention_worker is None or not retention_worker.is_alive():
+                retention_worker = threading.Thread(target=retention.cleanup_retained_files, daemon=True)
+                retention_worker.start()
+
+        cleanup_retention()
+        retention_timer = QTimer(app)
+        retention_timer.setInterval(24 * 60 * 60 * 1000)
+        retention_timer.timeout.connect(cleanup_retention)
+        retention_timer.start()
 
     controller = create_app_controller(arguments)
     controller.nativeTitleBarRequested.connect(schedule_windows_title_bar)

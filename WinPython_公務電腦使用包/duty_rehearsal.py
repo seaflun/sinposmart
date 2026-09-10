@@ -3263,6 +3263,7 @@ def _write_duty_browser_startup_diagnostic(
         "profiles_pruned": profiles_pruned,
     }
     output_path = Path(__file__).resolve().parent / _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH
+    output_path = output_path.with_name(f"browser_startup_{datetime.now():%Y%m%d}.jsonl")
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("a", encoding="utf-8") as handle:

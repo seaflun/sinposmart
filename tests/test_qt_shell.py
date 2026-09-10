@@ -5942,6 +5942,85 @@ class UpdateControllerTests(unittest.TestCase):
 
 
 class DiagnosticsServiceTests(unittest.TestCase):
+    def test_retention_keeps_boundary_and_skips_linked_output(self):
+        import os
+        from app_core.diagnostics_service import DiagnosticsService
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as external:
+            root = Path(directory)
+            now = 2_000_000_000
+            folder = root / 'runtime_outputs/form_tests'
+            folder.mkdir(parents=True)
+            boundary = folder / 'boundary.json'
+            boundary.write_text('{}', encoding='utf-8')
+            os.utime(boundary, (now - 30 * 86400,) * 2)
+            outside = Path(external) / 'outside.json'
+            outside.write_text('{}', encoding='utf-8')
+            os.utime(outside, (now - 31 * 86400,) * 2)
+            try:
+                (folder / 'linked.json').symlink_to(outside)
+            except OSError:
+                pass  # Windows may disallow creating symlinks for this test account.
+            DiagnosticsService(root).cleanup_retained_files(now=now, backup_dir=root / 'backups')
+            self.assertTrue(boundary.exists())
+            self.assertTrue(outside.exists())
+
+    def test_retention_trims_legacy_log_and_preserves_unreadable_state(self):
+        import os
+        from datetime import datetime
+        from app_core.diagnostics_service import DiagnosticsService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = 2_000_000_000
+            log = root / 'runtime_outputs/browser/browser_startup.jsonl'
+            log.parent.mkdir(parents=True)
+            old = json.dumps({'timestamp': datetime.fromtimestamp(now - 31 * 86400).isoformat()})
+            recent = json.dumps({'timestamp': datetime.fromtimestamp(now).isoformat()})
+            log.write_text(old + '\n' + recent + '\nunknown\n', encoding='utf-8')
+            service = DiagnosticsService(root)
+            service.cleanup_retained_files(now=now, backup_dir=root / 'backups')
+            self.assertEqual(log.read_text(encoding='utf-8'), recent + '\nunknown\n')
+            state = root / 'runtime_outputs/unreturned_return_queue.json'
+            state.write_text('invalid', encoding='utf-8')
+            result = root / 'runtime_outputs/form_tests/old.json'
+            result.parent.mkdir()
+            result.write_text('{}', encoding='utf-8')
+            os.utime(result, (now - 31 * 86400,) * 2)
+            service.cleanup_retained_files(now=now, backup_dir=root / 'backups')
+            self.assertTrue(result.exists())
+
+    def test_retention_removes_only_expired_owned_files_and_keeps_latest_backup(self):
+        import os
+        from app_core.diagnostics_service import DiagnosticsService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = 2_000_000_000
+            old = now - 31 * 86400
+            paths = ["runtime_outputs/form_tests/old.json", "runtime_outputs/form_tests/recent.json",
+                     "runtime_outputs/form_tests/pending.json", "runtime_outputs/unreturned_return_queue.json",
+                     "runtime_outputs/snapshots/old.json", "screenshots/old.png", "unknown/old.json"]
+            for name in paths:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('{}', encoding='utf-8')
+                os.utime(path, (old, old))
+            os.utime(root / paths[1], (now, now))
+            (root / paths[3]).write_text('{"result_ref":"pending.json"}', encoding='utf-8')
+            backups = root / 'backups'
+            backups.mkdir()
+            for name, stamp in [('SinpoSmart-package-backup-20200101.zip', old),
+                                ('SinpoSmart-package-backup-20200201.zip', now), ('personal.zip', old)]:
+                path = backups / name
+                path.write_bytes(b'backup')
+                os.utime(path, (stamp, stamp))
+            DiagnosticsService(root).cleanup_retained_files(now=now, backup_dir=backups)
+            for name in (paths[0], paths[4], paths[5]):
+                self.assertFalse((root / name).exists())
+            for name in (paths[1], paths[2], paths[3], paths[6]):
+                self.assertTrue((root / name).exists())
+            self.assertFalse((backups / 'SinpoSmart-package-backup-20200101.zip').exists())
+            self.assertTrue((backups / 'SinpoSmart-package-backup-20200201.zip').exists())
+            self.assertTrue((backups / 'personal.zip').exists())
+
     def test_issue_package_uses_allowlist_and_excludes_credentials(self) -> None:
         from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
 
