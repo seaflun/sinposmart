@@ -5888,20 +5888,25 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(launched, [script_path])
             self.assertIn("已開啟更新程式", controller.statusText)
 
-    def test_update_controller_defers_busy_update_and_disables_future_checks(self) -> None:
+    def test_update_controller_defers_busy_update_and_retries_when_idle(self) -> None:
         from app_core.update_repository import UpdateRepository
         from qt_app.controllers.update_controller import UpdateController
 
         with tempfile.TemporaryDirectory() as temp_dir:
             version_path = Path(temp_dir) / "VERSION.txt"
             version_path.write_text("2026.08.12.0001\n", encoding="utf-8")
+            script_path = version_path.with_name("update_package.ps1")
+            script_path.write_text("# test updater\n", encoding="utf-8")
             fetched: list[str] = []
+            launched: list[Path] = []
+            block_reason = ["勤務登打仍在執行"]
             controller = UpdateController(
                 UpdateRepository(
                     version_path,
                     text_fetcher=lambda _url, _timeout: fetched.append("checked") or "2026.08.12.0002",
                 ),
-                stop_guard=lambda: "勤務登打仍在執行",
+                process_launcher=lambda path: launched.append(path),
+                stop_guard=lambda: block_reason[0],
             )
             controller._update_available = True
 
@@ -5911,6 +5916,15 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertTrue(controller.updateDeferred)
             self.assertIn("更新已延後", controller.statusText)
             self.assertEqual(fetched, [])
+            self.assertTrue(controller._deferred_retry_timer.isActive())
+
+            block_reason[0] = ""
+            controller._retry_deferred_update()
+
+            self.assertFalse(controller.updateDeferred)
+            self.assertEqual(launched, [script_path])
+            self.assertIn("已開啟更新程式", controller.statusText)
+            controller.shutdown()
 
     def test_update_controller_emits_update_prompt_or_completed_status(self) -> None:
         from PySide6.QtTest import QSignalSpy

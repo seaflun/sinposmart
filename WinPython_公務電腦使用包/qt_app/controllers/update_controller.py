@@ -13,6 +13,8 @@ from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 from app_core.update_repository import UpdateCheckError, UpdateRepository, VersionInfo
 from qt_app.workers.update_check_worker import UpdateCheckWorker
 
+DEFERRED_UPDATE_RETRY_INTERVAL_MS = 30_000
+
 
 def launch_update_process(script_path: Path) -> Any:
     command = [
@@ -51,6 +53,10 @@ class UpdateController(QObject):
         self._status_text = "尚未檢查更新"
         self._update_available = False
         self._update_deferred = False
+        self._deferred_retry_timer = QTimer(self)
+        self._deferred_retry_timer.setSingleShot(True)
+        self._deferred_retry_timer.setInterval(DEFERRED_UPDATE_RETRY_INTERVAL_MS)
+        self._deferred_retry_timer.timeout.connect(self._retry_deferred_update)
         self._request_id = 0
         self._workers: dict[int, tuple[QThread, UpdateCheckWorker]] = {}
         self._shutdown_admission = False
@@ -138,12 +144,48 @@ class UpdateController(QObject):
 
     @Slot(str)
     def deferUpdate(self, block_reason: str) -> None:
+        if self._shutdown_admission:
+            return
         if self._update_deferred:
+            self._schedule_deferred_retry()
             return
         self._update_deferred = True
-        self._status_text = f"更新已延後：{str(block_reason or '').strip()}"
+        self._status_text = (
+            f"更新已延後：{str(block_reason or '').strip()}；"
+            "工作完成後會自動重試"
+        )
         self.stateChanged.emit()
         self.errorOccurred.emit(self._status_text)
+        self._schedule_deferred_retry()
+
+    def _schedule_deferred_retry(self) -> None:
+        if self._shutdown_admission or not self._update_available:
+            return
+        if not self._deferred_retry_timer.isActive():
+            self._deferred_retry_timer.start()
+
+    @Slot()
+    def _retry_deferred_update(self) -> None:
+        if self._shutdown_admission or not self._update_deferred:
+            self._deferred_retry_timer.stop()
+            return
+        if not self._update_available:
+            self._update_deferred = False
+            self._deferred_retry_timer.stop()
+            self.stateChanged.emit()
+            return
+        block_reason = self._stop_block_reason()
+        if block_reason:
+            self._status_text = (
+                f"更新已延後：{block_reason}；工作完成後會自動重試"
+            )
+            self.stateChanged.emit()
+            self._deferred_retry_timer.start()
+            return
+        self._update_deferred = False
+        self._deferred_retry_timer.stop()
+        self.stateChanged.emit()
+        self.launchUpdate()
 
     def _stop_block_reason(self) -> str:
         if self._stop_guard is None:
@@ -214,6 +256,7 @@ class UpdateController(QObject):
     @Slot()
     def prepare_shutdown_admission(self) -> None:
         self._shutdown_admission = True
+        self._deferred_retry_timer.stop()
 
     @Slot()
     def shutdown(self) -> None:
