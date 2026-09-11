@@ -368,6 +368,24 @@ class SessionController(QObject):
 
         return self._actor_no_from_user_id(user_id)
 
+    def saved_credentials_for_actor(self, actor_no: str) -> tuple[str, str] | None:
+        """Return one complete saved credential pair for an identified duty number."""
+
+        actor_no = str(actor_no or "").strip()
+        if not actor_no:
+            return None
+        candidates = [
+            (
+                str(account.get("user_id", "") or "").strip(),
+                str(account.get("password", "") or ""),
+            )
+            for account in self._accounts
+            if str(account.get("actor_no", "") or "").strip() == actor_no
+            and str(account.get("user_id", "") or "").strip()
+            and str(account.get("password", "") or "")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
     def _actor_no_from_name(self, name: str) -> str:
         name = str(name or "").strip()
         for account in self._accounts:

@@ -110,8 +110,8 @@ ColumnLayout {
                 }
                 DangerButton {
                     implicitHeight: 30
-                    implicitWidth: 74
-                    text: "登出"
+                    implicitWidth: 104
+                    text: sessionHeader.backend.updateController.logoutActionText
                     onClicked: sessionHeader.backend.requestLogout()
                 }
             }

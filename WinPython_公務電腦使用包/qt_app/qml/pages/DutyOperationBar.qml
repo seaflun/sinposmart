@@ -277,7 +277,7 @@ RowLayout {
         }
         CommandMenuItem {
             objectName: "logoutMenuItem"
-            text: "登出"
+            text: dutyOperationBar.backend.updateController.logoutActionText
             onTriggered: dutyOperationBar.backend.requestLogout()
         }
         MenuSeparator {}

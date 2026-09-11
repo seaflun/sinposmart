@@ -321,6 +321,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cleanup_acceptance_directory(controller)
         return 1
     root_window = engine.rootObjects()[0]
+    if not isolated_startup:
+        QTimer.singleShot(0, controller.resumePendingAutoLogin)
     root_window.windowTitleChanged.connect(
         lambda _title: schedule_windows_title_bar(root_window)
     )

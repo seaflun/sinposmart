@@ -5954,6 +5954,127 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(ready_spy.at(0)[0], "2026.07.29.1100")
             self.assertEqual(completed_spy.count(), 1)
 
+    def test_remote_update_changes_logout_action_and_applies_staged_package(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        class RunningProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, {"LOCALAPPDATA": temp_dir}
+        ):
+            package_root = Path(temp_dir)
+            version_path = package_root / "VERSION.txt"
+            version_path.write_text("2026.09.11.0900\n", encoding="utf-8")
+            (package_root / "update_package.ps1").write_text("# test updater\n", encoding="utf-8")
+            launched: list[tuple[str, str]] = []
+            controller = UpdateController(
+                UpdateRepository(version_path),
+                remote_update_enabled=False,
+                remote_process_launcher=lambda _path, request_id, phase: launched.append((request_id, phase)) or RunningProcess(),
+            )
+            controller._remote_workers[1] = (object(), object())
+            request_id = "remote-duty-gui-test"
+            command = {
+                "request_id": request_id,
+                "target": "duty_gui",
+                "status": "pending",
+                "detail": "等待值班台接收。",
+            }
+            controller._remote_poll_succeeded(1, {"ok": True, "command": command})
+            self.assertTrue(controller.remoteUpdateActive)
+            self.assertEqual(controller.logoutActionText, "登出並更新")
+            self.assertEqual(launched, [(request_id, "PrepareOnly")])
+
+            manifest_path = controller._remote_update_manifest_path(request_id)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps({"request_id": request_id, "status": "staged"}),
+                encoding="utf-8",
+            )
+            controller._check_remote_stage()
+            self.assertTrue(controller.remoteUpdateReady)
+            self.assertEqual(controller.remoteUpdateStatus, "waiting_handoff")
+            self.assertTrue(controller.applyRemoteUpdate())
+            self.assertEqual(launched[-1], (request_id, "ApplyStaged"))
+            self.assertEqual(controller.remoteUpdateStatus, "applying")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "completed",
+                        "installed_version": "2026.09.11.1100",
+                        "detail": "遠端更新已完成，值班台已重新啟動。",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            controller._check_remote_stage()
+            self.assertFalse(controller.remoteUpdateActive)
+            self.assertEqual(controller.remoteUpdateStatus, "completed")
+            controller._remote_workers.clear()
+            controller.shutdown()
+
+    def test_remote_update_button_keeps_session_until_updater_restarts_gui(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "secret", verified=True),
+        )
+        launched: list[tuple[str, str]] = []
+        controller.updateController._remote_update_active = True
+        controller.updateController._remote_update_ready = True
+        controller.updateController._remote_update_request_id = "remote-logout-test"
+        controller.updateController._remote_process_launcher = (
+            lambda _path, request_id, phase: launched.append((request_id, phase))
+        )
+        try:
+            controller.requestLogout()
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertEqual(launched, [("remote-logout-test", "ApplyStaged")])
+            self.assertEqual(controller.updateController.logoutActionText, "登出並更新")
+        finally:
+            controller.shutdown()
+
+    def test_remote_update_logout_falls_back_when_stage_is_already_terminal(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, {"LOCALAPPDATA": temp_dir}
+        ):
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.09.11.0900\n", encoding="utf-8")
+            controller = UpdateController(
+                UpdateRepository(version_path),
+                remote_update_enabled=False,
+            )
+            request_id = "remote-terminal-stage-test"
+            controller._remote_update_active = True
+            controller._remote_update_request_id = request_id
+            manifest_path = controller._remote_update_manifest_path(request_id)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "up_to_date",
+                        "installed_version": "2026.09.11.0900",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(controller.applyRemoteUpdate())
+            self.assertFalse(controller.remoteUpdateActive)
+            self.assertEqual(controller.remoteUpdateStatus, "up_to_date")
+            controller.shutdown()
+
 
 class DiagnosticsServiceTests(unittest.TestCase):
     def test_retention_keeps_boundary_and_skips_linked_output(self):
@@ -14335,6 +14456,120 @@ if return_code != 0 or loaded:
         controller.handle_submission_result(0, "skipped_duplicate", "已存在", "result.json")
         self.assertFalse(controller._auto_logout_timer.isActive())
 
+    def test_auto_logout_keeps_identified_successor_for_followup_login(self) -> None:
+        from datetime import datetime
+
+        from PySide6.QtTest import QSignalSpy
+
+        from qt_app.controllers.duty_controller import DutyController
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "10",
+                "source": "值班交接",
+                "fields": {"出或入": "值退", "領用事由及地點": "值退"},
+            },
+            {
+                "kind": "entry_log",
+                "time": "08:00",
+                "actor": "10",
+                "target": "11",
+                "source": "值班交接",
+                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+            },
+        ]
+        controller = DutyController()
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("10")
+        controller.replace_schedule_data(
+            {"target_date": "1150729", "actions": actions}
+        )
+        controller._login_started_at = datetime(2026, 7, 29, 7, 59)
+        logout_spy = QSignalSpy(controller.autoLogoutRequested)
+
+        controller.handle_submission_result(0, "submitted", "完成", "result.json")
+        controller.handle_submission_result(1, "submitted", "完成", "result.json")
+        controller._check_auto_logout()
+
+        self.assertEqual(logout_spy.count(), 1)
+        self.assertEqual(controller.take_auto_logout_successor_actor_no(), "11")
+
+    def test_auto_logout_starts_saved_successor_login_after_logout(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.login_verifier import LoginResult
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class MemoryCredentialRepository:
+            def __init__(self) -> None:
+                self.accounts = [
+                    {
+                        "actor_no": "11",
+                        "user_id": "user11",
+                        "password": "secret11",
+                        "display_name": "11番 接班人",
+                    }
+                ]
+
+            @staticmethod
+            def account_identity(account):
+                return account.get("user_id") or account.get("actor_no") or ""
+
+            def load(self):
+                return SimpleNamespace(
+                    accounts=list(self.accounts),
+                    last_selected="user11",
+                    can_persist=True,
+                    needs_rewrite=False,
+                    invalid_file=False,
+                )
+
+            def save(self, accounts, _last_selected=""):
+                self.accounts = list(accounts)
+                return True
+
+            def enable_persistence(self):
+                return None
+
+        class FakeVerifier:
+            def verify(self, **kwargs):
+                return LoginResult(
+                    actor_no="11",
+                    user_id=kwargs["user_id"],
+                    actor_name="接班人",
+                )
+
+        controller = AppController(
+            repository=MemoryCredentialRepository(),
+            verifier=FakeVerifier(),
+            credential_sync_service=SimpleNamespace(enabled=False),
+            read_only_acceptance=True,
+        )
+        self.addCleanup(controller.shutdown)
+        attempt_id = controller._session_state.begin_login()
+        controller._session_state.complete_login(
+            attempt_id,
+            LoginSession("10", "user10", "secret10", verified=True),
+        )
+        controller.sessionController.sessionChanged.emit()
+
+        controller.dutyController._last_auto_logout_successor_actor_no = "11"
+        controller.dutyController.autoLogoutRequested.emit("10")
+        for _ in range(40):
+            if (
+                controller.sessionController.isLoggedIn
+                and controller.sessionController.actorNo == "11"
+            ):
+                break
+            QTest.qWait(25)
+
+        self.assertTrue(controller.sessionController.isLoggedIn)
+        self.assertEqual(controller.sessionController.actorNo, "11")
+
     def test_auto_logout_waits_for_paused_handoff_queue_then_restarts_ten_minutes(self) -> None:
         from datetime import datetime
 
@@ -15119,6 +15354,115 @@ if return_code != 0 or loaded:
         )
         restored.enable_auto_execution()
         self.assertEqual(restored._due_task_indices, [])
+
+    def test_recovery_bridge_from_outgoing_actor_uses_next_scheduled_successor(self) -> None:
+        from datetime import datetime
+
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        def handoff_actions(hour: int, actor: str, incoming: str, start: str) -> list[dict]:
+            return [
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值退:{actor}",
+                    "fields": {"出或入": "值退", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "entry_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": incoming,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:1150807:{hour}:值班:{incoming}",
+                    "fields": {"出或入": "值班", "勤務項目": "值班(宿)"},
+                },
+                {
+                    "kind": "work_log",
+                    "time": f"{hour:02d}:00",
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"work:1150807:{hour}:值班交接:{actor}",
+                    "fields": {"處理情形": f"一、時間: {start}-{hour:02d}:00"},
+                },
+            ]
+
+        at_ten = datetime(2026, 8, 7, 10, 0)
+        at_twelve = datetime(2026, 8, 7, 12, 0)
+        old_group = handoff_actions(10, "6", "7", "08:00")
+        scheduled_group = handoff_actions(12, "7", "8", "10:00")
+        temporary_queue_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_queue_dir.cleanup)
+        queue = UnreturnedReturnQueue(Path(temporary_queue_dir.name), now_factory=lambda: at_twelve)
+        record, created = queue.pause_group(
+            old_group,
+            {"target_date": "1150807", "today": {"staff": {}}},
+            owner_actor_no="6",
+            now=at_ten,
+        )
+        self.assertTrue(created)
+        controller = DutyController(unreturned_return_queue=queue)
+        self.addCleanup(controller.shutdown)
+        controller.set_actor_no("6")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"6": {}, "7": {}, "8": {}}},
+                "actions": old_group + scheduled_group,
+            }
+        )
+        controller._login_started_at = datetime(2026, 8, 7, 8, 0)
+        controller._schedule_auto_logout_for_handoff_indices({0, 1, 2})
+        controller._pause_auto_logout_for_handoff_queue(record["queue_id"], {0, 1, 2})
+
+        preflight_requests = controller.recovery_submission_requests(
+            "user6",
+            "secret",
+            record,
+            submit_at=at_twelve,
+        )
+
+        self.assertEqual(len(preflight_requests), 1)
+        preflight_action = preflight_requests[0].schedule_data["actions"][0]
+        self.assertEqual(preflight_action["kind"], "handoff_preflight")
+        self.assertEqual(preflight_action["target"], "8")
+        self.assertEqual(controller._auto_logout_successor_actor_no, "8")
+
+        self.assertTrue(controller.handle_handoff_preflight_ready(preflight_requests[0]))
+        actual_requests = controller.handoff_group_submission_requests(
+            "user6",
+            "secret",
+            preflight_requests[0],
+            submit_at=at_twelve,
+        )
+        actual_actions = [request.schedule_data["actions"][request.action_index] for request in actual_requests]
+        self.assertEqual([action["kind"] for action in actual_actions], ["entry_log", "entry_log", "work_log"])
+        self.assertEqual([action["target"] for action in actual_actions[:2]], ["6", "8"])
+
+        for request, action in zip(actual_requests, actual_actions):
+            controller.handle_external_return_queue_result(
+                record["queue_id"],
+                action,
+                "submitted",
+                str(request.schedule_data["_unreturned_return_component_key"]),
+            )
+
+        self.assertEqual(queue.active_records(), [])
+        self.assertTrue(controller._auto_logout_handoff_completed)
+        self.assertEqual(controller._auto_logout_successor_actor_no, "8")
+        controller.replace_schedule_data(
+            {
+                "target_date": "1150807",
+                "today": {"staff": {"6": {}, "7": {}, "8": {}}},
+                "actions": old_group + scheduled_group,
+            }
+        )
+        self.assertEqual(controller._auto_logout_successor_actor_no, "8")
 
     def test_recovery_bridge_skips_each_unavailable_scheduled_shift(self) -> None:
         from datetime import datetime

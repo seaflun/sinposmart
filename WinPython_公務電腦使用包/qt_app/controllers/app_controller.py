@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -187,6 +189,10 @@ class AppController(QObject):
         self._actor_identity_pending = False
         self._logout_pending = False
         self._pending_logout_message = ""
+        self._pending_auto_login_actor_no = ""
+        self._pending_update_logout = False
+        self._auto_login_marker_path = self._auto_login_marker_file(package_root)
+        self._restore_auto_login_marker()
         self._update_shutdown_prepared = False
         self._worker_admissions_closed = False
         self._allow_shutdown_operational_sync = False
@@ -923,18 +929,29 @@ class AppController(QObject):
     def requestLogout(self) -> None:
         """Cancel queued work and wait for an irreversible active request."""
 
-        self._begin_session_logout("")
+        self._begin_session_logout(
+            "",
+            apply_update=self._update_controller.remoteUpdateActive,
+        )
 
-    def _begin_session_logout(self, message: str) -> None:
+    def _begin_session_logout(self, message: str, *, apply_update: bool = False) -> None:
         if self._logout_pending:
             return
+        self._pending_update_logout = bool(apply_update)
         self._pending_live_refresh_generation = None
         self._duty_controller.prepare_session_end()
         if self._duty_execution_controller.prepare_session_end():
+            if self._pending_update_logout:
+                if self._update_controller.applyRemoteUpdate():
+                    self._pending_update_logout = False
+                    return
+                self._clear_auto_login_marker()
+            self._pending_update_logout = False
             if message:
                 self._session_controller.systemLogout(message)
             else:
                 self._session_controller.logout()
+            self._schedule_auto_login_successor()
             return
         self._logout_pending = True
         self._pending_logout_message = str(message or "")
@@ -948,12 +965,92 @@ class AppController(QObject):
         if not self._logout_pending or self._duty_execution_controller.isBusy:
             return
         message = self._pending_logout_message
+        apply_update = self._pending_update_logout
         self._logout_pending = False
         self._pending_logout_message = ""
+        self._pending_update_logout = False
+        if apply_update:
+            if self._update_controller.applyRemoteUpdate():
+                return
+            self._clear_auto_login_marker()
         if message:
             self._session_controller.systemLogout(message)
         else:
             self._session_controller.logout()
+        self._schedule_auto_login_successor()
+
+    def _schedule_auto_login_successor(self) -> None:
+        actor_no = self._pending_auto_login_actor_no
+        self._pending_auto_login_actor_no = ""
+        if not actor_no:
+            return
+        QTimer.singleShot(
+            0,
+            lambda successor_actor_no=actor_no: self._auto_login_successor(
+                successor_actor_no
+            ),
+        )
+
+    def _auto_login_successor(self, actor_no: str) -> None:
+        if (
+            self._worker_admissions_closed
+            or self._session_controller.isLoggedIn
+            or self._session_controller.isBusy
+        ):
+            return
+        credentials = self._session_controller.saved_credentials_for_actor(actor_no)
+        if credentials is None:
+            return
+        user_id, password = credentials
+        self._tray_controller.notify(
+            "SinpoSmart",
+            f"{actor_no}番接班人已辨識，正在自動登入",
+        )
+        self._session_controller.login(user_id, password, False)
+
+    @staticmethod
+    def _auto_login_marker_file(package_root: Path) -> Path:
+        state_root = os.environ.get("LOCALAPPDATA", "").strip() or tempfile.gettempdir()
+        return Path(state_root) / "SinpoSmart" / "pending_auto_login.json"
+
+    def _restore_auto_login_marker(self) -> None:
+        try:
+            payload = json.loads(self._auto_login_marker_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        actor_no = str(payload.get("actor_no") or "").strip()
+        if actor_no:
+            self._pending_auto_login_actor_no = actor_no
+
+    def _persist_auto_login_marker(self, actor_no: str) -> None:
+        actor_no = str(actor_no or "").strip()
+        if not actor_no:
+            return
+        self._auto_login_marker_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._auto_login_marker_path.with_suffix(".tmp")
+        payload = {
+            "actor_no": actor_no,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(self._auto_login_marker_path)
+
+    def _clear_auto_login_marker(self) -> None:
+        try:
+            self._auto_login_marker_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+
+    @Slot()
+    def resumePendingAutoLogin(self) -> None:
+        if self._read_only_acceptance or not self._pending_auto_login_actor_no:
+            return
+        self._clear_auto_login_marker()
+        self._schedule_auto_login_successor()
 
     def _sync_session_actor(self) -> None:
         previous_actor_no = self._synced_actor_no
@@ -2368,11 +2465,24 @@ class AppController(QObject):
 
     @Slot(str)
     def _auto_logout(self, actor_no: str) -> None:
+        successor_actor_no = self._duty_controller.take_auto_logout_successor_actor_no()
         session = self._session_state.session
-        if session is None or str(session.actor_no) != str(actor_no):
+        if (
+            session is None
+            or not session.verified
+            or str(session.actor_no) != str(actor_no)
+            or self._logout_pending
+        ):
             return
+        self._pending_auto_login_actor_no = str(successor_actor_no or "").strip()
+        remote_update = self._update_controller.remoteUpdateActive
+        if remote_update and self._pending_auto_login_actor_no:
+            self._persist_auto_login_marker(self._pending_auto_login_actor_no)
         self._tray_controller.notify("SinpoSmart", f"{actor_no} 值班交接已完成，自動登出")
-        self._begin_session_logout("系統已自動登出")
+        self._begin_session_logout(
+            "系統已自動登出",
+            apply_update=remote_update,
+        )
 
     @Slot(str)
     def _force_logout(self, message: str) -> None:

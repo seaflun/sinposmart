@@ -147,6 +147,8 @@ class DutyController(QObject):
         self._login_started_at: datetime | None = None
         self._auto_logout_actor_no = ""
         self._auto_logout_handoff_at: datetime | None = None
+        self._auto_logout_successor_actor_no = ""
+        self._last_auto_logout_successor_actor_no = ""
         self._auto_logout_deadline: datetime | None = None
         self._auto_logout_pending_handoff_queue_id = ""
         self._auto_logout_handoff_completed = False
@@ -1559,6 +1561,39 @@ class DutyController(QObject):
         )
         return (handoff_at, incoming_actions) if incoming_actions else None
 
+    def _scheduled_future_bridge_incoming_actions(
+        self,
+        original_at: datetime,
+        current: datetime,
+    ) -> tuple[datetime, list[dict[str, Any]]] | None:
+        """Return the latest scheduled value-handoff arrival after a missed group."""
+
+        candidates: list[tuple[datetime, int]] = []
+        for index, action in enumerate(self._actions):
+            fields = action.get("fields", {})
+            if (
+                action.get("kind") != "entry_log"
+                or action.get("source") != "值班交接"
+                or not isinstance(fields, Mapping)
+                or fields.get("出或入") != "值班"
+            ):
+                continue
+            action_at = action_datetime(
+                action,
+                self._target_date_text,
+                fallback_date=current.date(),
+            )
+            if original_at < action_at <= current:
+                candidates.append((action_at, index))
+        if not candidates:
+            return None
+        handoff_at, anchor_index = max(candidates, key=lambda item: item[0])
+        group_indices = self._handoff_group_indices(anchor_index)
+        incoming_actions = self._handoff_incoming_actions(
+            [self._actions[index] for index in group_indices]
+        )
+        return (handoff_at, incoming_actions) if incoming_actions else None
+
     def _recovery_cross_shift_bridge(
         self,
         record: Mapping[str, Any],
@@ -1570,15 +1605,19 @@ class DutyController(QObject):
         if record.get("completed_keys"):
             return None
         original_incoming = self._handoff_incoming_actions(actions)
-        scheduled = self._scheduled_bridge_incoming_actions(current)
-        if not original_incoming or scheduled is None:
+        if not original_incoming:
             return None
-        scheduled_at, scheduled_incoming = scheduled
         source_target_date = str(record.get("source_target_date") or self._target_date_text)
         original_at = min(
             action_datetime(action, source_target_date, fallback_date=current.date())
             for action in actions
         )
+        scheduled = self._scheduled_bridge_incoming_actions(current)
+        if scheduled is None or scheduled[0] <= original_at:
+            scheduled = self._scheduled_future_bridge_incoming_actions(original_at, current)
+        if scheduled is None:
+            return None
+        scheduled_at, scheduled_incoming = scheduled
         if scheduled_at <= original_at:
             return None
         original_targets = {
@@ -1819,13 +1858,25 @@ class DutyController(QObject):
             bridge = self._recovery_cross_shift_bridge(record, actions, current)
             bridge_actions, bridge_metadata = bridge if bridge is not None else (actions, None)
             group_id = "queue:" + str(record.get("queue_id") or "")
+            queue_id = str(record.get("queue_id") or "")
+            if bridge_metadata and queue_id == self._auto_logout_pending_handoff_queue_id:
+                incoming_actor_nos = {
+                    str(actor_no or "").strip()
+                    for actor_no in bridge_metadata.get("incoming_actor_nos", ())
+                    if str(actor_no or "").strip()
+                }
+                self._auto_logout_successor_actor_no = (
+                    next(iter(incoming_actor_nos))
+                    if len(incoming_actor_nos) == 1
+                    else ""
+                )
             return self._handoff_preflight_requests(
                 user_id,
                 password,
                 bridge_actions,
                 group_id=group_id,
                 trigger_type="recovery",
-                queue_id=str(record.get("queue_id") or ""),
+                queue_id=queue_id,
                 submit_at=current,
                 bridge=bridge_metadata,
             )
@@ -2246,6 +2297,16 @@ class DutyController(QObject):
             if isinstance(info, Mapping)
         }
         self._target_date_text = next_target_date
+        if (
+            same_schedule_date
+            and self._auto_logout_actor_no
+            and self._auto_logout_handoff_at is not None
+            and not self._auto_logout_pending_handoff_queue_id
+            and not self._auto_logout_handoff_completed
+        ):
+            self._auto_logout_successor_actor_no = self._successor_actor_no_for_auto_logout(
+                self._auto_logout_handoff_at
+            )
         if target_date_changed:
             self._manual_departure_pair_keys.clear()
             self._background_manual_departure_pair_keys.clear()
@@ -3135,6 +3196,10 @@ class DutyController(QObject):
             return
         self._auto_logout_actor_no = self._actor_no
         self._auto_logout_handoff_at = handoff_at
+        self._auto_logout_successor_actor_no = self._successor_actor_no_for_auto_logout(
+            handoff_at
+        )
+        self._last_auto_logout_successor_actor_no = ""
         self._auto_logout_deadline = handoff_at + timedelta(minutes=10)
         delay_ms = max(0, int((self._auto_logout_deadline - datetime.now()).total_seconds() * 1000))
         self._auto_logout_timer.start(delay_ms)
@@ -3202,8 +3267,7 @@ class DutyController(QObject):
                 self.scheduleChanged.emit()
                 return
             actor_no = self._auto_logout_actor_no
-            self._cancel_auto_logout()
-            self.autoLogoutRequested.emit(actor_no)
+            self._emit_auto_logout_request(actor_no)
             return
         group = [
             index
@@ -3229,21 +3293,54 @@ class DutyController(QObject):
             self.scheduleChanged.emit()
             return
         actor_no = self._auto_logout_actor_no
-        self._cancel_auto_logout()
-        self.autoLogoutRequested.emit(actor_no)
+        self._emit_auto_logout_request(actor_no)
 
     def _is_paused_handoff_group_index(self, index: int) -> bool:
         queue_id = self._external_return_queue_ids_by_action_index.get(index, "")
         record = self._unreturned_return_queue.get(queue_id)
         return bool(record is not None and record.get("record_type") == "handoff_group")
 
-    def _cancel_auto_logout(self) -> None:
+    def _successor_actor_no_for_auto_logout(self, handoff_at: datetime) -> str:
+        actor_no = str(self._auto_logout_actor_no or "").strip()
+        if not actor_no:
+            return ""
+        successor_actor_nos = {
+            str(action.get("target", "") or "").strip()
+            for action in self._actions
+            if (
+                action.get("kind") == "entry_log"
+                and action.get("source") == "值班交接"
+                and str(action.get("actor", "") or "").strip() == actor_no
+                and action_datetime(action, self._target_date_text) == handoff_at
+                and isinstance(action.get("fields", {}), Mapping)
+                and action.get("fields", {}).get("出或入") == "值班"
+                and str(action.get("target", "") or "").strip()
+                and str(action.get("target", "") or "").strip() != actor_no
+            )
+        }
+        return next(iter(successor_actor_nos)) if len(successor_actor_nos) == 1 else ""
+
+    def _emit_auto_logout_request(self, actor_no: str) -> None:
+        successor_actor_no = self._auto_logout_successor_actor_no
+        self._cancel_auto_logout(preserve_successor=True)
+        self._last_auto_logout_successor_actor_no = successor_actor_no
+        self.autoLogoutRequested.emit(actor_no)
+
+    def take_auto_logout_successor_actor_no(self) -> str:
+        successor_actor_no = self._last_auto_logout_successor_actor_no
+        self._last_auto_logout_successor_actor_no = ""
+        return successor_actor_no
+
+    def _cancel_auto_logout(self, *, preserve_successor: bool = False) -> None:
         self._auto_logout_timer.stop()
         self._auto_logout_actor_no = ""
         self._auto_logout_handoff_at = None
+        self._auto_logout_successor_actor_no = ""
         self._auto_logout_deadline = None
         self._auto_logout_pending_handoff_queue_id = ""
         self._auto_logout_handoff_completed = False
+        if not preserve_successor:
+            self._last_auto_logout_successor_actor_no = ""
 
     @Slot(int, object)
     def _schedule_loaded(self, request_id: int, snapshot: ScheduleSnapshot) -> None:

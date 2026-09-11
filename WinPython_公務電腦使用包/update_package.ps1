@@ -1,5 +1,8 @@
-param(
-    [switch]$AssumeYes
+﻿param(
+    [switch]$AssumeYes,
+    [switch]$PrepareOnly,
+    [switch]$ApplyStaged,
+    [string]$RequestId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +16,11 @@ $packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localVersionPath = Join-Path $packageDir "VERSION.txt"
 $backupRoot = Join-Path $env:LOCALAPPDATA "SinpoSmart"
 $backupDir = Join-Path $backupRoot "update_backups"
+$stagingRoot = Join-Path $backupRoot "update_staging"
+$safeRequestId = [regex]::Replace($RequestId, "[^A-Za-z0-9._-]", "_")
+$stagingDir = if ($safeRequestId) { Join-Path $stagingRoot $safeRequestId } else { "" }
+$stagingPackageDir = if ($stagingDir) { Join-Path $stagingDir "package" } else { "" }
+$stagingManifestPath = if ($stagingDir) { Join-Path $stagingDir "manifest.json" } else { "" }
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $tempDir = Join-Path $env:TEMP "SinpoSmartUpdate-$stamp"
 $zipPath = Join-Path $tempDir "package.zip"
@@ -63,6 +71,13 @@ $preserveIfExistsFiles = @(
     "work_log_defaults.json"
 )
 $skipExtensions = @(".xls", ".xlsx", ".xlsm", ".xlsb", ".zip", ".pyc", ".pyo", ".key", ".pem", ".token", ".jsonl")
+
+if ($PrepareOnly -and $ApplyStaged) {
+    throw "PrepareOnly and ApplyStaged cannot be used together."
+}
+if (($PrepareOnly -or $ApplyStaged) -and -not $safeRequestId) {
+    throw "Remote update phases require a non-empty request ID."
+}
 
 function Test-SkipPackagePath {
     param([string]$RelativePath)
@@ -483,13 +498,73 @@ function New-PackageBackup {
     Write-Host "Backup completed: $copied files"
 }
 
+function Write-RemoteStageManifest {
+    param(
+        [string]$Status,
+        [string]$RemoteVersion,
+        [string]$RemoteSha256,
+        [string]$InstalledVersion = "",
+        [string]$Detail = ""
+    )
+
+    if (-not $stagingDir) {
+        throw "Remote update staging path is unavailable."
+    }
+    New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+    $manifest = [ordered]@{
+        schema_version = 1
+        request_id = $RequestId
+        package_dir = $packageDir
+        status = $Status
+        remote_version = $RemoteVersion
+        remote_sha256 = $RemoteSha256
+        installed_version = $InstalledVersion
+        detail = $Detail
+        updated_at = (Get-Date).ToString("o")
+    }
+    $tempManifestPath = Join-Path $stagingDir ".manifest.$([guid]::NewGuid().ToString('N')).tmp"
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempManifestPath -Encoding UTF8
+    Move-Item -LiteralPath $tempManifestPath -Destination $stagingManifestPath -Force
+}
+
+function Copy-RemoteStagePackage {
+    param([string]$SourceDir)
+
+    if (Test-Path -LiteralPath $stagingPackageDir) {
+        Remove-Item -LiteralPath $stagingPackageDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $stagingPackageDir -Force | Out-Null
+    Get-ChildItem -LiteralPath $SourceDir -Force | Copy-Item -Destination $stagingPackageDir -Recurse -Force
+}
+
 if (-not (Test-Path -LiteralPath $localVersionPath)) {
     "0" | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
 }
 
 $localVersion = (Get-Content -LiteralPath $localVersionPath -Raw -Encoding UTF8).Trim().TrimStart([char]0xFEFF)
-$remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
-$remoteSha256 = Get-Sha256FromText -Text (Get-TextFromUrl -Url $remoteSha256Url)
+$remoteVersion = ""
+$remoteSha256 = ""
+$sourceDir = ""
+$stagedManifest = $null
+if ($ApplyStaged) {
+    if (-not (Test-Path -LiteralPath $stagingManifestPath -PathType Leaf)) {
+        throw "Staged remote update manifest was not found."
+    }
+    try {
+        $stagedManifest = Get-Content -LiteralPath $stagingManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "Staged remote update manifest could not be read."
+    }
+    if ([string]$stagedManifest.request_id -ne $RequestId -or [string]$stagedManifest.package_dir -ne $packageDir) {
+        throw "Staged remote update manifest does not belong to this package."
+    }
+    $remoteVersion = [string]$stagedManifest.remote_version
+    $remoteSha256 = [string]$stagedManifest.remote_sha256
+    $sourceDir = $stagingPackageDir
+} else {
+    $remoteVersion = Get-TextFromUrl -Url $remoteVersionUrl
+    $remoteSha256 = Get-Sha256FromText -Text (Get-TextFromUrl -Url $remoteSha256Url)
+}
 
 if (-not (Test-VersionText -Version $localVersion -AllowZero)) {
     throw "Local VERSION.txt has an invalid version: $localVersion"
@@ -503,6 +578,12 @@ Write-Host "Remote version: $remoteVersion"
 
 if ([string]::CompareOrdinal($remoteVersion, $localVersion) -le 0) {
     Write-Host "Already up to date."
+    if ($PrepareOnly -or $ApplyStaged) {
+        Write-RemoteStageManifest -Status "up_to_date" -RemoteVersion $remoteVersion -RemoteSha256 $remoteSha256 -InstalledVersion $localVersion -Detail "值班台目前已是最新版本。"
+        if ($stagingPackageDir -and (Test-Path -LiteralPath $stagingPackageDir)) {
+            Remove-Item -LiteralPath $stagingPackageDir -Recurse -Force
+        }
+    }
     exit 0
 }
 
@@ -519,32 +600,32 @@ $wasRunning = $false
 $guiStoppedForUpdate = $false
 $guiRestarted = $false
 try {
-    New-Item -ItemType Directory -Path $tempDir | Out-Null
+    if (-not $ApplyStaged) {
+        New-Item -ItemType Directory -Path $tempDir | Out-Null
+    }
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
-    Write-Host "Downloading update package..."
-    Invoke-WebRequest -Uri $remoteZipUrl -OutFile $zipPath -UseBasicParsing -MaximumRedirection 5
+    if (-not $ApplyStaged) {
+        Write-Host "Downloading update package..."
+        Invoke-WebRequest -Uri $remoteZipUrl -OutFile $zipPath -UseBasicParsing -MaximumRedirection 5
 
-    if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
-        throw "Downloaded package is missing or too small."
-    }
-    $downloadedSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($downloadedSha256 -ne $remoteSha256) {
-        throw "Downloaded package SHA256 mismatch. Expected $remoteSha256 but got $downloadedSha256."
-    }
+        if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
+            throw "Downloaded package is missing or too small."
+        }
+        $downloadedSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($downloadedSha256 -ne $remoteSha256) {
+            throw "Downloaded package SHA256 mismatch. Expected $remoteSha256 but got $downloadedSha256."
+        }
 
-    $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
-    Write-Host "Creating backup: $backupZip"
-    New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir (Join-Path $tempDir "backup-stage")
+        New-Item -ItemType Directory -Path $extractDir | Out-Null
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
 
-    New-Item -ItemType Directory -Path $extractDir | Out-Null
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
-
-    $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.pyw") } |
-        Select-Object -First 1 -ExpandProperty FullName
-    if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.pyw"))) {
-        $sourceDir = $extractDir
+        $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "duty_gui.pyw") } |
+            Select-Object -First 1 -ExpandProperty FullName
+        if (-not $sourceDir -and (Test-Path -LiteralPath (Join-Path $extractDir "duty_gui.pyw"))) {
+            $sourceDir = $extractDir
+        }
     }
     if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
         throw "Update zip does not contain a valid package folder."
@@ -630,6 +711,18 @@ try {
         throw "Update version mismatch. Remote VERSION.txt is $remoteVersion but package VERSION.txt is $packageVersion."
     }
 
+    if ($PrepareOnly) {
+        Copy-RemoteStagePackage -SourceDir $sourceDir
+        Write-RemoteStageManifest -Status "staged" -RemoteVersion $remoteVersion -RemoteSha256 $remoteSha256 -InstalledVersion $localVersion -Detail "更新套件已完成下載與驗證，等待交接登出套用。"
+        Write-Host "Remote update package staged for request $RequestId."
+        exit 0
+    }
+
+    $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
+    Write-Host "Creating backup: $backupZip"
+    $backupStageRoot = if ($ApplyStaged) { Join-Path $env:TEMP "SinpoSmartUpdate-$stamp-backup-stage" } else { Join-Path $tempDir "backup-stage" }
+    New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir $backupStageRoot
+
     $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
     $wasRunning = $runningDutyGuiProcesses.Count -gt 0
     if ($wasRunning) {
@@ -657,7 +750,23 @@ try {
         $guiRestarted = [bool](Start-DutyGui)
     }
 
+    if ($ApplyStaged) {
+        Write-RemoteStageManifest -Status "completed" -RemoteVersion $remoteVersion -RemoteSha256 $remoteSha256 -InstalledVersion $packageVersion -Detail "遠端更新已完成，值班台已重新啟動。"
+        if ($stagingPackageDir -and (Test-Path -LiteralPath $stagingPackageDir)) {
+            Remove-Item -LiteralPath $stagingPackageDir -Recurse -Force
+        }
+    }
+
     Write-Host "Update completed."
+} catch {
+    if ($RequestId) {
+        try {
+            Write-RemoteStageManifest -Status "failed" -RemoteVersion $remoteVersion -RemoteSha256 $remoteSha256 -InstalledVersion $localVersion -Detail ("遠端更新失敗：{0}" -f $_.Exception.Message)
+        } catch {
+            Write-Warning "Could not write remote update failure manifest: $($_.Exception.Message)"
+        }
+    }
+    throw
 } finally {
     if ($guiStoppedForUpdate -and -not $guiRestarted) {
         Write-Warning "Update did not complete after closing SinpoSmart; attempting to restart it."
