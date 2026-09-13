@@ -654,8 +654,8 @@ class AppController(QObject):
             if now > action_at + AUTO_DUE_CATCH_UP_WINDOW:
                 self._expire_background_manual_chain(chain_id, phase, now)
                 continue
-            self._start_background_manual_submission(chain_id, phase, now)
-            return
+            if self._start_background_manual_submission(chain_id, phase, now):
+                return
 
     def _background_submission_request(
         self,
@@ -693,6 +693,29 @@ class AppController(QObject):
         schedule_data = dict(base_request.schedule_data)
         schedule_data["actions"] = snapshot_actions
         action = snapshot_actions[action_index]
+        if phase == "return":
+            actor_no = str(action.get("actor", "") or "").strip()
+            if not actor_no:
+                return None
+            if actor_no != str(base_request.session_actor_no or "").strip():
+                session = self._session_state.session
+                if (
+                    session is None
+                    or not session.verified
+                    or str(session.actor_no or "").strip() != actor_no
+                    or not str(session.user_id or "").strip()
+                    or not session.password
+                ):
+                    return None
+                # The paired return can belong to a different duty shift.
+                # Keep its action snapshot, but use that actor's verified login.
+                base_request = replace(
+                    base_request,
+                    user_id=session.user_id,
+                    password=session.password,
+                    session_actor_no=actor_no,
+                    session_generation=self._session_state.generation,
+                )
         return replace(
             base_request,
             action_index=action_index,
@@ -722,14 +745,15 @@ class AppController(QObject):
         chain_id: str,
         phase: str,
         submit_at: datetime,
-    ) -> None:
+    ) -> bool:
         chain = self._background_manual_chains.get(chain_id)
         if chain is None or chain.active_request_id is not None:
-            return
+            return False
         request = self._background_submission_request(chain, phase, submit_at)
         if request is None:
-            self._discard_background_manual_chain(chain_id)
-            return
+            if phase != "return":
+                self._discard_background_manual_chain(chain_id)
+            return False
         self._background_manual_request_id += 1
         request_id = self._background_manual_request_id
         self._background_manual_workers[request_id] = (chain_id, phase, request)
@@ -740,7 +764,7 @@ class AppController(QObject):
         if phase == "departure":
             self._duty_controller.release_background_manual_waiting(request)
         if self._duty_execution_controller.enqueue_background(request):
-            return
+            return True
         if request_id in self._background_manual_workers:
             self._background_manual_workers.pop(request_id, None)
             if chain.active_request_id == request_id:
@@ -748,6 +772,7 @@ class AppController(QObject):
             if chain_id in self._background_manual_chains:
                 chain.phase = f"{phase}_waiting"
                 self._sync_background_return_status()
+        return False
 
     def _expire_background_manual_chain(
         self,
@@ -770,6 +795,8 @@ class AppController(QObject):
                     "到點逾時，未送出",
                 ),
             )
+        elif phase == "return":
+            self._tray_controller.notify("SinpoSmart", "返隊未取得有效登打身分，逾時未送出。")
         self._discard_background_manual_chain(chain_id)
 
     @staticmethod

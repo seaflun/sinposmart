@@ -17299,6 +17299,7 @@ if return_code != 0 or loaded:
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
         from app_core.duty_task_projection import action_completion_key, project_duty_tasks
         from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
 
         departure = {
@@ -17336,6 +17337,7 @@ if return_code != 0 or loaded:
                     duty.set_session_context(2, "")
                     duty.set_session_context(3, "user8")
                     duty.set_actor_no("8")
+                    controller._session_state.session = LoginSession("8", "user8", "next-secret", verified=True)
                     from dataclasses import replace
                     for rejected_request, rejected_status in (
                         (replace(request, background=False), "submitted"),
@@ -17359,6 +17361,10 @@ if return_code != 0 or loaded:
 
                     self.assertEqual(status(datetime(2026, 9, 13, 17)), "等待")
                     self.assertEqual(duty._auto_return_indices(), set())
+                    prewarmed = []
+                    controller.dutyExecutionController.prewarm_background_browser = lambda request: prewarmed.append(request) or True
+                    controller._check_background_manual_chains(datetime(2026, 9, 13, 17, 59))
+                    self.assertEqual([request.user_id for request in prewarmed], ["user8"])
                     self.assertEqual(status(datetime(2026, 9, 13, 18)), "到點待執行")
                     controller.dutyExecutionController.enqueue_background = lambda _request: False
                     controller._start_background_manual_submission("rest-chain", "return", datetime(2026, 9, 13, 18))
@@ -17367,7 +17373,10 @@ if return_code != 0 or loaded:
                     controller._start_background_manual_submission("rest-chain", "return", datetime(2026, 9, 13, 18))
                     self.assertEqual(status(datetime(2026, 9, 13, 18)), "正在登打")
                     tracked = next(iter(controller._background_manual_workers.values()))[2]
-                    self.assertEqual(tracked.user_id, "user18")
+                    self.assertEqual(tracked.user_id, "user8")
+                    self.assertEqual(tracked.password, "next-secret")
+                    self.assertEqual(tracked.session_actor_no, "8")
+                    self.assertEqual(tracked.session_generation, controller._session_state.generation)
                     if outcome == "completed":
                         self.assertTrue(duty.handle_submission_request_result(
                             tracked, "skipped_duplicate", "已存在", "", {"compare": "已存在", "group": "done"},
@@ -17388,6 +17397,157 @@ if return_code != 0 or loaded:
                     self.assertEqual(controller._background_manual_chains, {})
                 finally:
                     controller.shutdown()
+
+    def test_background_rest_returns_wait_for_scheduled_actor_without_blocking_other_chains(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(schedule_repository=ScheduleRepository(Path(temp_dir)))
+            try:
+                controller._background_manual_timer.stop()
+                controller._send_operational_event = lambda *_args, **_kwargs: None
+                controller.trayController.notify = lambda *_args: None
+                queued = []
+                prewarmed = []
+                controller.dutyExecutionController.enqueue_background = lambda request: queued.append(request) or True
+                controller.dutyExecutionController.prewarm_background_browser = lambda request: prewarmed.append(request) or True
+                for target in ("8", "18"):
+                    pair_key = f"rest:1150913:{target}:18-20"
+                    actions = [
+                        {"kind": "entry_log", "time": "18:00", "actor": "8", "target": target,
+                         "source": "休息簽出", "return_pair_key": pair_key,
+                         "fields": {"出或入": "出", "領用事由及地點": "休息"}},
+                        {"kind": "entry_log", "time": "20:00", "actor": "5", "target": target,
+                         "source": "休息結束", "return_pair_key": pair_key,
+                         "fields": {"出或入": "入", "領用事由及地點": "休息返隊"}},
+                    ]
+                    request = DutySubmissionRequest(
+                        "user8", "original-secret", 0, {"target_date": "1150913", "actions": actions},
+                        session_actor_no="8", background=True,
+                    )
+                    controller._background_manual_chains[target] = _BackgroundManualChain(request, 1, phase="return_waiting")
+                original_request = request
+
+                for session in (None, LoginSession("14", "user14", "other-secret", verified=True),
+                                LoginSession("5", "user5", "next-secret", verified=False)):
+                    controller._session_state.session = session
+                    controller._check_background_manual_chains(datetime(2026, 9, 13, 19, 59))
+                    controller._check_background_manual_chains(datetime(2026, 9, 13, 20))
+                    self.assertEqual(prewarmed, [])
+                    self.assertEqual(queued, [])
+                    self.assertEqual(set(controller._background_manual_chains), {"8", "18"})
+
+                # A return waiting for another actor must not block an unrelated confirmed departure.
+                departure = {"kind": "entry_log", "time": "20:00", "actor": "8", "target": "23",
+                             "duplicate_key": "waiting-owner:other-departure",
+                             "source": "休息簽出", "fields": {"出或入": "出", "領用事由及地點": "休息"}}
+                request = DutySubmissionRequest(
+                    "user8", "original-secret", 0, {"target_date": "1150913", "actions": [departure]},
+                    session_actor_no="8", background=True,
+                )
+                controller._background_manual_chains["departure"] = _BackgroundManualChain(request, None)
+                controller._check_background_manual_chains(datetime(2026, 9, 13, 20))
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0].action_key, action_completion_key(departure))
+                controller._background_manual_submission_succeeded(
+                    queued[0], DutySubmissionResult(0, "submitted", "完成", Path("result.json"), {}, departure),
+                )
+
+                controller._session_state.session = LoginSession("5", "user5", "next-secret", verified=True)
+                for target in ("8", "18"):
+                    controller._check_background_manual_chains(datetime(2026, 9, 13, 20, 1))
+                    request = queued[-1]
+                    action = request.schedule_data["actions"][request.action_index]
+                    self.assertEqual(action["target"], target)
+                    self.assertEqual(action["actor"], "5")
+                    self.assertEqual(request.user_id, "user5")
+                    self.assertEqual(request.session_actor_no, "5")
+                    self.assertEqual(request.password, "next-secret")
+                    controller._background_manual_submission_succeeded(
+                        request, DutySubmissionResult(1, "submitted", "完成", Path("result.json"), {}, action),
+                    )
+                self.assertEqual(len(queued), 3)
+                self.assertEqual(controller._background_manual_chains, {})
+                notices = []
+                controller.trayController.notify = lambda _title, message: notices.append(message)
+                controller._session_state.session = None
+                controller._background_manual_chains["expired"] = _BackgroundManualChain(
+                    original_request, 1, phase="return_waiting",
+                )
+                controller._check_background_manual_chains(datetime(2026, 9, 13, 22, 1))
+                self.assertEqual(len(queued), 3)
+                self.assertEqual(controller._background_manual_chains, {})
+                self.assertIn("返隊未取得有效登打身分，逾時未送出。", notices)
+            finally:
+                controller.shutdown()
+
+    def test_background_rest_return_opens_browser_with_scheduled_actor(self) -> None:
+        from datetime import datetime
+        from PySide6.QtTest import QTest
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        class FakeSubmissionService:
+            def __init__(self):
+                self.opened = []
+                self.executed = []
+
+            def validate(self, request):
+                return request
+
+            def open_browser_session(self, request, **_kwargs):
+                self.opened.append(request.user_id)
+                return SimpleNamespace(user_id=request.user_id, visible=request.visible)
+
+            def execute_with_browser_session(self, request, browser_session, **_kwargs):
+                self.executed.append((request.user_id, browser_session.user_id, request.session_actor_no))
+                action = request.schedule_data["actions"][request.action_index]
+                return DutySubmissionResult(request.action_index, "submitted", "完成", Path("result.json"), {}, action)
+
+            def close_browser_session(self, _session):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeSubmissionService()
+            controller = AppController(
+                schedule_repository=ScheduleRepository(Path(temp_dir)), duty_submission_service=service,
+            )
+            try:
+                controller._background_manual_timer.stop()
+                events = []
+                controller._send_operational_event = lambda kind, **fields: events.append((kind, fields))
+                controller.trayController.notify = lambda *_args: None
+                controller._session_state.session = LoginSession("5", "user5", "next-secret", verified=True)
+                actions = [
+                    {"kind": "entry_log", "time": "18:00", "actor": "8", "target": "18",
+                     "source": "休息簽出", "fields": {"出或入": "出", "領用事由及地點": "休息"}},
+                    {"kind": "entry_log", "time": "20:00", "actor": "5", "target": "18",
+                     "source": "休息結束", "fields": {"出或入": "入", "領用事由及地點": "休息返隊"}},
+                ]
+                request = DutySubmissionRequest(
+                    "user8", "original-secret", 0, {"target_date": "1150913", "actions": actions},
+                    session_actor_no="8", background=True,
+                )
+                controller._background_manual_chains["return"] = _BackgroundManualChain(request, 1, phase="return_waiting")
+                controller._check_background_manual_chains(datetime(2026, 9, 13, 20))
+                for _ in range(100):
+                    if not controller._background_manual_workers:
+                        break
+                    QTest.qWait(10)
+                self.assertEqual(service.opened, ["user5"])
+                self.assertEqual(service.executed, [("user5", "user5", "5")])
+                self.assertEqual(controller._background_manual_chains, {})
+                for kind in ("action_queued", "action_result"):
+                    self.assertEqual([fields["actor_no"] for event, fields in events if event == kind], ["5"])
+            finally:
+                controller.shutdown()
 
     def test_manual_external_submission_preserves_actual_match_and_audit_status(self) -> None:
         from app_core.duty_task_projection import project_audit_tasks
