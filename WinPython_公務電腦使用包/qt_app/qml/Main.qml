@@ -310,20 +310,9 @@ ApplicationWindow {
         }
     }
 
-    Connections {
-        target: window.backend.updateController
-
-        function onUpdateReady(_latestVersion) {
-            actionConfirmations.openUpdateConfirmation()
-        }
-
-        function onCheckCompleted(message) {
-            actionConfirmations.openUpdateStatus(message)
-        }
-
-        function onErrorOccurred(message) {
-            actionConfirmations.openUpdateStatus(message)
-        }
+    UpdateProgressWindow {
+        controller: window.backend.updateController
+        transientParent: window
     }
 
     Connections {

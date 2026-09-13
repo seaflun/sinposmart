@@ -2,3 +2,4 @@ AccountManagerWindow 1.0 AccountManagerWindow.qml
 RescueVideoWindow 1.0 RescueVideoWindow.qml
 ActionConfirmations 1.0 ActionConfirmations.qml
 ErrorDetailDialog 1.0 ErrorDetailDialog.qml
+UpdateProgressWindow 1.0 UpdateProgressWindow.qml

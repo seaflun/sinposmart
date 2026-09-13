@@ -2,10 +2,22 @@
     [switch]$AssumeYes,
     [switch]$PrepareOnly,
     [switch]$ApplyStaged,
-    [string]$RequestId = ""
+    [string]$RequestId = "",
+    [switch]$RestartAfterUpdate,
+    [string]$ProgressPath = ""
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+$script:restartedProcessId = 0
+$script:lastProgressPercent = -1
+$script:lastProgressPhase = ""
+
+trap {
+    [Console]::Error.WriteLine($_.ToString())
+    [Console]::Error.WriteLine($_.ScriptStackTrace)
+    exit 1
+}
 
 $releaseBaseUrl = "https://github.com/seaflun/sinposmart/releases/latest/download"
 $remoteVersionUrl = "$releaseBaseUrl/sinposmart-version.txt"
@@ -26,9 +38,62 @@ $tempDir = Join-Path $env:TEMP "SinpoSmartUpdate-$stamp"
 $zipPath = Join-Path $tempDir "package.zip"
 $extractDir = Join-Path $tempDir "extract"
 
+function Write-UpdateProgress {
+    param([string]$Phase, [int]$Percent)
+
+    if (-not $ProgressPath) { return }
+    $Percent = [Math]::Max($script:lastProgressPercent, [Math]::Min(98, $Percent))
+    if ($Phase -eq $script:lastProgressPhase -and $Percent -eq $script:lastProgressPercent) { return }
+    $record = @{ phase = $Phase; percent = $Percent; pid = $script:restartedProcessId }
+    $temporaryPath = $ProgressPath + ".partial"
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($temporaryPath, ($record | ConvertTo-Json -Compress), $utf8)
+    if (Test-Path -LiteralPath $ProgressPath) {
+        [System.IO.File]::Replace($temporaryPath, $ProgressPath, [NullString]::Value)
+    } else {
+        [System.IO.File]::Move($temporaryPath, $ProgressPath)
+    }
+    $script:lastProgressPercent = $Percent
+    $script:lastProgressPhase = $Phase
+}
+
+function Receive-UpdatePackage {
+    param([string]$Uri, [string]$Destination)
+
+    $request = [System.Net.HttpWebRequest]::Create($Uri)
+    $request.Timeout = 30000
+    $request.ReadWriteTimeout = 30000
+    $response = $null
+    $source = $null
+    $destinationStream = $null
+    try {
+        $response = $request.GetResponse()
+        $source = $response.GetResponseStream()
+        $destinationStream = [System.IO.File]::Create($Destination)
+        $buffer = New-Object byte[] 262144
+        $received = [long]0
+        Write-UpdateProgress -Phase "downloading" -Percent 10
+        while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $destinationStream.Write($buffer, 0, $count)
+            $received += $count
+            if ($response.ContentLength -gt 0) {
+                $percent = 10 + [int][Math]::Floor(35 * $received / $response.ContentLength)
+                Write-UpdateProgress -Phase "downloading" -Percent ([Math]::Min(45, $percent))
+            }
+        }
+        if ($response.ContentLength -ge 0 -and $received -ne $response.ContentLength) {
+            throw "Downloaded package was truncated."
+        }
+    } finally {
+        if ($destinationStream) { $destinationStream.Dispose() }
+        if ($source) { $source.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
 function Get-TextFromUrl {
     param([string]$Url)
-    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -MaximumRedirection 5
+    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 30
     if ($response.Content -is [byte[]]) {
         $text = [System.Text.Encoding]::UTF8.GetString($response.Content)
     } else {
@@ -292,6 +357,31 @@ function Stop-RunningDutyGui {
     return $true
 }
 
+function Invoke-HiddenProcess {
+    param([string]$FileName, [string]$Arguments)
+
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $FileName
+    $info.Arguments = $Arguments
+    $info.WorkingDirectory = $packageDir
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $info.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $info.EnvironmentVariables["PYTHONUTF8"] = "1"
+    $process = [System.Diagnostics.Process]::Start($info)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $stdout.Result; Error = $stderr.Result }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Start-DutyGui {
     try {
         $entrypoint = Join-Path $packageDir "duty_gui.pyw"
@@ -300,15 +390,7 @@ function Start-DutyGui {
             return $false
         }
 
-        $finder = Join-Path $packageDir "find_winpython.ps1"
-        $python = ""
-        if (Test-Path -LiteralPath $finder -PathType Leaf) {
-            $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
-        }
-        if (-not $python) {
-            Write-Warning "Could not restart app because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
-            return $false
-        }
+        $python = Get-WinPythonExe
 
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = $python
@@ -316,7 +398,9 @@ function Start-DutyGui {
         $startInfo.WorkingDirectory = $packageDir
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
-        [System.Diagnostics.Process]::Start($startInfo) | Out-Null
+        $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
+        $script:restartedProcessId = $startedProcess.Id
+        $startedProcess.Dispose()
         Write-Host "Restarted SinpoSmart app."
         return $true
     } catch {
@@ -342,10 +426,13 @@ function Get-WinPythonExe {
     $finder = Join-Path $packageDir "find_winpython.ps1"
     $python = ""
     if (Test-Path -LiteralPath $finder -PathType Leaf) {
-        $python = (& powershell -NoProfile -ExecutionPolicy Bypass -File $finder | Select-Object -First 1)
+        $finderCommand = '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); & ''' + $finder.Replace("'", "''") + "'"
+        $encodedFinder = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($finderCommand))
+        $found = Invoke-HiddenProcess -FileName "powershell" -Arguments ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $encodedFinder)
+        if ($found.ExitCode -eq 0) { $python = ($found.Output -split "`r?`n")[0].Trim() }
     }
     if (-not $python) {
-        throw "Could not run setup because WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
+        throw "WinPython python.exe was not found. Set WINPYTHON_DIR or place WinPython beside the package."
     }
     return [string]$python
 }
@@ -360,18 +447,24 @@ function Invoke-SetupAfterUpdate {
     $python = Get-WinPythonExe
     Push-Location $packageDir
     try {
+        Write-UpdateProgress -Phase "setup" -Percent 85
         Write-Host "Installing or refreshing Python requirements..."
-        & $python -m pip install -r $requirementsPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "pip install failed with exit code $LASTEXITCODE."
+        $setup = Invoke-HiddenProcess -FileName $python -Arguments ('-m pip install -r "{0}"' -f $requirementsPath)
+        [Console]::Out.Write($setup.Output)
+        [Console]::Error.Write($setup.Error)
+        if ($setup.ExitCode -ne 0) {
+            throw "pip install failed with exit code $($setup.ExitCode)."
         }
 
         $environmentCheck = Join-Path $packageDir "check_environment.py"
         if (Test-Path -LiteralPath $environmentCheck -PathType Leaf) {
+            Write-UpdateProgress -Phase "environment" -Percent 92
             Write-Host "Running environment check..."
-            & $python $environmentCheck
-            if ($LASTEXITCODE -ne 0) {
-                throw "Environment check failed with exit code $LASTEXITCODE."
+            $checked = Invoke-HiddenProcess -FileName $python -Arguments ('"{0}"' -f $environmentCheck)
+            [Console]::Out.Write($checked.Output)
+            [Console]::Error.Write($checked.Error)
+            if ($checked.ExitCode -ne 0) {
+                throw "Environment check failed with exit code $($checked.ExitCode)."
             }
         }
     } finally {
@@ -387,7 +480,9 @@ function Copy-UpdateTree {
 
     $slash = [string][char]92
     $sourceRoot = $SourceDir.TrimEnd([char]92) + $slash
-    Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force | ForEach-Object {
+    $updateFiles = @(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force)
+    $copiedFiles = 0
+    $updateFiles | ForEach-Object {
         $relative = $_.FullName.Substring($sourceRoot.Length)
         $target = Join-Path $DestDir $relative
         if (Test-SkipPackagePath -RelativePath $relative) {
@@ -404,6 +499,8 @@ function Copy-UpdateTree {
             New-Item -ItemType Directory -Path $targetDir | Out-Null
         }
         Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+        $copiedFiles += 1
+        Write-UpdateProgress -Phase "installing" -Percent (60 + [int][Math]::Floor(20 * $copiedFiles / [Math]::Max(1, $updateFiles.Count)))
         Write-Host "Updated: $relative"
     }
 }
@@ -537,6 +634,7 @@ function Copy-RemoteStagePackage {
     Get-ChildItem -LiteralPath $SourceDir -Force | Copy-Item -Destination $stagingPackageDir -Recurse -Force
 }
 
+Write-UpdateProgress -Phase "checking" -Percent 2
 if (-not (Test-Path -LiteralPath $localVersionPath)) {
     "0" | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
 }
@@ -584,6 +682,7 @@ if ([string]::CompareOrdinal($remoteVersion, $localVersion) -le 0) {
             Remove-Item -LiteralPath $stagingPackageDir -Recurse -Force
         }
     }
+    Write-UpdateProgress -Phase "current" -Percent 2
     exit 0
 }
 
@@ -607,7 +706,8 @@ try {
 
     if (-not $ApplyStaged) {
         Write-Host "Downloading update package..."
-        Invoke-WebRequest -Uri $remoteZipUrl -OutFile $zipPath -UseBasicParsing -MaximumRedirection 5
+        Receive-UpdatePackage -Uri $remoteZipUrl -Destination $zipPath
+        Write-UpdateProgress -Phase "verifying" -Percent 46
 
         if (-not (Test-Path -LiteralPath $zipPath) -or (Get-Item -LiteralPath $zipPath).Length -lt 1024) {
             throw "Downloaded package is missing or too small."
@@ -618,6 +718,7 @@ try {
         }
 
         New-Item -ItemType Directory -Path $extractDir | Out-Null
+        Write-UpdateProgress -Phase "extracting" -Percent 54
         Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
 
         $sourceDir = Get-ChildItem -LiteralPath $extractDir -Directory |
@@ -674,6 +775,7 @@ try {
         "qt_app\qml\dialogs\RescueVideoWindow.qml",
         "qt_app\qml\dialogs\ActionConfirmations.qml",
         "qt_app\qml\dialogs\ErrorDetailDialog.qml",
+        "qt_app\qml\dialogs\UpdateProgressWindow.qml",
         "qt_app\qml\dialogs\qmldir",
         "qt_app\qml\pages\DutySheetToolPanel.qml",
         "qt_app\qml\pages\RestTimeToolPanel.qml",
@@ -719,10 +821,12 @@ try {
     }
 
     $backupZip = Join-Path $backupDir "SinpoSmart-package-backup-$stamp.zip"
+    Write-UpdateProgress -Phase "backup" -Percent 55
     Write-Host "Creating backup: $backupZip"
     $backupStageRoot = if ($ApplyStaged) { Join-Path $env:TEMP "SinpoSmartUpdate-$stamp-backup-stage" } else { Join-Path $tempDir "backup-stage" }
     New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir $backupStageRoot
 
+    Write-UpdateProgress -Phase "closing" -Percent 58
     $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
     $wasRunning = $runningDutyGuiProcesses.Count -gt 0
     if ($wasRunning) {
@@ -743,11 +847,17 @@ try {
         }
         $guiStoppedForUpdate = $true
     }
+    Write-UpdateProgress -Phase "installing" -Percent 60
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
+    Write-UpdateProgress -Phase "setup" -Percent 82
     Invoke-SetupAfterUpdate
     $packageVersion | Set-Content -LiteralPath $localVersionPath -Encoding UTF8
-    if ($wasRunning) {
+    if ($wasRunning -or $RestartAfterUpdate) {
+        Write-UpdateProgress -Phase "restarting" -Percent 95
         $guiRestarted = [bool](Start-DutyGui)
+        if (-not $guiRestarted) {
+            throw "Updated files were installed, but SinpoSmart could not restart."
+        }
     }
 
     if ($ApplyStaged) {
@@ -757,6 +867,7 @@ try {
         }
     }
 
+    Write-UpdateProgress -Phase "installed" -Percent 98
     Write-Host "Update completed."
 } catch {
     if ($RequestId) {

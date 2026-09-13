@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from datetime import date
@@ -5875,9 +5876,306 @@ class TrayControllerTests(unittest.TestCase):
 class UpdateControllerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        from PySide6.QtQuickControls2 import QQuickStyle
         from PySide6.QtWidgets import QApplication
 
+        QQuickStyle.setStyle("Basic")
         cls.app = QApplication.instance() or QApplication(["test_update_controller"])
+
+    def test_remote_update_apply_uses_qml_and_preserves_staged_request(self) -> None:
+        from unittest.mock import patch, Mock
+        from qt_app.controllers import update_controller as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.object(module, "launch_update_process", return_value="qml-host") as launch:
+                self.assertEqual(module.launch_remote_update_process(root / "update_package.ps1", "request-1", "ApplyStaged"), "qml-host")
+            launch.assert_called_once_with(root / "update_package.ps1", request_id="request-1")
+            controller = module.UpdateProgressController(root / "update_package.ps1", root, request_id="request-1")
+            try:
+                with patch.object(module.subprocess, "Popen", return_value=Mock()) as start:
+                    controller.start()
+                command = start.call_args.args[0]
+                self.assertIn("-ApplyStaged", command)
+                self.assertEqual(command[command.index("-RequestId") + 1], "request-1")
+                self.assertIn("-ProgressPath", command)
+            finally:
+                controller._poll_timer.stop()
+
+    def test_update_launcher_opens_independent_qml_without_a_console(self) -> None:
+        from qt_app.controllers.update_controller import launch_update_process
+
+        script = PACKAGE_ROOT / "update_package.ps1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("qt_app.controllers.update_controller.create_update_run_directory", return_value=Path(temp_dir)):
+                with patch("qt_app.controllers.update_controller.subprocess.Popen") as popen:
+                    launch_update_process(script)
+        command = popen.call_args.args[0]
+        self.assertIn("qt_app.controllers.update_controller", command)
+        self.assertIn("--install", command)
+        self.assertNotIn("powershell", command)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+
+    def test_check_window_opens_immediately_and_cannot_dismiss_while_checking(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        fetched = threading.Event()
+        release = threading.Event()
+        def fetch(_url, _timeout):
+            fetched.set()
+            release.wait(3)
+            return "2026.09.13.0001"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version = Path(temp_dir) / "VERSION.txt"
+            version.write_text("2026.09.12.0001", encoding="utf-8")
+            controller = UpdateController(UpdateRepository(version, text_fetcher=fetch))
+            try:
+                controller.check()
+                self.assertTrue(controller.updateView["visible"])
+                self.assertTrue(controller.updateView["busy"])
+                self.assertEqual(controller.updateView["progress"], -1)
+                controller.dismissUpdateWindow()
+                self.assertTrue(controller.updateView["visible"])
+            finally:
+                release.set()
+                controller.shutdown()
+
+    def test_install_launch_is_single_flight(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "VERSION.txt").write_text("2026.09.12.0001", encoding="utf-8")
+            (root / "update_package.ps1").write_text("# fixture", encoding="utf-8")
+            launches = []
+            controller = UpdateController(UpdateRepository(root / "VERSION.txt"),
+                                          process_launcher=lambda path: launches.append(path))
+            controller._update_available = True
+            controller.launchUpdate()
+            controller.launchUpdate()
+            self.assertEqual(len(launches), 1)
+
+    def test_check_failure_keeps_raw_diagnostics_out_of_the_main_message(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "VERSION.txt").write_text("2026.09.13.0001", encoding="utf-8")
+            controller = UpdateController(UpdateRepository(root / "VERSION.txt"))
+            with patch("qt_app.controllers.update_controller.create_update_run_directory", return_value=root):
+                controller._check_failed(0, "fixture socket timeout: raw diagnostic")
+            self.assertEqual((root / "check.log").read_text(encoding="utf-8"), controller.statusText)
+            self.assertNotIn("raw diagnostic", controller.updateView["subtitle"])
+            self.assertEqual(controller.updateView["diagnosticPath"], str(root / "check.log"))
+
+    def test_installer_progress_survives_partial_status_and_never_claims_early_success(self) -> None:
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = UpdateProgressController(root / "update_package.ps1", root)
+            controller.accept_progress({"phase": "installing", "percent": 68})
+            self.assertEqual(controller.updateView["progress"], 68)
+            controller.accept_progress({"phase": "installing", "percent": "broken"})
+            self.assertEqual(controller.updateView["progress"], 68)
+            controller.accept_progress({"phase": "downloading", "percent": 20})
+            self.assertEqual(controller.updateView["progress"], 68)
+            controller.accept_progress({"phase": "installed", "percent": 100, "pid": 123})
+            self.assertEqual(controller.updateView["progress"], 98)
+            self.assertTrue(controller.updateView["busy"])
+            controller.dismissUpdateWindow()
+            self.assertTrue(controller.updateView["visible"])
+            controller.confirm_window_ready("ready:999")
+            self.assertNotEqual(controller.updateView["progress"], 100)
+            controller.confirm_window_ready("ready:123")
+            self.assertNotEqual(controller.updateView["progress"], 100)
+            controller.process_finished(0)
+            controller.confirm_window_ready("ready:123")
+            self.assertEqual(controller.updateView["progress"], 100)
+            self.assertFalse(controller.updateView["busy"])
+            controller._poll_timer.stop()
+
+    def test_installer_abnormal_exit_is_visible_and_dismissible(self) -> None:
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = UpdateProgressController(root / "update_package.ps1", root)
+            controller.accept_progress({"phase": "setup", "percent": 85})
+            controller.process_finished(1)
+            self.assertEqual(controller.updateView["phase"], "failed")
+            self.assertLess(controller.updateView["progress"], 100)
+            self.assertFalse(controller.updateView["busy"])
+            controller.dismissUpdateWindow()
+            self.assertFalse(controller.updateView["visible"])
+
+    def test_installer_zero_exit_without_terminal_status_is_not_success(self) -> None:
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = UpdateProgressController(root / "update_package.ps1", root)
+            controller.process_finished(0)
+            self.assertEqual(controller.updateView["phase"], "failed")
+
+    def test_qml_update_window_rejects_close_during_install_and_allows_error_dismissal(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlApplicationEngine
+        from PySide6.QtTest import QTest
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = UpdateProgressController(root / "update_package.ps1", root)
+            engine = QQmlApplicationEngine()
+            errors = []
+            engine.warnings.connect(lambda warnings: errors.extend(w.toString() for w in warnings))
+            engine.setInitialProperties({"controller": controller})
+            engine.load(QUrl.fromLocalFile(str(PACKAGE_ROOT / "qt_app/qml/dialogs/UpdateProgressWindow.qml")))
+            self.assertTrue(engine.rootObjects(), errors)
+            window = engine.rootObjects()[0]
+            controller.accept_progress({"phase": "installing", "percent": 68})
+            QTest.qWait(40)
+            self.assertTrue(window.isVisible())
+            self.assertFalse(window.close())
+            self.assertTrue(window.isVisible())
+            controller.process_finished(1)
+            QTest.qWait(20)
+            self.assertEqual(window.height(), 344)
+            self.assertTrue(window.close())
+            self.assertFalse(controller.updateView["visible"])
+            self.assertEqual(errors, [])
+            engine.deleteLater()
+            QTest.qWait(10)
+
+    def test_real_hidden_installer_reports_current_version_without_restarting(self) -> None:
+        from PySide6.QtTest import QTest
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "fixture.ps1"
+            script.write_text(
+                'param([switch]$AssumeYes,[switch]$RestartAfterUpdate,[string]$ProgressPath)\n'
+                '[IO.File]::WriteAllText($ProgressPath,\'{"phase":"current","percent":2,"pid":0}\')\n',
+                encoding="utf-8-sig",
+            )
+            controller = UpdateProgressController(script, root)
+            controller.start()
+            deadline = time.monotonic() + 10
+            while controller.updateView["busy"] and time.monotonic() < deadline:
+                QTest.qWait(50)
+            self.assertFalse(controller.updateView["busy"])
+            self.assertEqual(controller.updateView["phase"], "current")
+            self.assertEqual(controller.updateView["progress"], -1)
+
+    def test_independent_qml_host_installs_and_waits_for_matching_ready_window(self) -> None:
+        from uuid import uuid4
+        from PySide6.QtNetwork import QLocalServer
+        from PySide6.QtTest import QTest
+
+        server_name = "SinpoSmart.UpdateFixture." + uuid4().hex
+        server = QLocalServer()
+        self.assertTrue(server.listen(server_name))
+        commands = []
+        connections = []
+
+        def accept_connection():
+            connection = server.nextPendingConnection()
+            connections.append(connection)
+            def reply():
+                command = bytes(connection.readAll()).strip()
+                if command:
+                    commands.append(command)
+                    connection.write(f"ready:{os.getpid()}\n".encode("ascii"))
+                    connection.flush()
+            connection.readyRead.connect(reply)
+            reply()
+        server.newConnection.connect(accept_connection)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                script = root / "fixture.ps1"
+                record = json.dumps({"phase": "installed", "percent": 98, "pid": os.getpid()})
+                script.write_text(
+                    'param([switch]$AssumeYes,[switch]$RestartAfterUpdate,[string]$ProgressPath)\n'
+                    f"[IO.File]::WriteAllText($ProgressPath,'{record}')\n", encoding="utf-8-sig",
+                )
+                code = (
+                    "import sys; import qt_app.controllers.update_controller as module; "
+                    "module.UPDATE_INSTANCE_SERVER=sys.argv[1]; "
+                    "raise SystemExit(module.run_update_window(['--install',sys.argv[2],'--state-dir',sys.argv[3]]))"
+                )
+                with (root / "host.log").open("wb") as output:
+                    process = subprocess.Popen(
+                        [sys.executable, "-c", code, server_name, str(script), str(root)],
+                        cwd=PACKAGE_ROOT, stdout=output, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        env={**os.environ, "LOCALAPPDATA": str(root), "QT_QPA_PLATFORM": "offscreen",
+                             "QT_QUICK_CONTROLS_STYLE": "Basic", "PYTHONUTF8": "1"},
+                    )
+                    try:
+                        deadline = time.monotonic() + 15
+                        while process.poll() is None and time.monotonic() < deadline:
+                            QTest.qWait(50)
+                        self.assertIsNotNone(process.poll(), "The independent updater did not finish.")
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=5)
+                self.assertEqual(process.returncode, 0, (root / "host.log").read_text(encoding="utf-8"))
+                self.assertTrue((root / "window-ready").is_file())
+                self.assertIn(b"update_status", commands)
+        finally:
+            for connection in connections:
+                connection.abort()
+            server.close()
+            QLocalServer.removeServer(server_name)
+
+    def test_ready_status_requires_visible_exposed_logged_out_main_window(self) -> None:
+        from qt_app.main import show_existing_window_requests
+
+        class Connection:
+            def __init__(self):
+                self.response = None
+            def waitForReadyRead(self, _timeout):
+                return True
+            def readAll(self):
+                return b"update_status\n"
+            def write(self, response):
+                self.response = response
+            def waitForBytesWritten(self, _timeout):
+                return True
+            def disconnectFromServer(self):
+                pass
+
+        class Server:
+            def __init__(self, connection):
+                self.connection = connection
+            def hasPendingConnections(self):
+                return self.connection is not None
+            def nextPendingConnection(self):
+                connection, self.connection = self.connection, None
+                return connection
+
+        previous = getattr(self.app, "sinposmart_main_window", None)
+        try:
+            for visible, exposed, logged_in in ((False, True, False), (True, False, False),
+                                                (True, True, True), (True, True, False)):
+                with self.subTest(visible=visible, exposed=exposed, logged_in=logged_in):
+                    self.app.sinposmart_main_window = SimpleNamespace(
+                        isVisible=lambda: visible, isExposed=lambda: exposed)
+                    controller = SimpleNamespace(sessionController=SimpleNamespace(isLoggedIn=logged_in))
+                    connection = Connection()
+                    show_existing_window_requests(Server(connection), controller)
+                    expected = f"ready:{os.getpid()}\n".encode("ascii") if visible and exposed and not logged_in else b"starting\n"
+                    self.assertEqual(connection.response, expected)
+        finally:
+            self.app.sinposmart_main_window = previous
 
     def test_update_repository_compares_valid_release_versions(self) -> None:
         from app_core.update_repository import UpdateRepository
@@ -7000,6 +7298,7 @@ class QtShellTests(unittest.TestCase):
                 "RescueVideoWindow 1.0 RescueVideoWindow.qml",
                 "ActionConfirmations 1.0 ActionConfirmations.qml",
                 "ErrorDetailDialog 1.0 ErrorDetailDialog.qml",
+                "UpdateProgressWindow 1.0 UpdateProgressWindow.qml",
             ],
         )
         self.assertIn('import "dialogs"', qml)
@@ -7300,13 +7599,11 @@ class QtShellTests(unittest.TestCase):
         self.assertIn('text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"', rescue_video)
         self.assertIn('title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"', rescue_video)
         self.assertIn('id: rescueVideoCopyConfirmation', rescue_video)
-        self.assertIn("id: updateConfirmation", source)
-        self.assertIn("function onUpdateReady(_latestVersion)", source)
-        self.assertIn("actionConfirmations.openUpdateConfirmation()", source)
-        self.assertIn("function onCheckCompleted(message)", source)
-        self.assertIn("actionConfirmations.openUpdateStatus(message)", source)
+        self.assertIn("UpdateProgressWindow {", source)
+        self.assertIn("controller: window.backend.updateController", source)
         self.assertIn("id: updateStatusDialog", source)
-        self.assertIn("updateController.launchUpdate()", source)
+        update_window = (PACKAGE_ROOT / "qt_app/qml/dialogs/UpdateProgressWindow.qml").read_text(encoding="utf-8")
+        self.assertIn("updateWindow.controller.launchUpdate()", update_window)
         self.assertIn("dutyOperationBar.backend.exportIssuePackage()", source)
         self.assertIn("未返隊案件出勤估算", source)
         self.assertIn("workLogSettingsDialog.controller.caseItems", source)
@@ -12240,15 +12537,24 @@ if return_code != 0 or loaded:
         class FakeService:
             def __init__(self) -> None:
                 self.calls: list[int] = []
+                self.opened_sessions = 0
+                self.serialized_actions: list[int] = []
+                self.parallel_actions: list[int] = []
 
             def validate(self, request):
                 return request
 
             def open_browser_session(self, request, *, status_callback=None):
+                self.opened_sessions += 1
                 return SimpleNamespace(user_id=request.user_id, visible=request.visible)
 
             def execute_with_browser_session(self, request, _session, *, status_callback=None):
                 self.calls.append(request.action_index)
+                action = request.schedule_data["actions"][request.action_index]
+                if action["kind"] == "work_log":
+                    self.parallel_actions.append(request.action_index)
+                else:
+                    self.serialized_actions.append(request.action_index)
                 if request.action_index == 0:
                     first_entry_started.set()
                     release_first_entry.wait(timeout=2)
@@ -18562,8 +18868,10 @@ if return_code != 0 or loaded:
                 self.copy_started = threading.Event()
                 self.release_copy = threading.Event()
                 self.requests = []
+                self.defaults_calls = 0
 
             def load_defaults(self, *_args, **_kwargs):
+                self.defaults_calls += 1
                 defaults = RescueVideoDefaults(
                     "X:/DCIM",
                     "Z:/救護行車影片",
@@ -19675,6 +19983,11 @@ if return_code != 0 or loaded:
                 )
                 rescue_dialog = root.findChild(QObject, "rescueVideoDialog")
                 self.assertTrue(QMetaObject.invokeMethod(rescue_dialog, "close", Qt.DirectConnection))
+                wait_until(
+                    lambda: not controller._operational_sync_workers
+                    and not controller._operational_sync_queue,
+                    "工具事件同步佇列尚未完成",
+                )
 
                 tool_events = [
                     (record_type, fields)
@@ -19687,6 +20000,8 @@ if return_code != 0 or loaded:
                     for record_type, fields in operational_sync_service.events
                     if fields.get("snapshot", {}).get("tool_name") == "rescue_video_preflight"
                 ]
+                # Opening the tool twice and pressing check each run one preflight.
+                self.assertEqual(rescue_video_service.defaults_calls, 3)
                 self.assertEqual([kind for kind, _ in preflight_events],
                                  ["tool_action_started", "tool_action_finished"] * 3)
                 self.assertEqual([fields["status"] for _, fields in preflight_events],

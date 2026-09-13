@@ -108,6 +108,12 @@ def show_existing_window_requests(server: QLocalServer, controller: AppControlle
                 quit_after_response = result == "ready"
             elif command == "update_logout":
                 response = b"ok\n" if controller.recordUpdateLogout() else b"skipped\n"
+            elif command in {"update_status", "update_status_handoff"}:
+                app = QApplication.instance()
+                window = getattr(app, "sinposmart_main_window", None)
+                ready = (window is not None and window.isVisible() and window.isExposed()
+                         and (command == "update_status_handoff" or not controller.sessionController.isLoggedIn))
+                response = f"ready:{os.getpid()}\n".encode("ascii") if ready else b"starting\n"
             else:
                 controller.trayController.showWindow()
                 response = b"ok\n"
@@ -321,6 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cleanup_acceptance_directory(controller)
         return 1
     root_window = engine.rootObjects()[0]
+    app.sinposmart_main_window = root_window
     if not isolated_startup:
         QTimer.singleShot(0, controller.resumePendingAutoLogin)
     root_window.windowTitleChanged.connect(

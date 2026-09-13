@@ -1130,11 +1130,11 @@ class DutyExistingDeletePrewriteUnavailable(RuntimeError):
     """No existing-duty delete click was sent, so a fresh-browser retry is safe."""
 
 
-def wait_for_duty_query_completion(driver, wait, *, prewrite=False):
+def wait_for_duty_query_completion(driver, wait, *, prewrite=False, expected_mode=""):
     log_status("⏳ 等待勤務表查詢完成...")
 
     def query_completed(candidate):
-        return candidate.execute_script(r"""
+        mode = candidate.execute_script(r"""
             function findById(win, targetId) {
                 let element = null;
                 try { element = win.document.getElementById(targetId); } catch (error) {}
@@ -1176,11 +1176,16 @@ def wait_for_duty_query_completion(driver, wait, *, prewrite=False):
             }
             return false;
         """)
+        return mode if not expected_mode or mode == expected_mode else False
 
     try:
         return wait.until(query_completed)
     except TimeoutException as error:
-        message = "勤務表查詢逾時，尚未進入設定頁或既有勤務表。"
+        message = (
+            "既有勤務表刪除後尚未進入設定頁，已停止後續登打。"
+            if expected_mode == "setup"
+            else "勤務表查詢逾時，尚未進入設定頁或既有勤務表。"
+        )
         if prewrite:
             raise DutyQueryPrewriteTimeout(message) from error
         raise RuntimeError(message) from error
@@ -1216,11 +1221,21 @@ def click_duty_existing_delete_and_accept_alert(driver):
                 return false;
             }
             return findAndClickDeleteButton(window.top);
-        """) is True
+        """)
     except UnexpectedAlertPresentException:
         # 原生提醒在按鈕點擊後立即出現時，Selenium 會先回報例外。
         clicked = True
 
+    if clicked is None:
+        # Chrome may return null while a synchronous confirm is still open.
+        # A null result does not prove that no click was sent; never retry it.
+        try:
+            WebDriverWait(driver, 3).until(EC.alert_is_present())
+        except TimeoutException as error:
+            raise RuntimeError(
+                "既有勤務表刪除結果尚未確認，已停止登打以避免重複刪除。"
+            ) from error
+        clicked = True
     if clicked:
         accept_pending_alerts(driver, timeout=3)
     return clicked
@@ -1888,11 +1903,12 @@ def start_automation(
             if query_mode == "existing":
                 report_stage("duty_existing_data_delete")
                 ensure_existing_duty_delete(candidate)
-                log_status("✅ 舊資料已刪除")
                 query_mode = wait_for_duty_query_completion(
                     candidate,
                     query_wait,
+                    expected_mode="setup",
                 )
+                log_status("✅ 舊資料已刪除，設定頁已就緒")
             if query_mode != "setup":
                 raise RuntimeError("勤務表查詢結果無法進入設定流程，未執行登打。")
             return candidate

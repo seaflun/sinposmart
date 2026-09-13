@@ -2,18 +2,17 @@
 setlocal
 cd /d "%~dp0"
 
-echo SinpoSmart package updater
-echo Package: %CD%
-echo.
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update_package.ps1"
-if errorlevel 1 (
-  echo.
-  echo [ERROR] Update failed.
-  pause
-  exit /b 1
+if /i not "%~1"=="--hidden" (
+  wscript.exe "%~dp0RUN_DUTY_GUI_WINPYTHON.vbs" --check-update
+  exit /b 0
 )
 
-echo.
-echo [OK] Update check completed.
-pause
+for /f "usebackq delims=" %%F in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find_winpython.ps1" -Windowed`) do (
+  set "UPDATE_PYTHONW=%%F"
+  goto :found_pythonw
+)
+
+:found_pythonw
+if not defined UPDATE_PYTHONW exit /b 1
+start "" /b /wait "%UPDATE_PYTHONW%" -m qt_app.controllers.update_controller --check
+exit /b %ERRORLEVEL%
