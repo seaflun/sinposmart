@@ -45,6 +45,7 @@ class DutyTaskProjectionState:
     task_errors: Mapping[int, str] = field(default_factory=dict)
     auto_return_indices: frozenset[int] = frozenset()
     manual_waiting_indices: frozenset[int] = frozenset()
+    background_return_phases: Mapping[int, str] = field(default_factory=dict)
     completed_return_pair_keys: frozenset[str] = frozenset()
 
 
@@ -595,12 +596,15 @@ def _task_status(
 ) -> tuple[str, str]:
     if index in state.submitting_indices:
         return "正在登打", "running"
-    is_auto_return = (
-        index in state.auto_return_indices
+    background_phase = state.background_return_phases.get(index, "")
+    is_scheduled_return = (
+        (index in state.auto_return_indices or background_phase)
         and is_external_or_rest_return(action)
         and index not in state.executed_indices
     )
-    if is_auto_return:
+    if is_scheduled_return:
+        if background_phase == "return_submitting":
+            return "正在登打", "running"
         action_at = action_datetime(action, state.target_roc_date)
         if action_at + AUTO_DUE_CATCH_UP_WINDOW < now:
             return "逾時未補跑", "manual"

@@ -17223,6 +17223,172 @@ if return_code != 0 or loaded:
             finally:
                 controller.shutdown()
 
+    def test_background_rest_return_recovers_after_restart_for_scheduled_actor(self) -> None:
+        from datetime import datetime
+        from app_core.duty_task_projection import (
+            DueTaskSelectionState, project_duty_tasks, select_due_task_indices,
+        )
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        actions = []
+        for target in ("23", "24"):
+            pair_key = f"rest:1150913:{target}:16-18"
+            actions.extend([
+                {"kind": "entry_log", "time": "16:00", "actor": "18", "target": target,
+                 "source": "休息簽出", "return_pair_key": pair_key,
+                 "fields": {"出或入": "出", "領用事由及地點": "休息"}},
+                {"kind": "entry_log", "time": "18:00", "actor": "8", "target": target,
+                 "source": "休息結束", "return_pair_key": pair_key,
+                 "fields": {"出或入": "入", "領用事由及地點": "休息返隊"}},
+            ])
+        data = {"target_date": "1150913", "actions": actions}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = ScheduleRepository(Path(temp_dir))
+            first = DutyController(repository=repository)
+            try:
+                first.set_session_context(1, "user18")
+                first.set_actor_no("18")
+                first.replace_schedule_data(data)
+                first.handle_submission_result(
+                    0, "submitted", "完成", "", {"compare": "已登打", "group": "done"},
+                    trigger_type="manual", allow_manual_departure_return=False,
+                )
+                self.assertEqual(first._auto_return_indices(), set())
+            finally:
+                first.shutdown()
+
+            restarted = DutyController(repository=repository)
+            try:
+                restarted.set_session_context(1, "user8")
+                restarted.set_actor_no("8")
+                restarted.replace_schedule_data(data)
+                rows = project_duty_tasks(actions, restarted._projection_state(), now=datetime(2026, 9, 13, 17))
+                statuses = {row["taskIndex"]: row["statusText"] for row in rows}
+                self.assertEqual(statuses[1], "等待")
+                self.assertEqual(statuses[3], "手動")
+                self.assertIn(0, restarted._executed_indices)
+                state = DueTaskSelectionState(
+                    actor_no="8", target_roc_date="1150913",
+                    auto_return_indices=frozenset(restarted._auto_return_indices()),
+                )
+                self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 9, 13, 18)), [1])
+                from dataclasses import replace
+                self.assertEqual(select_due_task_indices(
+                    actions, replace(state, actor_no="18"), now=datetime(2026, 9, 13, 18),
+                ), [])
+                self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 9, 13, 20, 1)), [])
+                restarted.handle_submission_result(
+                    1, "skipped_duplicate", "已存在", "", {"compare": "已存在", "group": "done"},
+                    trigger_type="due",
+                )
+            finally:
+                restarted.shutdown()
+
+            completed = DutyController(repository=repository)
+            try:
+                completed.set_actor_no("8")
+                completed.replace_schedule_data(data)
+                self.assertEqual(completed._auto_return_indices(), set())
+                self.assertIn(1, completed._executed_indices)
+            finally:
+                completed.shutdown()
+
+    def test_live_background_rest_return_status_tracks_owner_and_lifecycle(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.duty_task_projection import action_completion_key, project_duty_tasks
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        departure = {
+            "kind": "entry_log", "time": "16:00", "actor": "18", "target": "23",
+            "source": "休息簽出", "return_pair_key": "rest:1150913:23:16-18",
+            "fields": {"出或入": "出", "領用事由及地點": "休息"},
+        }
+        returning = {
+            "kind": "entry_log", "time": "18:00", "actor": "8", "target": "23",
+            "source": "休息結束", "return_pair_key": departure["return_pair_key"],
+            "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+        }
+        data = {"target_date": "1150913", "actions": [departure, returning]}
+        for outcome in ("completed", "failed", "cancelled", "expired"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                controller = AppController(schedule_repository=ScheduleRepository(Path(temp_dir)))
+                duty = controller.dutyController
+                try:
+                    controller._background_manual_timer.stop()
+                    controller._send_operational_event = lambda *_args, **_kwargs: None
+                    controller.trayController.notify = lambda *_args: None
+                    duty.set_session_context(1, "user18")
+                    duty.set_actor_no("18")
+                    duty.replace_schedule_data(data)
+                    request = DutySubmissionRequest(
+                        "user18", "secret", 0, data, trigger_type="manual", background=True,
+                        session_generation=1, schedule_generation=duty.schedule_generation,
+                        session_actor_no="18", action_key=action_completion_key(departure),
+                    )
+                    chain = _BackgroundManualChain(request, 1, phase="departure_submitting", active_request_id=1)
+                    controller._background_manual_chains["rest-chain"] = chain
+                    controller._background_manual_workers[1] = ("rest-chain", "departure", request)
+                    result = DutySubmissionResult(0, "submitted", "完成", Path("result.json"),
+                                                  {"compare": "已登打", "group": "done"}, departure)
+                    duty.set_session_context(2, "")
+                    duty.set_session_context(3, "user8")
+                    duty.set_actor_no("8")
+                    from dataclasses import replace
+                    for rejected_request, rejected_status in (
+                        (replace(request, background=False), "submitted"),
+                        (request, "failed"),
+                        (replace(request, schedule_data={**data, "target_date": "1150914"}), "submitted"),
+                        (replace(request, action_key="different-return"), "submitted"),
+                    ):
+                        self.assertFalse(duty.handle_submission_request_result(
+                            rejected_request, rejected_status, "測試", "", result.comparison,
+                        ))
+                    self.assertTrue(duty.handle_submission_request_result(
+                        request, result.status, result.message, "", result.comparison,
+                    ))
+                    controller._background_manual_submission_succeeded(request, result)
+                    # Reordered hourly refresh must preserve the return identity.
+                    duty.replace_schedule_data({**data, "actions": [returning, departure]})
+
+                    def status(now):
+                        rows = project_duty_tasks(duty._actions, duty._projection_state(), now=now)
+                        return next(row["statusText"] for row in rows if row["taskIndex"] == 0)
+
+                    self.assertEqual(status(datetime(2026, 9, 13, 17)), "等待")
+                    self.assertEqual(duty._auto_return_indices(), set())
+                    self.assertEqual(status(datetime(2026, 9, 13, 18)), "到點待執行")
+                    controller.dutyExecutionController.enqueue_background = lambda _request: False
+                    controller._start_background_manual_submission("rest-chain", "return", datetime(2026, 9, 13, 18))
+                    self.assertEqual(status(datetime(2026, 9, 13, 18)), "到點待執行")
+                    controller.dutyExecutionController.enqueue_background = lambda _request: True
+                    controller._start_background_manual_submission("rest-chain", "return", datetime(2026, 9, 13, 18))
+                    self.assertEqual(status(datetime(2026, 9, 13, 18)), "正在登打")
+                    tracked = next(iter(controller._background_manual_workers.values()))[2]
+                    self.assertEqual(tracked.user_id, "user18")
+                    if outcome == "completed":
+                        self.assertTrue(duty.handle_submission_request_result(
+                            tracked, "skipped_duplicate", "已存在", "", {"compare": "已存在", "group": "done"},
+                        ))
+                        controller._background_manual_submission_succeeded(
+                            tracked, DutySubmissionResult(1, "skipped_duplicate", "已存在", Path("result.json"),
+                                                           {"compare": "已存在", "group": "done"}, returning),
+                        )
+                        self.assertEqual(status(datetime(2026, 9, 13, 18)), "已登打")
+                    elif outcome == "cancelled":
+                        controller._background_manual_submission_cancelled(tracked, "測試取消", "test")
+                    elif outcome == "expired":
+                        controller._expire_background_manual_chain("rest-chain", "return", datetime(2026, 9, 13, 20, 1))
+                    else:
+                        controller._background_manual_submission_failed(tracked, "測試失敗", "test", "")
+                    if outcome != "completed":
+                        self.assertEqual(status(datetime(2026, 9, 13, 18)), "手動")
+                    self.assertEqual(controller._background_manual_chains, {})
+                finally:
+                    controller.shutdown()
+
     def test_manual_external_submission_preserves_actual_match_and_audit_status(self) -> None:
         from app_core.duty_task_projection import project_audit_tasks
         from app_core.schedule_repository import ScheduleRepository

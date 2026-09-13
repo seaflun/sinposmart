@@ -100,6 +100,11 @@ class DutyController(QObject):
         self._completed_return_pair_keys = self._load_return_policy_pair_keys(
             "completed_return_pair_keys"
         )
+        # A fresh controller has no live background workers. Resume confirmed
+        # departures through the scheduled actor after login, without saved credentials.
+        self._manual_departure_pair_keys.update(self._background_manual_departure_pair_keys)
+        self._manual_departure_pair_keys.difference_update(self._completed_return_pair_keys)
+        self._background_manual_departure_pair_keys.clear()
         self._actual_handoff_times = self._load_actual_handoff_times()
         self._current_date_text = ""
         self._current_time_text = ""
@@ -134,6 +139,7 @@ class DutyController(QObject):
         self._manual_confirmation_summary = ""
         self._manual_waiting_action_keys: set[str] = set()
         self._background_manual_waiting_action_keys: set[str] = set()
+        self._background_return_actions: dict[tuple[str, str], str] = {}
         self._pending_external_return_indices: list[int] = []
         self._pending_external_return_action_keys: tuple[str, ...] = ()
         self._pending_external_return_schedule_generation = 0
@@ -894,6 +900,22 @@ class DutyController(QObject):
             if key in self._manual_waiting_action_keys
         }
 
+    def set_background_return_actions(self, actions: Mapping[tuple[str, str], str]) -> None:
+        """Display live background returns without adding a second submission owner."""
+        updated = dict(actions)
+        if updated == self._background_return_actions:
+            return
+        self._background_return_actions = updated
+        self._refresh_projection()
+
+    def _background_return_phases(self) -> dict[int, str]:
+        return {
+            index: phase
+            for key, index in self._unique_action_indices_by_key().items()
+            if (phase := self._background_return_actions.get((self._target_date_text, key)))
+            and is_external_or_rest_return(self._actions[index])
+        }
+
     def background_manual_waiting_requests(
         self,
         user_id: str,
@@ -990,9 +1012,15 @@ class DutyController(QObject):
             return None
         return indices
 
-    def _resolve_request_action_index(self, request: DutySubmissionRequest) -> int | None:
-        if not self.request_matches_current_session(request):
-            return None
+    def _resolve_request_action_index(
+        self,
+        request: DutySubmissionRequest,
+        *,
+        allow_background_result: bool = False,
+    ) -> int | None:
+        if not (allow_background_result and request.background):
+            if not self.request_matches_current_session(request):
+                return None
         request_target_date = str(request.schedule_data.get("target_date", "") or "").strip()
         if request_target_date != str(self._target_date_text or "").strip():
             return None
@@ -2087,7 +2115,10 @@ class DutyController(QObject):
         result_path: str,
         comparison: Mapping[str, Any] | None = None,
     ) -> bool:
-        action_index = self._resolve_request_action_index(request)
+        action_index = self._resolve_request_action_index(
+            request,
+            allow_background_result=status in {"submitted", "skipped_duplicate"},
+        )
         if action_index is None:
             return False
         self.handle_submission_result(
@@ -2436,6 +2467,7 @@ class DutyController(QObject):
             task_errors=self._task_errors,
             auto_return_indices=frozenset(self._auto_return_indices()),
             manual_waiting_indices=frozenset(self._manual_waiting_indices()),
+            background_return_phases=self._background_return_phases(),
             completed_return_pair_keys=frozenset(self._completed_return_pair_keys),
         )
 

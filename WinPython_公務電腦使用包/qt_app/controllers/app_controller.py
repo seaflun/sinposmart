@@ -613,6 +613,21 @@ class AppController(QObject):
             fallback_date=current.date(),
         )
 
+    def _sync_background_return_status(self) -> None:
+        actions: dict[tuple[str, str], str] = {}
+        for chain in self._background_manual_chains.values():
+            if chain.phase not in {"return_waiting", "return_submitting"}:
+                continue
+            index = chain.return_action_index
+            snapshot = chain.request.schedule_data
+            snapshot_actions = snapshot.get("actions", [])
+            if index is None or not 0 <= index < len(snapshot_actions):
+                continue
+            key = action_completion_key(snapshot_actions[index])
+            target_date = str(snapshot.get("target_date", "") or "")
+            actions[(target_date, key)] = chain.phase
+        self._duty_controller.set_background_return_actions(actions)
+
     def _check_background_manual_chains(self, current: datetime | None = None) -> None:
         if self._worker_admissions_closed or self._background_manual_workers:
             return
@@ -721,6 +736,7 @@ class AppController(QObject):
         chain.active_request_id = request_id
         chain.phase = f"{phase}_submitting"
         chain.prewarmed_phase = ""
+        self._sync_background_return_status()
         if phase == "departure":
             self._duty_controller.release_background_manual_waiting(request)
         if self._duty_execution_controller.enqueue_background(request):
@@ -731,6 +747,7 @@ class AppController(QObject):
                 chain.active_request_id = None
             if chain_id in self._background_manual_chains:
                 chain.phase = f"{phase}_waiting"
+                self._sync_background_return_status()
 
     def _expire_background_manual_chain(
         self,
@@ -814,6 +831,7 @@ class AppController(QObject):
         ):
             chain.phase = "return_waiting"
             chain.prewarmed_phase = ""
+            self._sync_background_return_status()
             return
         self._discard_background_manual_chain(chain_id)
 
@@ -864,6 +882,7 @@ class AppController(QObject):
             if candidate_chain_id == chain_id:
                 self._background_manual_workers.pop(request_id, None)
         chain.request = DutySubmissionRequest("", "", 0, {"target_date": "", "actions": []})
+        self._sync_background_return_status()
 
     @Slot(int)
     def shiftAuditDate(self, days: int) -> None:
@@ -2587,6 +2606,7 @@ class AppController(QObject):
         self._background_manual_timer.stop()
         self._background_manual_chains.clear()
         self._background_manual_workers.clear()
+        self._sync_background_return_status()
 
     @Slot()
     def shutdown(self) -> None:
