@@ -22,6 +22,7 @@ from app_core.update_repository import UpdateCheckError, UpdateRepository, Versi
 from qt_app.workers.update_check_worker import RemoteUpdateWorker, UpdateCheckWorker
 
 DEFERRED_UPDATE_RETRY_INTERVAL_MS = 30_000
+DEFERRED_UPDATE_TIMEOUT_SECONDS = 300
 REMOTE_UPDATE_POLL_INTERVAL_MS = 10_000
 REMOTE_UPDATE_ACTIVE_STATUSES = frozenset(
     {"pending", "preparing", "staged", "waiting_handoff", "applying", "updating"}
@@ -190,6 +191,8 @@ class UpdateController(UpdateWindowState):
         self._status_text = "尚未檢查更新"
         self._update_available = False
         self._update_deferred = False
+        self._deferred_since: float | None = None
+        self._deferred_reason = ""
         self._deferred_retry_timer = QTimer(self)
         self._deferred_retry_timer.setSingleShot(True)
         self._deferred_retry_timer.setInterval(DEFERRED_UPDATE_RETRY_INTERVAL_MS)
@@ -216,6 +219,7 @@ class UpdateController(UpdateWindowState):
         self._remote_update_prepare_process_request_id = ""
         self._remote_update_stage_reported = False
         self._remote_update_apply_inflight = False
+        self._remote_update_apply_process: Any | None = None
         self._remote_status_actions: dict[int, Callable[[], None]] = {}
         self._remote_update_poll_timer = QTimer(self)
         self._remote_update_poll_timer.setInterval(REMOTE_UPDATE_POLL_INTERVAL_MS)
@@ -554,6 +558,13 @@ class UpdateController(UpdateWindowState):
                 if stage_status == "staged":
                     self._remote_update_prepare_process = None
                     self._remote_update_ready = True
+                    if self._remote_update_apply_inflight:
+                        process = self._remote_update_apply_process
+                        if process is not None and process.poll() is not None:
+                            self._fail_remote_update("更新視窗已結束，但尚未收到安裝完成結果。")
+                        return
+                    if self._update_deferred:
+                        return
                     self._status_text = "遠端更新檔已準備，等待交接登出套用。"
                     self._set_remote_state(status="waiting_handoff")
                     if not self._remote_update_stage_reported:
@@ -575,9 +586,14 @@ class UpdateController(UpdateWindowState):
                 self._fail_remote_update("背景更新準備未產生可套用的套件。")
 
     def _launch_remote_apply(self) -> bool:
-        if not self._remote_update_active or not self._remote_update_ready:
+        if self._shutdown_admission or not self._remote_update_active or not self._remote_update_ready:
             return False
         if self._remote_update_apply_inflight:
+            return True
+        block_reason = self._stop_block_reason()
+        if block_reason:
+            self._remote_update_apply_requested = True
+            self.deferUpdate(block_reason)
             return True
         request_id = self._remote_update_request_id
         script_path = self._repository.version_path.with_name("update_package.ps1")
@@ -585,16 +601,26 @@ class UpdateController(UpdateWindowState):
             self._fail_remote_update("找不到遠端更新套用腳本。")
             return False
         self._remote_update_apply_requested = False
+        self._clear_deferred_update()
         self._status_text = "正在登出並套用遠端更新，完成後會自動重啟。"
         self._set_remote_state(status="applying")
         self._remote_update_apply_inflight = True
+        launch_started = False
 
         def launch_apply() -> None:
-            if not self._remote_update_apply_inflight:
+            nonlocal launch_started
+            if (
+                launch_started
+                or not self._remote_update_apply_inflight
+                or self._shutdown_admission
+                or request_id != self._remote_update_request_id
+            ):
                 return
-            self._remote_update_apply_inflight = False
+            launch_started = True
             try:
-                self._remote_process_launcher(script_path, request_id, "ApplyStaged")
+                self._remote_update_apply_process = self._remote_process_launcher(
+                    script_path, request_id, "ApplyStaged"
+                )
             except OSError as exc:
                 self._fail_remote_update(f"無法啟動遠端更新套用：{exc}")
 
@@ -608,19 +634,31 @@ class UpdateController(UpdateWindowState):
         return True
 
     def _finish_remote_update(self, status: str, command: dict[str, Any]) -> None:
+        was_deferred = self._remote_update_active and self._update_deferred
+        if self._remote_update_active:
+            self._clear_deferred_update()
         self._remote_update_command = dict(command)
         self._remote_update_status = status
         self._remote_update_active = False
         self._remote_update_ready = False
         self._remote_update_apply_requested = False
         self._remote_update_apply_inflight = False
+        self._remote_update_apply_process = None
         self._remote_update_stage_reported = False
         detail = str(command.get("detail") or "遠端更新已結束。")
         self._status_text = detail
-        self.stateChanged.emit()
+        if was_deferred and status in {"failed", "timed_out"}:
+            self._show_launch_error(detail)
+        elif was_deferred:
+            self._show_view(visible=False, phase="idle", busy=False)
+        else:
+            self.stateChanged.emit()
 
     def _fail_remote_update(self, detail: str) -> None:
         message = str(detail or "遠端更新準備失敗。")
+        if self._deferred_reason and self._deferred_reason not in message:
+            message += f" 最後等待原因：{self._deferred_reason}。"
+        self._clear_deferred_update()
         request_id = self._remote_update_request_id
         if request_id:
             self._send_remote_status("failed", message)
@@ -629,10 +667,11 @@ class UpdateController(UpdateWindowState):
         self._remote_update_ready = False
         self._remote_update_apply_requested = False
         self._remote_update_apply_inflight = False
+        self._remote_update_apply_process = None
         self._remote_update_stage_reported = False
         self._remote_update_prepare_process = None
         self._status_text = f"{message} 已恢復一般登出。"
-        self.stateChanged.emit()
+        self._show_launch_error(self._status_text)
 
     def _send_remote_status(
         self,
@@ -730,26 +769,32 @@ class UpdateController(UpdateWindowState):
     def deferUpdate(self, block_reason: str) -> None:
         if self._shutdown_admission:
             return
-        if self._update_deferred:
+        reason = str(block_reason or "目前工作尚未結束").strip()
+        if self._update_deferred and reason == self._deferred_reason:
             self._schedule_deferred_retry()
             return
+        if not self._update_deferred:
+            self._deferred_since = time.monotonic()
         self._update_deferred = True
+        self._deferred_reason = reason
         self._status_text = (
-            f"更新已延後：{str(block_reason or '').strip()}；"
-            "工作完成後會自動重試"
+            f"更新已延後：{reason}；工作完成後會自動重試（最多等待 5 分鐘）"
         )
+        if self._remote_update_active:
+            self._set_remote_state(status="waiting_handoff")
+            self._send_remote_status("waiting_handoff", self._status_text)
         self.stateChanged.emit()
         self.errorOccurred.emit(self._status_text)
         self._show_view(
             visible=True, phase="deferred", title="更新已延後",
-            subtitle=str(block_reason or "目前工作尚未結束"),
-            detail="目前工作完成後會自動重試更新。",
+            subtitle=reason,
+            detail="目前工作完成後會自動重試更新；超過 5 分鐘會停止等待並保留目前程式。",
             progress=-1, busy=False, canInstall=False, footer="目前程式會繼續保持開啟。",
         )
         self._schedule_deferred_retry()
 
     def _schedule_deferred_retry(self) -> None:
-        if self._shutdown_admission or not self._update_available:
+        if self._shutdown_admission:
             return
         if not self._deferred_retry_timer.isActive():
             self._deferred_retry_timer.start()
@@ -759,23 +804,48 @@ class UpdateController(UpdateWindowState):
         if self._shutdown_admission or not self._update_deferred:
             self._deferred_retry_timer.stop()
             return
-        if not self._update_available:
-            self._update_deferred = False
-            self._deferred_retry_timer.stop()
+        if self._remote_update_active:
+            self._check_remote_stage()
+            if not self._remote_update_active:
+                return
+        if self._remote_update_apply_inflight or self._install_launched:
+            # The existing installer owns the busy handshake and its timeout.
+            # Never spawn another installer while that attempt is still alive.
+            self._schedule_deferred_retry()
+            return
+        remote_pending = self._remote_update_active and self._remote_update_apply_requested
+        if not remote_pending and not self._update_available:
+            self._clear_deferred_update()
             self.stateChanged.emit()
             return
         block_reason = self._stop_block_reason()
         if block_reason:
-            self._status_text = (
-                f"更新已延後：{block_reason}；工作完成後會自動重試"
-            )
-            self.stateChanged.emit()
-            self._deferred_retry_timer.start()
+            if (
+                self._deferred_since is not None
+                and time.monotonic() - self._deferred_since >= DEFERRED_UPDATE_TIMEOUT_SECONDS
+            ):
+                message = f"更新等待超過 5 分鐘：{block_reason}。請待工作結束後重新嘗試。"
+                if remote_pending:
+                    self._fail_remote_update(message)
+                else:
+                    self._clear_deferred_update()
+                    self._status_text = message
+                    self._show_launch_error(message)
+                return
+            self.deferUpdate(block_reason)
             return
-        self._update_deferred = False
-        self._deferred_retry_timer.stop()
+        self._clear_deferred_update()
         self.stateChanged.emit()
-        self.launchUpdate()
+        if remote_pending:
+            self._launch_remote_apply()
+        else:
+            self.launchUpdate()
+
+    def _clear_deferred_update(self) -> None:
+        self._update_deferred = False
+        self._deferred_since = None
+        self._deferred_reason = ""
+        self._deferred_retry_timer.stop()
 
     def _stop_block_reason(self) -> str:
         if self._stop_guard is None:
@@ -897,6 +967,7 @@ UPDATE_PHASE_TEXT = {
     "backup": "正在備份目前版本…",
     "extracting": "正在解壓縮更新檔案…",
     "closing": "正在安全登出並關閉主程式…",
+    "waiting_idle": "目前工作尚未結束，完成後會接續更新（最多等待 5 分鐘）…",
     "installing": "正在安裝更新檔案…",
     "setup": "正在準備執行環境，可能需要一些時間…",
     "environment": "正在檢查執行環境…",
@@ -909,6 +980,8 @@ UPDATE_INSTANCE_SERVER = "TYFD.SinpoSmart.DutyAutomation.Qt"
 
 class UpdateProgressController(UpdateWindowState):
     """Read installer progress without tying the window to the duty GUI lifetime."""
+
+    installerFinished = Signal()
 
     def __init__(self, script_path: Path, state_dir: Path, parent: QObject | None = None, *, request_id: str = "") -> None:
         super().__init__(parent)
@@ -1004,6 +1077,7 @@ class UpdateProgressController(UpdateWindowState):
 
     def process_finished(self, exit_code: int) -> None:
         self._exit_code = exit_code
+        self.installerFinished.emit()
         if exit_code != 0:
             self._fail("這次更新未完成。", "請查看更新紀錄；若主程式未開啟，請手動重新開啟。")
         elif self._view["phase"] == "current":
@@ -1106,6 +1180,7 @@ def run_update_window(arguments: list[str] | None = None) -> int:
             controller._fail("另一個更新視窗正在處理更新。", "請等待原本的更新視窗完成。")
             (directory / "window-ready").write_text("ready", encoding="ascii")
             return app.exec()
+        controller.installerFinished.connect(app.update_lock.unlock)
         # Start only after the first rendered frame, so the progress window exists
         # before the updater can ask the main GUI to exit.
         def begin_install() -> None:

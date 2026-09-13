@@ -6000,13 +6000,24 @@ class UpdateControllerTests(unittest.TestCase):
             controller._poll_timer.stop()
 
     def test_installer_abnormal_exit_is_visible_and_dismissible(self) -> None:
+        from PySide6.QtCore import QLockFile
         from qt_app.controllers.update_controller import UpdateProgressController
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             controller = UpdateProgressController(root / "update_package.ps1", root)
+            install_lock = QLockFile(str(root / "install.lock"))
+            next_attempt = QLockFile(str(root / "install.lock"))
+            self.assertTrue(install_lock.tryLock(0))
+            controller.installerFinished.connect(install_lock.unlock)
+            self.assertFalse(next_attempt.tryLock(0))
+            controller.accept_progress({"phase": "waiting_idle", "percent": 58})
+            self.assertTrue(controller.updateView["busy"])
+            self.assertIn("5 分鐘", controller.updateView["detail"])
             controller.accept_progress({"phase": "setup", "percent": 85})
             controller.process_finished(1)
+            self.assertTrue(next_attempt.tryLock(0))
+            next_attempt.unlock()
             self.assertEqual(controller.updateView["phase"], "failed")
             self.assertLess(controller.updateView["progress"], 100)
             self.assertFalse(controller.updateView["busy"])
@@ -6288,6 +6299,155 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(launched, [script_path])
             self.assertIn("已開啟更新程式", controller.statusText)
             controller.shutdown()
+
+    def test_remote_update_terminal_result_releases_deferred_check(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.09.13.1901", encoding="utf-8")
+            for status in ("failed", "timed_out", "completed", "up_to_date"):
+                with self.subTest(status=status):
+                    fetched = []
+                    controller = UpdateController(
+                        UpdateRepository(version_path, text_fetcher=lambda *_args: fetched.append(True) or "2026.09.13.2051"),
+                        remote_update_enabled=False,
+                    )
+                    try:
+                        controller._remote_update_active = True
+                        controller._remote_update_request_id = "terminal-test"
+                        controller.deferUpdate("後台狀態正在同步")
+                        if status == "failed":
+                            controller._fail_remote_update("更新程序失敗")
+                        else:
+                            controller._finish_remote_update(status, {"status": status})
+                        controller.dismissUpdateWindow()
+                        controller.check()
+                        for _ in range(100):
+                            if fetched and not controller.isChecking:
+                                break
+                            QTest.qWait(10)
+                        self.assertTrue(fetched)
+                        self.assertFalse(controller.updateDeferred)
+                        self.assertFalse(controller._deferred_retry_timer.isActive())
+                    finally:
+                        controller.shutdown()
+
+    def test_remote_update_waits_for_busy_work_then_launches_same_request_once(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            version_path = Path(temp_dir) / "VERSION.txt"
+            version_path.write_text("2026.09.13.1901", encoding="utf-8")
+            version_path.with_name("update_package.ps1").write_text("# fixture", encoding="utf-8")
+            launched, reports = [], []
+            busy = ["救護行車紀錄器處理尚未完成"]
+            controller = UpdateController(
+                UpdateRepository(version_path), remote_update_enabled=False,
+                stop_guard=lambda: busy[0],
+                remote_process_launcher=lambda _path, request_id, phase: launched.append((request_id, phase)) or SimpleNamespace(poll=lambda: None),
+            )
+            controller._send_remote_status = lambda status, detail, **_kw: reports.append((status, detail)) or False
+            try:
+                controller._remote_update_active = True
+                controller._remote_update_request_id = "one-request"
+                manifest = controller._remote_update_manifest_path("one-request")
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"request_id": "one-request", "status": "staged"}), encoding="utf-8")
+                self.assertTrue(controller.applyRemoteUpdate())
+                self.assertEqual(launched, [])
+                self.assertTrue(controller.updateDeferred)
+                self.assertTrue(controller._deferred_retry_timer.isActive())
+                self.assertTrue(any(busy[0] in detail for _status, detail in reports))
+                controller._retry_deferred_update()
+                self.assertEqual(launched, [])
+                busy[0] = ""
+                controller._retry_deferred_update()
+                controller._check_remote_stage()
+                controller.applyRemoteUpdate()
+                self.assertEqual(launched, [("one-request", "ApplyStaged")])
+                self.assertFalse(controller.updateDeferred)
+                self.assertEqual(controller.remoteUpdateStatus, "applying")
+            finally:
+                controller.shutdown()
+
+    def test_remote_update_busy_timeout_releases_check_and_preserves_reason(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers import update_controller as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version = Path(temp_dir) / "VERSION.txt"
+            version.write_text("2026.09.13.1901", encoding="utf-8")
+            reports, launched = [], []
+            controller = module.UpdateController(
+                UpdateRepository(version), remote_update_enabled=False,
+                stop_guard=lambda: "救護行車紀錄器處理尚未完成",
+                remote_process_launcher=lambda *_args: launched.append(True),
+            )
+            controller._send_remote_status = lambda status, detail, **_kw: reports.append((status, detail)) or False
+            try:
+                controller._remote_update_active = True
+                controller._remote_update_ready = True
+                controller._remote_update_request_id = "timeout-test"
+                with patch.object(module.time, "monotonic", return_value=100):
+                    self.assertTrue(controller.applyRemoteUpdate())
+                with patch.object(module.time, "monotonic", return_value=401):
+                    controller._retry_deferred_update()
+                self.assertEqual(launched, [])
+                self.assertFalse(controller.remoteUpdateActive)
+                self.assertFalse(controller.updateDeferred)
+                self.assertFalse(controller._deferred_retry_timer.isActive())
+                self.assertEqual(reports[-1][0], "failed")
+                self.assertIn("救護行車紀錄器", reports[-1][1])
+                self.assertIn("5 分鐘", controller.statusText)
+                self.assertEqual(controller.logoutActionText, "登出")
+            finally:
+                controller.shutdown()
+
+    def test_remote_installer_owns_busy_handshake_without_duplicate_process(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            version = Path(temp_dir) / "VERSION.txt"
+            version.write_text("2026.09.13.1901", encoding="utf-8")
+            version.with_name("update_package.ps1").write_text("# fixture", encoding="utf-8")
+            launched, callbacks = [], []
+            controller = UpdateController(
+                UpdateRepository(version), remote_update_enabled=False,
+                remote_process_launcher=lambda *_args: launched.append(True) or SimpleNamespace(poll=lambda: None),
+            )
+            def report(_status, _detail, **actions):
+                if actions.get("after_success"):
+                    callbacks.append(actions["after_success"])
+                return True
+            controller._send_remote_status = report
+            try:
+                controller._remote_update_active = True
+                controller._remote_update_request_id = "race-test"
+                manifest = controller._remote_update_manifest_path("race-test")
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"request_id": "race-test", "status": "staged"}), encoding="utf-8")
+                controller.applyRemoteUpdate()
+                controller.applyRemoteUpdate()
+                self.assertEqual(len(callbacks), 1)
+                callbacks[0]()
+                callbacks[0]()
+                controller.deferUpdate("後台狀態正在同步")
+                controller._retry_deferred_update()
+                controller._check_remote_stage()
+                self.assertEqual(launched, [True])
+                self.assertTrue(controller.updateDeferred)
+                manifest.write_text(json.dumps({"request_id": "race-test", "status": "failed", "detail": "更新等待超過 5 分鐘"}), encoding="utf-8")
+                controller._check_remote_stage()
+                self.assertFalse(controller.updateDeferred)
+                self.assertFalse(controller.remoteUpdateActive)
+                self.assertIn("後台狀態正在同步", controller.statusText)
+            finally:
+                controller.shutdown()
 
     def test_update_controller_emits_update_prompt_or_completed_status(self) -> None:
         from PySide6.QtTest import QSignalSpy

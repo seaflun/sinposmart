@@ -87,6 +87,40 @@ def legacy_duty_sheet_module():
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_updater_busy_handshake_wait_is_bounded_and_preserves_process_identity(self) -> None:
+        source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("function Wait-UpdateLogoutEvent", source)
+        helper = source[source.index("function Wait-UpdateLogoutEvent"):source.index("function Stop-RunningDutyGui")]
+        for responses, identities, timeout, expected, calls in (
+            (["busy", "busy", "ready"], [123, 123, 123], 300, "ready", 3),
+            (["busy"], [123], 0, "busy_timeout", 1),
+            (["failed"], [123], 300, "failed", 1),
+            (["timeout"], [123], 300, "timeout", 1),
+            (["busy", "ready"], [123, 456], 300, "failed", 1),
+        ):
+            with self.subTest(responses=responses, identities=identities):
+                replies = ",".join(f"'{value}'" for value in responses)
+                pids = ",".join(str(value) for value in identities)
+                result = run_powershell_contract(f"""
+$ErrorActionPreference = 'Stop'
+{helper}
+$script:responses = @({replies})
+$script:identities = @({pids})
+$script:calls = 0
+$script:queries = 0
+function Send-UpdateLogoutEvent {{ $script:calls++; return $script:responses[$script:calls - 1] }}
+function Get-RunningDutyGuiProcesses {{
+    $script:queries++
+    return @([pscustomobject]@{{ ProcessId = $script:identities[$script:queries - 1] }})
+}}
+function Test-IsQtDutyGuiProcess {{ return $true }}
+function Write-UpdateProgress {{ }}
+function Start-Sleep {{ }}
+$result = Wait-UpdateLogoutEvent -ExpectedProcessId 123 -TimeoutSeconds {timeout}
+if ($result -ne '{expected}' -or $script:calls -ne {calls}) {{ throw "Unexpected result: $result, calls: $script:calls" }}
+""" )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_hidden_python_discovery_preserves_chinese_paths(self) -> None:
         source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
         hidden = source[source.index("function Invoke-HiddenProcess"):source.index("function Start-DutyGui")]
@@ -160,7 +194,20 @@ $remoteSha256Url = '{url}/sha'
 $remoteZipUrl = '{url}/package'
 $AssumeYes = $true
 $RestartAfterUpdate = $true
-function Get-RunningDutyGuiProcesses {{ return @() }}
+function Get-RunningDutyGuiProcesses {{ return @([pscustomobject]@{{ ProcessId = 123 }}) }}
+function Test-IsQtDutyGuiProcess {{ return $true }}
+$script:prepareCalls = 0
+function Send-UpdateLogoutEvent {{
+    $script:prepareCalls++
+    if (Test-Path -LiteralPath (Join-Path $packageDir 'fixture-marker.txt')) {{ throw 'Copied before ready.' }}
+    if ($script:prepareCalls -lt 3) {{ return 'busy' }}
+    return 'ready'
+}}
+function Start-Sleep {{ }}
+function Stop-RunningDutyGui {{
+    if ($script:prepareCalls -ne 3) {{ throw 'Stopped without waiting for ready.' }}
+    return $true
+}}
 function Invoke-SetupAfterUpdate {{ Write-UpdateProgress -Phase 'setup' -Percent 85 }}
 function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
 """
@@ -4146,7 +4193,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("-ExpectedProcessId $handshakenProcessId", install_section)
         self.assertLess(
             install_section.index("$runningDutyGuiProcesses.Count -ne 1"),
-            install_section.index("Send-UpdateLogoutEvent"),
+            install_section.index("Wait-UpdateLogoutEvent"),
         )
         self.assertLess(
             install_section.index('$prepareResult -ne "ready"'),

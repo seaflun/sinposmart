@@ -282,6 +282,30 @@ function Send-UpdateLogoutEvent {
     }
 }
 
+function Wait-UpdateLogoutEvent {
+    param([int]$ExpectedProcessId, [int]$TimeoutSeconds = 300)
+
+    $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        # Recheck identity before every handshake; never prepare a replacement GUI.
+        $currentGui = @(Get-RunningDutyGuiProcesses)
+        if ($currentGui.Count -ne 1 -or $ExpectedProcessId -le 0 -or
+            [int]$currentGui[0].ProcessId -ne $ExpectedProcessId -or
+            -not (Test-IsQtDutyGuiProcess -Process $currentGui[0])) {
+            return "failed"
+        }
+        $result = Send-UpdateLogoutEvent
+        if ($result -ne "busy") {
+            return $result
+        }
+        if ($waitClock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            return "busy_timeout"
+        }
+        Write-UpdateProgress -Phase "waiting_idle" -Percent 58
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Stop-RunningDutyGui {
     param(
         [object[]]$Processes = @(),
@@ -838,7 +862,10 @@ try {
             throw "Update postponed because the running SinpoSmart GUI is not the Qt duty_gui.pyw app. No process was stopped."
         }
         $handshakenProcessId = [int]$runningQtProcess.ProcessId
-        $prepareResult = Send-UpdateLogoutEvent
+        $prepareResult = Wait-UpdateLogoutEvent -ExpectedProcessId $handshakenProcessId
+        if ($prepareResult -eq "busy_timeout") {
+            throw "更新等待超過 5 分鐘，工作仍未結束；已停止本次更新，原程式保持開啟。"
+        }
         if ($prepareResult -ne "ready") {
             throw "Update postponed because the running SinpoSmart app did not report ready ($prepareResult). The app remains open."
         }
