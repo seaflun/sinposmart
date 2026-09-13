@@ -32,16 +32,6 @@ Item {
         dailyVehicleConfirmation.open()
     }
 
-    function openUpdateConfirmation() {
-        updateConfirmation.open()
-    }
-
-    function openUpdateStatus(message) {
-        statusDialogTitle = "檢查更新"
-        updateStatusText = String(message || "檢查更新完成。")
-        updateStatusDialog.open()
-    }
-
     function openDiagnosticsStatus(message) {
         statusDialogTitle = "問題包"
         updateStatusText = String(message || "問題包處理完成。")
@@ -83,24 +73,6 @@ Item {
         Label {
             width: parent.width
             text: actionConfirmations.backend.dutyController.externalReturnConfirmationSummary
-            color: actionConfirmations.hostWindow.ink
-            wrapMode: Text.Wrap
-        }
-    }
-
-    AppleDialog {
-        id: updateConfirmation
-        anchors.centerIn: parent
-        width: Math.min(actionConfirmations.hostWindow.width - 72, 520)
-        modal: true
-        title: "確認安裝更新"
-        standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "開始更新"
-        onAccepted: actionConfirmations.backend.updateController.launchUpdate()
-
-        Label {
-            width: parent.width
-            text: "將開啟更新視窗。更新程式可能關閉背景程式、安裝需求套件並重新啟動 SinpoSmart，是否繼續？"
             color: actionConfirmations.hostWindow.ink
             wrapMode: Text.Wrap
         }

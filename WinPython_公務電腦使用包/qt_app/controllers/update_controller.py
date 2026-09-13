@@ -7,7 +7,10 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -28,22 +31,84 @@ REMOTE_UPDATE_TERMINAL_STATUSES = frozenset(
 )
 
 
-def launch_update_process(script_path: Path) -> Any:
+def create_update_run_directory() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SinpoSmart" / "update_progress"
+    directory = root / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=False)
+    return directory
+
+
+def launch_update_process(script_path: Path, *, request_id: str = "") -> Any:
+    """The QML host survives the duty GUI; it alone starts the hidden installer."""
+    directory = create_update_run_directory()
+    python = Path(sys.executable)
+    if python.with_name("pythonw.exe").is_file():
+        python = python.with_name("pythonw.exe")
     command = [
-        "powershell",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(script_path),
-        "-AssumeYes",
+        str(python), "-m", "qt_app.controllers.update_controller",
+        "--install", str(script_path.resolve()), "--state-dir", str(directory),
     ]
-    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-    return subprocess.Popen(command, cwd=str(script_path.parent), creationflags=creationflags)
+    if request_id:
+        command.extend(["--request-id", request_id])
+    with (directory / "window.log").open("ab") as output:
+        process = subprocess.Popen(
+            command, cwd=str(script_path.parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+        )
+    process.update_state_dir = directory
+    return process
+
+
+class UpdateWindowState(QObject):
+    viewChanged = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._view = {
+            "visible": False, "phase": "idle", "title": "檢查更新",
+            "subtitle": "", "detail": "", "progress": -1,
+            "busy": False, "canInstall": False,
+            "footer": "", "diagnosticPath": "",
+        }
+
+    @Property("QVariantMap", notify=viewChanged)
+    def updateView(self) -> dict:
+        return dict(self._view)
+
+    @Property(bool, constant=True)
+    def reducedMotion(self) -> bool:
+        if os.name == "nt":
+            import ctypes
+            enabled = ctypes.c_int(1)
+            if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0):
+                return not enabled.value
+        return False
+
+    def _show_view(self, **values: Any) -> None:
+        self._view.update(values)
+        self.viewChanged.emit()
+
+    @Slot()
+    def dismissUpdateWindow(self) -> None:
+        if not self._view["busy"]:
+            self._show_view(visible=False)
+
+    @Slot()
+    def openUpdateDiagnostics(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        path = self._view["diagnosticPath"]
+        if path and Path(path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
 
 def launch_remote_update_process(script_path: Path, request_id: str, phase: str) -> Any:
     """Run one remote update phase without a console window or user prompt."""
+
+    if phase == "ApplyStaged":
+        return launch_update_process(script_path, request_id=request_id)
 
     command = [
         "powershell",
@@ -99,7 +164,7 @@ def _remote_update_worker_id() -> str:
     )
 
 
-class UpdateController(QObject):
+class UpdateController(UpdateWindowState):
     stateChanged = Signal()
     errorOccurred = Signal(str)
     updateReady = Signal(str)
@@ -156,6 +221,12 @@ class UpdateController(QObject):
         self._remote_update_poll_timer.setInterval(REMOTE_UPDATE_POLL_INTERVAL_MS)
         self._remote_update_poll_timer.timeout.connect(self._poll_remote_update)
         self._shutdown_admission = False
+        self._install_launched = False
+        self._update_process = None
+        self._update_window_started = False
+        self._launch_timer = QTimer(self)
+        self._launch_timer.setInterval(150)
+        self._launch_timer.timeout.connect(self._check_update_window_started)
         try:
             self._current_version = repository.current_version()
         except UpdateCheckError as exc:
@@ -163,6 +234,10 @@ class UpdateController(QObject):
         if self._remote_update_enabled:
             self._remote_update_poll_timer.start()
             QTimer.singleShot(0, self._poll_remote_update)
+
+    def _show_view(self, **values: Any) -> None:
+        super()._show_view(**values)
+        self.stateChanged.emit()
 
     @Property(str, notify=stateChanged)
     def currentVersion(self) -> str:
@@ -228,12 +303,17 @@ class UpdateController(QObject):
 
     @Slot()
     def check(self) -> None:
-        if self._shutdown_admission or self._update_deferred or self._workers:
+        if self._shutdown_admission or self._update_deferred or self._workers or self._install_launched:
             return
         self._request_id += 1
         request_id = self._request_id
         self._status_text = "正在檢查更新…"
-        self.stateChanged.emit()
+        self._show_view(
+            visible=True, phase="checking", title="正在檢查更新",
+            subtitle="正在確認是否有可用的新版本", detail=self._status_text,
+            progress=-1, busy=True, canInstall=False, footer="請稍候，檢查完成後會顯示結果。",
+            diagnosticPath="",
+        )
 
         worker = UpdateCheckWorker(request_id, self._repository)
         thread = QThread(self)
@@ -248,7 +328,7 @@ class UpdateController(QObject):
 
     @Slot()
     def launchUpdate(self) -> None:
-        if self._update_deferred:
+        if self._update_deferred or self._install_launched or self._shutdown_admission:
             return
         if not self._update_available:
             self._status_text = "目前沒有可安裝的新版。"
@@ -264,17 +344,58 @@ class UpdateController(QObject):
             self._status_text = message
             self.stateChanged.emit()
             self.errorOccurred.emit(message)
+            self._show_launch_error(message)
             return
         try:
-            self._process_launcher(script_path)
+            self._update_process = self._process_launcher(script_path)
         except OSError as exc:
             message = f"無法啟動更新程式：{exc}"
             self._status_text = message
             self.stateChanged.emit()
             self.errorOccurred.emit(message)
+            self._show_launch_error("無法開啟更新視窗，請稍後再試。")
             return
+        self._install_launched = True
         self._status_text = "已開啟更新程式，請依更新視窗完成操作。"
-        self.stateChanged.emit()
+        self._show_view(
+            visible=True, phase="launching", title="正在準備更新",
+            subtitle="即將開啟更新進度視窗", detail="正在啟動更新程式…",
+            progress=-1, busy=True, canInstall=False,
+            footer="更新期間無法取消或暫停，請勿關閉電腦。",
+        )
+        if self._update_process is not None:
+            self._launch_timer.start()
+
+    def _show_launch_error(self, message: str) -> None:
+        self._show_view(
+            visible=True, phase="failed", title="無法開始更新",
+            subtitle=message, detail="本次更新未開始。", progress=-1,
+            busy=False, canInstall=False, footer="關閉此視窗後，可稍後重新檢查。",
+        )
+
+    def _check_update_window_started(self) -> None:
+        process = self._update_process
+        directory = getattr(process, "update_state_dir", None)
+        if not self._update_window_started and directory is not None and (directory / "window-ready").is_file():
+            self._update_window_started = True
+            self._show_view(visible=False)
+        code = process.poll()
+        if code is not None:
+            self._launch_timer.stop()
+            self._install_launched = False
+            if not self._update_window_started:
+                self._show_launch_error("更新視窗未能啟動，請查看紀錄後再試。")
+            elif code != 0:
+                self._show_view(visible=True, phase="failed", title="更新視窗意外關閉",
+                                subtitle="請查看更新紀錄，確認目前安裝狀態。", busy=False,
+                                detail="若主程式未開啟，請手動重新開啟。", canInstall=False)
+            else:
+                self._status_text = "更新視窗已關閉，可重新檢查更新。"
+                self.stateChanged.emit()
+            self._update_window_started = False
+            if directory is not None and self._view["visible"]:
+                log = "installer.log" if (directory / "installer.log").is_file() else "window.log"
+                self._show_view(diagnosticPath=str(directory / log))
 
     @Slot(result=bool)
     def applyRemoteUpdate(self) -> bool:
@@ -619,6 +740,12 @@ class UpdateController(QObject):
         )
         self.stateChanged.emit()
         self.errorOccurred.emit(self._status_text)
+        self._show_view(
+            visible=True, phase="deferred", title="更新已延後",
+            subtitle=str(block_reason or "目前工作尚未結束"),
+            detail="目前工作完成後會自動重試更新。",
+            progress=-1, busy=False, canInstall=False, footer="目前程式會繼續保持開啟。",
+        )
         self._schedule_deferred_retry()
 
     def _schedule_deferred_retry(self) -> None:
@@ -670,7 +797,14 @@ class UpdateController(QObject):
             if info.update_available
             else "目前已是最新版"
         )
-        self.stateChanged.emit()
+        self._show_view(
+            visible=True, phase="available" if info.update_available else "current",
+            title="有新版本可以更新" if info.update_available else "目前已是最新版",
+            subtitle=f"目前版本 {info.current_version}",
+            detail=f"最新版本 {info.latest_version}", progress=-1, busy=False,
+            canInstall=info.update_available,
+            footer="更新會先安全登出，完成後自動開啟登入畫面。" if info.update_available else "你可以繼續使用 SinpoSmart。",
+        )
         if info.update_available:
             self.updateReady.emit(info.latest_version)
         else:
@@ -683,7 +817,20 @@ class UpdateController(QObject):
         self._latest_version = ""
         self._update_available = False
         self._status_text = message
-        self.stateChanged.emit()
+        diagnostic_path = ""
+        try:
+            diagnostic = create_update_run_directory() / "check.log"
+            diagnostic.write_text(message, encoding="utf-8")
+            diagnostic_path = str(diagnostic)
+        except OSError:
+            pass
+        self._show_view(
+            visible=True, phase="failed", title="暫時無法檢查更新",
+            subtitle="請確認網路連線後再試。", detail="目前程式可以繼續使用。",
+            progress=-1, busy=False, canInstall=False,
+            footer="關閉此視窗後，可稍後重新檢查。",
+            diagnosticPath=diagnostic_path,
+        )
         self.errorOccurred.emit(message)
 
     @Slot(int)
@@ -725,6 +872,7 @@ class UpdateController(QObject):
     @Slot()
     def shutdown(self) -> None:
         self.prepare_shutdown_admission()
+        self._launch_timer.stop()
         for request_id, (thread, _worker) in tuple(self._workers.items()):
             thread.requestInterruption()
             thread.quit()
@@ -740,3 +888,235 @@ class UpdateController(QObject):
             self._finalize_remote_worker(request_id)
             thread.deleteLater()
         self._remote_status_actions.clear()
+
+
+UPDATE_PHASE_TEXT = {
+    "checking": "正在確認更新版本…",
+    "downloading": "正在下載更新檔案…",
+    "verifying": "正在驗證更新檔案…",
+    "backup": "正在備份目前版本…",
+    "extracting": "正在解壓縮更新檔案…",
+    "closing": "正在安全登出並關閉主程式…",
+    "installing": "正在安裝更新檔案…",
+    "setup": "正在準備執行環境，可能需要一些時間…",
+    "environment": "正在檢查執行環境…",
+    "restarting": "正在重新開啟登入畫面…",
+    "installed": "正在確認登入畫面已開啟…",
+    "current": "目前已是最新版",
+}
+UPDATE_INSTANCE_SERVER = "TYFD.SinpoSmart.DutyAutomation.Qt"
+
+
+class UpdateProgressController(UpdateWindowState):
+    """Read installer progress without tying the window to the duty GUI lifetime."""
+
+    def __init__(self, script_path: Path, state_dir: Path, parent: QObject | None = None, *, request_id: str = "") -> None:
+        super().__init__(parent)
+        from PySide6.QtNetwork import QLocalSocket
+
+        self._script_path = script_path.resolve()
+        self._request_id = request_id
+        self._state_dir = state_dir
+        self._status_path = state_dir / "progress.json"
+        self._process = None
+        self._exit_code = None
+        self._expected_pid = 0
+        self._waiting_since = None
+        self._socket = QLocalSocket(self)
+        self._socket.connected.connect(lambda: self._socket.write(
+            b"update_status_handoff\n" if self._request_id else b"update_status\n"
+        ))
+        self._socket.readyRead.connect(self._read_ready_response)
+        self._socket.errorOccurred.connect(lambda _error: self._socket.abort())
+        self._reply = bytearray()
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(200)
+        self._poll_timer.timeout.connect(self.poll)
+        self._show_view(
+            visible=True, phase="checking", title="正在更新，請稍候",
+            subtitle="完成後將自動重新開啟值班台" if request_id else "完成後將自動開啟登入畫面",
+            detail=UPDATE_PHASE_TEXT["checking"],
+            progress=0, busy=True, canInstall=False,
+            footer="更新期間無法取消或暫停，請勿關閉電腦。",
+            diagnosticPath=str(state_dir / "installer.log"),
+        )
+
+    @Slot()
+    def start(self) -> None:
+        if self._process is not None or self._exit_code is not None:
+            return
+        command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(self._script_path), "-AssumeYes", "-RestartAfterUpdate",
+                   "-ProgressPath", str(self._status_path)]
+        if self._request_id:
+            command.extend(["-ApplyStaged", "-RequestId", self._request_id])
+        try:
+            with (self._state_dir / "installer.log").open("ab") as output:
+                self._process = subprocess.Popen(
+                    command,
+                    cwd=str(self._script_path.parent),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                )
+        except OSError as exc:
+            (self._state_dir / "installer.log").write_text(str(exc), encoding="utf-8")
+            self.process_finished(1)
+            return
+        self._poll_timer.start()
+
+    def accept_progress(self, record: Any) -> None:
+        if not isinstance(record, dict) or self._exit_code is not None:
+            return
+        phase = record.get("phase")
+        percent = record.get("percent")
+        if phase not in UPDATE_PHASE_TEXT or type(percent) is not int or not 0 <= percent <= 100:
+            return
+        if percent < self._view["progress"]:
+            return
+        if phase == "installed":
+            pid = record.get("pid")
+            if type(pid) is not int or pid <= 0:
+                return
+            self._expected_pid = pid
+        self._show_view(phase=phase, progress=min(percent, 98), detail=UPDATE_PHASE_TEXT[phase])
+
+    def poll(self) -> None:
+        if self._exit_code is None:
+            try:
+                self.accept_progress(json.loads(self._status_path.read_text(encoding="utf-8-sig")))
+            except (OSError, ValueError):
+                pass  # A missing/in-flight status never turns into success.
+            if self._process is not None:
+                code = self._process.poll()
+                if code is not None:
+                    try:
+                        self.accept_progress(json.loads(self._status_path.read_text(encoding="utf-8-sig")))
+                    except (OSError, ValueError):
+                        pass
+                    self.process_finished(code)
+        if self._waiting_since is not None:
+            if time.monotonic() - self._waiting_since >= 60:
+                self._fail("更新檔案已安裝，但尚未確認登入畫面。", "請手動開啟 SinpoSmart，並查看更新紀錄。")
+            elif self._socket.state() == self._socket.LocalSocketState.UnconnectedState:
+                self._reply.clear()
+                self._socket.connectToServer(UPDATE_INSTANCE_SERVER)
+                QTimer.singleShot(180, self._socket.abort)
+
+    def process_finished(self, exit_code: int) -> None:
+        self._exit_code = exit_code
+        if exit_code != 0:
+            self._fail("這次更新未完成。", "請查看更新紀錄；若主程式未開啟，請手動重新開啟。")
+        elif self._view["phase"] == "current":
+            self._poll_timer.stop()
+            self._show_view(title="目前已是最新版", subtitle="不需要安裝更新。", busy=False,
+                            progress=-1, footer="你可以繼續使用 SinpoSmart。")
+        elif self._view["phase"] == "installed" and self._expected_pid > 0:
+            self._waiting_since = time.monotonic()
+            self._poll_timer.start()
+        else:
+            self._fail("未收到完整的更新結果。", "請查看更新紀錄，確認目前安裝狀態。")
+
+    def _read_ready_response(self) -> None:
+        self._reply.extend(bytes(self._socket.readAll()))
+        if b"\n" in self._reply:
+            self.confirm_window_ready(self._reply.decode("utf-8", errors="replace").strip())
+            self._socket.abort()
+
+    def confirm_window_ready(self, response: str) -> None:
+        if self._waiting_since is None or response != f"ready:{self._expected_pid}":
+            return
+        self._waiting_since = None
+        self._poll_timer.stop()
+        self._show_view(phase="completed", title="更新完成",
+                        subtitle="值班台已重新開啟。" if self._request_id else "登入畫面已開啟。",
+                        detail="可以開始使用 SinpoSmart。", progress=100, busy=False,
+                        footer="此視窗將自動關閉。")
+        QTimer.singleShot(900, self.dismissUpdateWindow)
+
+    def _fail(self, subtitle: str, detail: str) -> None:
+        self._waiting_since = None
+        self._poll_timer.stop()
+        self._socket.abort()
+        self._show_view(phase="failed", title="更新需要處理", subtitle=subtitle, detail=detail,
+                        busy=False, footer="更新程序已結束，可以關閉此視窗。")
+
+
+def run_update_window(arguments: list[str] | None = None) -> int:
+    """Independent window mode in the existing module; never imports the duty app."""
+    import argparse
+    from PySide6.QtCore import QLockFile, QUrl
+    from PySide6.QtGui import QCursor, QFont, QFontDatabase, QIcon
+    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuick import QQuickWindow
+    from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtWidgets import QApplication
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--install", type=Path)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--request-id", default="")
+    options = parser.parse_args(arguments)
+    package_root = Path(__file__).resolve().parents[2]
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName("SinpoSmart 更新")
+    app.setQuitOnLastWindowClosed(False)
+    if (package_root / "duty_tray_icon.ico").is_file():
+        app.setWindowIcon(QIcon(str(package_root / "duty_tray_icon.ico")))
+    if not any(family in QFontDatabase.families() for family in ("Microsoft JhengHei UI", "Microsoft JhengHei")):
+        font_path = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msjh.ttc"
+        if font_path.is_file():
+            QFontDatabase.addApplicationFont(str(font_path))
+    for family in ("SF Pro Text", "Microsoft JhengHei UI", "Microsoft JhengHei"):
+        if family in QFontDatabase.families():
+            app.setFont(QFont(family))
+            break
+    QQuickStyle.setStyle("Basic")
+    if options.install or options.preview:
+        directory = options.state_dir or create_update_run_directory()
+        controller = UpdateProgressController(options.install or package_root / "update_package.ps1", directory,
+                                              request_id=options.request_id)
+    else:
+        controller = UpdateController(UpdateRepository(package_root / "VERSION.txt"), remote_update_enabled=False)
+        controller._show_view(visible=True)
+        app.aboutToQuit.connect(controller.shutdown)
+    engine = QQmlApplicationEngine()
+    engine.setInitialProperties({"controller": controller})
+    qml = Path(__file__).resolve().parents[1] / "qml" / "dialogs" / "UpdateProgressWindow.qml"
+    engine.load(QUrl.fromLocalFile(str(qml)))
+    if not engine.rootObjects():
+        return 1
+    window: QQuickWindow = engine.rootObjects()[0]
+    screen = app.screenAt(QCursor.pos()) or app.primaryScreen()
+    available = screen.availableGeometry()
+    window.setPosition(available.center().x() - window.width() // 2,
+                       available.center().y() - window.height() // 2)
+    controller.viewChanged.connect(lambda: app.quit() if not controller.updateView["visible"] else None)
+    if options.preview:
+        controller.accept_progress({"phase": "installing", "percent": 68})
+    elif options.install:
+        import hashlib
+        lock_key = hashlib.sha256(str(options.install.resolve()).casefold().encode("utf-8")).hexdigest()[:20]
+        lock_path = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SinpoSmart" / f"update-{lock_key}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        app.update_lock = QLockFile(str(lock_path))
+        app.update_lock.setStaleLockTime(0)
+        if not app.update_lock.tryLock(0):
+            controller._fail("另一個更新視窗正在處理更新。", "請等待原本的更新視窗完成。")
+            (directory / "window-ready").write_text("ready", encoding="ascii")
+            return app.exec()
+        # Start only after the first rendered frame, so the progress window exists
+        # before the updater can ask the main GUI to exit.
+        def begin_install() -> None:
+            window.frameSwapped.disconnect(begin_install)
+            (directory / "window-ready").write_text("ready", encoding="ascii")
+            controller.start()
+        window.frameSwapped.connect(begin_install)
+    else:
+        QTimer.singleShot(0, controller.check)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_update_window())

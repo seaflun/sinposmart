@@ -87,6 +87,98 @@ def legacy_duty_sheet_module():
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_hidden_python_discovery_preserves_chinese_paths(self) -> None:
+        source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        hidden = source[source.index("function Invoke-HiddenProcess"):source.index("function Start-DutyGui")]
+        finder = source[source.index("function Get-WinPythonExe"):source.index("function Invoke-SetupAfterUpdate")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            expected = r"C:\更新測試 WinPython\python.exe"
+            (root / "find_winpython.ps1").write_text(f"Write-Output '{expected}'\n", encoding="utf-8-sig")
+            result = run_powershell_contract(
+                f"$ErrorActionPreference='Stop'\n$packageDir='{root}'\n{hidden}\n{finder}\n"
+                f"$found=Get-WinPythonExe\nif ($found -ne '{expected}') {{ throw 'Unicode path was corrupted.' }}\n'ok'\n"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_update_progress_full_install_uses_only_local_fixtures(self) -> None:
+        import hashlib
+        import http.server
+        import io
+        import re
+        import zipfile
+
+        source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        required = source.split("$requiredQtPackageFiles = @(", 1)[1].split("\n    )", 1)[0]
+        paths = re.findall(r'"([^"\n]+)"', required)
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as archive:
+            for path in paths:
+                archive.writestr(path.replace("\\", "/"), "# isolated fixture\n")
+            archive.writestr("VERSION.txt", "2026.09.13.2359")
+            archive.writestr("fixture-marker.txt", "installed fixture")
+            archive.writestr("work_log_defaults.json", '"must not replace"')
+        zip_bytes = zip_buffer.getvalue()
+        routes = {
+            "/version": b"2026.09.13.2359",
+            "/sha": hashlib.sha256(zip_bytes).hexdigest().encode("ascii"),
+            "/package": zip_bytes,
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = routes[self.path]
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                installed = root / "installed"
+                installed.mkdir()
+                (installed / "VERSION.txt").write_text("2026.09.12.0001", encoding="utf-8")
+                (installed / "work_log_defaults.json").write_text('"preserved fixture"', encoding="utf-8")
+                url = f"http://127.0.0.1:{server.server_port}"
+                overrides = f"""
+$packageDir = '{installed}'
+$localVersionPath = Join-Path $packageDir 'VERSION.txt'
+$tempDir = '{root / 'stage'}'
+$zipPath = Join-Path $tempDir 'package.zip'
+$extractDir = Join-Path $tempDir 'extract'
+$backupDir = '{root / 'backups'}'
+$ProgressPath = '{root / 'progress.json'}'
+$remoteVersionUrl = '{url}/version'
+$remoteSha256Url = '{url}/sha'
+$remoteZipUrl = '{url}/package'
+$AssumeYes = $true
+$RestartAfterUpdate = $true
+function Get-RunningDutyGuiProcesses {{ return @() }}
+function Invoke-SetupAfterUpdate {{ Write-UpdateProgress -Phase 'setup' -Percent 85 }}
+function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
+"""
+                marker = 'Write-UpdateProgress -Phase "checking" -Percent 2\nif'
+                prefix, body = source.split(marker, 1)
+                contract = prefix + overrides + marker + body
+                result = run_powershell_contract(contract)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((installed / "fixture-marker.txt").read_text(), "installed fixture")
+                self.assertEqual((installed / "VERSION.txt").read_text(encoding="utf-8-sig").strip(), "2026.09.13.2359")
+                self.assertEqual((installed / "work_log_defaults.json").read_text(), '"preserved fixture"')
+                progress = json.loads((root / "progress.json").read_text(encoding="utf-8-sig"))
+                self.assertEqual(progress, {"phase": "installed", "percent": 98, "pid": 456})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def duty_board_schedule_payload(self) -> dict[str, object]:
         return {
             "target_date": "1150716",
@@ -2670,6 +2762,37 @@ class PackageSmokeTests(unittest.TestCase):
             query_flow.rindex("query_mode = wait_for_duty_query_completion("),
         )
         self.assertNotIn('super_js_execute(candidate, "_btnDelete", "click")', query_flow)
+
+    def test_existing_duty_delete_accepts_confirmation_after_null_click_result(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.execute_script.return_value = None
+        with mock.patch.object(module, "accept_pending_alerts") as accept_alerts:
+            module.ensure_existing_duty_delete(driver)
+        driver.execute_script.assert_called_once()
+        accept_alerts.assert_called_once_with(driver, timeout=3)
+
+    def test_existing_duty_delete_never_retries_an_unconfirmed_null_result(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.execute_script.return_value = None
+        with mock.patch.object(module, "WebDriverWait") as wait:
+            wait.return_value.until.side_effect = module.TimeoutException()
+            with self.assertRaisesRegex(RuntimeError, "刪除結果尚未確認") as caught:
+                module.ensure_existing_duty_delete(driver)
+        self.assertNotIsInstance(caught.exception, module.DutyExistingDeletePrewriteUnavailable)
+        driver.execute_script.assert_called_once()
+
+    def test_duty_delete_completion_waits_past_the_old_grid(self) -> None:
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.execute_script.side_effect = ["existing", False, "setup"]
+        wait = module.WebDriverWait(driver, 1, poll_frequency=0.01)
+        self.assertEqual(
+            module.wait_for_duty_query_completion(driver, wait, expected_mode="setup"),
+            "setup",
+        )
+        self.assertEqual(driver.execute_script.call_count, 3)
 
     def test_existing_duty_delete_accepts_alert_that_interrupts_the_click(self) -> None:
         module = legacy_duty_sheet_module()
