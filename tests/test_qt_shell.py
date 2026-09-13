@@ -2855,13 +2855,78 @@ class DutySubmissionServiceTests(unittest.TestCase):
             [
                 {
                     "start_roc_date": "1150813",
-                    "start_time": "23:50",
+                    "start_time": "00:00",
                     "end_roc_date": "1150814",
                     "end_time": "00:15",
                 }
             ],
         )
         self.assertEqual(result.comparison["unreturned_entry_at"], "2026-08-13T23:50")
+
+    def test_reversed_case_return_resumes_due_and_saved_recovery(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for trigger, now in (
+            ("due", datetime(2026, 9, 13, 8, 5)),
+            ("recovery", datetime(2026, 9, 13, 12, 6)),
+            ("recovery", datetime(2026, 9, 14, 0, 5)),
+        ):
+            with self.subTest(trigger=trigger, now=now), tempfile.TemporaryDirectory() as temp_dir:
+                fills = []
+                messages = []
+                reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
+                records = [
+                    ["115/09/13 06:41", "新坡分隊", "測試員", "隊員", "出", reason],
+                    ["115/09/13 06:38", "新坡分隊", "測試員", "隊員", "入", reason],
+                ]
+
+                def query_visible_table(_driver, _ap, _date, **query_range):
+                    start = query_range.get("start_time", "00:00")
+                    visible = [row for row in records if row[0][-5:] >= start]
+                    if fills:
+                        visible.append([
+                            "115/09/13 08:05", "新坡分隊", "測試員", "隊員", "出", "退勤",
+                        ])
+                    return visible
+
+                automation = SimpleNamespace(
+                    ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                    build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                    query_visible_table=query_visible_table,
+                    fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
+                    quit_driver=lambda _driver: None,
+                )
+                service = DutySubmissionService(
+                    Path(temp_dir), module_loader=lambda: automation, now_factory=lambda: now,
+                    comparison_builder=lambda *_args: {
+                        0: {"group": "done" if fills else "todo", "matched": []}
+                    },
+                )
+                data = {
+                    "target_date": "1150913",
+                    "today": {"staff": {"13": {"name": "測試員"}}},
+                    "actions": [{
+                        "kind": "entry_log", "time": "08:05", "actor": "13", "target": "13",
+                        "fields": {"出或入": "出", "領用事由及地點": "退勤"},
+                    }],
+                }
+                if trigger == "recovery":
+                    data["_unreturned_return_query_start_at"] = "2026-09-13T06:41:00"
+                result = service.execute(
+                    DutySubmissionRequest("user13", "test-password", 0, data, trigger_type=trigger),
+                    status_callback=messages.append,
+                )
+                self.assertEqual(result.status, "submitted")
+                self.assertEqual(fills, [True])
+                warnings = result.comparison["external_time_order_warnings"]
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("06:38", warnings[0])
+                self.assertIn("06:41", warnings[0])
+                self.assertIn("已視為返隊", warnings[0])
+                self.assertIn(warnings[0], messages)
+                saved = json.loads(result.result_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["comparison"]["external_time_order_warnings"], warnings)
 
     def test_handoff_preflight_checks_incoming_staff_without_writing_a_form(self) -> None:
         from datetime import datetime
@@ -10396,6 +10461,97 @@ if return_code != 0 or loaded:
         self.assertFalse(controller.isAwaitingConfirmation)
         self.assertEqual(controller.statusText, "已完成預覽，請選擇分類方式。")
 
+    def _create_rescue_video_test_window(self, controller):
+        # Match the runtime DLL search path before loading the real QML controls.
+        from qt_app import main as qt_main
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtQuick import QQuickWindow
+
+        engine = QQmlEngine()
+        host = QQuickWindow()
+        component = QQmlComponent(
+            engine,
+            QUrl.fromLocalFile(str(PACKAGE_ROOT / "qt_app/qml/dialogs/RescueVideoWindow.qml")),
+        )
+        component.setParent(engine)
+        window = component.createWithInitialProperties({"hostWindow": host, "controller": controller})
+        self.assertIsNotNone(window, [error.toString() for error in component.errors()])
+        self.addCleanup(controller.shutdown)
+        return engine, host, window
+
+    def test_rescue_video_calendar_date_follows_reset_and_reopen(self) -> None:
+        from PySide6.QtCore import QObject
+        from app_core.rescue_video_service import RescueVideoDefaults
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        controller._target_date = "2026-09-12"
+        engine, host, window = self._create_rescue_video_test_window(controller)
+        field = window.findChild(QObject, "rescueVideoDateField")
+        calendar = window.findChild(QObject, "rescueVideoDateCalendarButton")
+        with patch.object(controller, "_start_worker"):
+            calendar.dateSelected.emit("2026-09-02")
+        self.assertEqual(field.property("text"), "2026-09-02")
+
+        controller.resetForNextSession()
+        self.assertEqual(field.property("text"), "")
+        controller._defaults_loaded(
+            controller._request_id,
+            RescueVideoDefaults("card", "destination", "2026-09-13", ("93", "95"), "93"),
+        )
+        self.assertEqual(field.property("text"), "2026-09-13")
+        with patch.object(controller, "_start_worker") as start_worker:
+            window.findChild(QObject, "rescueVideoCheckButton").clicked.emit()
+        self.assertEqual(start_worker.call_args.kwargs["defaults_date"], "2026-09-13")
+
+    def test_rescue_video_reopening_visible_tool_preserves_preview_and_confirmation(self) -> None:
+        from PySide6.QtCore import QObject, QUrl
+        from PySide6.QtQml import QQmlComponent
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+
+        controller = RescueVideoController(object())
+        engine, host, window = self._create_rescue_video_test_window(controller)
+        component = QQmlComponent(
+            engine, QUrl.fromLocalFile(str(PACKAGE_ROOT / "qt_app/qml/pages/DutyQuickToolsPanel.qml"))
+        )
+        panel = component.createWithInitialProperties({
+            "backend": {
+                "sessionController": {"isLoggedIn": True},
+                "toolController": {
+                    "dailyCompletionCount": 0, "dailyVehicleCompleted": False,
+                    "dutySheetCompleted": False, "statusText": "",
+                },
+                "rescueVideoController": controller,
+            },
+            "hostWindow": {"activeToolSidePanel": None, "border": "white"},
+            "dutySheetPanel": {"opened": False}, "dailyVehiclePanel": {"opened": False},
+            "restTimePanel": {"opened": False}, "monthlyBasePanel": {"opened": False},
+            "rescueVideoWindow": window,
+        })
+        self.assertIsNotNone(panel, [error.toString() for error in component.errors()])
+        button = panel.findChild(QObject, "quickRescueVideoToolButton")
+        with patch.object(controller, "_start_worker"):
+            button.clicked.emit()
+            self.assertTrue(window.isVisible())
+            controller._is_ready = True
+            controller._has_preview = True
+            controller._report_path = "previous-preview.csv"
+            controller.resultModel.replace_rows(({"sourceText": "previous.TS"},))
+            controller.stateChanged.emit()
+            button.clicked.emit()
+            self.assertTrue(controller.hasPreview)
+            self.assertTrue(controller.isReady)
+            self.assertEqual(controller.resultModel.rowCount(), 1)
+            self.assertEqual(controller.reportPath, "previous-preview.csv")
+            controller._awaiting_confirmation = True
+            controller.stateChanged.emit()
+            button.clicked.emit()
+            self.assertTrue(controller.isAwaitingConfirmation)
+            controller._awaiting_confirmation = False
+            controller.stateChanged.emit()
+            window.close()
+
     def test_rescue_video_controller_clears_previous_results_when_a_new_check_starts(self) -> None:
         from qt_app.controllers.rescue_video_controller import RescueVideoController
 
@@ -13870,6 +14026,106 @@ if return_code != 0 or loaded:
             },
         )
         self.assertEqual(second_finished["snapshot"]["total_count"], 2)
+
+    def test_rescue_video_preflight_reports_start_before_wait_and_terminal_outcomes(self) -> None:
+        import time
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.rescue_video_service import (
+            RescueVideoCheckCard, RescueVideoDefaults, RescueVideoRunResult,
+        )
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        class FakeOperationalSyncService:
+            def __init__(self):
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+            def sync_board_async(self, _schedule_data):
+                return True
+
+        class FakeService:
+            def __init__(self):
+                self.release = threading.Event()
+                self.outcome = "ready"
+
+            def load_defaults(self, *_args, **_kwargs):
+                if not self.release.wait(5):
+                    raise TimeoutError("simulation was not released")
+                if self.outcome == "exception":
+                    raise OSError("simulated unreadable card")
+                return RescueVideoDefaults(
+                    "card", "destination", "2026-09-12", ("93",), "93",
+                    is_ready=self.outcome == "ready",
+                    check_cards=(RescueVideoCheckCard(
+                        "work_log", "工作／返隊紀錄", "模擬檢查",
+                        "ok" if self.outcome == "ready" else "error",
+                    ),),
+                )
+
+            def validate(self, request):
+                return request, [], {}
+
+            def execute(self, request, **_kwargs):
+                return RescueVideoRunResult("預覽完成", "", "report.csv", ())
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 4
+            while not predicate() and time.monotonic() < deadline:
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sync = FakeOperationalSyncService()
+            service = FakeService()
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                operational_sync_service=sync,
+                tool_controller=ToolController(Path(temp_dir)),
+                rescue_video_service=service,
+            )
+            try:
+                state = controller._session_state
+                state.complete_login(state.begin_login(), LoginSession("7", "test-user", "", verified=True))
+                rescue = controller.rescueVideoController
+                rescue.checkAndPreview("card", "2026-09-12", "93")
+                wait_until(lambda: bool(sync.events))
+                self.assertTrue(rescue.isRunning)
+                self.assertEqual(len(sync.events), 1)
+                self.assertEqual(sync.events[0][0], "tool_action_started")
+                self.assertEqual(sync.events[0][1]["snapshot"]["tool_name"], "rescue_video_preflight")
+                service.release.set()
+                wait_until(lambda: not rescue.isRunning and not controller._operational_sync_workers
+                           and not controller._operational_sync_queue)
+                self.assertEqual(len(sync.events), 4)
+                check_start, check_end, preview_start, preview_end = [fields for _, fields in sync.events]
+                self.assertEqual(check_start["snapshot"]["run_id"], check_end["snapshot"]["run_id"])
+                self.assertEqual(check_end["status"], "completed")
+                self.assertEqual(preview_start["snapshot"]["tool_name"], "rescue_video")
+                self.assertEqual(preview_start["snapshot"]["run_id"], preview_end["snapshot"]["run_id"])
+                self.assertNotEqual(check_start["snapshot"]["run_id"], preview_start["snapshot"]["run_id"])
+                for outcome in ("blocked", "exception"):
+                    with self.subTest(outcome=outcome):
+                        sync.events.clear()
+                        service.outcome = outcome
+                        rescue.checkAndPreview("card", "2026-09-12", "93")
+                        wait_until(lambda: not rescue.isRunning and not controller._operational_sync_workers
+                                   and not controller._operational_sync_queue)
+                        self.assertEqual(len(sync.events), 2)
+                        start, end = [fields for _, fields in sync.events]
+                        self.assertEqual(start["snapshot"]["run_id"], end["snapshot"]["run_id"])
+                        self.assertEqual(end["status"], "failed")
+                        self.assertEqual(end["snapshot"]["failure_stage"], "preflight")
+                        self.assertTrue(end["error"])
+                        self.assertFalse(rescue.hasPreview)
+            finally:
+                service.release.set()
+                controller.shutdown()
 
     def test_each_tool_run_has_distinct_run_id_for_backend_history(self) -> None:
         from app_core.credential_repository import CredentialRepository
@@ -19098,7 +19354,20 @@ if return_code != 0 or loaded:
                     (record_type, fields)
                     for record_type, fields in operational_sync_service.events
                     if record_type.startswith("tool_")
+                    and fields["snapshot"]["tool_name"] != "rescue_video_preflight"
                 ]
+                preflight_events = [
+                    (record_type, fields)
+                    for record_type, fields in operational_sync_service.events
+                    if fields.get("snapshot", {}).get("tool_name") == "rescue_video_preflight"
+                ]
+                self.assertEqual([kind for kind, _ in preflight_events],
+                                 ["tool_action_started", "tool_action_finished"] * 3)
+                self.assertEqual([fields["status"] for _, fields in preflight_events],
+                                 ["started", "completed"] * 3)
+                for index in range(0, len(preflight_events), 2):
+                    self.assertEqual(preflight_events[index][1]["snapshot"]["run_id"],
+                                     preflight_events[index + 1][1]["snapshot"]["run_id"])
                 self.assertEqual(
                     [record_type for record_type, _fields in tool_events],
                     [

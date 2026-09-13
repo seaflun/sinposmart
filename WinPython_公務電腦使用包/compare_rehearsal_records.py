@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 from datetime import datetime, timedelta
+from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -371,6 +372,7 @@ def find_open_external_assignment(
     current_at: datetime | None = None,
     start_at: datetime | None = None,
     end_at: datetime | None = None,
+    time_order_warnings: list[str] | None = None,
 ) -> str | None:
     target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
     if not target_name:
@@ -387,7 +389,8 @@ def find_open_external_assignment(
             ) + timedelta(minutes=effective_minute)
         except ValueError:
             return None
-    events: list[tuple[datetime, bool]] = []
+    events: list[tuple[datetime, bool, tuple[str, ...] | None]] = []
+    case_events: dict[tuple[str, ...], tuple[set[datetime], set[datetime]]] = {}
     for row in rows:
         if not row_has_primary_person(row, target_name):
             continue
@@ -402,12 +405,40 @@ def find_open_external_assignment(
             continue
         if row_at > current_at:
             continue
-        if row_has_outin(row, "出", external_entry=True):
-            events.append((row_at, True))
-        elif row_has_outin(row, "入", external_entry=True):
-            events.append((row_at, False))
+        is_out = row_has_outin(row, "出", external_entry=True)
+        if not is_out and not row_has_outin(row, "入", external_entry=True):
+            continue
+        case_key = None
+        for cell in row.split("|"):
+            match = re.fullmatch(
+                r"案件類別:(.+?)案發地點:(.+?)梯次:(\d+)",
+                clean(unescape(cell)).replace("：", ":"),
+            )
+            if match:
+                case_key = (
+                    row_at.date().isoformat(), match[1], match[2], str(int(match[3])),
+                )
+                departures, returns = case_events.setdefault(case_key, (set(), set()))
+                (departures if is_out else returns).add(row_at)
+                break
+        events.append((row_at, is_out, case_key))
+    reversed_departures: set[tuple[datetime, tuple[str, ...]]] = set()
+    for case_key, (departures, returns) in case_events.items():
+        # Only one distinct pair can prove this known source-system ordering bug.
+        if len(departures) != 1 or len(returns) != 1:
+            continue
+        departure, returned = next(iter(departures)), next(iter(returns))
+        if returned < departure:
+            reversed_departures.add((departure, case_key))
+            if time_order_warnings is not None:
+                time_order_warnings.append(
+                    f"出入時間異常（梯次 {case_key[-1]}）："
+                    f"入 {returned:%m/%d %H:%M}／出 {departure:%m/%d %H:%M}，已視為返隊。"
+                )
     active_at: datetime | None = None
-    for row_at, is_active in sorted(events, key=lambda item: item[0]):
+    for row_at, is_active, case_key in sorted(events, key=lambda item: item[0]):
+        if is_active and (row_at, case_key) in reversed_departures:
+            continue
         if is_active:
             active_at = row_at
         else:
@@ -425,6 +456,7 @@ def has_open_external_assignment(
     current_at: datetime | None = None,
     start_at: datetime | None = None,
     end_at: datetime | None = None,
+    time_order_warnings: list[str] | None = None,
 ) -> bool:
     return (
         find_open_external_assignment(
@@ -436,6 +468,7 @@ def has_open_external_assignment(
             current_at=current_at,
             start_at=start_at,
             end_at=end_at,
+            time_order_warnings=time_order_warnings,
         )
         is not None
     )

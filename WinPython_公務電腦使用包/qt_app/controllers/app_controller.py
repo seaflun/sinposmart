@@ -282,6 +282,22 @@ class AppController(QObject):
         self._daily_vehicle_controller.runFailed.connect(
             lambda message: self._tool_run_failed("daily_vehicle", "車輛保養清點", message)
         )
+        self._rescue_video_controller.preflightStarted.connect(
+            lambda: self._tool_run_started(
+                "rescue_video_preflight", "救護行車紀錄器前置檢查", mode="preflight"
+            )
+        )
+        self._rescue_video_controller.preflightSucceeded.connect(
+            lambda message: self._tool_run_finished(
+                "rescue_video_preflight", "救護行車紀錄器前置檢查", message, notify=False
+            )
+        )
+        self._rescue_video_controller.preflightFailed.connect(
+            lambda message: self._tool_run_failed(
+                "rescue_video_preflight", "救護行車紀錄器前置檢查", message,
+                mode="preflight", notify=False,
+            )
+        )
         self._rescue_video_controller.runStarted.connect(
             lambda mode: self._tool_run_started("rescue_video", "救護行車紀錄器", mode=mode)
         )
@@ -2133,6 +2149,7 @@ class AppController(QObject):
             "monthly_base": self._rest_monthly_controller,
             "daily_vehicle": self._daily_vehicle_controller,
             "rescue_video": self._rescue_video_controller,
+            "rescue_video_preflight": self._rescue_video_controller,
         }
         controller = controllers.get(tool_name)
         return str(getattr(controller, "failureStage", "unknown") or "unknown")

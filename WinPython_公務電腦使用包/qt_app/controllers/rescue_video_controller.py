@@ -27,6 +27,9 @@ class RescueVideoController(QObject):
     stateChanged = Signal()
     copyConfirmationRequested = Signal()
     deleteConfirmationRequested = Signal()
+    preflightStarted = Signal()
+    preflightSucceeded = Signal(str)
+    preflightFailed = Signal(str)
     runStarted = Signal(str)
     runSucceeded = Signal(str)
     runFailed = Signal(str, str)
@@ -527,6 +530,8 @@ class RescueVideoController(QObject):
         self.stateChanged.emit()
         if mode:
             self.runStarted.emit(mode)
+        else:
+            self.preflightStarted.emit()
         thread.start()
 
     @Slot(int, str)
@@ -602,6 +607,13 @@ class RescueVideoController(QObject):
             self._status_text = "尚未開始"
             self._summary_text = "插入單張記憶卡後會自動尋找 DCIM\\100CAREC；再確認日期與車號。"
         self.stateChanged.emit()
+        context = f"日期：{self._target_date}；車號：{self._selected_vehicle or '未選擇'}"
+        if self._check_requested and not self._is_ready:
+            self._failure_stage = "preflight"
+            self.preflightFailed.emit(f"{self._summary_text}（{context}）")
+        else:
+            message = "檢查通過" if self._check_requested else "工具設定已載入，尚未執行檢查"
+            self.preflightSucceeded.emit(f"{message}（{context}）")
 
     def _set_check_cards_pending(
         self,
@@ -726,6 +738,8 @@ class RescueVideoController(QObject):
             mode = self._worker_modes.get(request_id, "")
             if mode:
                 self.runFailed.emit(mode, message)
+            else:
+                self.preflightFailed.emit(message)
             self._set_error(message)
 
     @Slot(int)

@@ -178,7 +178,6 @@ Window {
         enabled: !rescueVideoWindow.controller.isRunning
                  && !rescueVideoWindow.controller.isAwaitingConfirmation
         onDateSelected: function(value) {
-            rescueVideoDateField.text = value
             rescueVideoWindow.controller.refreshVehicleOptions(
                 rescueVideoWindow.controller.sourcePath,
                 value

@@ -229,6 +229,7 @@ class DutySubmissionService:
                 query_range=query_range,
             )
             staff = self._staff(comparison_source)
+            time_order_warnings: list[str] = []
             pause_details = self._open_assignment_pause_details(
                 action,
                 action_date,
@@ -236,7 +237,11 @@ class DutySubmissionService:
                 staff,
                 request,
                 query_range=query_range,
+                time_order_warnings=time_order_warnings,
             )
+            if status_callback:
+                for warning in time_order_warnings:
+                    status_callback(warning)
             if pause_details is not None:
                 pause_comparison = {
                     "compare": "未返隊，暫停登打",
@@ -251,6 +256,7 @@ class DutySubmissionService:
                     "paused_external",
                     "人員尚未返隊，已暫停退勤登打。",
                     pause_comparison,
+                    time_order_warnings=time_order_warnings,
                 )
             if action.get("kind") == "handoff_preflight":
                 return self._finish(
@@ -260,6 +266,7 @@ class DutySubmissionService:
                     "handoff_preflight_ready",
                     "接班人員已返隊，可登打值退、值班與交接工作。",
                     {"compare": "接班人員已返隊", "group": "ready", "matched": []},
+                    time_order_warnings=time_order_warnings,
                 )
             comparison = self._comparison_for_action(
                 comparison_source,
@@ -298,6 +305,7 @@ class DutySubmissionService:
                     "skipped_duplicate",
                     "已存在相同紀錄，已略過重複登打。",
                     submission_comparison,
+                    time_order_warnings=time_order_warnings,
                 )
             if group in ("near", "adjust", "review", "manual") and not allows_manual_submission:
                 return self._finish(
@@ -307,6 +315,7 @@ class DutySubmissionService:
                     "review_required",
                     "查到時間近似或需人工確認的紀錄，未自動送出。",
                     comparison,
+                    time_order_warnings=time_order_warnings,
                 )
             if (
                 group == "future"
@@ -320,6 +329,7 @@ class DutySubmissionService:
                     "not_due",
                     "任務尚未到點，未送出。",
                     comparison,
+                    time_order_warnings=time_order_warnings,
                 )
 
             if status_callback:
@@ -348,6 +358,7 @@ class DutySubmissionService:
                     "filled",
                     "表單已填寫，未送出。",
                     {"group": "filled", "matched": [], "form_result": form_result},
+                    time_order_warnings=time_order_warnings,
                 )
 
             try:
@@ -386,6 +397,7 @@ class DutySubmissionService:
                     "submitted",
                     "勤務系統登打完成。",
                     verified,
+                    time_order_warnings=time_order_warnings,
                 )
             except DutySubmissionExecutionError:
                 raise
@@ -412,6 +424,7 @@ class DutySubmissionService:
                     "submitted",
                     "勤務系統登打完成；送出流程異常後已重新查詢確認資料存在。",
                     reconciled,
+                    time_order_warnings=time_order_warnings,
                 )
         except DutySubmissionValidationError:
             raise
@@ -651,6 +664,7 @@ class DutySubmissionService:
         request: DutySubmissionRequest,
         *,
         query_range: Mapping[str, Any] | None = None,
+        time_order_warnings: list[str] | None = None,
     ) -> dict[str, str] | None:
         if request.trigger_type not in ("due", "recovery"):
             return None
@@ -688,6 +702,7 @@ class DutySubmissionService:
                     "current_at": now if query_range else None,
                     "start_at": query_range.get("start_at") if query_range else None,
                     "end_at": query_range.get("end_at") if query_range else None,
+                    "time_order_warnings": time_order_warnings,
                 }
             )
         if not self.open_assignment_checker(
@@ -789,6 +804,8 @@ class DutySubmissionService:
             now = self.now_factory()
             if start_at > now:
                 return None
+            # Include an earlier return for the same case when source times are reversed.
+            start_at = start_at.replace(hour=0, minute=0, second=0, microsecond=0)
             return {
                 "start_at": start_at,
                 "start_roc_date": self._roc_date(start_at.date()),
@@ -1002,7 +1019,14 @@ class DutySubmissionService:
         status: str,
         message: str,
         comparison: Mapping[str, Any],
+        *,
+        time_order_warnings: list[str] | None = None,
     ) -> DutySubmissionResult:
+        if time_order_warnings:
+            comparison = {
+                **comparison,
+                "external_time_order_warnings": list(time_order_warnings),
+            }
         self._write_result(
             path,
             {

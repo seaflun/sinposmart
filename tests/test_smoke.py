@@ -3626,6 +3626,61 @@ class PackageSmokeTests(unittest.TestCase):
             )
         )
 
+    def test_external_assignment_reversed_case_return_is_returned(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
+        records = [
+            ["115/09/13 06:41", "新坡分隊", "測試員", "隊員", "出", reason],
+            ["115/09/13 06:38", "新坡分隊", "測試員", "隊員", "入", reason],
+        ]
+        for raw_rows in (records, list(reversed(records)), records + records):
+            with self.subTest(rows=raw_rows):
+                self.assertIsNone(module.find_open_external_assignment(
+                    module.flatten_rows(raw_rows, "1150913"), "1150913",
+                    {"13": {"name": "測試員"}}, {"target": "13"},
+                    current_at=datetime(2026, 9, 13, 8, 1),
+                ))
+
+    def test_external_assignment_reversed_return_requires_matching_case(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
+        incoming_variants = [
+            ("115/09/13 06:38", "另一人", reason),
+            ("115/09/13 06:38", "測試員", reason.replace("梯次：2", "梯次：1")),
+            ("115/09/13 06:38", "測試員", reason.replace("測試路段", "其他路段")),
+            ("115/09/13 06:38", "測試員", reason.replace("創傷", "急病")),
+            ("115/09/12 06:38", "測試員", reason),
+            ("115/09/13 06:38", "測試員", "救護返隊"),
+        ]
+        for stamp, name, incoming_reason in incoming_variants:
+            with self.subTest(stamp=stamp, name=name, reason=incoming_reason):
+                rows = module.flatten_rows([
+                    ["115/09/13 06:41", "新坡分隊", "測試員", "隊員", "出", reason],
+                    [stamp, "新坡分隊", name, "隊員", "入", incoming_reason],
+                ], "1150913", start_date="1150912", end_date="1150913")
+                self.assertEqual(module.find_open_external_assignment(
+                    rows, "1150913", {"13": {"name": "測試員"}}, {"target": "13"},
+                    current_at=datetime(2026, 9, 13, 8, 1),
+                ), "2026-09-13T06:41")
+
+    def test_external_assignment_reversed_return_preserves_other_departures(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
+        for extra_time, extra_reason, expected in (
+            ("06:40", reason.replace("梯次：2", "梯次：3"), "06:40"),
+            ("07:00", reason, "07:00"),
+        ):
+            with self.subTest(time=extra_time):
+                rows = module.flatten_rows([
+                    ["115/09/13 06:41", "新坡分隊", "測試員", "隊員", "出", reason],
+                    ["115/09/13 06:38", "新坡分隊", "測試員", "隊員", "入", reason],
+                    [f"115/09/13 {extra_time}", "新坡分隊", "測試員", "隊員", "出", extra_reason],
+                ], "1150913")
+                self.assertEqual(module.find_open_external_assignment(
+                    rows, "1150913", {"13": {"name": "測試員"}}, {"target": "13"},
+                    current_at=datetime(2026, 9, 13, 8, 1),
+                ), f"2026-09-13T{expected}")
+
     def test_external_assignment_state_includes_disaster_rescue_departure(self) -> None:
         module = package_module("compare_rehearsal_records")
 

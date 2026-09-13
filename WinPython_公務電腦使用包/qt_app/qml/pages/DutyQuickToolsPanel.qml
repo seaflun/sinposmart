@@ -132,7 +132,8 @@ Rectangle {
                             tone: "review"
                             selectedState: dutyQuickToolsPanel.rescueVideoWindow.visible
                             onClicked: {
-                                dutyQuickToolsPanel.backend.rescueVideoController.loadDefaults()
+                                if (!dutyQuickToolsPanel.rescueVideoWindow.visible)
+                                    dutyQuickToolsPanel.backend.rescueVideoController.loadDefaults()
                                 dutyQuickToolsPanel.rescueVideoWindow.open()
                             }
                         }
