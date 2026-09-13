@@ -6415,12 +6415,13 @@ class UpdateControllerTests(unittest.TestCase):
             version = Path(temp_dir) / "VERSION.txt"
             version.write_text("2026.09.13.1901", encoding="utf-8")
             version.with_name("update_package.ps1").write_text("# fixture", encoding="utf-8")
-            launched, callbacks = [], []
+            launched, callbacks, reports = [], [], []
             controller = UpdateController(
                 UpdateRepository(version), remote_update_enabled=False,
                 remote_process_launcher=lambda *_args: launched.append(True) or SimpleNamespace(poll=lambda: None),
             )
             def report(_status, _detail, **actions):
+                reports.append((_status, _detail))
                 if actions.get("after_success"):
                     callbacks.append(actions["after_success"])
                 return True
@@ -6437,6 +6438,8 @@ class UpdateControllerTests(unittest.TestCase):
                 callbacks[0]()
                 callbacks[0]()
                 controller.deferUpdate("後台狀態正在同步")
+                self.assertEqual(controller.remoteUpdateStatus, "applying")
+                self.assertEqual(reports[-1][0], "applying")
                 controller._retry_deferred_update()
                 controller._check_remote_stage()
                 self.assertEqual(launched, [True])

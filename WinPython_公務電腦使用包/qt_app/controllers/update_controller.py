@@ -781,8 +781,11 @@ class UpdateController(UpdateWindowState):
             f"更新已延後：{reason}；工作完成後會自動重試（最多等待 5 分鐘）"
         )
         if self._remote_update_active:
-            self._set_remote_state(status="waiting_handoff")
-            self._send_remote_status("waiting_handoff", self._status_text)
+            status = "applying" if self._remote_update_apply_inflight else "waiting_handoff"
+            if self._remote_update_status == "updating":
+                status = "updating"
+            self._set_remote_state(status=status)
+            self._send_remote_status(status, self._status_text)
         self.stateChanged.emit()
         self.errorOccurred.emit(self._status_text)
         self._show_view(
