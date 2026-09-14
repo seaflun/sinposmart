@@ -189,6 +189,7 @@ class AppController(QObject):
         self._actor_identity_pending = False
         self._logout_pending = False
         self._pending_logout_message = ""
+        self._pending_logout_method = "unknown"
         self._pending_auto_login_actor_no = ""
         self._pending_update_logout = False
         self._auto_login_marker_path = self._auto_login_marker_file(package_root)
@@ -435,6 +436,7 @@ class AppController(QObject):
             user_id=user_id,
             display_name=self._operational_display_name(actor_no, display_name),
             content="更新前登出",
+            snapshot={"logout_method": "update"},
             durable_only=True,
         )
         return True
@@ -993,12 +995,16 @@ class AppController(QObject):
 
         self._begin_session_logout(
             "",
+            logout_method="manual",
             apply_update=self._update_controller.remoteUpdateActive,
         )
 
-    def _begin_session_logout(self, message: str, *, apply_update: bool = False) -> None:
+    def _begin_session_logout(
+        self, message: str, *, logout_method: str = "system", apply_update: bool = False
+    ) -> None:
         if self._logout_pending:
             return
+        self._pending_logout_method = logout_method
         self._pending_update_logout = bool(apply_update)
         self._pending_live_refresh_generation = None
         self._duty_controller.prepare_session_end()
@@ -1179,7 +1185,9 @@ class AppController(QObject):
                 actor_no=previous_actor_no,
                 user_id=previous_user_id,
                 display_name=self._last_login_display_name,
+                snapshot={"logout_method": self._pending_logout_method},
             )
+            self._pending_logout_method = "unknown"
 
     @Slot()
     def _retry_pending_live_refresh(self) -> None:
@@ -2549,6 +2557,7 @@ class AppController(QObject):
         self._tray_controller.notify("SinpoSmart", f"{actor_no} 值班交接已完成，自動登出")
         self._begin_session_logout(
             "系統已自動登出",
+            logout_method="automatic",
             apply_update=remote_update,
         )
 

@@ -13319,6 +13319,7 @@ if return_code != 0 or loaded:
         self.assertEqual(record_type, "logout")
         self.assertEqual(fields["trigger_type"], "update")
         self.assertEqual(fields["content"], "更新前登出")
+        self.assertEqual(fields["snapshot"]["logout_method"], "update")
         self.assertEqual(fields["actor_no"], "10")
         self.assertEqual(fields["user_id"], "user10")
         self.assertEqual(fields["display_name"], "10番 測試員")
@@ -13426,6 +13427,43 @@ if return_code != 0 or loaded:
         finally:
             controller.dutyExecutionController._entry_active_request_id = None
             controller.shutdown()
+
+    def test_logout_events_keep_origin_through_immediate_and_pending_logout(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for method in ("manual", "automatic", "system"):
+            for pending in (False, True):
+                with self.subTest(method=method, pending=pending):
+                    controller = AppController(read_only_acceptance=True)
+                    controller.dutyController.load_current_schedule = lambda: None
+                    controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+                    attempt = controller._session_state.begin_login()
+                    controller._session_state.complete_login(attempt, LoginSession("10", "user10", "secret", verified=True))
+                    controller.sessionController.sessionChanged.emit()
+                    controller._read_only_acceptance = False
+                    try:
+                        with patch.object(controller, "_start_operational_sync") as send:
+                            if pending:
+                                controller.dutyExecutionController._entry_active_request_id = 41
+                            if method == "manual":
+                                controller.requestLogout()
+                            elif method == "automatic":
+                                controller._auto_logout("10")
+                            else:
+                                controller._force_logout("登入已失效")
+                            if pending:
+                                self.assertFalse(any(c.kwargs.get("record_type") == "logout" for c in send.call_args_list))
+                                controller.dutyExecutionController._entry_active_request_id = None
+                                controller._finish_pending_logout()
+                            events = [c.kwargs["fields"] for c in send.call_args_list if c.kwargs.get("record_type") == "logout"]
+                            self.assertEqual(len(events), 1)
+                            self.assertEqual(events[0]["snapshot"]["logout_method"], method)
+                            self.assertEqual(events[0]["actor_no"], "10")
+                            self.assertFalse(controller.sessionController.isLoggedIn)
+                    finally:
+                        controller.dutyExecutionController._entry_active_request_id = None
+                        controller.shutdown()
 
     def test_manual_logout_waits_for_active_submission_to_reach_terminal_state(self) -> None:
         from app_core.session import LoginSession
