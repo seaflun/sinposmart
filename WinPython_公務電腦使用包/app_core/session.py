@@ -16,6 +16,7 @@ class LoginSession:
     verified: bool = False
     actor_name: str = ""
     remember: bool = False
+    login_method: str = "unknown"
 
 
 class SessionState:

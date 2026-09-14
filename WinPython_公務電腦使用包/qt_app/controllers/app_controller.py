@@ -1068,7 +1068,7 @@ class AppController(QObject):
             "SinpoSmart",
             f"{actor_no}番接班人已辨識，正在自動登入",
         )
-        self._session_controller.login(user_id, password, False)
+        self._session_controller.login(user_id, password, False, login_method="automatic")
 
     @staticmethod
     def _auto_login_marker_file(package_root: Path) -> Path:
@@ -1347,8 +1347,8 @@ class AppController(QObject):
             return
         self._refresh_after_fire_day_change(target)
 
-    @Slot(str, str, str)
-    def _login_attempt_failed(self, user_id: str, message: str, error_code: str) -> None:
+    @Slot(str, str, str, str)
+    def _login_attempt_failed(self, user_id: str, message: str, error_code: str, login_method: str = "unknown") -> None:
         if self._read_only_acceptance:
             return
         self._send_operational_event(
@@ -1357,7 +1357,7 @@ class AppController(QObject):
             trigger_type="login",
             user_id=str(user_id or "").strip(),
             error=message,
-            snapshot={"error_code": error_code},
+            snapshot={"error_code": error_code, "login_method": login_method},
         )
 
     @Slot(str, str)
@@ -2234,6 +2234,11 @@ class AppController(QObject):
             "display_name": self._session_controller.displayName,
         }
         event_fields.update(fields)
+        if record_type == "login":
+            event_fields["snapshot"] = {
+                **dict(event_fields.get("snapshot") or {}),
+                "login_method": session.login_method if session else "unknown",
+            }
         event_fields["display_name"] = self._operational_display_name(
             str(event_fields.get("actor_no") or ""),
             str(event_fields.get("display_name") or ""),

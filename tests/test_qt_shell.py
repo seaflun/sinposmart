@@ -14357,6 +14357,7 @@ if return_code != 0 or loaded:
                     "user10",
                     "登入失敗：請確認帳號密碼。",
                     "login_failed",
+                    "automatic",
                 )
             finally:
                 controller.shutdown()
@@ -14367,6 +14368,7 @@ if return_code != 0 or loaded:
         self.assertEqual(fields["trigger_type"], "login")
         self.assertEqual(fields["user_id"], "user10")
         self.assertEqual(fields["snapshot"]["error_code"], "login_failed")
+        self.assertEqual(fields["snapshot"]["login_method"], "automatic")
         self.assertNotIn("password", json.dumps(fields, ensure_ascii=False).lower())
 
     def test_app_controller_reports_and_clears_expired_live_capture_session(self) -> None:
@@ -15358,6 +15360,13 @@ if return_code != 0 or loaded:
 
         self.assertTrue(controller.sessionController.isLoggedIn)
         self.assertEqual(controller.sessionController.actorNo, "11")
+        self.assertEqual(controller._session_state.session.login_method, "automatic")
+        controller._read_only_acceptance = False
+        with patch.object(controller, "_start_operational_sync") as send:
+            controller._send_operational_event("login", status="ok", snapshot={"diagnostic": "preserved"})
+        self.assertEqual(send.call_args.kwargs["fields"]["snapshot"], {
+            "diagnostic": "preserved", "login_method": "automatic",
+        })
 
     def test_auto_logout_waits_for_paused_handoff_queue_then_restarts_ten_minutes(self) -> None:
         from datetime import datetime
@@ -20332,6 +20341,7 @@ if return_code != 0 or loaded:
             self.assertEqual(controller.displayName, "10番 測試員")
             self.assertEqual(verifier.passwords, ["saved-secret"])
             self.assertEqual(verifier.actor_numbers, [""])
+            self.assertEqual(controller._state.session.login_method, "manual")
             for _ in range(100):
                 if not controller._login_workers:
                     break
@@ -20489,7 +20499,7 @@ if return_code != 0 or loaded:
                 credential_sync_service=SimpleNamespace(enabled=False),
             )
             attempt_id = state.begin_login()
-            controller._pending_credentials[attempt_id] = ("user10", "secret", False)
+            controller._pending_credentials[attempt_id] = ("user10", "secret", False, "manual")
 
             controller._login_succeeded(
                 attempt_id,
@@ -20523,7 +20533,7 @@ if return_code != 0 or loaded:
                 credential_sync_service=SimpleNamespace(enabled=False),
             )
             attempt_id = state.begin_login()
-            controller._pending_credentials[attempt_id] = ("user10", "secret", False)
+            controller._pending_credentials[attempt_id] = ("user10", "secret", False, "manual")
             controller._login_succeeded(
                 attempt_id,
                 LoginResult("", "user10", "測試員", "登入成功，正在查詢勤務資料…"),
@@ -20563,7 +20573,7 @@ if return_code != 0 or loaded:
                 credential_sync_service=sync_service,
             )
             attempt_id = state.begin_login()
-            controller._pending_credentials[attempt_id] = ("user12", "secret12", False)
+            controller._pending_credentials[attempt_id] = ("user12", "secret12", False, "manual")
 
             controller._login_succeeded(attempt_id, LoginResult("12", "user12", "測試員"))
             for _ in range(20):
@@ -20733,7 +20743,7 @@ if return_code != 0 or loaded:
             error_spy = QSignalSpy(controller.errorOccurred)
             failure_spy = QSignalSpy(controller.loginAttemptFailed)
 
-            controller.login("user10", "secret", False)
+            controller.login("user10", "secret", False, login_method="automatic")
 
             self.assertTrue(verifier.started.wait(1))
             self.assertTrue(error_spy.wait(1000))
@@ -20742,7 +20752,7 @@ if return_code != 0 or loaded:
             self.assertFalse(controller.isBusy)
             self.assertTrue(controller.hasRunningLoginWorkers)
             self.assertEqual(failure_spy.count(), 1)
-            self.assertEqual(failure_spy.at(0), ["user10", controller.loginStatus, "timeout"])
+            self.assertEqual(failure_spy.at(0), ["user10", controller.loginStatus, "timeout", "automatic"])
 
             controller.login("user10", "secret", False)
             for _ in range(100):
@@ -20762,6 +20772,7 @@ if return_code != 0 or loaded:
             self.assertTrue(controller.isLoggedIn)
             self.assertEqual(controller.actorNo, "20")
             self.assertIn("新登入", controller.displayName)
+            self.assertEqual(controller._state.session.login_method, "manual")
             self.assertFalse(controller._login_workers)
             self.assertFalse(controller.isBusy)
 

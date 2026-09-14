@@ -4397,7 +4397,7 @@ if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -R
             controller = SessionController(state, repository=repository, verifier=object())
             attempt_id = state.begin_login()
             self.assertIsNotNone(attempt_id)
-            controller._pending_credentials[attempt_id] = ("user10", "secret", False)
+            controller._pending_credentials[attempt_id] = ("user10", "secret", False, "manual")
             thread = FakeThread()
             controller._login_workers[attempt_id] = (thread, object())
 

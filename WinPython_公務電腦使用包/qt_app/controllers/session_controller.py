@@ -27,7 +27,7 @@ class SessionController(QObject):
     statusChanged = Signal()
     savedAccountSelected = Signal(str, str, str)
     errorOccurred = Signal(str)
-    loginAttemptFailed = Signal(str, str, str)
+    loginAttemptFailed = Signal(str, str, str, str)
     credentialSyncConfirmationRequested = Signal()
 
     def __init__(
@@ -52,7 +52,7 @@ class SessionController(QObject):
         self._accounts: list[dict[str, str]] = []
         self._last_selected_identity = ""
         self._saved_accounts_model = SavedAccountListModel(self)
-        self._pending_credentials: dict[int, tuple[str, str, bool]] = {}
+        self._pending_credentials: dict[int, tuple[str, str, bool, str]] = {}
         self._login_workers: dict[int, tuple[QThread, LoginWorker]] = {}
         self._credential_sync_request_id = 0
         self._credential_sync_workers: dict[int, tuple[QThread, CredentialSyncWorker]] = {}
@@ -103,7 +103,7 @@ class SessionController(QObject):
         return self._saved_accounts_model
 
     @Slot(str, str, bool)
-    def login(self, user_id: str, password: str, remember: bool = False) -> None:
+    def login(self, user_id: str, password: str, remember: bool = False, *, login_method: str = "manual") -> None:
         if self._shutdown_admission or self._state.login_running:
             return
         user_id = str(user_id or "").strip()
@@ -117,7 +117,8 @@ class SessionController(QObject):
         attempt_id = self._state.begin_login()
         if attempt_id is None:
             return
-        self._pending_credentials[attempt_id] = (user_id, password, bool(remember))
+        method = "automatic" if login_method == "automatic" else "manual"
+        self._pending_credentials[attempt_id] = (user_id, password, bool(remember), method)
         self._set_status("登入中…", tone="info")
 
         worker = LoginWorker(
@@ -400,7 +401,7 @@ class SessionController(QObject):
         pending = self._pending_credentials.pop(attempt_id, None)
         if self._shutdown_admission or pending is None:
             return
-        user_id, password, remember = pending
+        user_id, password, remember, login_method = pending
         session = LoginSession(
             actor_no=result.actor_no,
             user_id=result.user_id,
@@ -408,6 +409,7 @@ class SessionController(QObject):
             verified=True,
             actor_name=str(result.actor_name or "").strip(),
             remember=remember,
+            login_method=login_method,
         )
         if not self._state.complete_login(attempt_id, session):
             return
@@ -453,7 +455,7 @@ class SessionController(QObject):
         self._display_name = ""
         self._set_status(message, error=True)
         user_id = pending[0] if pending is not None else ""
-        self.loginAttemptFailed.emit(user_id, message, "login_failed")
+        self.loginAttemptFailed.emit(user_id, message, "login_failed", pending[3] if pending else "unknown")
 
     def _login_timed_out(self, attempt_id: int) -> None:
         pending = self._pending_credentials.pop(attempt_id, None)
@@ -466,7 +468,7 @@ class SessionController(QObject):
         message = "登入逾時：請確認帳號密碼或勤務系統是否有回應。"
         self._set_status(message, error=True)
         user_id = pending[0] if pending is not None else ""
-        self.loginAttemptFailed.emit(user_id, message, "timeout")
+        self.loginAttemptFailed.emit(user_id, message, "timeout", pending[3] if pending else "unknown")
 
     def _save_successful_account(
         self,
