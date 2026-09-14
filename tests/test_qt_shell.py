@@ -6480,6 +6480,67 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(ready_spy.at(0)[0], "2026.07.29.1100")
             self.assertEqual(completed_spy.count(), 1)
 
+    def test_expired_remote_update_reconciles_only_matching_running_install(self) -> None:
+        from unittest.mock import Mock
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        for state, manifest_id, installed, expected in (
+            ("completed", "expired-1", "2026.09.14.0900", "completed"),
+            ("up_to_date", "expired-1", "2026.09.14.0900", "up_to_date"),
+            ("staged", "expired-1", "2026.09.14.0900", "timed_out"),
+            ("completed", "other-request", "2026.09.14.0900", "timed_out"),
+            ("completed", "expired-1", "2026.09.14.0800", "timed_out"),
+            ("completed", "expired-1", "", "timed_out"),
+        ):
+            with self.subTest(state=state, manifest_id=manifest_id, installed=installed), tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+                version = Path(temp_dir) / "VERSION.txt"
+                version.write_text("2026.09.14.0900", encoding="utf-8")
+                launcher = Mock()
+                controller = UpdateController(UpdateRepository(version), remote_update_enabled=False, remote_process_launcher=launcher)
+                controller._remote_workers[1] = (object(), object())
+                manifest = controller._remote_update_manifest_path("expired-1")
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"request_id": manifest_id, "status": state, "installed_version": installed}), encoding="utf-8")
+                try:
+                    with patch.object(controller, "_send_remote_status", return_value=True) as report:
+                        command = {"request_id": "expired-1", "status": "timed_out"}
+                        controller._remote_poll_succeeded(1, {"command": command})
+                        self.assertEqual(controller.remoteUpdateStatus, expected)
+                        self.assertFalse(controller.remoteUpdateActive)
+                        launcher.assert_not_called()
+                        if expected != "timed_out":
+                            self.assertEqual(report.call_args.args[0], expected)
+                            # Lost acknowledgment is retried by the next regular poll.
+                            controller._remote_poll_succeeded(1, {"command": command})
+                            self.assertEqual(report.call_count, 2)
+                        else:
+                            report.assert_not_called()
+                finally:
+                    controller._remote_workers.clear()
+                    controller.shutdown()
+
+    def test_remote_completion_payload_reports_running_version_and_success(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers import update_controller as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            version = Path(temp_dir) / "VERSION.txt"
+            version.write_text("2026.09.14.0900", encoding="utf-8")
+            controller = module.UpdateController(UpdateRepository(version), remote_update_enabled=False)
+            controller._remote_update_enabled = True
+            controller._remote_update_request_id = "proof-1"
+            try:
+                with patch.object(module, "RemoteUpdateWorker") as worker, patch.object(module, "QThread"):
+                    for status in ("completed", "up_to_date"):
+                        controller._send_remote_status(status, "安裝已驗證")
+                        payload = worker.call_args.kwargs["status_request"]
+                        self.assertEqual(payload["installed_version"], "2026.09.14.0900")
+                        self.assertEqual(payload["exit_code"], 0)
+            finally:
+                controller._remote_workers.clear()
+                controller.shutdown()
+
     def test_remote_update_changes_logout_action_and_applies_staged_package(self) -> None:
         from app_core.update_repository import UpdateRepository
         from qt_app.controllers.update_controller import UpdateController
@@ -6537,6 +6598,9 @@ class UpdateControllerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            controller._check_remote_stage()
+            self.assertTrue(controller.remoteUpdateActive)
+            controller._current_version = "2026.09.11.1100"  # Simulate the restarted GUI.
             controller._check_remote_stage()
             self.assertFalse(controller.remoteUpdateActive)
             self.assertEqual(controller.remoteUpdateStatus, "completed")

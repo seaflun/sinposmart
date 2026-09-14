@@ -465,6 +465,8 @@ class UpdateController(UpdateWindowState):
         self._remote_update_command = dict(command)
         self._remote_update_request_id = command_id
         if status in REMOTE_UPDATE_TERMINAL_STATUSES:
+            if status == "timed_out" and self._check_remote_stage(reconcile_only=True):
+                return
             self._finish_remote_update(status, command)
             return
         if status not in REMOTE_UPDATE_ACTIVE_STATUSES:
@@ -519,9 +521,9 @@ class UpdateController(UpdateWindowState):
         self._status_text = "遠端更新已收到，正在背景準備套件。"
         self.stateChanged.emit()
 
-    def _check_remote_stage(self) -> None:
-        if not self._remote_update_active or not self._remote_update_request_id:
-            return
+    def _check_remote_stage(self, *, reconcile_only: bool = False) -> bool:
+        if not self._remote_update_request_id or (not self._remote_update_active and not reconcile_only):
+            return False
         manifest_path = self._remote_update_manifest_path(self._remote_update_request_id)
         if manifest_path.is_file():
             try:
@@ -531,6 +533,9 @@ class UpdateController(UpdateWindowState):
             if isinstance(manifest, dict) and str(manifest.get("request_id") or "") == self._remote_update_request_id:
                 stage_status = str(manifest.get("status") or "").strip()
                 if stage_status in {"completed", "up_to_date"}:
+                    installed_version = str(manifest.get("installed_version") or "").strip()
+                    if not installed_version or installed_version != self._current_version:
+                        return False
                     self._remote_update_prepare_process = None
                     terminal_detail = str(
                         manifest.get("detail")
@@ -544,17 +549,17 @@ class UpdateController(UpdateWindowState):
                         **self._remote_update_command,
                         "status": stage_status,
                         "detail": terminal_detail,
-                        "installed_version": str(
-                            manifest.get("installed_version") or self._current_version
-                        ),
+                        "installed_version": installed_version,
                     }
                     self._finish_remote_update(stage_status, terminal_command)
                     self._send_remote_status(stage_status, terminal_detail)
-                    return
+                    return True
+                if reconcile_only:
+                    return False
                 if stage_status == "failed":
                     self._remote_update_prepare_process = None
                     self._fail_remote_update(str(manifest.get("detail") or "背景更新準備失敗。"))
-                    return
+                    return False
                 if stage_status == "staged":
                     self._remote_update_prepare_process = None
                     self._remote_update_ready = True
@@ -562,9 +567,9 @@ class UpdateController(UpdateWindowState):
                         process = self._remote_update_apply_process
                         if process is not None and process.poll() is not None:
                             self._fail_remote_update("更新視窗已結束，但尚未收到安裝完成結果。")
-                        return
+                        return False
                     if self._update_deferred:
-                        return
+                        return False
                     self._status_text = "遠端更新檔已準備，等待交接登出套用。"
                     self._set_remote_state(status="waiting_handoff")
                     if not self._remote_update_stage_reported:
@@ -572,7 +577,9 @@ class UpdateController(UpdateWindowState):
                         self._send_remote_status("staged", self._status_text)
                     if self._remote_update_apply_requested:
                         self._launch_remote_apply()
-                    return
+                    return False
+        if reconcile_only:
+            return False
         process = self._remote_update_prepare_process
         poll = getattr(process, "poll", None) if process is not None else None
         if callable(poll):
@@ -584,6 +591,7 @@ class UpdateController(UpdateWindowState):
                 self._fail_remote_update("背景更新準備失敗，尚未套用任何檔案。")
             elif exit_code == 0:
                 self._fail_remote_update("背景更新準備未產生可套用的套件。")
+        return False
 
     def _launch_remote_apply(self) -> bool:
         if self._shutdown_admission or not self._remote_update_active or not self._remote_update_ready:
@@ -700,6 +708,8 @@ class UpdateController(UpdateWindowState):
                 "status": status,
                 "detail": str(detail or "")[:500],
                 "worker_id": self._remote_update_worker_id,
+                **({"installed_version": self._current_version, "exit_code": 0}
+                   if status in {"completed", "up_to_date"} else {}),
             },
         )
         thread = QThread(self)
