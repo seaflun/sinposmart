@@ -18,7 +18,9 @@
 RUN_DUTY_GUI_WINPYTHON.vbs
 ```
 
-這個啟動方式會由隱藏執行的 VBS／批次檔使用 WinPython `python.exe` 開啟 PySide6 + QML 正式介面，不會出現小黑窗。`duty_gui.py` 的 Tk 介面僅保留為回退版本，不是正式啟動入口。
+這個啟動方式會由隱藏執行的 VBS／批次檔使用 WinPython `python.exe` 開啟 PySide6 + QML 正式介面，不會出現小黑窗。舊 Tk 回退介面已集中至 `legacy_tk/`，不是正式啟動入口。
+
+若 QML 正式介面暫時無法使用，才依 [PORTABLE_SETUP.md](PORTABLE_SETUP.md#緊急-tk-回退) 安裝選用 Tk 套件並用 `pythonw.exe` 啟動回退介面。
 
 ## WinPython 放哪裡
 

@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from app_core.daily_vehicle_service import (
     DailyVehicleExecutionError,
+    DailyVehicleValidationError,
     DailyVehicleRequest,
     DailyVehicleService,
 )
@@ -46,7 +47,7 @@ class DailyVehicleWorker(QObject):
                     self.request,
                     status_callback=lambda message: self.progress.emit(self.request_id, message),
                 )
-        except DailyVehicleExecutionError as exc:
+        except (DailyVehicleExecutionError, DailyVehicleValidationError) as exc:
             self.failure_stage = getattr(exc, "failure_stage", stage)
             self.failed.emit(self.request_id, str(exc))
         except Exception:

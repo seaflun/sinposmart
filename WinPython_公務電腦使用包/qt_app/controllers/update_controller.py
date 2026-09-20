@@ -179,6 +179,7 @@ class UpdateController(UpdateWindowState):
         remote_process_launcher: Callable[[Path, str, str], Any] = launch_remote_update_process,
         remote_update_enabled: bool | None = None,
         stop_guard: Callable[[], str] | None = None,
+        read_only_acceptance: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -186,6 +187,7 @@ class UpdateController(UpdateWindowState):
         self._process_launcher = process_launcher
         self._remote_process_launcher = remote_process_launcher
         self._stop_guard = stop_guard
+        self._read_only_acceptance = bool(read_only_acceptance)
         self._current_version = ""
         self._latest_version = ""
         self._status_text = "尚未檢查更新"
@@ -208,7 +210,7 @@ class UpdateController(UpdateWindowState):
             bool(self._remote_update_endpoint and self._remote_update_token)
             if remote_update_enabled is None
             else bool(remote_update_enabled)
-        )
+        ) and not self._read_only_acceptance
         self._remote_update_command: dict[str, Any] = {}
         self._remote_update_request_id = ""
         self._remote_update_status = ""
@@ -307,6 +309,10 @@ class UpdateController(UpdateWindowState):
 
     @Slot()
     def check(self) -> None:
+        if self._read_only_acceptance:
+            self._status_text = "唯讀驗收模式，不檢查或安裝更新。"
+            self.stateChanged.emit()
+            return
         if self._shutdown_admission or self._update_deferred or self._workers or self._install_launched:
             return
         self._request_id += 1
@@ -332,6 +338,10 @@ class UpdateController(UpdateWindowState):
 
     @Slot()
     def launchUpdate(self) -> None:
+        if self._read_only_acceptance:
+            self._status_text = "唯讀驗收模式，不檢查或安裝更新。"
+            self.stateChanged.emit()
+            return
         if self._update_deferred or self._install_launched or self._shutdown_admission:
             return
         if not self._update_available:

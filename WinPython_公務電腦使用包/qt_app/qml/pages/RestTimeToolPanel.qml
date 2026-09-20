@@ -51,10 +51,12 @@ ToolSidePanel {
                         Layout.fillWidth: true
                         text: restTimeDialog.controller.restWorkbookPath
                         enabled: !restTimeDialog.controller.isRunning
+                                 && !restTimeDialog.hostWindow.backend.readOnlyAcceptance
                     }
                     ToolBrowseButton {
                         objectName: "restWorkbookBrowseButton"
                         enabled: !restTimeDialog.controller.isRunning
+                                 && !restTimeDialog.hostWindow.backend.readOnlyAcceptance
                         onClicked: restTimeDialog.browseWorkbookRequested()
                     }
                 }
@@ -100,7 +102,12 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: restTimeDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !restTimeDialog.controller.isRunning
-            onClicked: restTimeDialog.controller.prepareRestRun(restWorkbookField.text, restMonthCombo.currentText)
+                     && !restTimeDialog.hostWindow.backend.readOnlyAcceptance
+            onClicked: {
+                if (!restTimeDialog.hostWindow.backend.readOnlyAcceptance) {
+                    restTimeDialog.controller.prepareRestRun(restWorkbookField.text, restMonthCombo.currentText)
+                }
+            }
         }
     }
 }

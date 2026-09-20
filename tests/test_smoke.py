@@ -60,11 +60,19 @@ def duty_rehearsal_module():
     return importlib.import_module("duty_rehearsal")
 
 
-def duty_gui_module():
+def legacy_tk_path(*parts: str) -> Path:
+    return package_dir() / "legacy_tk" / Path(*parts)
+
+
+def legacy_tk_module(name: str):
     root = package_dir()
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    return importlib.import_module("duty_gui")
+    return importlib.import_module(f"legacy_tk.{name}")
+
+
+def duty_gui_module():
+    return legacy_tk_module("duty_gui")
 
 
 def package_module(name: str):
@@ -269,6 +277,12 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("from qt_app.main import main", windowed_entry)
         self.assertNotIn("from duty_gui import main", windowed_entry)
 
+        compatibility_entry = (root / "duty_gui.py").read_text(encoding="utf-8-sig")
+        self.assertIn("from qt_app.main import main", compatibility_entry)
+        self.assertNotIn("tkinter", compatibility_entry)
+        self.assertNotIn("from legacy_tk", compatibility_entry)
+        self.assertTrue(legacy_tk_path("duty_gui.py").is_file())
+
         launcher = (root / "RUN_DUTY_GUI_WINPYTHON.bat").read_text(encoding="utf-8-sig")
         self.assertIn('set "PYTHONW_EXE=%%F"', launcher)
         self.assertIn('start "" /b "%PYTHONW_EXE%" "%~dp0duty_gui.pyw"', launcher)
@@ -287,16 +301,16 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("from PySide6.QtQml import QQmlApplicationEngine", source)
         self.assertIn("PySide6/QML runtime imports succeeded", source)
 
-    def test_rescue_video_beta_tool_is_packaged_and_launches_without_delete_flags(self) -> None:
+    def test_legacy_rescue_video_tool_launches_without_delete_flags(self) -> None:
         root = package_dir()
-        gui_source = (root / "duty_gui.py").read_text(encoding="utf-8-sig")
+        gui_source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
-        self.assertTrue((root / "rescue_video" / "救護影片分類GUI.py").is_file())
+        self.assertTrue(legacy_tk_path("rescue_video_gui.py").is_file())
         self.assertTrue((root / "rescue_video" / "classify_rescue_video.py").is_file())
         self.assertIn('text="行車紀錄器（BETA）"', gui_source)
         update_source = (root / "update_package.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn('"rescue_video\\救護影片分類GUI.py"', update_source)
         self.assertIn('"rescue_video\\classify_rescue_video.py"', update_source)
+        self.assertIn('"rescue_video\\rescue_video_core.py"', update_source)
 
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)
@@ -307,7 +321,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             gui.open_rescue_video_tool()
 
         command = popen.call_args.args[0]
-        self.assertTrue(command[-1].endswith("救護影片分類GUI.py"))
+        self.assertEqual(Path(command[-1]).name, "rescue_video_gui.py")
         self.assertNotIn("--delete-source", command)
         self.assertNotIn("--apply", command)
         self.assertEqual(messages, [(module.APP_DISPLAY_NAME, "已開啟行車紀錄器（BETA）。")])
@@ -325,7 +339,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
                 compile(source, str(path), "exec")
 
     def test_background_chrome_options_have_offscreen_fallback(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         helper = next(
             node
@@ -369,6 +383,95 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             with self.subTest(expected=expected):
                 self.assertIn(expected, script)
 
+    def test_update_package_migrates_legacy_tk_fallback(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        skip_dirs = script[
+            script.index("$skipDirs = @("):
+            script.index("$alwaysSkipFiles = @(")
+        ]
+
+        self.assertNotIn('"legacy_tk"', skip_dirs)
+        self.assertIn("function Move-LegacyTkFallbacks", script)
+        self.assertIn("Move-LegacyTkFallbacks -PackageDir $packageDir", script)
+        for old_path in (
+            '"duty_gui.py"',
+            '"duty_sheet_automation.py"',
+            '"daily_vehicle_automation.py"',
+            '"rescue_video\\救護影片分類GUI.py"',
+        ):
+            with self.subTest(old_path=old_path):
+                self.assertIn(old_path, script)
+
+    def test_update_package_moves_legacy_tk_files_without_overwriting_fallback(self) -> None:
+        contract = r'''
+$updatePath = Join-Path (Get-Location) "update_package.ps1"
+$updateScript = Get-Content -LiteralPath $updatePath -Raw -Encoding UTF8
+$functionBlock = [regex]::Match(
+    $updateScript,
+    '(?s)function Test-LegacyTkScript\s*\{.*?(?=function New-PackageBackup)'
+)
+if (-not $functionBlock.Success) {
+    throw "Could not load legacy Tk migration functions."
+}
+
+$stamp = "migration-test"
+Invoke-Expression $functionBlock.Value
+$packageDir = Join-Path $env:TEMP ("SinpoSmartLegacyTkTest-" + [guid]::NewGuid().ToString("N"))
+
+try {
+    New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+    $rescueDir = Join-Path $packageDir "rescue_video"
+    $legacyDir = Join-Path $packageDir "legacy_tk"
+    New-Item -ItemType Directory -Path $rescueDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $legacyDir -Force | Out-Null
+
+    Set-Content -LiteralPath (Join-Path $packageDir "duty_gui.py") -Value "import tkinter as tk" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $packageDir "duty_sheet_automation.py") -Value "from tkinter import messagebox" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $packageDir "daily_vehicle_automation.py") -Value "# QML-compatible source" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $rescueDir "救護影片分類GUI.py") -Value "import customtkinter" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $legacyDir "duty_sheet_automation.py") -Value "existing fallback" -Encoding UTF8
+
+    Move-LegacyTkFallbacks -PackageDir $packageDir 6>$null
+
+    if (Test-Path -LiteralPath (Join-Path $packageDir "duty_gui.py")) {
+        throw "Tk duty GUI was not moved."
+    }
+    if (Test-Path -LiteralPath (Join-Path $packageDir "duty_sheet_automation.py")) {
+        throw "Tk duty sheet automation was not moved."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $packageDir "daily_vehicle_automation.py"))) {
+        throw "Non-Tk source should remain at its root path."
+    }
+    if (Test-Path -LiteralPath (Join-Path $rescueDir "救護影片分類GUI.py")) {
+        throw "Tk rescue video GUI was not moved."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $legacyDir "duty_gui.py"))) {
+        throw "Tk duty GUI fallback is missing."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $legacyDir "rescue_video_gui.py"))) {
+        throw "Tk rescue video fallback is missing."
+    }
+    if ((Get-Content -LiteralPath (Join-Path $legacyDir "duty_sheet_automation.py") -Raw -Encoding UTF8).Trim() -ne "existing fallback") {
+        throw "Existing Tk fallback was overwritten."
+    }
+    $migrationBackup = Join-Path $legacyDir "migration_backup\\migration-test\\duty_sheet_automation.py"
+    if (-not (Test-Path -LiteralPath $migrationBackup)) {
+        throw "Existing Tk fallback was not preserved in migration backup."
+    }
+    if ((Get-Content -LiteralPath $migrationBackup -Raw -Encoding UTF8) -notmatch "from tkinter") {
+        throw "Migration backup content is incorrect."
+    }
+} finally {
+    if (Test-Path -LiteralPath $packageDir) {
+        Remove-Item -LiteralPath $packageDir -Recurse -Force
+    }
+}
+'''
+
+        result = run_powershell_contract(contract)
+
+        self.assertEqual(result.returncode, 0, msg=(result.stdout or "") + (result.stderr or ""))
+
     def test_update_package_preserves_existing_work_log_settings(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
         preserve_section = script[
@@ -379,7 +482,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn('"work_log_defaults.json"', preserve_section)
 
     def test_sinposmart_events_include_installed_version(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("def current_app_version(", source)
         self.assertIn("snapshot_data = sanitize_frontend_json(dict(snapshot or {}))", source)
@@ -387,7 +490,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn('"snapshot": snapshot_data', source)
 
     def test_sinposmart_backend_event_call_keywords_match_signature(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         signature_keywords: set[str] = set()
         call_keywords: set[str] = set()
@@ -480,14 +583,17 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             "Traceback\nChromeDriver\ncookie=abc\nsession token=def\npassword secret": "執行失敗：系統發生未預期錯誤，請查看後端日誌。",
         }
 
-        for module_name in ("duty_sheet_automation", "rest_time_automation", "daily_vehicle_automation"):
-            module = package_module(module_name)
+        for module_name, module in (
+            ("duty_sheet_automation", legacy_tk_module("duty_sheet_automation")),
+            ("rest_time_automation", package_module("rest_time_automation")),
+            ("daily_vehicle_automation", legacy_tk_module("daily_vehicle_automation")),
+        ):
             for raw, safe in expected.items():
                 with self.subTest(module=module_name, safe=safe):
                     self.assertEqual(module.format_automation_error(RuntimeError(raw)), safe)
 
     def test_four_tool_entries_register_sinposmart_callbacks(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         for tool_name in ("duty_sheet", "rest_time", "monthly_base", "daily_vehicle"):
             with self.subTest(tool_name=tool_name):
@@ -524,12 +630,12 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
                     self.assertEqual(notifications[-1], (module.APP_DISPLAY_NAME, expected))
 
         self.assertEqual(len(notifications), len(cases))
-        rest_source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+        rest_source = legacy_tk_path("rest_time_dialogs.py").read_text(encoding="utf-8-sig")
         self.assertIn('on_finish(f"{expected_roc_year}年{expected_month}月 休息時間登打完成：{result}")', rest_source)
         self.assertIn('on_finish(f"{expected_roc_year}年{expected_month}月 勤務基準表登打完成：{result}")', rest_source)
 
     def test_rest_and_monthly_base_dialogs_use_fixed_year_and_three_month_combo(self) -> None:
-        source = (package_dir() / "rest_time_automation.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("rest_time_dialogs.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("month_var", source)
         self.assertIn("nearby_month_options", source)
@@ -1250,7 +1356,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertLess(source.index("clearRowValues(row, Object.keys(data).length)"), source.index("return setRowValues(row, data)"))
 
     def test_update_logout_command_reports_logout_synchronously(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn('elif message == "update_logout":', source)
         self.assertIn("def report_update_logout(self) -> bool:", source)
@@ -1261,7 +1367,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("immediate=True", source)
 
     def test_duty_control_buttons_keep_spacing(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn('self.manual_pause_button.pack(side=tk.RIGHT, padx=(0, 6))', source)
         self.assertIn('self.resume_schedule_button.pack(side=tk.RIGHT, padx=(0, 6))', source)
@@ -1276,7 +1382,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         )
 
     def test_logged_out_simple_mode_uses_compact_height(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertTrue(
             'self.geometry("550x320")' in source,
@@ -2107,7 +2213,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertEqual(action["fields"]["系統寫入時間"], "08:05")
 
     def test_manual_submit_confirmation_mentions_current_time(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("將使用按下「手動登打」時的當下時間登打。", source)
         self.assertEqual(source.count("將使用按下「手動登打」時的當下時間登打。"), 2)
@@ -2199,7 +2305,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertEqual(cache_args, [None])
 
     def test_submit_worker_verifies_saved_record_before_marking_success(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("def verify_action_saved_after_submit", source)
         self.assertLess(
@@ -2208,7 +2314,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         )
 
     def test_sinposmart_event_worker_persists_pending_before_posting(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertLess(
             source.index("write_pending_sinposmart_backend_events(pending)"),
@@ -2221,7 +2327,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         )
 
     def test_duty_sheet_preflight_false_result_reports_tool_error(self) -> None:
-        source = (package_dir() / "duty_sheet_automation.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_sheet_automation.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("automation_result = legacy.start_automation", source)
         self.assertIn("if automation_result is False:", source)
@@ -2230,7 +2336,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("on_error(error)", source)
 
     def test_login_success_auto_syncs_credentials_without_export_gate(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         login_fn = next(
             node
@@ -2314,7 +2420,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertEqual(gui.identify_logged_in_actor(Driver()), ("", "曾彥綸"))
 
     def test_auto_credential_sync_uses_saved_accounts_after_login(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         sync_fn = next(
             node
@@ -2327,7 +2433,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertIn("saved_accounts_for_credential_sync", calls)
 
     def test_credential_sync_worker_supports_silent_background_mode(self) -> None:
-        source = (package_dir() / "duty_gui.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("notify_user: bool = True", source)
         self.assertIn("notify_user=False", source)
@@ -2547,7 +2653,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             encoding="utf-8-sig"
         )
         start = source.index("def start_automation(")
-        flow = source[start:source.index("# ==========================================\n# [區塊七]", start)]
+        flow = source[start:]
         post_setup_flow = flow[flow.index("step_config_popups("):]
 
         self.assertLess(post_setup_flow.index("step_config_popups("), post_setup_flow.index("wait_for_duty_result_grid("))
@@ -3106,7 +3212,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
         self.assertEqual(peak_active, 1)
 
     def test_legacy_daily_vehicle_launcher_never_opens_a_console(self) -> None:
-        source = (package_dir() / "daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
+        source = legacy_tk_path("daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
 
         self.assertIn("process = subprocess.Popen(", source)
         self.assertIn('creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)', source)
@@ -4216,6 +4322,7 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             install_section.index('$prepareResult -ne "ready"'),
             install_section.index("Stop-RunningDutyGui"),
         )
+
     def test_update_package_restarts_gui_when_installation_fails_after_shutdown(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
 
@@ -4234,7 +4341,6 @@ function Start-DutyGui {{ $script:restartedProcessId = 456; return $true }}
             finally_section.index("$guiRestarted = [bool](Start-DutyGui)"),
             finally_section.index("if (Test-Path -LiteralPath $tempDir)"),
         )
-
 
     def test_update_package_detects_relative_entrypoints_fail_closed(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")

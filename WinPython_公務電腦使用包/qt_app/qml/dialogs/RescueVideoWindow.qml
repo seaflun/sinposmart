@@ -23,6 +23,8 @@ Window {
     flags: Qt.Window | Qt.FramelessWindowHint
     modality: Qt.NonModal
     readonly property bool usesCustomTitleBar: true
+    readonly property bool readOnlyAcceptance: Boolean(hostWindow.backend
+                                                       && hostWindow.backend.readOnlyAcceptance)
     readonly property bool interactionsLocked: rescueVideoWindow.controller.isRunning
                                                || rescueVideoWindow.controller.isAwaitingConfirmation
     property var resultColumnWidths: ({
@@ -160,11 +162,15 @@ Window {
     FolderDialog {
         id: rescueVideoSourceDialog
         title: "選擇記憶卡 DCIM\\100CAREC 資料夾"
-        onAccepted: rescueVideoWindow.controller.updateInputs(
-            rescueVideoWindow.controller.localPath(selectedFolder),
-            rescueVideoDateField.text,
-            rescueVideoVehicleCombo.currentText
-        )
+        onAccepted: {
+            if (!rescueVideoWindow.readOnlyAcceptance) {
+                rescueVideoWindow.controller.updateInputs(
+                    rescueVideoWindow.controller.localPath(selectedFolder),
+                    rescueVideoDateField.text,
+                    rescueVideoVehicleCombo.currentText
+                )
+            }
+        }
     }
 
     AppleCalendarButton {
@@ -177,7 +183,10 @@ Window {
         dateFormat: "iso"
         enabled: !rescueVideoWindow.controller.isRunning
                  && !rescueVideoWindow.controller.isAwaitingConfirmation
+                 && !rescueVideoWindow.readOnlyAcceptance
         onDateSelected: function(value) {
+            if (rescueVideoWindow.readOnlyAcceptance)
+                return
             rescueVideoWindow.controller.refreshVehicleOptions(
                 rescueVideoWindow.controller.sourcePath,
                 value
@@ -413,10 +422,15 @@ Window {
                         text: rescueVideoWindow.controller.targetDate
                         enabled: !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
-                        onEditingFinished: rescueVideoWindow.controller.refreshVehicleOptions(
-                            rescueVideoWindow.controller.sourcePath,
-                            text
-                        )
+                                 && !rescueVideoWindow.readOnlyAcceptance
+                        onEditingFinished: {
+                            if (!rescueVideoWindow.readOnlyAcceptance) {
+                                rescueVideoWindow.controller.refreshVehicleOptions(
+                                    rescueVideoWindow.controller.sourcePath,
+                                    text
+                                )
+                            }
+                        }
                         clickAction: function() {
                             rescueVideoDateCalendar.openForCurrentDate()
                         }
@@ -431,11 +445,16 @@ Window {
                         enabled: model.length > 0
                                  && !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
-                        onActivated: rescueVideoWindow.controller.updateInputs(
-                            rescueVideoWindow.controller.sourcePath,
-                            rescueVideoDateField.text,
-                            currentText
-                        )
+                                 && !rescueVideoWindow.readOnlyAcceptance
+                        onActivated: {
+                            if (!rescueVideoWindow.readOnlyAcceptance) {
+                                rescueVideoWindow.controller.updateInputs(
+                                    rescueVideoWindow.controller.sourcePath,
+                                    rescueVideoDateField.text,
+                                    currentText
+                                )
+                            }
+                        }
                     }
                     AppleButton {
                         objectName: "rescueVideoCheckButton"
@@ -443,11 +462,16 @@ Window {
                         tone: "neutralStrong"
                         enabled: !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
-                        onClicked: rescueVideoWindow.controller.checkAndPreview(
-                            rescueVideoWindow.controller.sourcePath,
-                            rescueVideoDateField.text,
-                            rescueVideoVehicleCombo.currentText
-                        )
+                                 && !rescueVideoWindow.readOnlyAcceptance
+                        onClicked: {
+                            if (!rescueVideoWindow.readOnlyAcceptance) {
+                                rescueVideoWindow.controller.checkAndPreview(
+                                    rescueVideoWindow.controller.sourcePath,
+                                    rescueVideoDateField.text,
+                                    rescueVideoVehicleCombo.currentText
+                                )
+                            }
+                        }
                     }
                     Label {
                         objectName: "rescueVideoSummaryText"
@@ -593,7 +617,12 @@ Window {
                                         tone: "neutralStrong"
                                         enabled: !rescueVideoWindow.controller.isRunning
                                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
-                                        onClicked: rescueVideoSourceDialog.open()
+                                                 && !rescueVideoWindow.readOnlyAcceptance
+                                        onClicked: {
+                                            if (!rescueVideoWindow.readOnlyAcceptance) {
+                                                rescueVideoSourceDialog.open()
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -780,14 +809,19 @@ Window {
                              && rescueVideoWindow.controller.hasPreview
                              && !rescueVideoWindow.controller.isRunning
                              && !rescueVideoWindow.controller.isAwaitingConfirmation
-                    onClicked: rescueVideoWindow.controller.prepareCopy(
-                        rescueVideoWindow.controller.sourcePath,
-                        rescueVideoWindow.controller.destinationPath,
-                        rescueVideoDateField.text,
-                        rescueVideoVehicleCombo.currentText,
-                        rescueVideoWindow.controller.offsetText,
-                        false
-                    )
+                             && !rescueVideoWindow.readOnlyAcceptance
+                    onClicked: {
+                        if (!rescueVideoWindow.readOnlyAcceptance) {
+                            rescueVideoWindow.controller.prepareCopy(
+                                rescueVideoWindow.controller.sourcePath,
+                                rescueVideoWindow.controller.destinationPath,
+                                rescueVideoDateField.text,
+                                rescueVideoVehicleCombo.currentText,
+                                rescueVideoWindow.controller.offsetText,
+                                false
+                            )
+                        }
+                    }
                 }
                 AppleButton {
                     objectName: "rescueVideoCopyStartButton"
@@ -798,14 +832,19 @@ Window {
                              && rescueVideoWindow.controller.hasPreview
                              && !rescueVideoWindow.controller.isRunning
                              && !rescueVideoWindow.controller.isAwaitingConfirmation
-                    onClicked: rescueVideoWindow.controller.prepareDelete(
-                        rescueVideoWindow.controller.sourcePath,
-                        rescueVideoWindow.controller.destinationPath,
-                        rescueVideoDateField.text,
-                        rescueVideoVehicleCombo.currentText,
-                        rescueVideoWindow.controller.offsetText,
-                        false
-                    )
+                             && !rescueVideoWindow.readOnlyAcceptance
+                    onClicked: {
+                        if (!rescueVideoWindow.readOnlyAcceptance) {
+                            rescueVideoWindow.controller.prepareDelete(
+                                rescueVideoWindow.controller.sourcePath,
+                                rescueVideoWindow.controller.destinationPath,
+                                rescueVideoDateField.text,
+                                rescueVideoVehicleCombo.currentText,
+                                rescueVideoWindow.controller.offsetText,
+                                false
+                            )
+                        }
+                    }
                 }
                 BusyIndicator {
                     running: rescueVideoWindow.controller.isRunning
@@ -834,7 +873,11 @@ Window {
         acceptText: "開始分類"
         rejectText: "取消"
         acceptTone: "primary"
-        onAccepted: rescueVideoWindow.controller.confirmCopy()
+        onAccepted: {
+            if (!rescueVideoWindow.readOnlyAcceptance) {
+                rescueVideoWindow.controller.confirmCopy()
+            }
+        }
         onRejected: rescueVideoWindow.controller.cancelCopy()
 
         Label {
@@ -856,7 +899,11 @@ Window {
         acceptText: "開始分類並刪除"
         rejectText: "取消"
         acceptTone: "dangerFilled"
-        onAccepted: rescueVideoWindow.controller.confirmDelete()
+        onAccepted: {
+            if (!rescueVideoWindow.readOnlyAcceptance) {
+                rescueVideoWindow.controller.confirmDelete()
+            }
+        }
         onRejected: rescueVideoWindow.controller.cancelDelete()
 
         Label {

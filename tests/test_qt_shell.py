@@ -47,6 +47,358 @@ def run_isolated_python(
         return result.returncode, output.read().decode("utf-8", errors="replace")
 
 
+class DailyAutomaticScheduleTests(unittest.TestCase):
+    def test_due_order_claim_survives_restart_and_manual_success_cancels(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as directory:
+            clock = lambda: datetime(2026, 9, 20, 16, 25)
+            controller = ToolController(Path(directory), now_factory=clock)
+            first = controller.next_daily_automatic()
+            self.assertEqual((first["tool_id"], first["target_date"]), ("daily_vehicle", "1150920"))
+            self.assertTrue(controller.claim_daily_automatic(first["key"]))
+            restarted = ToolController(Path(directory), now_factory=clock)
+            second = restarted.next_daily_automatic()
+            self.assertEqual((second["tool_id"], second["target_date"]), ("duty_sheet", "1150921"))
+            restarted.record_started("duty_sheet", "勤務表", "測試人員", "1150921")
+            restarted.record_finished("duty_sheet", "completed", "勤務表已登打完成：1150921")
+            self.assertIsNone(restarted.next_daily_automatic())
+
+    def test_time_boundaries_and_midnight_vehicle_expiry(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = ToolController(Path(directory))
+            self.assertIsNone(controller.next_daily_automatic(datetime(2026, 9, 20, 8, 59)))
+            self.assertEqual(controller.next_daily_automatic(datetime(2026, 9, 20, 9))["tool_id"], "daily_vehicle")
+            overdue = controller.next_daily_automatic(datetime(2026, 9, 21, 0, 1))
+            self.assertEqual((overdue["tool_id"], overdue["target_date"]), ("duty_sheet", "1150921"))
+            self.assertIsNone(controller.next_daily_automatic(datetime(2026, 9, 21, 8)))
+            self.assertEqual(controller.next_daily_automatic(datetime(2026, 9, 21, 9))["target_date"], "1150921")
+
+    def test_corrupt_or_unwritable_journal_never_authorizes_execution(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runtime_outputs" / "daily_tool_schedule.json"
+            journal.parent.mkdir()
+            journal.write_text("{broken", encoding="utf-8")
+            controller = ToolController(root)
+            with self.assertRaises(RuntimeError):
+                controller.next_daily_automatic(datetime(2026, 9, 20, 9))
+            self.assertEqual(journal.read_text(encoding="utf-8"), "{broken")
+        with tempfile.TemporaryDirectory() as directory:
+            controller = ToolController(Path(directory))
+            with patch("qt_app.controllers.tool_controller.os.replace", side_effect=OSError("disk")):
+                with self.assertRaises(RuntimeError):
+                    controller.next_daily_automatic(datetime(2026, 9, 20, 9))
+
+    def test_clock_rollback_does_not_run_before_due_time(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+        with tempfile.TemporaryDirectory() as directory:
+            controller = ToolController(Path(directory))
+            self.assertIsNotNone(controller.next_daily_automatic(datetime(2026, 9, 20, 9)))
+            self.assertIsNone(controller.next_daily_automatic(datetime(2026, 9, 20, 8, 59)))
+
+    def test_inconsistent_persisted_dates_fail_closed(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+        with tempfile.TemporaryDirectory() as directory:
+            controller = ToolController(Path(directory))
+            row = controller.next_daily_automatic(datetime(2026, 9, 20, 9))
+            controller._automatic_records[row["key"]]["due_at"] = "2026-09-20T00:00:00"
+            controller._save_automatic_records()
+            with self.assertRaises(RuntimeError):
+                ToolController(Path(directory)).next_daily_automatic(datetime(2026, 9, 20, 8, 59))
+
+    def test_manual_vehicle_success_after_midnight_suppresses_same_calendar_day(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+        with tempfile.TemporaryDirectory() as directory:
+            current = datetime(2026, 9, 21, 0, 30)
+            controller = ToolController(Path(directory), now_factory=lambda: current)
+            controller.record_started("daily_vehicle", "每日點車", "測試人員", "1150921")
+            controller.record_finished("daily_vehicle", "completed", "完成")
+            current = datetime(2026, 9, 21, 9)
+            self.assertIsNone(controller.next_daily_automatic())
+
+    def test_vehicle_final_confirmation_does_not_submit_after_midnight(self) -> None:
+        import importlib.util
+        from unittest.mock import Mock
+        script = PACKAGE_ROOT / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+        spec = importlib.util.spec_from_file_location("_daily_vehicle_midnight_test", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        check, checkbox, submit, confirm = (Mock() for _ in range(4))
+        row = Mock()
+        row.find_elements.side_effect = lambda by, _selector: (
+            [SimpleNamespace(text="test-car")] * 4 if by == module.By.TAG_NAME else [check]
+        )
+        driver = Mock()
+        driver.find_elements.return_value = [confirm]
+        confirm.is_displayed.return_value = True
+        values = iter([row, row, checkbox, submit, True])
+        midnight = False
+
+        def until(_condition):
+            nonlocal midnight
+            value = next(values, True)
+            if value is True:
+                midnight = True
+            return value
+
+        def date_guard():
+            if midnight:
+                raise RuntimeError("每日點車已跨日")
+
+        with patch.object(module, "query_grid_rows", side_effect=[[row], []]), patch.object(
+            module, "wait_for_spinner"
+        ), patch.object(module, "ensure_requested_date", side_effect=date_guard):
+            with self.assertRaisesRegex(RuntimeError, "每日點車已跨日"):
+                module.process_equip_checks(driver, SimpleNamespace(until=until))
+        self.assertFalse(any(call.args[-1] is confirm for call in driver.execute_script.call_args_list))
+
+
+class AutomaticDutyWorkbookTests(unittest.TestCase):
+    def test_automatic_selection_is_saved_only_after_success(self) -> None:
+        from app_core.duty_sheet_service import DutySheetService, DutySheetExecutionError
+        for success in (False, True):
+            with self.subTest(success=success), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workbook = root / "115" / "10月" / "新坡勤務表.xlsm"
+                self.workbook(workbook)
+                operations = []
+                config = {"last_selection": {"workbook_path": str(workbook), "attack": "A", "stop": "B", "amb1": "C", "amb2": "D"}, "notification": {"enabled": False}}
+                def execute(*_args, **_kwargs):
+                    operations.append("execute")
+                    return success
+                legacy = SimpleNamespace(
+                    load_config=lambda: config, convert_to_minguo=lambda value: "1151001",
+                    start_automation=execute, save_config=lambda *_args, **_kwargs: operations.append("save"),
+                )
+                service = DutySheetService(root, module_loader=lambda _: legacy)
+                service.project_dir.mkdir()
+                (service.project_dir / "sinposmart_1.py").write_text("# fixture", encoding="utf-8")
+                with patch.object(service, "_read_config", return_value=config):
+                    request = service.prepare_automatic_request("user", "secret", "1151001")
+                if success:
+                    self.assertIn("1151001", service.execute(request))
+                    self.assertEqual(operations, ["execute", "save"])
+                else:
+                    with self.assertRaises(DutySheetExecutionError):
+                        service.execute(request)
+                    self.assertEqual(operations, ["execute"])
+
+    @staticmethod
+    def workbook(path: Path, day: int = 1, month: int = 10) -> None:
+        from openpyxl import Workbook
+        path.parent.mkdir(parents=True, exist_ok=True)
+        book = Workbook()
+        sheet = book.active
+        sheet.title = f"{day}號"
+        sheet["A1"] = f"新坡分隊115年{month}月勤務表"
+        for column, label in enumerate(("時間", "值班", "休息", "備勤緊急救護", "備勤救災", "指揮官"), 1):
+            sheet.cell(5, column, label)
+        book.save(path)
+        book.close()
+
+    def test_saved_file_wins_and_month_change_uses_newest_valid_candidate(self) -> None:
+        from app_core.duty_sheet_service import DutySheetService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "schedules" / "115" / "9月" / "新坡勤務表115年9月.xlsm"
+            first = root / "schedules" / "115" / "10月" / "新坡勤務表115年10月v1.xlsm"
+            newest = first.with_name("新坡勤務表115年10月修訂.xlsm")
+            self.workbook(old, 1, 9)
+            self.workbook(first)
+            self.workbook(newest)
+            os.utime(first, (100, 100))
+            os.utime(newest, (200, 200))
+            service = DutySheetService(root)
+            self.assertEqual(service.resolve_automatic_workbook(str(first), "1151001"), first)
+            self.assertEqual(service.resolve_automatic_workbook(str(old), "1151001"), newest)
+            newest.write_bytes(b"corrupt")
+            self.assertEqual(service.resolve_automatic_workbook(str(old), "1151001"), first)
+
+    def test_tie_wrong_month_and_backups_fail_closed(self) -> None:
+        from app_core.duty_sheet_service import DutySheetService, DutySheetValidationError
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "115" / "9月" / "新坡勤務表.xlsm"
+            first = root / "115" / "10月" / "新坡勤務表甲.xlsm"
+            second = first.with_name("新坡勤務表乙.xlsm")
+            backup = first.with_name("新坡勤務表備份.xlsm")
+            self.workbook(old, 1, 9)
+            self.workbook(first)
+            self.workbook(second)
+            self.workbook(backup)
+            for path in (first, second, backup):
+                os.utime(path, (200, 200))
+            service = DutySheetService(root)
+            with self.assertRaisesRegex(DutySheetValidationError, "修改時間相同"):
+                service.resolve_automatic_workbook(str(old), "1151001")
+            self.workbook(first, month=9)
+            self.workbook(second, month=9)
+            with self.assertRaises(DutySheetValidationError):
+                service.resolve_automatic_workbook(str(old), "1151001")
+
+    def test_preparation_reuses_car_and_notification_settings_without_writing(self) -> None:
+        from app_core.duty_sheet_service import DutySheetService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook = root / "115" / "10月" / "新坡勤務表.xlsm"
+            self.workbook(workbook)
+            service = DutySheetService(root)
+            config = {"last_selection": {"workbook_path": str(workbook), "attack": "A", "stop": "B", "amb1": "C", "amb2": "D"}, "notification": {"enabled": True}}
+            with patch.object(service, "_read_config", return_value=config), patch.object(service, "_write_config") as save:
+                request = service.prepare_automatic_request("user", "secret", "1151001")
+            self.assertEqual(request.workbook_path, str(workbook))
+            self.assertEqual((request.attack, request.amb2, request.notification_enabled), ("A", "D", True))
+            self.assertTrue(request.automatic)
+            save.assert_not_called()
+
+
+class DailyAutomaticAdmissionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.now = datetime(2026, 9, 20, 16, 25)
+        self.controller = AppController(
+            tool_controller=ToolController(Path(self.directory.name), now_factory=lambda: self.now),
+            schedule_repository=ScheduleRepository(Path(self.directory.name)),
+            read_only_acceptance=True, automatic_tools_enabled=True,
+        )
+        self.addCleanup(self.controller.shutdown)
+        self.controller._read_only_acceptance = False
+        self.events = patch.object(self.controller, "_send_operational_event")
+        self.events.start()
+        self.addCleanup(self.events.stop)
+
+    def login(self) -> None:
+        from app_core.session import LoginSession
+        state = self.controller._session_state
+        attempt = state.begin_login()
+        state.complete_login(attempt, LoginSession("10", "test", "secret", verified=True, actor_name="測試人員"))
+
+    def test_login_identity_and_all_submitted_work_are_required_but_future_chains_do_not_block(self) -> None:
+        app = self.controller
+        with patch.object(app._daily_vehicle_controller, "start_automatic", return_value=True) as start:
+            app._check_daily_automatic_tools(self.now)
+            self.login()
+            app._check_daily_automatic_tools(self.now)
+            start.assert_not_called()
+            app._automatic_verified_context = app._daily_identity_context(self.now)
+            app._duty_execution_controller._requests[999] = SimpleNamespace(background=True)
+            app._check_daily_automatic_tools(self.now)
+            start.assert_not_called()
+            app._duty_execution_controller._requests.clear()
+            app._background_manual_chains["future"] = object()
+            try:
+                app._check_daily_automatic_tools(self.now)
+                app._check_daily_automatic_tools(self.now)
+                start.assert_called_once_with("1150920")
+            finally:
+                app._background_manual_chains.clear()
+
+    def test_read_only_and_restart_do_not_launch_again(self) -> None:
+        app = self.controller
+        self.login()
+        app._automatic_verified_context = app._daily_identity_context(self.now)
+        app._read_only_acceptance = True
+        with patch.object(app._daily_vehicle_controller, "start_automatic", return_value=True) as start:
+            app._check_daily_automatic_tools(self.now)
+            start.assert_not_called()
+            self.assertFalse((Path(self.directory.name) / "runtime_outputs/daily_tool_schedule.json").exists())
+
+    def test_prepared_source_rechecks_busy_identity_expiry_and_uses_latest_session(self) -> None:
+        from app_core.duty_sheet_service import DutySheetRequest
+        app = self.controller
+        self.login()
+        app._automatic_verified_context = app._daily_identity_context(self.now)
+        tools = app._tool_controller
+        vehicle = tools.next_daily_automatic(self.now)
+        tools.claim_daily_automatic(vehicle["key"], self.now)
+        tools.finish_daily_automatic(vehicle["key"], True)
+        with patch.object(app, "_prepare_automatic_duty_sheet") as prepare:
+            app._check_daily_automatic_tools(self.now)
+            prepare.assert_called_once()
+        app._automatic_prepared_request = DutySheetRequest("", "", "file.xlsm", "2026/09/21", "A", "B", "C", "D", False, automatic=True)
+        with patch.object(app._duty_sheet_controller, "start_automatic", return_value=True) as start:
+            app._duty_execution_controller._requests[999] = SimpleNamespace(background=True)
+            app._check_daily_automatic_tools(self.now)
+            app._duty_execution_controller._requests.clear()
+            app._automatic_verified_context = None
+            app._check_daily_automatic_tools(self.now)
+            start.assert_not_called()
+            app._automatic_verified_context = app._daily_identity_context(self.now)
+            app._check_daily_automatic_tools(self.now)
+            start.assert_called_once()
+            self.assertEqual(start.call_args.args[0].user_id, "test")
+            self.assertEqual(start.call_args.args[0].target_date, "2026/09/21")
+
+    def test_cached_identity_does_not_authorize_but_live_identity_does(self) -> None:
+        from datetime import datetime
+        from app_core.schedule_repository import business_roc_date
+        app = self.controller
+        self.login()
+        current = datetime.now()
+        schedule = {"target_date": business_roc_date(current), "today": {"staff": {"10": {"name": "測試人員"}}}, "actions": []}
+        app._cached_schedule_loaded(schedule)
+        self.assertIsNone(app._automatic_verified_context)
+        with patch.object(app, "_start_operational_sync"):
+            app._live_schedule_captured({**schedule, "_authenticated_actor": {"actor_no": "10", "actor_name": "測試人員"}})
+        self.assertEqual(app._automatic_verified_context, app._daily_identity_context(current))
+
+    def test_midnight_expiry_never_launches_vehicle_or_shows_a_new_prompt(self) -> None:
+        from datetime import datetime
+        app = self.controller
+        self.login()
+        app._automatic_verified_context = app._daily_identity_context(self.now)
+        self.now = datetime(2026, 9, 21, 0, 1)
+        with patch.object(app._daily_vehicle_controller, "start_automatic") as start, patch.object(app, "_prepare_automatic_duty_sheet") as prepare:
+            app._check_daily_automatic_tools(self.now)
+            start.assert_not_called()
+            prepare.assert_called_once()
+            self.assertEqual(prepare.call_args.args[0]["target_date"], "1150921")
+
+    def test_expired_prepared_duty_sheet_is_not_submitted(self) -> None:
+        from datetime import datetime
+        from app_core.duty_sheet_service import DutySheetRequest
+        app = self.controller
+        self.login()
+        record = app._tool_controller.next_daily_automatic(datetime(2026, 9, 21, 0, 1))
+        app._tool_controller.claim_daily_automatic(record["key"], datetime(2026, 9, 21, 0, 1))
+        app._automatic_tool_record = record
+        app._automatic_prepared_request = DutySheetRequest("", "", "file.xlsm", "2026/09/21", "A", "B", "C", "D", False, automatic=True)
+        with patch.object(app._duty_sheet_controller, "start_automatic") as start:
+            app._check_daily_automatic_tools(datetime(2026, 9, 21, 8))
+            start.assert_not_called()
+            self.assertIsNone(app._automatic_tool_record)
+
+    def test_vehicle_service_rejects_a_previous_date_before_starting_process(self) -> None:
+        from datetime import timedelta
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService, DailyVehicleValidationError
+        target = date.today() - timedelta(days=1)
+        roc = f"{target.year - 1911:03d}{target.month:02d}{target.day:02d}"
+        service = DailyVehicleService(Path(self.directory.name))
+        with self.assertRaisesRegex(DailyVehicleValidationError, "跨日"):
+            service.execute(DailyVehicleRequest("test", "secret", roc))
+
+
 class SessionStateTests(unittest.TestCase):
     def test_login_attempt_is_single_flight_and_accepts_current_result(self) -> None:
         from app_core.session import LoginSession, SessionState
@@ -201,6 +553,47 @@ class LoginVerifierTests(unittest.TestCase):
         self.assertEqual(result.actor_no, "10")
         self.assertEqual(result.actor_name, "測試員")
         self.assertEqual(events, ["create:options", "configure", "login:user10:secret", "cleanup"])
+
+    def test_verifier_can_disable_session_open_diagnostics(self) -> None:
+        from unittest.mock import patch
+
+        from app_core.login_verifier import LoginVerifier
+
+        driver = self.Driver()
+        events: list[str] = []
+        retry_options: dict[str, object] = {}
+        verifier = LoginVerifier(
+            options_factory=lambda: "options",
+            driver_factory=lambda _options: events.append("create") or driver,
+            configure_driver=lambda _driver: events.append("configure"),
+            login_function=lambda _driver, _user_id, _password: events.append("login"),
+            driver_cleanup=lambda _driver: events.append("cleanup"),
+            defer_actor_resolution=True,
+            session_open_diagnostics=False,
+        )
+
+        def retry(create_driver, initialize, *, cleanup, write_diagnostics):
+            retry_options["write_diagnostics"] = write_diagnostics
+            candidate = create_driver()
+            initialize(candidate)
+            return candidate
+
+        with (
+            patch("duty_rehearsal.retry_duty_browser_session_open", side_effect=retry),
+            patch("app_core.login_verifier.identify_logged_in_actor", return_value=("10", "測試員")),
+        ):
+            result = verifier.verify(
+                typed_actor_no="10",
+                user_id="user10",
+                password="secret",
+                actor_no_from_user_id=lambda _value: "10",
+                actor_no_from_name=lambda _value: "10",
+                staff={"10": {"name": "測試員"}},
+            )
+
+        self.assertFalse(retry_options["write_diagnostics"])
+        self.assertEqual(result.actor_name, "測試員")
+        self.assertEqual(events, ["create", "configure", "login", "cleanup"])
 
     def test_identity_matches_spaced_greeting_against_schedule_staff(self) -> None:
         from app_core.login_verifier import identify_logged_in_actor
@@ -427,6 +820,85 @@ class LoginVerifierTests(unittest.TestCase):
 
 
 class DutyTaskProjectionTests(unittest.TestCase):
+    def test_drowning_patrol_group_indices_link_outbound_and_inbound_work(self) -> None:
+        from app_core.duty_task_projection import drowning_patrol_group_indices
+
+        actions = [
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "5",
+                "source": "外勤簽出",
+                "fields": {
+                    "登打時間": "16:00",
+                    "出或入": "出",
+                    "領用事由及地點": "防溺車巡",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            },
+            {
+                "kind": "entry_log",
+                "time": "16:00",
+                "actor": "19",
+                "target": "25",
+                "source": "外勤簽出",
+                "fields": {
+                    "登打時間": "16:00",
+                    "出或入": "出",
+                    "領用事由及地點": "防溺車巡",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "5",
+                "source": "外勤簽入",
+                "fields": {
+                    "登打時間": "18:00",
+                    "出或入": "入",
+                    "領用事由及地點": "防溺車巡返隊",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            },
+            {
+                "kind": "entry_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "25",
+                "source": "外勤簽入",
+                "fields": {
+                    "登打時間": "18:00",
+                    "出或入": "入",
+                    "領用事由及地點": "防溺車巡返隊",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                },
+            },
+            {
+                "kind": "work_log",
+                "time": "18:00",
+                "actor": "19",
+                "target": "5,25",
+                "source": "防溺車巡",
+                "fields": {
+                    "工作時間": "18:00",
+                    "勤務項目": "車巡",
+                    "事由": "防溺",
+                    "服勤人員": ["5", "25"],
+                },
+            },
+        ]
+
+        self.assertEqual(drowning_patrol_group_indices(actions, 0, "1150807"), (0, 1))
+        self.assertEqual(drowning_patrol_group_indices(actions, 2, "1150807"), (2, 3, 4))
+        self.assertEqual(drowning_patrol_group_indices(actions, 4, "1150807"), (2, 3, 4))
+
     def test_projection_keeps_drowning_patrol_groups_contiguous(self) -> None:
         from datetime import datetime
 
@@ -1416,7 +1888,8 @@ class DutySheetServiceTests(unittest.TestCase):
             "from app_core.duty_sheet_service import load_legacy_module; "
             "load_legacy_module(package_root / 'duty_sheet_legacy'); "
             "forbidden = {'tkinter', 'customtkinter', 'tkcalendar'}; "
-            "raise SystemExit(1 if forbidden.intersection(sys.modules) else 0)"
+            "legacy_loaded = any(name == 'legacy_tk' or name.startswith('legacy_tk.') for name in sys.modules); "
+            "raise SystemExit(1 if forbidden.intersection(sys.modules) else 4 if legacy_loaded else 0)"
         )
 
         return_code, output = run_isolated_python(command)
@@ -1708,6 +2181,9 @@ for name, source_path in (
     ("duty_sheet", package_root / "duty_sheet_legacy" / "sinposmart_1.py"),
     ("rest_monthly", package_root / "rest_time_automation.py"),
 ):
+    source = source_path.read_text(encoding="utf-8")
+    if "import tkinter" in source or "import customtkinter" in source or "legacy_tk" in source:
+        raise RuntimeError(f"UI fallback dependency remains in {source_path}")
     spec = importlib.util.spec_from_file_location(f"_qt_ui_boundary_{name}", source_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {source_path}")
@@ -1715,8 +2191,16 @@ for name, source_path in (
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
-forbidden = {"tkinter", "customtkinter"}
-raise SystemExit(1 if forbidden.intersection(sys.modules) else 0)
+forbidden_prefixes = ("tkinter", "customtkinter", "legacy_tk")
+loaded_fallback_modules = [
+    name
+    for name in sys.modules
+    if name == forbidden_prefixes[0]
+    or name == forbidden_prefixes[1]
+    or name.startswith(f"{forbidden_prefixes[2]}.")
+    or name == forbidden_prefixes[2]
+]
+raise SystemExit(1 if loaded_fallback_modules else 0)
 """
 
         return_code, output = run_isolated_python(command)
@@ -3485,10 +3969,13 @@ class RestMonthlyServiceTests(unittest.TestCase):
             "from pathlib import Path; "
             f"package_root = Path({str(PACKAGE_ROOT)!r}); "
             "sys.path.insert(0, str(package_root)); "
-            "from app_core.rest_monthly_service import load_legacy_module; "
+            "from app_core.rest_monthly_service import LEGACY_SCRIPT_NAME, load_legacy_module; "
             "load_legacy_module(package_root); "
+            "source = (package_root / LEGACY_SCRIPT_NAME).read_text(encoding='utf-8'); "
+            "legacy_source_has_tk = 'import tkinter' in source or 'import customtkinter' in source; "
             "forbidden = {'tkinter', 'customtkinter'}; "
-            "raise SystemExit(1 if forbidden.intersection(sys.modules) else 0)"
+            "legacy_loaded = any(name == 'legacy_tk' or name.startswith('legacy_tk.') for name in sys.modules); "
+            "raise SystemExit(2 if legacy_source_has_tk else 1 if forbidden.intersection(sys.modules) else 4 if legacy_loaded else 0)"
         )
 
         return_code, output = run_isolated_python(command)
@@ -4423,10 +4910,13 @@ class RescueVideoServiceTests(unittest.TestCase):
             "from pathlib import Path; "
             f"package_root = Path({str(PACKAGE_ROOT)!r}); "
             "sys.path.insert(0, str(package_root)); "
-            "from app_core.rescue_video_service import load_rescue_video_core; "
-            "load_rescue_video_core(package_root); "
+            "from app_core.rescue_video_service import CORE_SCRIPT_NAME, load_rescue_video_core; "
+            "core = load_rescue_video_core(package_root); "
+            "wrong_core_name = CORE_SCRIPT_NAME != 'rescue_video_core.py'; "
+            "wrong_core_path = Path(core.__file__).name != CORE_SCRIPT_NAME; "
             "forbidden = {'tkinter', 'customtkinter'}; "
-            "raise SystemExit(1 if forbidden.intersection(sys.modules) else 0)"
+            "legacy_loaded = any(name == 'legacy_tk' or name.startswith('legacy_tk.') for name in sys.modules); "
+            "raise SystemExit(2 if wrong_core_name else 3 if wrong_core_path else 1 if forbidden.intersection(sys.modules) else 4 if legacy_loaded else 0)"
         )
 
         return_code, output = run_isolated_python(command)
@@ -4734,6 +5224,46 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         request = service.validate(ScheduleCaptureRequest("user10", "secret", "", "1150729"))
 
         self.assertEqual(request.actor_no, "")
+
+    def test_capture_browser_isolation_is_forwarded_to_automation(self) -> None:
+        from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
+
+        profile_root = Path("isolated-browser-root")
+        driver = object()
+        events: list[str] = []
+        received: dict[str, object] = {}
+
+        def build_initialized_driver(*, headless: bool, initialize, **kwargs):
+            received["headless"] = headless
+            received.update(kwargs)
+            initialize(driver)
+            return driver
+
+        automation = SimpleNamespace(
+            build_initialized_driver=build_initialized_driver,
+            login=lambda value, user_id, password: events.append(
+                f"login:{value is driver}:{user_id}:{len(password)}"
+            ),
+        )
+        service = ScheduleCaptureService(
+            Path("package"),
+            browser_profile_root=profile_root,
+            browser_prune_profiles=False,
+            browser_write_diagnostics=False,
+        )
+
+        result = service._build_browser_session(
+            automation,
+            ScheduleCaptureRequest("user10", "secret", "10", "1150828"),
+            stage_callback=events.append,
+        )
+
+        self.assertIs(result, driver)
+        self.assertEqual(events, ["start_browser", "login", "login:True:user10:6"])
+        self.assertTrue(received["headless"])
+        self.assertEqual(received["profile_root"], profile_root)
+        self.assertFalse(received["prune_profiles"])
+        self.assertFalse(received["write_diagnostics"])
 
     def test_capture_writes_live_schedule_and_comparison_without_credentials(self) -> None:
         from dataclasses import dataclass
@@ -5512,7 +6042,7 @@ class ToolControllerTests(unittest.TestCase):
             package_root = Path(temp_dir)
             tool_dir = package_root / "rescue_video"
             tool_dir.mkdir()
-            tool_path = tool_dir / "救護影片分類GUI.py"
+            tool_path = tool_dir / "rescue_video_core.py"
             tool_path.write_text("# test tool\n", encoding="utf-8")
             controller = ToolController(package_root)
             error_spy = QSignalSpy(controller.errorOccurred)
@@ -8493,7 +9023,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("readonly property int toolMonthComboWidth: 78", design)
         self.assertIn("readonly property int toolMonthComboHeight: toolCompactControlHeight", design)
         self.assertIn(
-            "onAccepted: window.backend.restMonthlyController.selectRestWorkbook(selectedFile)",
+            "if (!window.backend.readOnlyAcceptance)",
             source,
         )
 
@@ -8808,8 +9338,7 @@ class QtShellTests(unittest.TestCase):
         from datetime import datetime as RealDateTime
         from unittest.mock import patch
 
-        from PySide6.QtTest import QTest
-        from app_core.schedule_repository import ScheduleSnapshot
+        from app_core.schedule_repository import ScheduleRepository, ScheduleSnapshot
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
 
@@ -8854,6 +9383,7 @@ class QtShellTests(unittest.TestCase):
             controller = AppController(
                 schedule_capture_service=service,
                 operational_sync_service=operational_sync,
+                schedule_repository=ScheduleRepository(Path(temp_dir)),
             )
             attempt_id = controller._session_state.begin_login()
             controller._session_state.complete_login(
@@ -8870,7 +9400,9 @@ class QtShellTests(unittest.TestCase):
                     for _ in range(40):
                         if service.requests and not controller._tomorrow_schedule_workers:
                             break
-                        QTest.qWait(25)
+                        # Yield the GIL to Python workers instead of nesting QtTest's wait loop.
+                        self.app.processEvents()
+                        time.sleep(0.025)
                     controller._capture_evening_tomorrow_schedule()
 
                 self.assertEqual([request.target_roc_date for request in service.requests], ["1150730"])
@@ -8918,6 +9450,462 @@ class QtShellTests(unittest.TestCase):
             self.assertFalse(controller.dutyExecutionController.isBusy)
         finally:
             controller.shutdown()
+
+    def test_read_only_preflight_failure_never_defers_return_queue(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.app_controller import AppController
+
+        class NoWriteReturnQueue:
+            def __init__(self) -> None:
+                self.defer_calls = 0
+
+            @staticmethod
+            def active_records() -> list[dict]:
+                return []
+
+            @staticmethod
+            def bridge_history_records() -> list[dict]:
+                return []
+
+            @staticmethod
+            def record_actions(_record: dict) -> list[dict]:
+                return []
+
+            def defer(self, *_args, **_kwargs):
+                self.defer_calls += 1
+                raise AssertionError("唯讀驗收不得寫入未返隊 queue")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary_root = Path(temp_dir)
+            return_queue = NoWriteReturnQueue()
+            controller = AppController(
+                repository=CredentialRepository(
+                    temporary_root / "saved_login.json",
+                    "SinpoSmart",
+                    None,
+                ),
+                schedule_repository=ScheduleRepository(temporary_root / "runtime_outputs"),
+                unreturned_return_queue=return_queue,
+                read_only_acceptance=True,
+            )
+            try:
+                controller.dutyController.set_session_context(1, "read-only-user")
+                controller.dutyController.set_actor_no("10")
+                action = {
+                    "kind": "entry_log",
+                    "time": "09:00",
+                    "actor": "10",
+                    "target": "10",
+                    "fields": {},
+                }
+                controller.dutyController.replace_schedule_data(
+                    {"target_date": "1150828", "actions": [action]},
+                )
+                request = DutySubmissionRequest(
+                    "read-only-user",
+                    "must-not-submit",
+                    0,
+                    {
+                        "target_date": "1150828",
+                        "actions": [{**action, "kind": "handoff_preflight"}],
+                        "_handoff_preflight_group_id": "read-only-preflight",
+                    },
+                    session_generation=1,
+                    schedule_generation=controller.dutyController.schedule_generation,
+                    session_actor_no="10",
+                )
+                controller.dutyController._handoff_preflight_groups["read-only-preflight"] = {
+                    "indices": (0,),
+                    "action_keys": (),
+                    "actions": [dict(action)],
+                    "pending_keys": set(),
+                    "paused": False,
+                    "queue_id": "must-not-defer",
+                    "bridge": {},
+                }
+
+                controller._submission_failed(
+                    request,
+                    "離線預檢失敗",
+                    "timeout",
+                    "",
+                )
+
+                self.assertEqual(return_queue.defer_calls, 0)
+            finally:
+                controller.shutdown()
+
+    def test_read_only_acceptance_blocks_tool_and_manual_write_entrypoints(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        class NoWriteService:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def __getattr__(self, name: str):
+                def blocked(*_args, **_kwargs):
+                    self.calls.append(name)
+                    raise AssertionError(f"唯讀驗收不應呼叫 {name}")
+
+                return blocked
+
+        class NoWriteReturnQueue:
+            def __init__(self) -> None:
+                self.write_calls: list[str] = []
+
+            def active_records(self) -> list[dict]:
+                return []
+
+            def bridge_history_records(self) -> list[dict]:
+                return []
+
+            def record_actions(self, _record: dict) -> list[dict]:
+                return []
+
+            def prune_bridge_history(self) -> None:
+                self.write_calls.append("prune_bridge_history")
+
+            def expire_due(self) -> list[dict]:
+                self.write_calls.append("expire_due")
+                return []
+
+            def claim_due(self, _actor_no: str) -> None:
+                self.write_calls.append("claim_due")
+                return None
+
+        class NoWriteCredentialRepository:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.account = {
+                    "actor_no": "10",
+                    "user_id": "test-user",
+                    "password": "test-password",
+                }
+
+            def load(self):
+                return SimpleNamespace(
+                    invalid_file=False,
+                    accounts=[dict(self.account)],
+                    last_selected="test-user",
+                    can_persist=False,
+                    needs_rewrite=False,
+                )
+
+            @staticmethod
+            def account_identity(account: dict) -> str:
+                return str(account.get("user_id") or "")
+
+            def enable_persistence(self) -> None:
+                self.calls.append("enable_persistence")
+
+            def save(self, *_args) -> bool:
+                self.calls.append("save")
+                raise AssertionError("唯讀驗收不應儲存帳號")
+
+        duty_sheet_service = NoWriteService()
+        rest_monthly_service = NoWriteService()
+        daily_vehicle_service = NoWriteService()
+        rescue_video_service = NoWriteService()
+        work_log_settings_service = NoWriteService()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        runtime_output_dir = Path(temporary.name) / "runtime_outputs"
+        return_queue = NoWriteReturnQueue()
+        credential_repository = NoWriteCredentialRepository()
+        controller = AppController(
+            repository=credential_repository,
+            duty_sheet_service=duty_sheet_service,
+            rest_monthly_service=rest_monthly_service,
+            daily_vehicle_service=daily_vehicle_service,
+            rescue_video_service=rescue_video_service,
+            work_log_settings_service=work_log_settings_service,
+            schedule_repository=ScheduleRepository(runtime_output_dir),
+            unreturned_return_queue=return_queue,
+            read_only_acceptance=True,
+        )
+        try:
+            attempt_id = controller._session_state.begin_login()
+            controller._session_state.complete_login(
+                attempt_id,
+                LoginSession(
+                    "10",
+                    "test-user",
+                    "test-password",
+                    verified=True,
+                    actor_name="驗收人員",
+                ),
+            )
+            duty_sheet = controller.dutySheetController
+            duty_sheet.loadDefaults()
+            duty_sheet.addVehicleOption("amb", "新坡93", "BSL-9230")
+            duty_sheet.removeVehicleOption("amb", "新坡93/BSL-9230")
+            duty_sheet.prepareRun("duty.xlsm", "2026/08/28", "A", "S", "M1", "M2", False)
+
+            rest_monthly = controller.restMonthlyController
+            rest_monthly.loadRestDefaults()
+            rest_monthly.loadMonthlyDefaults()
+            rest_monthly.selectRestWorkbook(QUrl.fromLocalFile("C:/read-only.xlsm"))
+            rest_monthly.prepareRestRun("C:/read-only.xlsm", "08")
+            rest_monthly._monthly_source_ready = True
+            rest_monthly._roc_year = 115
+            rest_monthly._monthly_month = "08"
+            rest_monthly.prepareMonthlyRun()
+
+            daily_vehicle = controller.dailyVehicleController
+            daily_vehicle.loadDefaults()
+            daily_vehicle.prepareRun()
+
+            rescue_video = controller.rescueVideoController
+            rescue_video.loadDefaults()
+            rescue_video.refreshAutomaticState("C:/source", "1150828", "新坡91")
+            rescue_video.checkAndPreview("C:/source", "1150828", "新坡91")
+            rescue_video.refreshVehicleOptions("C:/source", "1150828")
+            rescue_video.updateInputs("C:/source", "1150828", "新坡91")
+            rescue_video.preparePreview("C:/source", "C:/destination", "1150828", "新坡91", "", False)
+            rescue_video.prepareCopy("C:/source", "C:/destination", "1150828", "新坡91", "", False)
+            rescue_video.prepareDelete("C:/source", "C:/destination", "1150828", "新坡91", "", False)
+            controller.workLogSettingsController.save()
+            controller.sessionController.deleteSavedAccount("test-user")
+            controller.sessionController._save_successful_account(
+                actor_no="10",
+                user_id="test-user",
+                password="test-password",
+                display_name="10番 驗收人員",
+                actor_name="驗收人員",
+            )
+            controller.sessionController.prepareCredentialSync()
+            controller.sessionController.syncSavedAccounts()
+
+            manual_confirmation = QSignalSpy(
+                controller.dutyController.manualSubmissionConfirmationRequested
+            )
+            controller.dutyController.replace_schedule_data(
+                {
+                    "target_date": "1150828",
+                    "actions": [
+                        {
+                            "kind": "work_log",
+                            "time": "08:00",
+                            "actor": "10",
+                            "target": "10",
+                            "source": "人工補登",
+                            "fields": {"勤務項目": "工作紀錄"},
+                        }
+                    ],
+                },
+                comparisons={0: {"compare": "手動登打", "group": "manual", "matched": []}},
+            )
+            controller.dutyController.toggleTaskSelection(0)
+            controller.dutyController.prepareManualSubmission()
+            controller.dutyController.enable_auto_execution()
+
+            self.assertEqual(duty_sheet_service.calls, [])
+            self.assertEqual(rest_monthly_service.calls, [])
+            self.assertEqual(daily_vehicle_service.calls, [])
+            self.assertEqual(rescue_video_service.calls, [])
+            self.assertEqual(work_log_settings_service.calls, [])
+            self.assertEqual(credential_repository.calls, [])
+            self.assertFalse(duty_sheet.isRunning)
+            self.assertFalse(rest_monthly.isRunning)
+            self.assertFalse(daily_vehicle.isRunning)
+            self.assertFalse(rescue_video.isRunning)
+            self.assertEqual(manual_confirmation.count(), 0)
+            self.assertFalse(controller.dutyController._auto_execution_enabled)
+            self.assertEqual(return_queue.write_calls, [])
+            self.assertFalse((runtime_output_dir / "duty_return_policy.json").exists())
+        finally:
+            controller.shutdown()
+
+    def test_read_only_acceptance_blocks_update_and_diagnostics_write_entrypoints(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.update_controller import UpdateController
+
+        class NoWriteDiagnostics:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def export(self, _snapshot) -> Path:
+                self.calls.append("export")
+                raise AssertionError("唯讀驗收不應匯出問題包")
+
+        class NoWriteOperationalSync:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def enqueue_event(self, _record_type: str, **_fields) -> dict:
+                self.calls.append("enqueue_event")
+                raise AssertionError("唯讀驗收不應登錄更新前登出")
+
+            def sync_board_async(self, _schedule_data: dict) -> bool:
+                return False
+
+        class FakeUpdateRepository:
+            def __init__(self, root: Path) -> None:
+                self.version_path = root / "VERSION.txt"
+
+            def current_version(self) -> str:
+                return "2026.08.28.0000"
+
+        diagnostics = NoWriteDiagnostics()
+        operational_sync = NoWriteOperationalSync()
+        controller = AppController(
+            diagnostics_service=diagnostics,
+            operational_sync_service=operational_sync,
+            read_only_acceptance=True,
+        )
+        update_launches: list[Path] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            updater = UpdateController(
+                FakeUpdateRepository(Path(temp_dir)),
+                process_launcher=update_launches.append,
+                read_only_acceptance=True,
+            )
+            try:
+                attempt_id = controller._session_state.begin_login()
+                controller._session_state.complete_login(
+                    attempt_id,
+                    LoginSession("10", "test-user", "test-password", verified=True),
+                )
+                controller.exportIssuePackage()
+                self.assertEqual(diagnostics.calls, [])
+                self.assertIn("不匯出問題包", controller.diagnosticsStatus)
+                controller._submission_failed(
+                    DutySubmissionRequest(
+                        "test-user",
+                        "test-password",
+                        0,
+                        {"target_date": "1150828", "actions": []},
+                    ),
+                    "非預期的唯讀驗收失敗",
+                    "unknown_error",
+                    "unexpected-result.json",
+                )
+                self.assertEqual(diagnostics.calls, [])
+                self.assertFalse(controller.recordUpdateLogout())
+                self.assertEqual(controller.prepareUpdateShutdown(), "failed")
+                self.assertEqual(operational_sync.calls, [])
+
+                updater.check()
+                updater._update_available = True
+                updater.launchUpdate()
+                self.assertEqual(update_launches, [])
+                self.assertFalse(updater.isChecking)
+                self.assertIn("不檢查或安裝更新", updater.statusText)
+            finally:
+                controller.shutdown()
+
+    def test_read_only_tool_controller_never_persists_usage_history(self) -> None:
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            history_path = package_root / "runtime_outputs" / "tool_usage_history.json"
+            controller = ToolController(package_root, read_only_acceptance=True)
+
+            controller.record_started(
+                "daily_vehicle",
+                "車輛保養清點",
+                "10番 驗收人員",
+                "1150828",
+            )
+            controller.record_finished("daily_vehicle", "completed")
+
+            self.assertFalse(history_path.exists())
+            self.assertEqual(controller.usage("daily_vehicle")["report"], "尚無執行紀錄")
+            self.assertEqual(controller.dailyCompletionCount, 0)
+
+    def test_read_only_acceptance_qml_disables_write_entrypoints(self) -> None:
+        qml_root = PACKAGE_ROOT / "qt_app" / "qml"
+        quick_tools = (qml_root / "pages" / "DutyQuickToolsPanel.qml").read_text(encoding="utf-8")
+        self.assertEqual(
+            quick_tools.count("enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance"),
+            5,
+        )
+        for relative_path, binding in (
+            ("pages/DutySheetToolPanel.qml", "!dutySheetDialog.hostWindow.backend.readOnlyAcceptance"),
+            ("pages/RestTimeToolPanel.qml", "!restTimeDialog.hostWindow.backend.readOnlyAcceptance"),
+            ("pages/MonthlyBaseToolPanel.qml", "!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance"),
+            ("pages/DailyVehicleToolPanel.qml", "!dailyVehicleDialog.hostWindow.backend.readOnlyAcceptance"),
+            ("dialogs/RescueVideoWindow.qml", "!rescueVideoWindow.readOnlyAcceptance"),
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(binding, (qml_root / relative_path).read_text(encoding="utf-8"))
+
+        rescue_video = (qml_root / "dialogs" / "RescueVideoWindow.qml").read_text(encoding="utf-8")
+        check_button = rescue_video.split('objectName: "rescueVideoCheckButton"', 1)[1].split(
+            "                    Label {",
+            1,
+        )[0]
+        self.assertIn("readonly property bool readOnlyAcceptance: Boolean(hostWindow.backend", rescue_video)
+        self.assertIn("&& hostWindow.backend.readOnlyAcceptance)", rescue_video)
+        self.assertIn("!rescueVideoWindow.readOnlyAcceptance", check_button)
+        self.assertIn(
+            "if (!rescueVideoWindow.readOnlyAcceptance)",
+            check_button,
+        )
+        self.assertGreaterEqual(
+            rescue_video.count("if (!rescueVideoWindow.readOnlyAcceptance)"),
+            7,
+        )
+        monthly_base = (qml_root / "pages" / "MonthlyBaseToolPanel.qml").read_text(
+            encoding="utf-8"
+        )
+        source_open = monthly_base.split('objectName: "monthlySourceOpenButton"', 1)[1].split(
+            "                }",
+            1,
+        )[0]
+        self.assertIn(
+            "!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance",
+            source_open,
+        )
+        self.assertIn(
+            "if (!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance)",
+            source_open,
+        )
+
+        confirmations = (qml_root / "dialogs" / "ActionConfirmations.qml").read_text(encoding="utf-8")
+        self.assertEqual(
+            confirmations.count("if (!actionConfirmations.backend.readOnlyAcceptance)"),
+            5,
+        )
+        operation_bar = (qml_root / "pages" / "DutyOperationBar.qml").read_text(encoding="utf-8")
+        self.assertEqual(
+            operation_bar.count("enabled: !dutyOperationBar.backend.readOnlyAcceptance"),
+            2,
+        )
+        self.assertIn(
+            "if (!dutyOperationBar.backend.readOnlyAcceptance)",
+            operation_bar,
+        )
+        work_log_settings = (qml_root / "pages" / "WorkLogSettingsPanel.qml").read_text(encoding="utf-8")
+        self.assertIn(
+            "enabled: !workLogSettingsDialog.hostWindow.backend.readOnlyAcceptance",
+            work_log_settings,
+        )
+        self.assertIn(
+            "if (!workLogSettingsDialog.hostWindow.backend.readOnlyAcceptance)",
+            work_log_settings,
+        )
+        session_header = (qml_root / "pages" / "SessionHeader.qml").read_text(encoding="utf-8")
+        self.assertIn("visible: !sessionHeader.backend.readOnlyAcceptance", session_header)
+        self.assertIn("if (!sessionHeader.backend.readOnlyAcceptance)", session_header)
+        account_manager = (qml_root / "dialogs" / "AccountManagerWindow.qml").read_text(encoding="utf-8")
+        self.assertIn("if (hostWindow.backend.readOnlyAcceptance)", account_manager)
+        self.assertIn("if (!accountManagerWindow.hostWindow.backend.readOnlyAcceptance)", account_manager)
+        main_qml = (qml_root / "Main.qml").read_text(encoding="utf-8")
+        self.assertIn(
+            "if (!window.backend.readOnlyAcceptance)",
+            main_qml.split("id: restWorkbookDialog", 1)[1].split("RescueVideoWindow", 1)[0],
+        )
 
     def test_verified_login_captures_schedule_then_resolves_actor_from_existing_staff(self) -> None:
         from unittest.mock import patch
@@ -9297,14 +10285,32 @@ class QtShellTests(unittest.TestCase):
             create_app_controller,
         )
 
+        previous_selenium_cache = os.environ.get("SE_CACHE_PATH")
+        previous_selenium_stats = os.environ.get("SE_AVOID_STATS")
         controller = create_app_controller([READ_ONLY_ACCEPTANCE_ARG])
         temporary_root = Path(controller.acceptance_temporary_directory.name)
         try:
             self.assertTrue(temporary_root.is_dir())
+            self.assertEqual(
+                controller.dutyController._repository.runtime_output_dir,
+                temporary_root / "runtime_outputs",
+            )
+            self.assertEqual(
+                controller.dutyController._unreturned_return_queue.path,
+                temporary_root / "runtime_outputs" / "unreturned_return_queue.json",
+            )
+            self.assertEqual(
+                controller.dutyController._return_policy_state_path,
+                temporary_root / "runtime_outputs" / "duty_return_policy.json",
+            )
+            self.assertEqual(os.environ.get("SE_CACHE_PATH"), str(temporary_root / "selenium_cache"))
+            self.assertEqual(os.environ.get("SE_AVOID_STATS"), "true")
             cleanup_acceptance_directory(controller)
 
             self.assertFalse(temporary_root.exists())
             self.assertIsNone(controller.acceptance_temporary_directory)
+            self.assertEqual(os.environ.get("SE_CACHE_PATH"), previous_selenium_cache)
+            self.assertEqual(os.environ.get("SE_AVOID_STATS"), previous_selenium_stats)
         finally:
             controller.shutdown()
             cleanup_acceptance_directory(controller)
@@ -9323,6 +10329,61 @@ class QtShellTests(unittest.TestCase):
             self.assertIn("--window-size=1280,900", options.arguments)
             self.assertIn("--window-position=80,80", options.arguments)
             self.assertTrue(controller.sessionController._verifier.allow_post_login_lookup_warning)
+        finally:
+            controller.shutdown()
+            cleanup_acceptance_directory(controller)
+
+    def test_isolated_qt_runtime_disables_disk_caches(self) -> None:
+        from PySide6.QtCore import Qt
+
+        from qt_app.main import configure_isolated_qt_runtime
+
+        with patch("qt_app.main.QApplication") as application, patch.dict(
+            os.environ,
+            {"QML_DISABLE_DISK_CACHE": ""},
+            clear=False,
+        ):
+            configure_isolated_qt_runtime()
+
+            self.assertEqual(os.environ["QML_DISABLE_DISK_CACHE"], "1")
+            application.setAttribute.assert_called_once_with(
+                Qt.ApplicationAttribute.AA_DisableShaderDiskCache,
+                True,
+            )
+
+    def test_read_only_acceptance_isolates_browser_profiles(self) -> None:
+        from unittest.mock import patch
+
+        from qt_app.main import (
+            READ_ONLY_ACCEPTANCE_ARG,
+            cleanup_acceptance_directory,
+            create_app_controller,
+        )
+
+        controller = create_app_controller([READ_ONLY_ACCEPTANCE_ARG])
+        temporary_root = Path(controller.acceptance_temporary_directory.name)
+        driver = object()
+        try:
+            with patch("qt_app.main.create_login_webdriver", return_value=driver) as create_driver:
+                result = controller.sessionController._verifier.driver_factory(
+                    SimpleNamespace(arguments=[])
+                )
+
+            self.assertIs(result, driver)
+            create_driver.assert_called_once_with(
+                SimpleNamespace(arguments=[]),
+                profile_root=temporary_root / "browser_profiles",
+                prune_profiles=False,
+                write_diagnostics=False,
+            )
+            capture_service = controller._schedule_capture_service
+            self.assertEqual(
+                capture_service._browser_profile_root,
+                temporary_root / "browser_profiles",
+            )
+            self.assertFalse(capture_service._browser_prune_profiles)
+            self.assertFalse(capture_service._browser_write_diagnostics)
+            self.assertFalse(controller.sessionController._verifier.session_open_diagnostics)
         finally:
             controller.shutdown()
             cleanup_acceptance_directory(controller)
@@ -12797,23 +13858,41 @@ if return_code != 0 or loaded:
                 return None
 
         data = {
-            "target_date": "1150806",
+            "target_date": "1150807",
             "actions": [
-                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
-                {"kind": "entry_log", "time": "18:00", "actor": "17", "target": "5", "source": "值班交接"},
-                {"kind": "work_log", "time": "18:00", "actor": "17", "target": "17", "source": "值班交接"},
                 {
                     "kind": "entry_log",
-                    "time": "18:00",
-                    "actor": "17",
-                    "target": "17",
-                    "source": "昨日在勤且今日未在勤",
+                    "time": "16:00",
+                    "actor": "19",
+                    "target": "5",
+                    "source": "外勤簽出",
                     "fields": {
-                        "登打時間": "18:00",
-                        "系統寫入時間": "18:05",
                         "出或入": "出",
-                        "領用事由及地點": "退勤",
+                        "領用事由及地點": "防溺車巡",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
                     },
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "16:00",
+                    "actor": "19",
+                    "target": "25",
+                    "source": "外勤簽出",
+                    "fields": {
+                        "出或入": "出",
+                        "領用事由及地點": "防溺車巡",
+                        "勤務項目": "車巡",
+                        "事由": "防溺",
+                    },
+                },
+                {
+                    "kind": "entry_log",
+                    "time": "16:00",
+                    "actor": "19",
+                    "target": "19",
+                    "source": "值班交接",
+                    "fields": {"出或入": "值退", "領用事由及地點": "值退"},
                 },
             ],
         }
@@ -12821,20 +13900,33 @@ if return_code != 0 or loaded:
         controller = DutyExecutionController(service)
         finished_spy = QSignalSpy(controller.actionFinished)
         try:
-            for index in (0, 1, 2, 3):
-                self.assertTrue(controller.enqueue(DutySubmissionRequest("user17", "secret", index, data)))
+            self.assertTrue(
+                controller.enqueue(
+                    DutySubmissionRequest("user19", "secret", 0, data, trigger_type="due")
+                )
+            )
+            self.assertTrue(first_entry_started.wait(timeout=2))
+            self.assertTrue(
+                controller.enqueue(
+                    DutySubmissionRequest("user19", "secret", 1, data, trigger_type="due")
+                )
+            )
+            self.assertTrue(
+                controller.enqueue(
+                    DutySubmissionRequest("user19", "secret", 2, data, trigger_type="due")
+                )
+            )
+            release_first_entry.set()
             for _ in range(30):
-                if finished_spy.count() == 4 and not controller.isBusy:
+                if finished_spy.count() == 3 and not controller.isBusy:
                     break
                 finished_spy.wait(250)
                 QTest.qWait(10)
 
-            self.assertEqual(service.opened_sessions, 2)
-            self.assertEqual(service.serialized_actions, [0, 1, 3])
-            self.assertEqual(service.parallel_actions, [2])
-            self.assertEqual(finished_spy.count(), 4)
+            self.assertEqual(service.calls, [0, 1, 2])
             self.assertFalse(controller.isBusy)
         finally:
+            release_first_entry.set()
             controller.shutdown()
 
     def test_app_controller_deduplicates_identical_schedule_snapshot_events(self) -> None:
@@ -13093,7 +14185,7 @@ if return_code != 0 or loaded:
                 target_roc_date,
             )
 
-    def test_app_controller_reports_due_existing_task_to_nas(self) -> None:
+    def test_app_controller_does_not_report_due_existing_task_as_submission(self) -> None:
         from datetime import datetime
 
         from app_core.credential_repository import CredentialRepository
@@ -13150,12 +14242,7 @@ if return_code != 0 or loaded:
                 with patch.object(controller, "_send_operational_event") as send_event:
                     controller.dutyController.enable_auto_execution()
 
-                self.assertEqual(send_event.call_count, 1)
-                self.assertEqual(send_event.call_args.args, ("action_result",))
-                self.assertEqual(send_event.call_args.kwargs["status"], "skipped_duplicate")
-                self.assertEqual(send_event.call_args.kwargs["trigger_type"], "due")
-                self.assertEqual(send_event.call_args.kwargs["action"]["source"], "防溺車巡")
-                self.assertTrue(send_event.call_args.kwargs["snapshot"]["completion_key"])
+                self.assertEqual(send_event.call_count, 0)
                 self.assertEqual(controller.dutyController._executed_indices, {0})
             finally:
                 controller.shutdown()
@@ -13341,7 +14428,7 @@ if return_code != 0 or loaded:
         service = FakeOperationalSyncService()
         controller = AppController(
             operational_sync_service=service,
-            read_only_acceptance=True,
+            read_only_acceptance=False,
         )
         attempt_id = controller._session_state.begin_login()
         controller._session_state.complete_login(
@@ -13492,7 +14579,7 @@ if return_code != 0 or loaded:
             controller.dutyExecutionController._entry_active_request_id = None
             controller.shutdown()
 
-    def test_background_manual_waiting_chain_keeps_original_account_after_logout_and_new_login(self) -> None:
+    def test_background_manual_waiting_chain_uses_current_account_after_logout_and_new_login(self) -> None:
         from datetime import datetime as RealDateTime
         from unittest.mock import patch
 
@@ -13620,7 +14707,7 @@ if return_code != 0 or loaded:
 
             controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 8, 59))
             self.assertTrue(service.opened.wait(timeout=2))
-            self.assertEqual(service.open_requests, ["user10"])
+            self.assertEqual(service.open_requests, ["user20"])
             self.assertEqual(service.requests, [])
 
             controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 9, 0))
@@ -13630,7 +14717,8 @@ if return_code != 0 or loaded:
                 QTest.qWait(10)
 
             self.assertEqual(len(service.requests), 1)
-            self.assertEqual(service.requests[0].user_id, "user10")
+            self.assertEqual(service.requests[0].user_id, "user20")
+            self.assertEqual(service.requests[0].session_actor_no, "20")
             self.assertEqual(service.requests[0].trigger_type, "manual")
             self.assertEqual(
                 service.requests[0].schedule_data["actions"][0]["fields"]["登打時間"],
@@ -13645,7 +14733,8 @@ if return_code != 0 or loaded:
                 QTest.qWait(10)
 
             self.assertEqual(len(service.requests), 2)
-            self.assertEqual(service.requests[1].user_id, "user10")
+            self.assertEqual(service.requests[1].user_id, "user20")
+            self.assertEqual(service.requests[1].session_actor_no, "20")
             self.assertEqual(service.requests[1].trigger_type, "due")
             self.assertEqual(controller._background_manual_chains, {})
             self.assertEqual(controller._stop_block_reason(), "")
@@ -18023,6 +19112,7 @@ if return_code != 0 or loaded:
                     self.assertEqual(set(controller._background_manual_chains), {"8", "18"})
 
                 # A return waiting for another actor must not block an unrelated confirmed departure.
+                controller._session_state.session = LoginSession("8", "user8", "original-secret", verified=True)
                 departure = {"kind": "entry_log", "time": "20:00", "actor": "8", "target": "23",
                              "duplicate_key": "waiting-owner:other-departure",
                              "source": "休息簽出", "fields": {"出或入": "出", "領用事由及地點": "休息"}}
@@ -18980,6 +20070,153 @@ if return_code != 0 or loaded:
                 engine.deleteLater()
                 self._flush_qt_deferred_deletes()
 
+    def test_audit_fixture_rejects_non_temporary_runtime_output(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import configure_audit_fixture
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temporary_root = Path(temp_dir)
+            runtime_output_dir = temporary_root / "runtime_outputs"
+            controller = AppController(
+                repository=CredentialRepository(
+                    temporary_root / "saved_login.json",
+                    "SinpoSmart",
+                    None,
+                ),
+                schedule_repository=ScheduleRepository(runtime_output_dir),
+                unreturned_return_queue=UnreturnedReturnQueue(runtime_output_dir),
+                offline_fixture_acceptance=True,
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "暫存目錄"):
+                    configure_audit_fixture(controller)
+                self.assertFalse(runtime_output_dir.exists())
+            finally:
+                controller.shutdown()
+
+    def test_audit_fixture_acceptance_opens_read_only_qml_detail(self) -> None:
+        from PySide6.QtCore import QObject, QPointF, Qt
+        from PySide6.QtTest import QTest
+
+        from qt_app.main import (
+            AUDIT_FIXTURE_ACCEPTANCE_ARG,
+            cleanup_acceptance_directory,
+            configure_audit_fixture,
+            create_app_controller,
+            create_engine,
+            show_audit_fixture,
+        )
+
+        controller = create_app_controller([AUDIT_FIXTURE_ACCEPTANCE_ARG])
+        temporary_root = Path(controller.acceptance_temporary_directory.name)
+        engine = None
+        root = None
+
+        try:
+            configure_audit_fixture(controller)
+            fixture_path = (
+                temporary_root
+                / "runtime_outputs"
+                / "schedule"
+                / "schedule_output_1150729.json"
+            )
+            comparison_path = (
+                temporary_root
+                / "runtime_outputs"
+                / "comparison"
+                / "comparison_output_1150729.json"
+            )
+            self.assertTrue(fixture_path.is_file())
+            self.assertTrue(comparison_path.is_file())
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+
+            def find_visible(name: str):
+                stack = [root.contentItem()]
+                while stack:
+                    item = stack.pop()
+                    if item.objectName() == name and item.isVisible():
+                        return item
+                    stack.extend(item.childItems())
+                return None
+
+            def wait_until(predicate, failure_message: str) -> None:
+                for _ in range(80):
+                    if predicate():
+                        return
+                    QTest.qWait(25)
+                self.fail(failure_message)
+
+            show_audit_fixture(engine)
+
+            wait_until(lambda: root.title() == "審核模式", "離線審核 fixture 未開啟")
+            wait_until(
+                lambda: find_visible("auditTaskRow") is not None
+                and not controller.dutyController._schedule_workers,
+                "離線審核 fixture 未載入暫存排程",
+            )
+            audit_task_row = find_visible("auditTaskRow")
+            self.assertIsNotNone(audit_task_row)
+            self.assertTrue(controller.readOnlyAcceptance)
+            self.assertTrue(controller.offlineFixtureAcceptance)
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertEqual(controller.dutyController.targetDateText, "1150729")
+            self.assertEqual(controller.dutyController.auditModel.rowCount(), 1)
+            self.assertEqual(controller.dutyController._comparisons[0]["group"], "review")
+            self.assertFalse(controller.dutyController._auto_execution_enabled)
+            self.assertFalse(controller.dutyController._schedule_workers)
+            self.assertFalse(controller.dutyController._capture_workers)
+            self.assertFalse(controller.dutyController._comparison_workers)
+            self.assertFalse(controller.sessionController._login_workers)
+            self.assertIn("離線驗收差異", str(audit_task_row.property("fullDetailText")))
+
+            audit_dialog = root.findChild(QObject, "auditDetailDialog")
+            detail_text = root.findChild(QObject, "auditDetailTextArea")
+            logout_button = root.findChild(QObject, "logoutButton")
+            self.assertIsNotNone(audit_dialog)
+            self.assertIsNotNone(detail_text)
+            self.assertIsNotNone(logout_button)
+            self.assertFalse(logout_button.property("visible"))
+
+            controller.sessionController.login("offline-fixture", "must-not-login")
+            controller.requestLogout()
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertFalse(controller.sessionController._login_workers)
+            self.assertFalse(controller.dutyController._capture_workers)
+
+            point = audit_task_row.mapToScene(
+                QPointF(audit_task_row.width() / 2, audit_task_row.height() / 2)
+            )
+            QTest.mouseClick(root, Qt.LeftButton, Qt.NoModifier, point.toPoint())
+            wait_until(
+                lambda: audit_dialog.property("visible")
+                and "離線驗收差異" in str(detail_text.property("text")),
+                "離線審核 fixture 明細未開啟",
+            )
+            self.assertIn("原始預演資料", str(detail_text.property("text")))
+        finally:
+            if root is not None:
+                root.close()
+            controller.shutdown()
+            if engine is not None:
+                engine.deleteLater()
+            cleanup_acceptance_directory(controller)
+            self._flush_qt_deferred_deletes()
+
+    def test_audit_fixture_rejects_other_acceptance_flags(self) -> None:
+        from qt_app.main import (
+            AUDIT_FIXTURE_ACCEPTANCE_ARG,
+            READ_ONLY_ACCEPTANCE_ARG,
+            STARTUP_SMOKE_ARG,
+            main,
+        )
+
+        self.assertEqual(main([AUDIT_FIXTURE_ACCEPTANCE_ARG, READ_ONLY_ACCEPTANCE_ARG]), 2)
+        self.assertEqual(main([AUDIT_FIXTURE_ACCEPTANCE_ARG, STARTUP_SMOKE_ARG]), 2)
+
     def test_qml_shell_loads_with_app_controller(self) -> None:
         from dataclasses import replace
         from datetime import datetime
@@ -19819,8 +21056,12 @@ if return_code != 0 or loaded:
                     "行車紀錄器日期月曆未開啟",
                 )
                 self.assertTrue(QMetaObject.invokeMethod(rescue_date_calendar, "closeCalendar", Qt.DirectConnection))
+                wait_until(
+                    lambda: not controller.rescueVideoController._workers,
+                    "首次救護影片預檢尚未結束，不應嘗試關閉視窗",
+                )
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
-                QTest.qWait(100)
+                wait_until(lambda: not rescue_window.property("visible"), "首次救護影片視窗未關閉")
 
                 click(wait_for("quickDutySheetToolButton"))
                 duty_date_field = wait_for("dutyDateField")

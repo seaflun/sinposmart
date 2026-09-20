@@ -27,6 +27,8 @@ class DailyVehicleController(QObject):
         session_state: SessionState,
         service: DailyVehicleService,
         parent: QObject | None = None,
+        *,
+        read_only_acceptance: bool = False,
     ) -> None:
         super().__init__(parent)
         self._session_state = session_state
@@ -40,6 +42,7 @@ class DailyVehicleController(QObject):
         self._failure_stage = "unknown"
         self._workers: dict[int, tuple[QThread, DailyVehicleWorker]] = {}
         self._shutdown_admission = False
+        self._read_only_acceptance = bool(read_only_acceptance)
 
     @Property(str, notify=stateChanged)
     def targetDate(self) -> str:
@@ -67,6 +70,8 @@ class DailyVehicleController(QObject):
 
     @Slot()
     def loadDefaults(self) -> None:
+        if self._reject_read_only_execution():
+            return
         defaults = self._service.load_defaults()
         self._target_date = defaults.target_date
         self._operations = list(defaults.operations)
@@ -75,6 +80,8 @@ class DailyVehicleController(QObject):
 
     @Slot()
     def prepareRun(self) -> None:
+        if self._reject_read_only_execution():
+            return
         session = self._session_state.session
         if session is None or not session.verified:
             self._set_error("請先完成勤務系統登入。")
@@ -96,6 +103,8 @@ class DailyVehicleController(QObject):
 
     @Slot()
     def confirmRun(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutdown_admission or self._pending_request is None or self._workers:
             return
         self._request_id += 1
@@ -125,6 +134,24 @@ class DailyVehicleController(QObject):
         self._confirmation_summary = ""
         self._status_text = "已取消車輛保養清點。"
         self.stateChanged.emit()
+
+    def start_automatic(self, target_date: str) -> bool:
+        session = self._session_state.session
+        if (self._read_only_acceptance or self._shutdown_admission or self._workers or self._pending_request
+                or session is None or not session.verified or not session.actor_no):
+            return False
+        self._pending_request = DailyVehicleRequest(session.user_id, session.password, target_date=target_date)
+        self.confirmRun()
+        return bool(self._workers)
+
+    def _reject_read_only_execution(self) -> bool:
+        if not self._read_only_acceptance:
+            return False
+        self._pending_request = None
+        self._confirmation_summary = ""
+        self._status_text = "唯讀驗收模式，不執行正式登打。"
+        self.stateChanged.emit()
+        return True
 
     @Slot(int, str)
     def _progress(self, request_id: int, message: str) -> None:

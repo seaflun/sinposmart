@@ -1,0 +1,6 @@
+# Optional dependencies for the isolated Tk fallback only.
+-r ../requirements.txt
+pystray==0.19.5
+Pillow==11.3.0
+tkcalendar==1.6.1
+customtkinter==5.2.2

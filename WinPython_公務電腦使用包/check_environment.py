@@ -10,7 +10,6 @@ import sys
 
 REQUIRED_MODULES = [
     "selenium",
-    "PIL",
     "win32crypt",
     "win32com",
     "win11toast",

@@ -17,6 +17,10 @@ import customtkinter as ctk
 from types import ModuleType
 from typing import Callable, Iterator
 
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
 UI_FONT = "Microsoft JhengHei UI"
 UI_BG = "#f5f7fb"
 UI_PANEL = "#ffffff"
@@ -98,7 +102,7 @@ def log_automation_exception(context: str, exc: BaseException) -> None:
 
 
 def candidate_project_dirs(base_dir: Path | None = None) -> list[Path]:
-    base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
+    base_dir = (base_dir or PACKAGE_ROOT).resolve()
     candidates: list[Path] = []
     env_path = os.environ.get(ENV_PROJECT_DIR, "").strip()
     if env_path:
@@ -178,7 +182,7 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
             pass
         setattr(parent, "_duty_sheet_dialog", None)
 
-    base_dir = Path(__file__).resolve().parent
+    base_dir = PACKAGE_ROOT
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
         searched = "\n".join(str(path) for path in candidate_project_dirs(base_dir))
@@ -579,10 +583,6 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
         def worker() -> None:
             success = False
             try:
-                legacy.root = dialog
-                legacy.status_var = status_var
-                if hasattr(legacy, "log_text"):
-                    delattr(legacy, "log_text")
                 with legacy_workdir(project_dir):
                     legacy.save_config(
                         cars_config,
@@ -597,6 +597,9 @@ def open_duty_sheet_dialog(parent: tk.Tk, user_id: str = "", password: str = "",
                         target_date,
                         excel_path,
                         cars_config,
+                        status_callback=set_status,
+                        success_callback=set_status,
+                        show_dialogs=False,
                         stage_callback=report_stage,
                     )
                 if automation_result is False:

@@ -93,12 +93,20 @@ class ScheduleCaptureService:
             [Any, Mapping[str, Mapping[str, Any]]],
             tuple[str, str],
         ] = resolve_authenticated_actor,
+        browser_profile_root: Path | None = None,
+        browser_prune_profiles: bool = True,
+        browser_write_diagnostics: bool = True,
     ) -> None:
         self.package_root = Path(package_root)
         self.runtime_dir = self.package_root / "runtime_outputs"
         self.module_loader = module_loader
         self.now_factory = now_factory
         self.identity_resolver = identity_resolver
+        self._browser_profile_root = (
+            Path(browser_profile_root) if browser_profile_root is not None else None
+        )
+        self._browser_prune_profiles = bool(browser_prune_profiles)
+        self._browser_write_diagnostics = bool(browser_write_diagnostics)
 
     def current_request(
         self,
@@ -420,14 +428,21 @@ class ScheduleCaptureService:
             authenticated_actor_name=schedule_snapshot.authenticated_actor_name,
         )
 
-    @staticmethod
     def _build_browser_session(
+        self,
         automation: Any,
         request: ScheduleCaptureRequest,
         *,
         stage_callback: Callable[[str], None],
     ) -> Any:
         driver = None
+        browser_options: dict[str, Any] = {}
+        if self._browser_profile_root is not None:
+            browser_options["profile_root"] = self._browser_profile_root
+        if not self._browser_prune_profiles:
+            browser_options["prune_profiles"] = False
+        if not self._browser_write_diagnostics:
+            browser_options["write_diagnostics"] = False
 
         def initialize_browser(candidate: Any) -> None:
             stage_callback("login")
@@ -437,8 +452,12 @@ class ScheduleCaptureService:
             stage_callback("start_browser")
             session_builder = getattr(automation, "build_initialized_driver", None)
             if callable(session_builder):
-                return session_builder(headless=True, initialize=initialize_browser)
-            driver = automation.build_driver(headless=True)
+                return session_builder(
+                    headless=True,
+                    initialize=initialize_browser,
+                    **browser_options,
+                )
+            driver = automation.build_driver(headless=True, **browser_options)
             initialize_browser(driver)
             return driver
         except Exception:

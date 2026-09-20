@@ -58,14 +58,16 @@ class RescueVideoPackageTests(unittest.TestCase):
 
     def test_package_contains_rescue_video_core_and_qml_boundary(self) -> None:
         for relative_path in (
-            "rescue_video/救護影片分類GUI.py",
             "rescue_video/classify_rescue_video.py",
+            "rescue_video/rescue_video_core.py",
+            "legacy_tk/rescue_video_gui.py",
             "app_core/rescue_video_service.py",
             "qt_app/controllers/rescue_video_controller.py",
             "qt_app/workers/rescue_video_worker.py",
             "qt_app/models/rescue_video_result_model.py",
         ):
             self.assertTrue((PACKAGE_ROOT / relative_path).is_file(), relative_path)
+        self.assertFalse((PACKAGE_ROOT / "rescue_video/救護影片分類GUI.py").exists())
 
     def test_rescue_video_uses_nonmodal_qml_window_contract(self) -> None:
         source = (
@@ -166,6 +168,8 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertIn('"rescue_video\\救護影片分類GUI.py"', source)
         self.assertIn('"rescue_video\\classify_rescue_video.py"', source)
+        self.assertIn('"rescue_video\\rescue_video_core.py"', source)
+        self.assertIn("function Move-LegacyTkFallbacks", source)
         self.assertIn('"app_core"', source)
         self.assertIn('"qt_app"', source)
 

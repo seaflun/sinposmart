@@ -392,7 +392,11 @@ ApplicationWindow {
         id: restWorkbookDialog
         title: "選擇勤務表 Excel"
         nameFilters: ["Excel files (*.xlsx *.xlsm)"]
-        onAccepted: window.backend.restMonthlyController.selectRestWorkbook(selectedFile)
+        onAccepted: {
+            if (!window.backend.readOnlyAcceptance) {
+                window.backend.restMonthlyController.selectRestWorkbook(selectedFile)
+            }
+        }
     }
 
     RescueVideoWindow {
@@ -646,7 +650,11 @@ ApplicationWindow {
             backend: window.backend
             hostWindow: window
             visible: modeTabs.currentIndex === 0
-            onAccountManagerRequested: accountManagerWindow.open()
+            onAccountManagerRequested: {
+                if (!window.backend.readOnlyAcceptance) {
+                    accountManagerWindow.open()
+                }
+            }
             onWorkLogSettingsRequested: {
                 window.backend.workLogSettingsController.load()
                 workLogSettingsDialog.open()

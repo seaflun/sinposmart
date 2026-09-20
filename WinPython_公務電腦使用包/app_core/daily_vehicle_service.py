@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Callable
+from app_core.duty_task_projection import parse_roc_date
 
 
 AUTOMATION_SCRIPT = Path("automation") / "ppe_selenium_daily.py"
@@ -43,6 +44,7 @@ class DailyVehicleDefaults:
 class DailyVehicleRequest:
     user_id: str
     password: str = field(repr=False)
+    target_date: str = ""
 
 
 class DailyVehicleService:
@@ -67,6 +69,8 @@ class DailyVehicleService:
     def validate(self, request: DailyVehicleRequest) -> DailyVehicleRequest:
         if not str(request.user_id or "").strip() or not request.password:
             raise DailyVehicleValidationError("請先完成勤務系統登入。")
+        if request.target_date and parse_roc_date(request.target_date) != date.today():
+            raise DailyVehicleValidationError("每日點車已跨日，未執行，請人工確認。")
         project_dir = self._project_dir()
         if project_dir is None:
             raise DailyVehicleValidationError("找不到車輛保養清點自動化專案。")
@@ -75,7 +79,7 @@ class DailyVehicleService:
             raise DailyVehicleValidationError("車輛保養清點目前正在執行。")
         if running_pid:
             self._clear_running_pid(project_dir, running_pid)
-        return DailyVehicleRequest(request.user_id.strip(), request.password)
+        return DailyVehicleRequest(request.user_id.strip(), request.password, request.target_date)
 
     def confirmation_summary(self, request: DailyVehicleRequest) -> str:
         self.validate(request)
@@ -110,6 +114,7 @@ class DailyVehicleService:
                 "HEADLESS": "false",
                 "KEEP_BROWSER_OPEN": "true",
                 "SELENIUM_REMOTE_URL": "",
+                "PPE_TARGET_DATE": parse_roc_date(request.target_date).isoformat() if request.target_date else "",
             }
         )
         if status_callback:
@@ -143,7 +148,7 @@ class DailyVehicleService:
                 message = self._browser_startup_safe_error(output) or self._safe_error(output)
                 raise DailyVehicleExecutionError(message, failure_stage=stage)
             report_stage("result_evaluation")
-            return "車輛保養清點已完成。"
+            return f"車輛保養清點已完成：{request.target_date}" if request.target_date else "車輛保養清點已完成。"
         except DailyVehicleExecutionError:
             raise
         except OSError as exc:
@@ -169,6 +174,8 @@ class DailyVehicleService:
     def _safe_error(output: str) -> str:
         text = str(output or "")[-3000:]
         lowered = text.lower()
+        if "每日點車已跨日" in text:
+            return "每日點車已跨日，已停止送出，請人工確認。"
         if any(marker in text for marker in ("登入失敗", "帳號或密碼", "重新登入")):
             return "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。"
         if "timeout" in lowered or "timed out" in lowered or "逾時" in text:

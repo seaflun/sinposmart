@@ -529,6 +529,51 @@ function Copy-UpdateTree {
     }
 }
 
+function Test-LegacyTkScript {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $source = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        return $source -match "(?im)^\s*(import\s+tkinter|from\s+tkinter\s+import|import\s+customtkinter)"
+    } catch {
+        Write-Warning "Could not inspect retired Tk fallback: $Path"
+        return $false
+    }
+}
+
+function Move-LegacyTkFallbacks {
+    param([string]$PackageDir)
+
+    $legacyDir = Join-Path $PackageDir "legacy_tk"
+    $moves = @(
+        @{ Source = "duty_gui.py"; Destination = "duty_gui.py" },
+        @{ Source = "duty_sheet_automation.py"; Destination = "duty_sheet_automation.py" },
+        @{ Source = "daily_vehicle_automation.py"; Destination = "daily_vehicle_automation.py" },
+        @{ Source = "rescue_video\救護影片分類GUI.py"; Destination = "rescue_video_gui.py" }
+    )
+
+    foreach ($move in $moves) {
+        $source = Join-Path $PackageDir $move.Source
+        if (-not (Test-LegacyTkScript -Path $source)) {
+            continue
+        }
+
+        $target = Join-Path $legacyDir $move.Destination
+        if (Test-Path -LiteralPath $target) {
+            $target = Join-Path $legacyDir (Join-Path (Join-Path "migration_backup" $stamp) $move.Destination)
+        }
+        $targetDir = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        Move-Item -LiteralPath $source -Destination $target
+        Write-Host "Moved retired Tk fallback: $($move.Source) -> $target"
+    }
+}
+
 function New-PackageBackup {
     param(
         [string]$SourceDir,
@@ -552,8 +597,10 @@ function New-PackageBackup {
         "duty_sheet_automation.py",
         "daily_vehicle_automation.py",
         "rest_time_automation.py",
+        "duty_sheet_legacy\sinposmart_1.py",
         "rescue_video\救護影片分類GUI.py",
         "rescue_video\classify_rescue_video.py",
+        "rescue_video\rescue_video_core.py",
         "duty_rehearsal.py",
         "compare_rehearsal_records.py",
         "check_environment.py",
@@ -562,7 +609,8 @@ function New-PackageBackup {
     )
     $backupDirectories = @(
         "app_core",
-        "qt_app"
+        "qt_app",
+        "legacy_tk"
     )
 
     $copied = 0
@@ -757,7 +805,19 @@ try {
     }
 
     $requiredQtPackageFiles = @(
+        "duty_gui.py",
         "duty_gui.pyw",
+        "rest_time_automation.py",
+        "duty_sheet_legacy\sinposmart_1.py",
+        "rescue_video\classify_rescue_video.py",
+        "rescue_video\rescue_video_core.py",
+        "legacy_tk\duty_gui.py",
+        "legacy_tk\duty_sheet_automation.py",
+        "legacy_tk\daily_vehicle_automation.py",
+        "legacy_tk\rest_time_dialogs.py",
+        "legacy_tk\duty_sheet_window.py",
+        "legacy_tk\rescue_video_gui.py",
+        "legacy_tk\requirements.txt",
         "qt_app\main.py",
         "qt_app\qml\Main.qml",
         "qt_app\qml\components\AppleButton.qml",
@@ -816,7 +876,11 @@ try {
         "qt_app\qml\styles\qmldir",
         "qt_app\workers\operational_sync_worker.py",
         "app_core\operational_sync_service.py",
-        "app_core\credential_repository.py"
+        "app_core\credential_repository.py",
+        "app_core\duty_sheet_service.py",
+        "app_core\daily_vehicle_service.py",
+        "app_core\rest_monthly_service.py",
+        "app_core\rescue_video_service.py"
     )
     foreach ($relative in $requiredQtPackageFiles) {
         $requiredPath = Join-Path $sourceDir $relative
@@ -874,6 +938,7 @@ try {
         }
         $guiStoppedForUpdate = $true
     }
+    Move-LegacyTkFallbacks -PackageDir $packageDir
     Write-UpdateProgress -Phase "installing" -Percent 60
     Copy-UpdateTree -SourceDir $sourceDir -DestDir $packageDir
     Write-UpdateProgress -Phase "setup" -Percent 82

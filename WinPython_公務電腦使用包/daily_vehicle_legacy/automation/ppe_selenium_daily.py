@@ -178,6 +178,12 @@ def login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password
     print("[login] success")
 
 
+def ensure_requested_date() -> None:
+    target = os.environ.get("PPE_TARGET_DATE", "").strip()
+    if target and target != dt.date.today().isoformat():
+        raise RuntimeError("每日點車已跨日，停止送出，請人工確認。")
+
+
 def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str], today: dt.datetime) -> None:
     needs_weekly = today.weekday() == 6
     needs_monthly = today.day == 28
@@ -188,6 +194,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
     rows = query_grid_rows(driver, wait, "maintain")
 
     for index in range(1, len(rows) + 1):
+        ensure_requested_date()
         wait_for_spinner(wait)
         row_xpath = f"//div[@id='grid']//tbody/tr[{index}]"
         row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
@@ -237,6 +244,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
                 break
 
             if target_event is not None:
+                ensure_requested_date()
                 driver.execute_script("arguments[0].click();", target_event)
                 result = "SUCCESS"
             else:
@@ -247,6 +255,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
                 submit_button = wait.until(
                     EC.presence_of_element_located((By.XPATH, "//button[@onclick='SaveProc()']"))
                 )
+                ensure_requested_date()
                 driver.execute_script("arguments[0].click();", submit_button)
                 wait.until(
                     EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'swal') or contains(@class, 'sweet')]"))
@@ -273,6 +282,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
 
 
 def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    ensure_requested_date()
     print("[equip] opening equipment check list")
     driver.get(EQUIP_CHECK_LIST_URL)
 
@@ -316,6 +326,7 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
             continue
 
         print(f"[equip] {target_license}: processing")
+        ensure_requested_date()
         driver.execute_script("arguments[0].click();", check_buttons[0])
         wait_for_spinner(wait)
 
@@ -327,6 +338,7 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
         submit_button = wait.until(
             EC.presence_of_element_located((By.XPATH, f"//button[contains(., '{TEXT_FINISH_EQUIP_CHECK}')]"))
         )
+        ensure_requested_date()
         driver.execute_script("arguments[0].click();", submit_button)
 
         wait.until(
@@ -348,6 +360,7 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
             "//button[contains(@class, 'swal-button') or contains(@class, 'swal2-confirm')]",
         ):
             if confirm_button.is_displayed():
+                ensure_requested_date()
                 driver.execute_script("arguments[0].click();", confirm_button)
                 break
 
@@ -423,6 +436,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     today = dt.datetime.now()
+    ensure_requested_date()
     today_strings = build_today_strings(today)
 
     try:

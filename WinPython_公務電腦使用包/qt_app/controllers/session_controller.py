@@ -38,6 +38,8 @@ class SessionController(QObject):
         verifier: LoginVerifier | Any | None = None,
         credential_sync_service: CredentialSyncService | None = None,
         login_timeout_ms: int = DEFAULT_LOGIN_TIMEOUT_MS,
+        read_only_acceptance: bool = False,
+        offline_fixture_acceptance: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -46,6 +48,8 @@ class SessionController(QObject):
         self._verifier = verifier or LoginVerifier(defer_actor_resolution=True)
         self._credential_sync_service = credential_sync_service or CredentialSyncService()
         self._login_timeout_ms = max(1, int(login_timeout_ms))
+        self._read_only_acceptance = bool(read_only_acceptance)
+        self._offline_fixture_acceptance = bool(offline_fixture_acceptance)
         self._login_status = "未登入"
         self._login_status_tone = "neutral"
         self._display_name = ""
@@ -104,6 +108,9 @@ class SessionController(QObject):
 
     @Slot(str, str, bool)
     def login(self, user_id: str, password: str, remember: bool = False, *, login_method: str = "manual") -> None:
+        if self._offline_fixture_acceptance:
+            self._set_status("離線審核 fixture 不提供登入。", tone="info")
+            return
         if self._shutdown_admission or self._state.login_running:
             return
         user_id = str(user_id or "").strip()
@@ -118,7 +125,9 @@ class SessionController(QObject):
         if attempt_id is None:
             return
         method = "automatic" if login_method == "automatic" else "manual"
-        self._pending_credentials[attempt_id] = (user_id, password, bool(remember), method)
+        self._pending_credentials[attempt_id] = (
+            user_id, password, bool(remember) and not self._read_only_acceptance, method
+        )
         self._set_status("登入中…", tone="info")
 
         worker = LoginWorker(
@@ -175,6 +184,9 @@ class SessionController(QObject):
 
     @Slot(str)
     def deleteSavedAccount(self, identity: str) -> None:
+        if self._read_only_acceptance:
+            self._set_status("唯讀驗收模式，不變更已儲存帳號。", error=True)
+            return
         account = self._account_by_identity(identity)
         if not account:
             return
@@ -203,6 +215,9 @@ class SessionController(QObject):
 
     @Slot()
     def prepareCredentialSync(self) -> None:
+        if self._read_only_acceptance:
+            self._set_status("唯讀驗收模式，不同步帳密。", error=True)
+            return
         if not self.isLoggedIn:
             self._set_status("請先登入後再同步帳密。", error=True)
             return
@@ -210,6 +225,9 @@ class SessionController(QObject):
 
     @Slot()
     def syncSavedAccounts(self) -> None:
+        if self._read_only_acceptance:
+            self._set_status("唯讀驗收模式，不同步帳密。", error=True)
+            return
         if self._shutdown_admission:
             return
         self._start_credential_sync(notify_user=True)
@@ -279,6 +297,9 @@ class SessionController(QObject):
 
     @Slot()
     def logout(self) -> None:
+        if self._offline_fixture_acceptance:
+            self._set_status("離線審核 fixture 僅供查看。", tone="info")
+            return
         self._state.clear_session()
         self._display_name = ""
         self._set_status("未登入", tone="neutral")
@@ -324,7 +345,7 @@ class SessionController(QObject):
         self._accounts = self._sorted_accounts(snapshot.accounts)
         self._last_selected_identity = str(snapshot.last_selected or "")
         self._saved_accounts_model.replace_accounts(self._accounts)
-        if snapshot.can_persist and snapshot.needs_rewrite:
+        if not self._read_only_acceptance and snapshot.can_persist and snapshot.needs_rewrite:
             self._repository.save(self._accounts, snapshot.last_selected)
 
     def _account_by_identity(self, identity: str) -> dict[str, str] | None:
@@ -479,6 +500,8 @@ class SessionController(QObject):
         display_name: str,
         actor_name: str,
     ) -> None:
+        if self._read_only_acceptance:
+            return
         existing = self._account_by_user_id(user_id) or {}
         updated = {
             "actor_no": actor_no,
@@ -532,6 +555,8 @@ class SessionController(QObject):
         extra_account: dict[str, str] | None = None,
         notify_user: bool,
     ) -> None:
+        if self._read_only_acceptance:
+            return
         if self._shutdown_admission:
             return
         if not self._credential_sync_service.enabled:

@@ -63,8 +63,13 @@ ColumnLayout {
                 SettingsButton {
                     objectName: "settingsTab"
                     visible: !sessionHeader.backend.readOnlyAcceptance
+                    enabled: !sessionHeader.backend.readOnlyAcceptance
                     Accessible.name: "工作紀錄預設內容"
-                    onClicked: sessionHeader.workLogSettingsRequested()
+                    onClicked: {
+                        if (!sessionHeader.backend.readOnlyAcceptance) {
+                            sessionHeader.workLogSettingsRequested()
+                        }
+                    }
                 }
             }
 
@@ -109,9 +114,12 @@ ColumnLayout {
                     }
                 }
                 DangerButton {
+                    objectName: "logoutButton"
                     implicitHeight: 30
                     implicitWidth: 104
                     text: sessionHeader.backend.updateController.logoutActionText
+                    visible: !sessionHeader.backend.offlineFixtureAcceptance
+                    enabled: !sessionHeader.backend.offlineFixtureAcceptance
                     onClicked: sessionHeader.backend.requestLogout()
                 }
             }
@@ -165,10 +173,16 @@ ColumnLayout {
                     objectName: "savedAccountManagerButton"
                     Layout.preferredWidth: 136
                     implicitHeight: 38
-                    enabled: !sessionHeader.backend.sessionController.isBusy
+                    visible: !sessionHeader.backend.readOnlyAcceptance
+                    enabled: !sessionHeader.backend.readOnlyAcceptance
+                             && !sessionHeader.backend.sessionController.isBusy
                     text: "帳號選擇"
                     tone: "infoStrong"
-                    onClicked: sessionHeader.accountManagerRequested()
+                    onClicked: {
+                        if (!sessionHeader.backend.readOnlyAcceptance) {
+                            sessionHeader.accountManagerRequested()
+                        }
+                    }
                 }
             }
 

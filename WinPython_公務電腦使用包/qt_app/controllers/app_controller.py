@@ -21,7 +21,7 @@ from app_core.credential_repository import CredentialRepository
 from app_core.credential_sync_service import CredentialSyncService
 from app_core.daily_vehicle_service import DailyVehicleService
 from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot
-from app_core.duty_sheet_service import DutySheetService
+from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
 from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult, DutySubmissionService
 from app_core.duty_task_projection import (
     AUTO_DUE_CATCH_UP_WINDOW,
@@ -41,7 +41,8 @@ from app_core.schedule_repository import ScheduleRepository
 from app_core.schedule_repository import business_roc_date
 from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
 from app_core.scheduled_folder_service import ScheduledFolderService
-from app_core.session import SessionState
+from app_core.session import LoginSession, SessionState
+from app_core.unreturned_return_queue import UnreturnedReturnQueue
 from app_core.update_repository import UpdateRepository
 from app_core.work_log_settings_service import WorkLogSettingsService
 from qt_app.controllers.duty_controller import DutyController
@@ -58,6 +59,7 @@ from qt_app.controllers.work_log_settings_controller import WorkLogSettingsContr
 from qt_app.workers.operational_sync_worker import OperationalSyncWorker
 from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 from qt_app.workers.scheduled_folder_worker import ScheduledFolderWorker
+from qt_app.workers.duty_sheet_worker import DutySheetWorker
 
 
 BACKGROUND_MANUAL_PREWARM_WINDOW = timedelta(minutes=1)
@@ -86,6 +88,7 @@ class AppController(QObject):
         verifier: LoginVerifier | None = None,
         credential_sync_service: CredentialSyncService | None = None,
         schedule_repository: ScheduleRepository | None = None,
+        unreturned_return_queue: UnreturnedReturnQueue | None = None,
         tool_controller: ToolController | None = None,
         tray_controller: TrayController | None = None,
         update_repository: UpdateRepository | None = None,
@@ -100,16 +103,23 @@ class AppController(QObject):
         work_log_settings_service: WorkLogSettingsService | None = None,
         scheduled_folder_service: ScheduledFolderService | None = None,
         read_only_acceptance: bool = False,
+        offline_fixture_acceptance: bool = False,
+        automatic_tools_enabled: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._read_only_acceptance = bool(read_only_acceptance)
+        self._offline_fixture_acceptance = bool(offline_fixture_acceptance)
+        self._read_only_acceptance = bool(
+            read_only_acceptance or self._offline_fixture_acceptance
+        )
         self._session_state = SessionState()
         self._session_controller = SessionController(
             self._session_state,
             repository=repository,
             verifier=verifier,
             credential_sync_service=credential_sync_service,
+            read_only_acceptance=self._read_only_acceptance,
+            offline_fixture_acceptance=self._offline_fixture_acceptance,
             parent=self,
         )
         package_root = Path(__file__).resolve().parents[2]
@@ -121,14 +131,28 @@ class AppController(QObject):
         self._operational_sync_queue: deque[tuple[int, str, str, dict, dict]] = deque()
         self._operational_sync_shutting_down = False
         self._active_tool_runs: dict[str, tuple[str, str, str]] = {}
+        self._automatic_tools_enabled = automatic_tools_enabled
+        self._automatic_tool_record: dict | None = None
+        self._automatic_tool_started = False
+        self._automatic_prepared_request: DutySheetRequest | None = None
+        self._automatic_verified_context: tuple | None = None
+        self._automatic_prepare_id = 0
+        self._automatic_prepare_workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
             self,
             repository=schedule_repository,
             capture_service=self._schedule_capture_service,
+            unreturned_return_queue=unreturned_return_queue,
+            read_only_acceptance=self._read_only_acceptance,
+            offline_fixture_acceptance=self._offline_fixture_acceptance,
         )
-        self._tool_controller = tool_controller or ToolController(package_root, parent=self)
+        self._tool_controller = tool_controller or ToolController(
+            package_root,
+            read_only_acceptance=self._read_only_acceptance,
+            parent=self,
+        )
         if self._tool_controller.parent() is None:
             self._tool_controller.setParent(self)
         self._tray_controller = tray_controller or TrayController(
@@ -139,27 +163,32 @@ class AppController(QObject):
             self._tray_controller.setParent(self)
         self._update_controller = UpdateController(
             update_repository or UpdateRepository(package_root / "VERSION.txt"),
+            read_only_acceptance=self._read_only_acceptance,
             parent=self,
         )
         self._duty_sheet_controller = DutySheetController(
             self._session_state,
             duty_sheet_service or DutySheetService(package_root),
             self,
+            read_only_acceptance=self._read_only_acceptance,
         )
         self._rest_monthly_controller = RestMonthlyController(
             self._session_state,
             rest_monthly_service or RestMonthlyService(package_root),
             self,
+            read_only_acceptance=self._read_only_acceptance,
         )
         self._daily_vehicle_controller = DailyVehicleController(
             self._session_state,
             daily_vehicle_service or DailyVehicleService(package_root),
             self,
+            read_only_acceptance=self._read_only_acceptance,
         )
         self._rescue_video_controller = RescueVideoController(
             rescue_video_service or RescueVideoService(package_root),
             self,
             session_state=self._session_state,
+            read_only_acceptance=self._read_only_acceptance,
         )
         self._duty_submission_service = duty_submission_service or DutySubmissionService(package_root)
         self._duty_execution_controller = DutyExecutionController(
@@ -169,6 +198,7 @@ class AppController(QObject):
         self._work_log_settings_controller = WorkLogSettingsController(
             work_log_settings_service or WorkLogSettingsService(),
             self,
+            read_only_acceptance=self._read_only_acceptance,
         )
         self._scheduled_folder_service = scheduled_folder_service
         self._scheduled_folder_timer: QTimer | None = None
@@ -229,6 +259,12 @@ class AppController(QObject):
         self._tomorrow_schedule_timer.timeout.connect(self._capture_evening_tomorrow_schedule)
         self._tomorrow_schedule_timer.start()
         QTimer.singleShot(15_000, self._capture_evening_tomorrow_schedule)
+        self._automatic_tools_timer = QTimer(self)
+        self._automatic_tools_timer.setInterval(1_000)
+        self._automatic_tools_timer.timeout.connect(self._check_daily_automatic_tools)
+        if automatic_tools_enabled and not self._read_only_acceptance:
+            self._automatic_tools_timer.start()
+        self._tool_controller.automaticNotice.connect(self._record_automatic_notice)
         self._session_controller.sessionChanged.connect(self._sync_session_actor)
         self._session_controller.loginAttemptFailed.connect(self._login_attempt_failed)
         self._duty_controller.liveScheduleCaptured.connect(self._live_schedule_captured)
@@ -238,7 +274,7 @@ class AppController(QObject):
         self._duty_controller.fireDayChanged.connect(self._refresh_after_fire_day_change)
         self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
-        self._duty_controller.dueExistingTasksAvailable.connect(self._report_due_existing_tasks)
+        self._duty_controller.dueExistingTasksAvailable.connect(self._mark_due_existing_tasks)
         self._duty_controller.handoffPrewarmRequested.connect(self._prewarm_handoff_entry_browser)
         self._duty_controller.handoffWorkPrewarmRequested.connect(self._prewarm_handoff_work_browser)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
@@ -374,6 +410,10 @@ class AppController(QObject):
     def readOnlyAcceptance(self) -> bool:
         return self._read_only_acceptance
 
+    @Property(bool, constant=True)
+    def offlineFixtureAcceptance(self) -> bool:
+        return self._offline_fixture_acceptance
+
     @Property(str, notify=diagnosticsChanged)
     def diagnosticsStatus(self) -> str:
         return self._diagnostics_status
@@ -387,6 +427,11 @@ class AppController(QObject):
 
     @Slot()
     def exportIssuePackage(self) -> None:
+        if self._read_only_acceptance:
+            self._diagnostics_status = "唯讀驗收模式，不匯出問題包。"
+            self.diagnosticsChanged.emit()
+            self.diagnosticsStatusRequested.emit(self._diagnostics_status)
+            return
         try:
             package_path = self._diagnostics_service.export(
                 DiagnosticSnapshot(
@@ -410,6 +455,8 @@ class AppController(QObject):
     def recordUpdateLogout(self) -> bool:
         """Durably queue the update logout before the updater may stop this process."""
 
+        if self._read_only_acceptance:
+            return False
         session = self._session_state.session
         actor_no = (
             str(session.actor_no or "").strip()
@@ -445,6 +492,8 @@ class AppController(QObject):
     def prepareUpdateShutdown(self) -> str:
         """Return the updater handshake result without risking an in-flight task."""
 
+        if self._read_only_acceptance:
+            return "failed"
         if self._update_shutdown_prepared:
             return "ready"
         block_reason = self._stop_block_reason()
@@ -473,6 +522,7 @@ class AppController(QObject):
         """Stop every timer and controller entry point before process exit."""
 
         self._worker_admissions_closed = True
+        self._automatic_tools_timer.stop()
         self._hourly_refresh_timer.stop()
         self._board_retry_timer.stop()
         self._tomorrow_schedule_timer.stop()
@@ -498,11 +548,14 @@ class AppController(QObject):
 
         if self._update_shutdown_prepared or self._worker_admissions_closed:
             return "程式正在關閉"
+        if self._automatic_prepare_workers:
+            return "勤務表資料正在讀取"
         if self._background_manual_workers:
             return "到點自動登打正在執行"
         if self._background_manual_chains:
             return f"尚有 {len(self._background_manual_chains)} 筆到點自動登打等待中"
-        if self._duty_execution_controller.isBusy or self._logout_pending:
+        if (self._duty_execution_controller.isBusy
+                or self._duty_execution_controller.hasPendingSubmissions or self._logout_pending):
             return "勤務登打尚未完成"
         if self._session_controller.isBusy or self._session_controller.hasRunningWorkers:
             return "登入驗證尚未完成"
@@ -524,6 +577,150 @@ class AppController(QObject):
         if self._update_controller.isChecking:
             return "更新檢查尚未完成"
         return ""
+
+    def _daily_identity_context(self, now: datetime) -> tuple | None:
+        session = self._session_state.session
+        if session is None or not session.verified or not session.actor_no:
+            return None
+        return (self._session_state.generation, session.user_id, session.actor_no, business_roc_date(now))
+
+    def _daily_tools_idle(self) -> bool:
+        if (self._logout_pending or self._session_controller.isBusy
+                or self._session_controller.hasRunningWorkers or self._actor_identity_pending
+                or self._pending_live_refresh_generation is not None or self._pending_fire_day_refresh
+                or self._duty_controller.isRefreshing or self._tomorrow_schedule_workers
+                or self._duty_execution_controller.isBusy
+                or self._duty_execution_controller.hasPendingSubmissions or self._background_manual_workers
+                or self._update_controller.isChecking or self._update_controller.remoteUpdateActive
+                or self._update_controller._install_launched):
+            return False
+        # A future waiting chain is not a submitted/queued job and does not block.
+        for controller in (self._duty_sheet_controller, self._daily_vehicle_controller,
+                           self._rest_monthly_controller, self._rescue_video_controller):
+            running = (bool(controller._workers) if controller is self._duty_sheet_controller
+                       else controller.isRunning)
+            if (running or getattr(controller, "_pending_request", None)
+                    or getattr(controller, "isAwaitingConfirmation", False)):
+                return False
+        return True
+
+    @Slot()
+    def _check_daily_automatic_tools(self, now: datetime | None = None) -> None:
+        if (not self._automatic_tools_enabled or self._read_only_acceptance
+                or self._worker_admissions_closed or not self._duty_mode_active):
+            return
+        current = now or datetime.now()
+        record = self._automatic_tool_record
+        if record is not None:
+            if self._automatic_tool_started:
+                return
+            if current >= datetime.fromisoformat(record["expires_at"]):
+                self._automatic_preflight_failed(0, "已超過補跑期限，未送出，請人工確認。")
+                return
+            if self._automatic_prepare_workers or self._automatic_prepared_request is None:
+                return
+        else:
+            try:
+                record = self._tool_controller.next_daily_automatic(current)
+            except RuntimeError as exc:
+                self._automatic_tools_enabled = False
+                self._record_automatic_notice(str(exc))
+                return
+            if record is None or self._automatic_prepare_workers:
+                return
+        identity = self._daily_identity_context(current)
+        if identity is None or identity != self._automatic_verified_context or not self._daily_tools_idle():
+            return
+        if self._automatic_tool_record is None:
+            try:
+                if not self._tool_controller.claim_daily_automatic(record["key"], current):
+                    return
+            except RuntimeError as exc:
+                self._automatic_tools_enabled = False
+                self._record_automatic_notice(str(exc))
+                return
+            self._automatic_tool_record = record
+            if record["tool_id"] == "duty_sheet":
+                self._prepare_automatic_duty_sheet(record)
+                return
+        self._automatic_tool_started = True
+        if record["tool_id"] == "daily_vehicle":
+            started = self._daily_vehicle_controller.start_automatic(record["target_date"])
+        else:
+            session = self._session_state.session
+            request = replace(self._automatic_prepared_request, user_id=session.user_id, password=session.password)
+            self._automatic_prepared_request = None
+            self._duty_sheet_controller.set_automatic_preparing(False)
+            started = self._duty_sheet_controller.start_automatic(request)
+        if not started:
+            self._automatic_preflight_failed(0, "工具未能啟動，請人工確認。")
+
+    def _prepare_automatic_duty_sheet(self, record: dict) -> None:
+        session = self._session_state.session
+        self._automatic_prepare_id += 1
+        request_id = self._automatic_prepare_id
+        request = DutySheetRequest(session.user_id, session.password, "", record["target_date"], "", "", "", "", False)
+        worker = DutySheetWorker(request_id, self._duty_sheet_controller._service, request, prepare_only=True)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.prepared.connect(self._automatic_source_prepared)
+        worker.failed.connect(self._automatic_preflight_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.finished.connect(self._automatic_prepare_finished)
+        self._automatic_prepare_workers[request_id] = (thread, worker)
+        self._duty_sheet_controller.set_automatic_preparing(True)
+        thread.start()
+
+    @Slot(int, object)
+    def _automatic_source_prepared(self, request_id: int, request: DutySheetRequest) -> None:
+        if (request_id == self._automatic_prepare_id and self._automatic_tool_record
+                and not self._worker_admissions_closed):
+            # Credentials are taken again from the verified session at actual admission.
+            self._automatic_prepared_request = replace(request, user_id="", password="")
+
+    @Slot(int, str)
+    def _automatic_preflight_failed(self, request_id: int, message: str) -> None:
+        record = self._automatic_tool_record
+        if record is None or (request_id and request_id != self._automatic_prepare_id):
+            return
+        tool_id, label = record["tool_id"], record["label"]
+        self._automatic_tool_started = True
+        if tool_id not in self._active_tool_runs:
+            self._tool_run_started(tool_id, label)
+        self._tool_run_failed(tool_id, label, message, notify=False)
+
+    @Slot(int)
+    def _automatic_prepare_finished(self, request_id: int) -> None:
+        pair = self._automatic_prepare_workers.get(request_id)
+        if pair is None:
+            return
+        thread, _worker = pair
+        if not thread.wait(10):
+            QTimer.singleShot(50, lambda: self._automatic_prepare_finished(request_id))
+            return
+        self._automatic_prepare_workers.pop(request_id)
+        thread.deleteLater()
+
+    def _finish_automatic_tool(self, tool_name: str, succeeded: bool) -> None:
+        record = self._automatic_tool_record
+        if record is None or record["tool_id"] != tool_name or not self._automatic_tool_started:
+            return
+        try:
+            self._tool_controller.finish_daily_automatic(record["key"], succeeded)
+        except RuntimeError as exc:
+            self._automatic_tools_enabled = False
+            self._record_automatic_notice(str(exc))
+        self._automatic_tool_record = None
+        self._automatic_tool_started = False
+        self._automatic_prepared_request = None
+        self._duty_sheet_controller.set_automatic_preparing(False)
+
+    @Slot(str)
+    def _record_automatic_notice(self, message: str) -> None:
+        # No new GUI prompts; retain an auditable backend result.
+        self._send_operational_event("error", status="failed", trigger_type="daily_tool_schedule", error=message)
 
     def _register_background_manual_waiting(self, indices: list[int]) -> None:
         if self._read_only_acceptance or self._worker_admissions_closed:
@@ -659,6 +856,18 @@ class AppController(QObject):
             if self._start_background_manual_submission(chain_id, phase, now):
                 return
 
+    def _current_background_session(self) -> LoginSession | None:
+        """Return the authenticated on-duty session allowed to run background work."""
+
+        session = self._session_state.session
+        if session is None or not session.verified:
+            return None
+        if not str(session.user_id or "").strip() or not session.password:
+            return None
+        if not str(session.actor_no or "").strip():
+            return None
+        return session
+
     def _background_submission_request(
         self,
         chain: _BackgroundManualChain,
@@ -666,6 +875,9 @@ class AppController(QObject):
         submit_at: datetime,
     ) -> DutySubmissionRequest | None:
         base_request = chain.request
+        session = self._current_background_session()
+        if session is None:
+            return None
         actions = base_request.schedule_data.get("actions", [])
         if not isinstance(actions, list):
             return None
@@ -720,8 +932,13 @@ class AppController(QObject):
                 )
         return replace(
             base_request,
+            user_id=session.user_id,
+            password=session.password,
             action_index=action_index,
             schedule_data=schedule_data,
+            session_generation=self._session_state.generation,
+            schedule_generation=self._duty_controller.schedule_generation,
+            session_actor_no=session.actor_no,
             trigger_type="manual" if phase == "departure" else "due",
             action_key=action_completion_key(action),
             background=True,
@@ -991,6 +1208,9 @@ class AppController(QObject):
 
     @Slot()
     def requestLogout(self) -> None:
+        if self._offline_fixture_acceptance:
+            self._session_controller.setOperationalStatus("離線審核 fixture 僅供查看。", "info")
+            return
         """Cancel queued work and wait for an irreversible active request."""
 
         self._begin_session_logout(
@@ -1136,6 +1356,7 @@ class AppController(QObject):
             return
         if previous_actor_no or previous_user_id:
             self._duty_execution_controller.close_entry_session()
+        self._automatic_verified_context = None
         self._duty_controller.disable_auto_execution()
         self._synced_actor_no = actor_no
         self._synced_user_id = user_id
@@ -1161,6 +1382,9 @@ class AppController(QObject):
         )
         self._provisional_actor_no = provisional_actor_no
         self._duty_controller.set_actor_no(provisional_actor_no)
+        if self._offline_fixture_acceptance:
+            self._pending_live_refresh_generation = None
+            return
         session = self._session_state.session
         if session is not None and session.verified:
             self._duty_controller.resume_unreturned_return_recovery_after_verified_login()
@@ -1191,6 +1415,9 @@ class AppController(QObject):
 
     @Slot()
     def _retry_pending_live_refresh(self) -> None:
+        if self._offline_fixture_acceptance:
+            self._pending_live_refresh_generation = None
+            return
         generation = self._pending_live_refresh_generation
         if generation is None or self._duty_controller.isRefreshing:
             return
@@ -1244,6 +1471,7 @@ class AppController(QObject):
 
     @Slot(object)
     def _live_schedule_captured(self, schedule_data: dict) -> None:
+        self._automatic_verified_context = None
         schedule_data = dict(schedule_data)
         authenticated_actor = schedule_data.pop("_authenticated_actor", {})
         self._operational_staff = operational_staff_from_schedule(schedule_data)
@@ -1298,6 +1526,11 @@ class AppController(QObject):
                 "warning",
             )
         self._work_log_settings_controller.set_schedule_data(schedule_data)
+        verified_session = self._session_state.session
+        if (verified_session is not None and verified_session.verified
+                and verified_session.actor_no and not actor_identity_unresolved
+                and (verified_session.actor_name or resolved_actor_name)):
+            self._automatic_verified_context = self._daily_identity_context(datetime.now())
         if self._read_only_acceptance:
             QTimer.singleShot(0, self._duty_controller.disable_auto_execution)
             return
@@ -1988,6 +2221,22 @@ class AppController(QObject):
         error_code: str,
         result_path: str,
     ) -> None:
+        if self._read_only_acceptance:
+            is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
+            if not is_handoff_preflight:
+                failure_applied = self._duty_controller.handle_submission_request_failure(
+                    request,
+                    message,
+                    error_code,
+                )
+                if failure_applied:
+                    action_key = self._submission_ui_action_key(request)
+                    if action_key:
+                        self.dutyActionFailed.emit(action_key, str(message or "").strip())
+            if error_code == "login_failed":
+                self._duty_controller.disable_auto_execution()
+                self._force_logout(message)
+            return
         queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
@@ -2092,6 +2341,8 @@ class AppController(QObject):
             user_id=self._session_controller.userId,
         )
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        if self._automatic_tool_record and self._automatic_tool_record["tool_id"] == tool_name:
+            snapshot.update(automatic=True, target_date=self._automatic_tool_record["target_date"])
         if run_id:
             snapshot["run_id"] = run_id
         if mode:
@@ -2119,6 +2370,7 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "completed", message)
+        self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         run_id = active_run[2] if active_run is not None else ""
         if run_id:
@@ -2152,6 +2404,7 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         self._tool_controller.record_finished(tool_name, "failed", message)
+        self._finish_automatic_tool(tool_name, False)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         run_id = active_run[2] if active_run is not None else ""
         if run_id:
@@ -2217,6 +2470,16 @@ class AppController(QObject):
         return str(getattr(controller, "failureDetail", "") or "")
 
     def _tool_usage_period(self, tool_name: str) -> str:
+        if self._automatic_tool_record and self._automatic_tool_record["tool_id"] == tool_name:
+            return self._automatic_tool_record["target_date"]
+        if tool_name == "duty_sheet":
+            try:
+                target = datetime.strptime(self._duty_sheet_controller.targetDate, "%Y/%m/%d")
+                return f"{target.year - 1911:03d}{target.month:02d}{target.day:02d}"
+            except ValueError:
+                return ""
+        if tool_name == "daily_vehicle":
+            return self._tool_controller.current_calendar_roc_date()
         if tool_name == "rest_time":
             month = self._rest_monthly_controller.restMonth
         elif tool_name == "monthly_base":
@@ -2405,7 +2668,7 @@ class AppController(QObject):
                 self._duty_controller.mark_submission_enqueued(request.action_index)
 
     @Slot(object)
-    def _report_due_existing_tasks(self, indices: list[int]) -> None:
+    def _mark_due_existing_tasks(self, indices: list[int]) -> None:
         if self._read_only_acceptance or not self._duty_mode_active:
             return
         session = self._session_state.session
@@ -2416,21 +2679,7 @@ class AppController(QObject):
             session.password,
             list(indices),
         ):
-            action = self._submission_action(request)
-            if not self._duty_controller.report_due_existing_submission(request):
-                continue
-            self._send_operational_event(
-                "action_result",
-                status="skipped_duplicate",
-                trigger_type=request.trigger_type,
-                action=action,
-                snapshot={
-                    "action_index": request.action_index,
-                    "completion_key": request.action_key or action_completion_key(action),
-                    "comparison_source": "existing_schedule_comparison",
-                },
-                **self._submission_event_fields(request, action),
-            )
+            self._duty_controller.mark_due_existing_submission(request)
 
     @Slot(int)
     def _prewarm_handoff_entry_browser(self, action_index: int) -> None:
@@ -2653,6 +2902,12 @@ class AppController(QObject):
     def shutdown(self) -> None:
         self._shutdown_background_manual_chains()
         self._close_worker_admissions()
+        for request_id, (thread, _worker) in tuple(self._automatic_prepare_workers.items()):
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait()
+            self._automatic_prepare_workers.pop(request_id, None)
+            thread.deleteLater()
         for request_id, (thread, _worker) in tuple(self._scheduled_folder_workers.items()):
             thread.requestInterruption()
             thread.quit()

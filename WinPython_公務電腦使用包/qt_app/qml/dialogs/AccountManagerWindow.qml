@@ -62,6 +62,8 @@ Window {
     }
 
     function open() {
+        if (hostWindow.backend.readOnlyAcceptance)
+            return
         show()
         Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
         raise()
@@ -245,10 +247,13 @@ Window {
                                     rightPadding: 0
                                     text: "X"
                                     tone: "danger"
+                                    enabled: !accountManagerWindow.hostWindow.backend.readOnlyAcceptance
                                     onClicked: {
-                                        accountManagerWindow.pendingAccountIdentity = savedAccountRow.identity
-                                        accountManagerWindow.pendingAccountLabel = savedAccountRow.label
-                                        accountDeleteConfirmation.open()
+                                        if (!accountManagerWindow.hostWindow.backend.readOnlyAcceptance) {
+                                            accountManagerWindow.pendingAccountIdentity = savedAccountRow.identity
+                                            accountManagerWindow.pendingAccountLabel = savedAccountRow.label
+                                            accountDeleteConfirmation.open()
+                                        }
                                     }
                                 }
                                 Label {
@@ -319,9 +324,11 @@ Window {
         acceptText: "刪除帳號"
         acceptTone: "dangerFilled"
         onAccepted: {
-            accountManagerWindow.sessionController.deleteSavedAccount(
-                accountManagerWindow.pendingAccountIdentity
-            )
+            if (!accountManagerWindow.hostWindow.backend.readOnlyAcceptance) {
+                accountManagerWindow.sessionController.deleteSavedAccount(
+                    accountManagerWindow.pendingAccountIdentity
+                )
+            }
             accountManagerWindow.pendingAccountIdentity = ""
             accountManagerWindow.pendingAccountLabel = ""
         }

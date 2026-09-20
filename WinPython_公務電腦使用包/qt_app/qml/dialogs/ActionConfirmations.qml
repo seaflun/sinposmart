@@ -47,7 +47,11 @@ Item {
         title: "確認手動登打"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "開始登打"
-        onAccepted: actionConfirmations.backend.dutyController.confirmManualSubmission()
+        onAccepted: {
+            if (!actionConfirmations.backend.readOnlyAcceptance) {
+                actionConfirmations.backend.dutyController.confirmManualSubmission()
+            }
+        }
         onRejected: actionConfirmations.backend.dutyController.cancelManualSubmission()
 
         Label {
@@ -67,7 +71,11 @@ Item {
         title: "確認返隊手動登打"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "確認登打"
-        onAccepted: actionConfirmations.backend.dutyController.confirmExternalReturnManualSubmission()
+        onAccepted: {
+            if (!actionConfirmations.backend.readOnlyAcceptance) {
+                actionConfirmations.backend.dutyController.confirmExternalReturnManualSubmission()
+            }
+        }
         onRejected: actionConfirmations.backend.dutyController.cancelExternalReturnManualSubmission()
 
         Label {
@@ -122,7 +130,11 @@ Item {
         title: "確認同步帳密"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "開始同步"
-        onAccepted: actionConfirmations.backend.sessionController.syncSavedAccounts()
+        onAccepted: {
+            if (!actionConfirmations.backend.readOnlyAcceptance) {
+                actionConfirmations.backend.sessionController.syncSavedAccounts()
+            }
+        }
 
         Label {
             width: parent.width
@@ -141,7 +153,11 @@ Item {
         title: "確認正式登打"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "開始登打"
-        onAccepted: actionConfirmations.backend.restMonthlyController.confirmRun()
+        onAccepted: {
+            if (!actionConfirmations.backend.readOnlyAcceptance) {
+                actionConfirmations.backend.restMonthlyController.confirmRun()
+            }
+        }
         onRejected: actionConfirmations.backend.restMonthlyController.cancelPendingRun()
 
         Label {
@@ -161,7 +177,11 @@ Item {
         title: "車輛保養清點"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "開始登打"
-        onAccepted: actionConfirmations.backend.dailyVehicleController.confirmRun()
+        onAccepted: {
+            if (!actionConfirmations.backend.readOnlyAcceptance) {
+                actionConfirmations.backend.dailyVehicleController.confirmRun()
+            }
+        }
         onRejected: actionConfirmations.backend.dailyVehicleController.cancelPendingRun()
 
         Label {

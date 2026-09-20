@@ -103,6 +103,11 @@ class DutyExecutionController(QObject):
     def isBusy(self) -> bool:
         return self.activeCount > 0 or self.queuedCount > 0
 
+    @Property(bool, notify=stateChanged)
+    def hasPendingSubmissions(self) -> bool:
+        """Include app-owned background submissions, but not future planned actions."""
+        return bool(self._requests)
+
     def enqueue(self, request: DutySubmissionRequest) -> bool:
         """Queue a submission owned by the currently authenticated GUI session."""
 

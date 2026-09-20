@@ -243,14 +243,24 @@ RowLayout {
             text: dutyOperationBar.backend.updateController.updateDeferred
                   ? "更新已延後"
                   : dutyOperationBar.backend.updateController.isChecking ? "檢查中…" : "檢查更新"
-            enabled: !dutyOperationBar.backend.updateController.isChecking
+            enabled: !dutyOperationBar.backend.readOnlyAcceptance
+                     && !dutyOperationBar.backend.updateController.isChecking
                      && !dutyOperationBar.backend.updateController.updateDeferred
-            onTriggered: dutyOperationBar.backend.updateController.check()
+            onTriggered: {
+                if (!dutyOperationBar.backend.readOnlyAcceptance) {
+                    dutyOperationBar.backend.updateController.check()
+                }
+            }
         }
         CommandMenuItem {
             objectName: "exportIssuePackageMenuItem"
             text: "匯出問題包"
-            onTriggered: dutyOperationBar.backend.exportIssuePackage()
+            enabled: !dutyOperationBar.backend.readOnlyAcceptance
+            onTriggered: {
+                if (!dutyOperationBar.backend.readOnlyAcceptance) {
+                    dutyOperationBar.backend.exportIssuePackage()
+                }
+            }
         }
     }
 
@@ -278,6 +288,8 @@ RowLayout {
         CommandMenuItem {
             objectName: "logoutMenuItem"
             text: dutyOperationBar.backend.updateController.logoutActionText
+            visible: !dutyOperationBar.backend.offlineFixtureAcceptance
+            enabled: !dutyOperationBar.backend.offlineFixtureAcceptance
             onTriggered: dutyOperationBar.backend.requestLogout()
         }
         MenuSeparator {}

@@ -49,9 +49,16 @@ class WorkLogSettingsController(QObject):
     settingsSaved = Signal()
     errorOccurred = Signal(str)
 
-    def __init__(self, service: WorkLogSettingsService, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        service: WorkLogSettingsService,
+        parent: QObject | None = None,
+        *,
+        read_only_acceptance: bool = False,
+    ) -> None:
         super().__init__(parent)
         self._service = service
+        self._read_only_acceptance = bool(read_only_acceptance)
         self._values: dict[str, int] = dict(_BUILTIN_WORK_LOG_VALUES)
         self._important_note = _BUILTIN_WORK_LOG_NOTE
         self._schedule_data: dict = {}
@@ -162,6 +169,10 @@ class WorkLogSettingsController(QObject):
 
     @Slot(result=bool)
     def save(self) -> bool:
+        if self._read_only_acceptance:
+            self._status_text = "唯讀驗收模式，不儲存工作紀錄預設內容。"
+            self.stateChanged.emit()
+            return False
         try:
             settings = self._service.save(self._values, self._important_note, self._case_values)
             case_items = self._service.case_items(self._schedule_data, settings.preserved)

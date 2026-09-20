@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -51,6 +52,12 @@ class DutySheetDefaults:
 
 
 @dataclass(frozen=True)
+class WorkbookSignature:
+    size: int
+    modified_ns: int
+
+
+@dataclass(frozen=True)
 class DutySheetRequest:
     user_id: str
     password: str = field(repr=False)
@@ -61,6 +68,8 @@ class DutySheetRequest:
     amb1: str
     amb2: str
     notification_enabled: bool
+    automatic: bool = False
+    workbook_signature: WorkbookSignature | None = None
 
     @property
     def cars_config(self) -> dict[str, str]:
@@ -233,7 +242,7 @@ class DutySheetService:
     def validate(self, request: DutySheetRequest) -> DutySheetRequest:
         if not request.user_id.strip() or not request.password:
             raise DutySheetValidationError("請先完成勤務系統登入。")
-        workbook = self._resolve_workbook(request.workbook_path)
+        workbook = Path(request.workbook_path) if request.automatic else self._resolve_workbook(request.workbook_path)
         if workbook is None or not workbook.is_file() or workbook.suffix.lower() not in (".xlsx", ".xlsm"):
             raise DutySheetValidationError("請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
         try:
@@ -262,7 +271,133 @@ class DutySheetService:
             amb1=request.amb1.strip(),
             amb2=request.amb2.strip(),
             notification_enabled=bool(request.notification_enabled),
+            automatic=request.automatic,
+            workbook_signature=request.workbook_signature,
         )
+
+    def prepare_automatic_request(self, user_id: str, password: str, target_date: str) -> DutySheetRequest:
+        """Runs in a worker: use only the existing saved selection, never a bundled sample."""
+        config = self._read_config(for_update=True)
+        last = config.get("last_selection", {})
+        if not isinstance(last, dict):
+            raise DutySheetValidationError("請先手動選取一次勤務表。")
+        workbook = self.resolve_automatic_workbook(str(last.get("workbook_path", "") or ""), target_date)
+        stat = workbook.stat()
+        return self.validate(DutySheetRequest(
+            user_id, password, str(workbook), parse_roc_date(target_date).strftime("%Y/%m/%d"),
+            *(str(last.get(key, "") or "") for key in ("attack", "stop", "amb1", "amb2")),
+            notification_enabled=bool(config.get("notification", {}).get("enabled", False)),
+            automatic=True, workbook_signature=WorkbookSignature(stat.st_size, stat.st_mtime_ns),
+        ))
+
+    def resolve_automatic_workbook(self, saved_path: str, target_date: str) -> Path:
+        target = parse_roc_date(target_date)
+        if not saved_path.strip():
+            raise DutySheetValidationError("尚無前一次選取的勤務表，請手動選取檔案。")
+        saved = Path(saved_path)
+        if not saved.is_absolute():
+            saved = self.project_dir / saved
+        candidates = []
+
+        def inspect(path: Path) -> bool:
+            try:
+                stat = path.stat()
+                self._validate_automatic_workbook(path, target)
+                if path.stat().st_mtime_ns != stat.st_mtime_ns:
+                    raise DutySheetValidationError("檔案正在修改")
+            except Exception as exc:
+                reason = str(exc) if isinstance(exc, DutySheetValidationError) else "檔案無法讀取"
+                candidates.append({"file": str(path), "valid": False, "reason": reason})
+                return False
+            candidates.append({"file": str(path), "valid": True, "modified_ns": stat.st_mtime_ns})
+            return True
+
+        if inspect(saved):
+            self._record_workbook_selection(target_date, candidates, saved)
+            return saved
+        month_match = re.fullmatch(r"0?(\d{1,2})月", saved.parent.name)
+        year_match = re.fullmatch(r"(\d{3,4})(年)?", saved.parent.parent.name)
+        if month_match and year_match:
+            suffix = year_match.group(2) or ""
+            root = saved.parent.parent.parent
+            folder = root / f"{target.year - 1911}{suffix}" / f"{target.month}月"
+            if not folder.is_dir():
+                padded = root / f"{target.year - 1911}{suffix}" / f"{target.month:02d}月"
+                folder = padded if padded.is_dir() else folder
+        else:
+            folder = saved.parent
+        try:
+            paths = sorted(folder.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            self._record_workbook_selection(target_date, candidates, None)
+            raise DutySheetValidationError("勤務表資料夾無法讀取，請確認網路路徑或手動選檔。") from exc
+        for path in paths:
+            if path == saved or not self._automatic_filename_allowed(path):
+                continue
+            if "新坡" in path.stem and "勤務表" in path.stem:
+                inspect(path)
+        valid = sorted((row for row in candidates if row["valid"]), key=lambda row: row["modified_ns"], reverse=True)
+        selected = None
+        error = "找不到年月、日期分頁及必要欄位皆正確的勤務表，請手動選取。"
+        if valid:
+            if len(valid) > 1 and valid[0]["modified_ns"] == valid[1]["modified_ns"]:
+                error = "多份勤務表修改時間相同，請手動選取，未自行猜測。"
+            else:
+                selected = Path(valid[0]["file"])
+        self._record_workbook_selection(target_date, candidates, selected)
+        if selected is None:
+            raise DutySheetValidationError(error)
+        return selected
+
+    @staticmethod
+    def _automatic_filename_allowed(path: Path) -> bool:
+        return (path.suffix.lower() == ".xlsm" and not path.name.startswith("~$")
+                and not re.search(r"備份|舊版|副本|複製|暫存|backup|copy|old|temp", path.stem, re.I))
+
+    def _validate_automatic_workbook(self, path: Path, target: datetime) -> None:
+        from openpyxl import load_workbook
+        if not self._automatic_filename_allowed(path):
+            raise DutySheetValidationError("不是可用的 .xlsm 勤務表或屬於備份檔")
+        with path.open("rb") as source:
+            workbook = load_workbook(source, read_only=True, data_only=True, keep_links=False)
+            try:
+                title = f"{target.day}號"
+                if title not in workbook.sheetnames:
+                    raise DutySheetValidationError("缺少目標日期分頁")
+                sheet = workbook[title]
+                header = list(sheet.iter_rows(min_row=1, max_row=6, max_col=99, values_only=True))
+                texts = [re.sub(r"\s+", "", str(value or "")) for row in header[4:6] for value in row]
+                required = ("值班", "休息", "備勤緊急救護", "備勤救災", "指揮官")
+                if any(not any(label in text for text in texts) for label in required):
+                    raise DutySheetValidationError("缺少勤務表必要欄位")
+                periods = []
+                for text in [path.stem] + [str(value or "") for row in header[:4] for value in row]:
+                    for match in re.finditer(r"(?<!\d)(\d{3,4})年\s*(\d{1,2})月", text):
+                        year, month = map(int, match.groups())
+                        periods.append((year + 1911 if year < 1911 else year, month))
+                for row in header[:4]:
+                    for value in row:
+                        if isinstance(value, datetime):
+                            periods.append((value.year, value.month))
+                year_folder = re.fullmatch(r"(\d{3,4})年?", path.parent.parent.name)
+                month_folder = re.fullmatch(r"(\d{1,2})月", path.parent.name)
+                if year_folder and month_folder:
+                    year = int(year_folder.group(1))
+                    periods.append((year + 1911 if year < 1911 else year, int(month_folder.group(1))))
+                if not periods or any(period != (target.year, target.month) for period in periods):
+                    raise DutySheetValidationError("無法確認目標年月或年月不符")
+            finally:
+                workbook.close()
+
+    def _record_workbook_selection(self, target_date: str, candidates: list[dict], selected: Path | None) -> None:
+        path = self.package_root / "runtime_outputs" / "daily_workbook_selection.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({
+            "target_date": target_date, "checked_at": datetime.now().isoformat(),
+            "candidates": candidates, "selected": str(selected) if selected else "",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
 
     def confirmation_summary(self, request: DutySheetRequest) -> str:
         return (
@@ -289,6 +424,10 @@ class DutySheetService:
 
         report_stage(stage)
         request = self.validate(request)
+        if request.automatic:
+            stat = Path(request.workbook_path).stat()
+            if request.workbook_signature != WorkbookSignature(stat.st_size, stat.st_mtime_ns):
+                raise DutySheetValidationError("勤務表選取後已變更，請人工確認後重新登打。")
         if not (self.project_dir / LEGACY_SCRIPT_NAME).is_file():
             raise DutySheetExecutionError("找不到勤務表自動化模組。")
         report_stage("config_load")
@@ -300,13 +439,14 @@ class DutySheetService:
                 current_config = legacy.load_config()
                 notification = dict(current_config.get("notification", {}))
                 notification["enabled"] = request.notification_enabled
-                legacy.save_config(
-                    request.cars_config,
-                    login_settings=dict(current_config.get("login", {})),
-                    notification_settings=notification,
-                    car_options=current_config.get("car_options", {}),
-                    hidden_car_options=current_config.get("hidden_car_options", {}),
-                )
+                if not request.automatic:
+                    legacy.save_config(
+                        request.cars_config,
+                        login_settings=dict(current_config.get("login", {})),
+                        notification_settings=notification,
+                        car_options=current_config.get("car_options", {}),
+                        hidden_car_options=current_config.get("hidden_car_options", {}),
+                    )
                 selected_date = datetime.strptime(request.target_date, "%Y/%m/%d")
                 target_date = legacy.convert_to_minguo(selected_date)
                 result = legacy.start_automation(
@@ -338,6 +478,13 @@ class DutySheetService:
                 errors[-1] if errors else "勤務表登打未完成。",
                 failure_stage=stage,
             )
+        selection_warning = ""
+        if request.automatic:
+            try:
+                with legacy_workdir(self.project_dir):
+                    legacy.save_config(request.cars_config)
+            except Exception:
+                selection_warning = "（登打成功，但前一次檔案設定未能保存）"
         legacy_result = successes[-1] if successes else ""
         if "勤務表截圖保存失敗" in legacy_result:
             suffix = "（截圖保存失敗）"
@@ -345,7 +492,7 @@ class DutySheetService:
             suffix = "（LINE 截圖通知失敗）"
         else:
             suffix = ""
-        return f"勤務表已登打完成：{target_date}{suffix}"
+        return f"勤務表已登打完成：{target_date}{suffix}{selection_warning}"
 
     def _resolve_workbook(self, value: str) -> Path | None:
         value = str(value or "").strip()

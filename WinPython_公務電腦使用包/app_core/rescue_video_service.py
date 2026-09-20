@@ -13,7 +13,7 @@ from typing import Callable
 
 
 CORE_MODULE_NAME = "_sinposmart_qt_rescue_video_core"
-CORE_SCRIPT_NAME = "救護影片分類GUI.py"
+CORE_SCRIPT_NAME = "rescue_video_core.py"
 
 
 class RescueVideoValidationError(ValueError):

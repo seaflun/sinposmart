@@ -34,6 +34,8 @@ class DutySheetController(QObject):
         session_state: SessionState,
         service: DutySheetService,
         parent: QObject | None = None,
+        *,
+        read_only_acceptance: bool = False,
     ) -> None:
         super().__init__(parent)
         self._session_state = session_state
@@ -55,6 +57,8 @@ class DutySheetController(QObject):
         self._failure_stage = "unknown"
         self._workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
         self._shutdown_admission = False
+        self._read_only_acceptance = bool(read_only_acceptance)
+        self._automatic_preparing = False
 
     @Property(str, notify=stateChanged)
     def workbookPath(self) -> str:
@@ -120,10 +124,16 @@ class DutySheetController(QObject):
 
     @Property(bool, notify=stateChanged)
     def isRunning(self) -> bool:
-        return bool(self._workers)
+        return bool(self._workers) or self._automatic_preparing
+
+    def set_automatic_preparing(self, value: bool) -> None:
+        self._automatic_preparing = value
+        self.stateChanged.emit()
 
     @Slot()
     def loadDefaults(self) -> None:
+        if self._reject_read_only_execution():
+            return
         defaults = self._service.load_defaults()
         self._apply_defaults(defaults)
         self._status_text = "準備就緒。"
@@ -147,6 +157,8 @@ class DutySheetController(QObject):
 
     @Slot(str, str, str)
     def addVehicleOption(self, group: str, code: str, plate: str) -> None:
+        if self._reject_read_only_execution():
+            return
         try:
             value = self._service.add_vehicle_option(group, code, plate)
             defaults = self._service.load_defaults()
@@ -160,6 +172,8 @@ class DutySheetController(QObject):
 
     @Slot(str, str)
     def removeVehicleOption(self, group: str, value: str) -> None:
+        if self._reject_read_only_execution():
+            return
         try:
             removed = self._service.remove_vehicle_option(group, value)
             defaults = self._service.load_defaults()
@@ -182,6 +196,10 @@ class DutySheetController(QObject):
         amb2: str,
         notification_enabled: bool,
     ) -> None:
+        if self._reject_read_only_execution():
+            return
+        if self.isRunning:
+            return
         session = self._session_state.session
         if session is None or not session.verified:
             self._set_error("請先完成勤務系統登入。")
@@ -206,6 +224,8 @@ class DutySheetController(QObject):
             self._set_error(str(exc))
             return
         self._attack = request.attack
+        self._target_date = request.target_date
+        self._workbook_path = request.workbook_path
         self._stop = request.stop
         self._amb1 = request.amb1
         self._amb2 = request.amb2
@@ -217,6 +237,8 @@ class DutySheetController(QObject):
 
     @Slot()
     def confirmRun(self) -> None:
+        if self._reject_read_only_execution():
+            return
         if self._shutdown_admission or self._pending_request is None or self._workers:
             return
         self._request_id += 1
@@ -241,12 +263,30 @@ class DutySheetController(QObject):
         self.runStarted.emit()
         thread.start()
 
+    def start_automatic(self, request: DutySheetRequest) -> bool:
+        if self._read_only_acceptance or self._shutdown_admission or self._workers or self._pending_request:
+            return False
+        self._target_date = request.target_date
+        self._workbook_path = request.workbook_path
+        self._pending_request = request
+        self.confirmRun()
+        return bool(self._workers)
+
     @Slot()
     def cancelPendingRun(self) -> None:
         self._pending_request = None
         self._confirmation_summary = ""
         self._status_text = "已取消勤務表登打。"
         self.stateChanged.emit()
+
+    def _reject_read_only_execution(self) -> bool:
+        if not self._read_only_acceptance:
+            return False
+        self._pending_request = None
+        self._confirmation_summary = ""
+        self._status_text = "唯讀驗收模式，不執行或變更設定。"
+        self.stateChanged.emit()
+        return True
 
     @Slot(int, str)
     def _progress(self, request_id: int, message: str) -> None:

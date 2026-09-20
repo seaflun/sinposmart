@@ -79,6 +79,8 @@ class DutyController(QObject):
         repository: ScheduleRepository | None = None,
         capture_service: ScheduleCaptureService | None = None,
         unreturned_return_queue: UnreturnedReturnQueue | None = None,
+        read_only_acceptance: bool = False,
+        offline_fixture_acceptance: bool = False,
     ) -> None:
         super().__init__(parent)
         package_root = Path(__file__).resolve().parents[2]
@@ -116,6 +118,8 @@ class DutyController(QObject):
         self._session_generation = 0
         self._session_user_id = ""
         self._session_closing = False
+        self._read_only_acceptance = bool(read_only_acceptance)
+        self._offline_fixture_acceptance = bool(offline_fixture_acceptance)
         self._schedule_generation = 0
         self._actions: list[dict[str, Any]] = []
         self._schedule_data: dict[str, Any] = {}
@@ -438,6 +442,8 @@ class DutyController(QObject):
 
     @Slot()
     def prepareManualSubmission(self) -> None:
+        if self._reject_read_only_manual_submission():
+            return
         if self._session_closing:
             return
         if not self._can_manually_submit_selected():
@@ -489,6 +495,8 @@ class DutyController(QObject):
 
     @Slot()
     def confirmManualSubmission(self) -> None:
+        if self._reject_read_only_manual_submission():
+            return
         if self._session_closing:
             return
         if not self._pending_manual_indices:
@@ -563,6 +571,8 @@ class DutyController(QObject):
 
     @Slot()
     def prepareExternalReturnManualSubmission(self) -> None:
+        if self._reject_read_only_manual_submission():
+            return
         if self._session_closing:
             return
         if not self.canConfirmExternalReturnManualSubmissionSelected:
@@ -588,6 +598,8 @@ class DutyController(QObject):
 
     @Slot()
     def confirmExternalReturnManualSubmission(self) -> None:
+        if self._reject_read_only_manual_submission():
+            return
         if self._session_closing:
             return
         if not self._pending_external_return_indices:
@@ -627,6 +639,19 @@ class DutyController(QObject):
         self._external_return_confirmation_summary = ""
         self._schedule_status = "已取消確認返隊手動登打"
         self.scheduleChanged.emit()
+
+    def _reject_read_only_manual_submission(self) -> bool:
+        if not self._read_only_acceptance:
+            return False
+        self._pending_manual_indices.clear()
+        self._pending_manual_action_keys = ()
+        self._manual_confirmation_summary = ""
+        self._pending_external_return_indices.clear()
+        self._pending_external_return_action_keys = ()
+        self._external_return_confirmation_summary = ""
+        self._schedule_status = "唯讀驗收模式，不可手動登打勤務。"
+        self._refresh_projection()
+        return True
 
     def _can_manually_submit_selected(self) -> bool:
         """Require all selected tasks to be manually eligible before enabling the action."""
@@ -782,6 +807,8 @@ class DutyController(QObject):
         }
 
     def _save_manual_departure_pair_keys(self) -> None:
+        if self._read_only_acceptance:
+            return
         self._prune_actual_handoff_times()
         payload = {
             "schema_version": 1,
@@ -1110,6 +1137,8 @@ class DutyController(QObject):
         self._comparison_contexts.clear()
 
     def enable_auto_execution(self) -> None:
+        if self._read_only_acceptance:
+            return
         if self._auto_execution_enabled:
             return
         self._auto_execution_enabled = True
@@ -1154,6 +1183,10 @@ class DutyController(QObject):
         publish_events: bool = True,
         allow_auto_execution: bool = True,
     ) -> bool:
+        if self._offline_fixture_acceptance:
+            self._schedule_status = "離線審核 fixture 不會執行即時勤務查詢。"
+            self.scheduleChanged.emit()
+            return False
         if not user_id or not password:
             return False
         self._capture_request_id += 1
@@ -1204,6 +1237,10 @@ class DutyController(QObject):
     ) -> bool:
         """Refresh saved-record comparisons without replacing the loaded duty schedule."""
 
+        if self._offline_fixture_acceptance:
+            self._schedule_status = "離線審核 fixture 不會執行即時比對查詢。"
+            self.scheduleChanged.emit()
+            return False
         if not user_id or not password:
             return False
         target = str(target_roc_date or business_roc_date()).strip()
@@ -1340,7 +1377,9 @@ class DutyController(QObject):
             )
         return requests
 
-    def report_due_existing_submission(self, request: DutySubmissionRequest) -> bool:
+    def mark_due_existing_submission(self, request: DutySubmissionRequest) -> bool:
+        """Mark a confirmed existing due task without reporting a fake submission."""
+
         action_index = self._resolve_request_action_index(request)
         if action_index is None or action_index not in self._due_existing_task_indices:
             return False
@@ -2145,6 +2184,8 @@ class DutyController(QObject):
         return True
 
     def load_current_schedule(self) -> None:
+        if self._offline_fixture_acceptance:
+            return
         if self._schedule_workers:
             return
         self._start_schedule_load()
@@ -2643,6 +2684,8 @@ class DutyController(QObject):
                 self.handoffWorkPrewarmRequested.emit(work_index)
 
     def _refresh_unreturned_return_queue(self) -> None:
+        if self._read_only_acceptance:
+            return
         self._unreturned_return_queue.prune_bridge_history()
         expired = self._unreturned_return_queue.expire_due()
         for record in expired:

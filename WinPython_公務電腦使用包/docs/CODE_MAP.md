@@ -1,6 +1,6 @@
 ﻿# SinpoSmart_值班台程式地圖
 
-本文件記錄 2026-07-29 PySide6 + QML 正式架構，以及仍保留的 Tk 回退邊界。
+本文件記錄 PySide6 + QML 正式架構，以及集中在 `legacy_tk/` 的 Tk 回退邊界。
 
 ## 正式啟動路徑
 
@@ -34,9 +34,9 @@ UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
 - `operational_sync_service.py`、`diagnostics_service.py`：後台事件、值班看板與去敏問題包。
 - `scheduled_folder_service.py`：16:30／21:55 Windows 截圖資料夾排程。
 
-## duty_gui.py（回退）
+## legacy_tk/duty_gui.py（回退）
 
-舊 Tkinter／CustomTkinter 主程式目前保留作為回退與行為參考。正式 Qt 入口不 import 此檔；不要把新 QML 功能再橋接回隱藏 Tk 視窗。
+舊 Tkinter／CustomTkinter 主程式目前保留作為回退與行為參考。正式 Qt 入口不 import `legacy_tk/`；不要把新 QML 功能再橋接回隱藏 Tk 視窗。根目錄的 `duty_gui.py` 僅是 QML 相容入口。
 
 目前區塊：
 
@@ -87,9 +87,9 @@ UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
 - `Report builder`：整份比對報告組裝。
 - `CLI entrypoint`：命令列入口。
 
-## duty_sheet_automation.py
+## legacy_tk/duty_sheet_automation.py
 
-勤務表登打內嵌視窗，負責從 SinpoSmart 值班模式開啟勤務表登打表單，並呼叫包內 `duty_sheet_legacy\sinposmart_1.py` 核心流程。
+勤務表登打的 Tk 內嵌視窗，負責從舊 SinpoSmart 值班模式開啟表單，並呼叫包內 `duty_sheet_legacy\sinposmart_1.py` 核心流程。
 
 目前定位：
 
@@ -106,7 +106,7 @@ UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
 1. QML 只做顯示與使用者操作，不持有帳密或 Selenium driver。
 2. Controller 只協調狀態與 worker，不把長時間工作放在 GUI thread。
 3. 可單元測試的規則留在 `app_core`；既有網站欄位規則仍以 `duty_rehearsal.py` 為唯一來源。
-4. 未經使用者確認，不刪除 `duty_gui.py` 或其他回退檔案。
+4. 未經使用者確認，不刪除 `legacy_tk/` 或其他回退檔案。
 
 每次拆檔後都應先跑：
 

@@ -14,6 +14,10 @@ from tkinter import messagebox
 import tkinter as tk
 from typing import Callable
 
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
 
 PACKAGED_PROJECT_DIR = "daily_vehicle_legacy"
 LEGACY_PROJECT_DIR = "每日車輛"
@@ -60,7 +64,7 @@ _RUNNING_LOCK = threading.Lock()
 
 
 def candidate_project_dirs(base_dir: Path | None = None) -> list[Path]:
-    base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
+    base_dir = (base_dir or PACKAGE_ROOT).resolve()
     candidates: list[Path] = []
     env_path = os.environ.get(ENV_PROJECT_DIR, "").strip()
     if env_path:
@@ -209,7 +213,7 @@ def set_running(project_dir: Path, running: bool, pid: int | None = None) -> Non
 
 
 def start_daily_vehicle_automation(parent: tk.Tk, user_id: str = "", password: str = "", on_start: Callable[[], None] | None = None, on_finish: Callable[[str], None] | None = None, on_error: Callable[[str], None] | None = None, on_stage: Callable[[str], None] | None = None) -> None:
-    base_dir = Path(__file__).resolve().parent
+    base_dir = PACKAGE_ROOT
     project_dir = find_project_dir(base_dir)
     if project_dir is None:
         searched = "\n".join(str(path) for path in candidate_project_dirs(base_dir))

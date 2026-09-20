@@ -34,6 +34,24 @@ RUN_DUTY_GUI_WINPYTHON.vbs
 python duty_gui.pyw
 ```
 
+## 緊急 Tk 回退
+
+只有在 QML 正式介面無法使用、且已確認需要回退時，才使用 `legacy_tk/`。它不會被正式啟動器載入，也不會隨 QML 的基本安裝自動安裝相依套件。
+
+先在套件根目錄使用同一份 WinPython 安裝回退介面的選用套件：
+
+```powershell
+python -m pip install -r legacy_tk\requirements.txt
+```
+
+接著以同一份 WinPython 的 `pythonw.exe` 開啟 `legacy_tk\duty_gui.py`，例如：
+
+```powershell
+& "D:\WinPython-3.11.9\python-3.11.9.amd64\pythonw.exe" .\legacy_tk\duty_gui.py
+```
+
+這是暫時的相容回退，不是日常正式入口；問題排除後仍應回到 `duty_gui.pyw`。
+
 ## 需要一起帶走的檔案
 
 程式必要檔：
@@ -41,11 +59,10 @@ python duty_gui.pyw
 - `duty_gui.pyw`：PySide6 + QML 正式入口
 - `qt_app/`：QML 介面、controller、model 與 worker
 - `app_core/`：登入、班表、登打、同步與診斷服務
-- `duty_gui.py`：舊 Tk 回退介面
+- `duty_gui.py`：QML 相容入口
+- `legacy_tk/`：已隔離的 Tk 回退介面與其選用依賴；更新包會保留它，但正式啟動不會載入它
 - `duty_rehearsal.py`
 - `compare_rehearsal_records.py`
-- `duty_sheet_automation.py`
-- `daily_vehicle_automation.py`
 - `rest_time_automation.py`
 - `requirements.txt`
 - `check_environment.py`

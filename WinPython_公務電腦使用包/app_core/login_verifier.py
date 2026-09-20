@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -66,7 +67,13 @@ def configure_login_webdriver_timeouts(driver: Any) -> None:
         pass
 
 
-def create_login_webdriver(options: Any) -> Any:
+def create_login_webdriver(
+    options: Any,
+    *,
+    profile_root: Path | None = None,
+    prune_profiles: bool = True,
+    write_diagnostics: bool = True,
+) -> Any:
     from duty_rehearsal import build_driver
 
     arguments = tuple(str(argument) for argument in getattr(options, "arguments", ()) or ())
@@ -76,7 +83,18 @@ def create_login_webdriver(options: Any) -> Any:
         for argument in arguments
         if not argument.startswith("--headless") and not argument.startswith("--window-size")
     )
-    return build_driver(headless=headless, option_arguments=passthrough_arguments)
+    browser_options: dict[str, Any] = {}
+    if profile_root is not None:
+        browser_options["profile_root"] = profile_root
+    if not prune_profiles:
+        browser_options["prune_profiles"] = False
+    if not write_diagnostics:
+        browser_options["write_diagnostics"] = False
+    return build_driver(
+        headless=headless,
+        option_arguments=passthrough_arguments,
+        **browser_options,
+    )
 
 
 def run_duty_login(driver: Any, user_id: str, password: str) -> None:
@@ -253,6 +271,7 @@ class LoginVerifier:
         allow_post_login_lookup_warning: bool = False,
         defer_actor_resolution: bool = False,
         driver_cleanup: Callable[[Any], None] = close_login_webdriver,
+        session_open_diagnostics: bool = True,
     ) -> None:
         self.options_factory = options_factory
         self.driver_factory = driver_factory
@@ -262,6 +281,7 @@ class LoginVerifier:
         self.allow_post_login_lookup_warning = bool(allow_post_login_lookup_warning)
         self.defer_actor_resolution = bool(defer_actor_resolution)
         self.driver_cleanup = driver_cleanup
+        self.session_open_diagnostics = bool(session_open_diagnostics)
 
     def verify(
         self,
@@ -285,6 +305,7 @@ class LoginVerifier:
                 lambda: self.driver_factory(self.options_factory()),
                 initialize_browser,
                 cleanup=self.driver_cleanup,
+                write_diagnostics=self.session_open_diagnostics,
             )
             try:
                 detected_actor_no, actor_name = identify_logged_in_actor(driver, actor_no_from_name, staff)

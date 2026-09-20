@@ -98,6 +98,7 @@ Rectangle {
                             Layout.preferredWidth: 1
                             text: "勤務表登打"
                             tone: "info"
+                            enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                             showStatusLight: true
                             statusLightOn: !dutyQuickToolsPanel.backend.toolController.dutySheetCompleted
                             statusLightObjectName: "quickDutySheetCompletionLight"
@@ -114,6 +115,7 @@ Rectangle {
                             Layout.preferredWidth: 1
                             text: "車輛保養清點"
                             tone: "info"
+                            enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                             showStatusLight: true
                             statusLightOn: !dutyQuickToolsPanel.backend.toolController.dailyVehicleCompleted
                             statusLightObjectName: "quickDailyVehicleCompletionLight"
@@ -130,6 +132,7 @@ Rectangle {
                             Layout.preferredWidth: 1
                             text: "救護行車紀錄器"
                             tone: "review"
+                            enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                             selectedState: dutyQuickToolsPanel.rescueVideoWindow.visible
                             onClicked: {
                                 if (!dutyQuickToolsPanel.rescueVideoWindow.visible)
@@ -167,6 +170,7 @@ Rectangle {
                             Layout.preferredWidth: 1
                             text: "休息時間登打"
                             tone: "monthly"
+                            enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                             selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.restTimePanel)
                             onClicked: {
                                 dutyQuickToolsPanel.backend.restMonthlyController.loadRestDefaults()
@@ -180,6 +184,7 @@ Rectangle {
                             Layout.preferredWidth: 1
                             text: "勤務基準表登打"
                             tone: "monthly"
+                            enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                             selectedState: dutyQuickToolsPanel.isSelected(dutyQuickToolsPanel.monthlyBasePanel)
                             onClicked: {
                                 dutyQuickToolsPanel.backend.restMonthlyController.loadMonthlyDefaults()

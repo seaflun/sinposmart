@@ -285,10 +285,13 @@ ToolSidePanel {
                 Layout.preferredWidth: Design.workLogActionButtonWidth
                 Layout.preferredHeight: Design.toolActionButtonHeight
                 text: "儲存"
+                enabled: !workLogSettingsDialog.hostWindow.backend.readOnlyAcceptance
                 onClicked: {
-                    workLogSettingsDialog.controller.setImportantNote(workLogNoteField.text);
-                    if (workLogSettingsDialog.controller.save())
-                        workLogSettingsDialog.close();
+                    if (!workLogSettingsDialog.hostWindow.backend.readOnlyAcceptance) {
+                        workLogSettingsDialog.controller.setImportantNote(workLogNoteField.text);
+                        if (workLogSettingsDialog.controller.save())
+                            workLogSettingsDialog.close();
+                    }
                 }
             }
         }

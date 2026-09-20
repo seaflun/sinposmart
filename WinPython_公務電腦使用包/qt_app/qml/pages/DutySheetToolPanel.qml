@@ -39,7 +39,11 @@ ToolSidePanel {
             dutyVehiclePlateField.text = "";
             dutyVehicleAddFunction.currentIndex = 0;
         }
-        onAccepted: dutySheetDialog.controller.addVehicleOption(dutyVehicleAddType.currentIndex === 0 ? (dutyVehicleAddFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleCodeField.text, dutyVehiclePlateField.text)
+        onAccepted: {
+            if (!dutySheetDialog.hostWindow.backend.readOnlyAcceptance) {
+                dutySheetDialog.controller.addVehicleOption(dutyVehicleAddType.currentIndex === 0 ? (dutyVehicleAddFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleCodeField.text, dutyVehiclePlateField.text)
+            }
+        }
 
         contentItem: ColumnLayout {
             spacing: 10
@@ -103,7 +107,11 @@ ToolSidePanel {
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "移除車輛"
         acceptTone: "dangerFilled"
-        onAccepted: dutySheetDialog.controller.removeVehicleOption(dutyVehicleRemoveType.currentIndex === 0 ? (dutyVehicleRemoveFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleRemoveValue.currentText)
+        onAccepted: {
+            if (!dutySheetDialog.hostWindow.backend.readOnlyAcceptance) {
+                dutySheetDialog.controller.removeVehicleOption(dutyVehicleRemoveType.currentIndex === 0 ? (dutyVehicleRemoveFunction.currentIndex === 0 ? "attack" : "stop") : "amb", dutyVehicleRemoveValue.currentText)
+            }
+        }
 
         contentItem: ColumnLayout {
             spacing: 10
@@ -200,6 +208,7 @@ ToolSidePanel {
                     ToolBrowseButton {
                         objectName: "dutyWorkbookBrowseButton"
                         enabled: !dutySheetDialog.controller.isRunning
+                                 && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                         onClicked: dutySheetDialog.browseWorkbookRequested()
                     }
 
@@ -218,6 +227,7 @@ ToolSidePanel {
                             Layout.preferredWidth: Design.toolDateFieldWidth
                             text: dutySheetDialog.controller.targetDate
                             enabled: !dutySheetDialog.controller.isRunning
+                                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                             clickAction: function () {
                                 dutyDateCalendar.openForCurrentDate();
                             }
@@ -226,12 +236,14 @@ ToolSidePanel {
                             objectName: "dutyPreviousDateButton"
                             text: "<"
                             enabled: !dutySheetDialog.controller.isRunning
+                                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                             onClicked: dutyDateField.text = window.shiftSlashDate(dutyDateField.text, -1)
                         }
                         ToolDateStepButton {
                             objectName: "dutyNextDateButton"
                             text: ">"
                             enabled: !dutySheetDialog.controller.isRunning
+                                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                             onClicked: dutyDateField.text = window.shiftSlashDate(dutyDateField.text, 1)
                         }
                         Item {
@@ -340,6 +352,7 @@ ToolSidePanel {
                             Layout.preferredWidth: 0
                             text: "新增車輛"
                             enabled: !dutySheetDialog.controller.isRunning
+                                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                             onClicked: dutyVehicleAddDialog.open()
                         }
                         ToolRemoveButton {
@@ -348,6 +361,7 @@ ToolSidePanel {
                             Layout.preferredWidth: 0
                             text: "移除車輛"
                             enabled: !dutySheetDialog.controller.isRunning
+                                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                             onClicked: dutyVehicleRemoveDialog.open()
                         }
                     }
@@ -370,7 +384,12 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: dutySheetDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !dutySheetDialog.controller.isRunning
-            onClicked: dutySheetDialog.controller.prepareRun(dutyWorkbookField.text, dutyDateField.text, dutyAttackCombo.currentText, dutyStopCombo.currentText, dutyAmb1Combo.currentText, dutyAmb2Combo.currentText, dutySheetDialog.controller.notificationEnabled)
+                     && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
+            onClicked: {
+                if (!dutySheetDialog.hostWindow.backend.readOnlyAcceptance) {
+                    dutySheetDialog.controller.prepareRun(dutyWorkbookField.text, dutyDateField.text, dutyAttackCombo.currentText, dutyStopCombo.currentText, dutyAmb1Combo.currentText, dutyAmb2Combo.currentText, dutySheetDialog.controller.notificationEnabled)
+                }
+            }
         }
     }
 
@@ -384,7 +403,11 @@ ToolSidePanel {
         title: "確認正式登打"
         standardButtons: Dialog.Yes | Dialog.No
         acceptText: "開始登打"
-        onAccepted: dutySheetDialog.controller.confirmRun()
+        onAccepted: {
+            if (!dutySheetDialog.hostWindow.backend.readOnlyAcceptance) {
+                dutySheetDialog.controller.confirmRun()
+            }
+        }
         onRejected: dutySheetDialog.controller.cancelPendingRun()
 
         Label {

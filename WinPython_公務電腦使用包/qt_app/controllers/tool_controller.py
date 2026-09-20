@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -88,20 +89,27 @@ class ToolController(QObject):
     errorOccurred = Signal(str)
     usageChanged = Signal(str)
     dailyCompletionChanged = Signal()
+    automaticNotice = Signal(str)
 
     def __init__(
         self,
         package_root: Path,
         *,
         now_factory: Callable[[], datetime] = datetime.now,
+        read_only_acceptance: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._package_root = Path(package_root)
         self._now_factory = now_factory
+        self._read_only_acceptance = bool(read_only_acceptance)
         self._daily_completion_date = business_roc_date(self._now_factory())
         self._usage_path = self._package_root / "runtime_outputs" / "tool_usage_history.json"
+        self._usage_history_valid = True
         self._usage_history = self._load_usage_history()
+        self._automatic_path = self._usage_path.with_name("daily_tool_schedule.json")
+        self._automatic_records: dict[str, dict] | None = None
+        self._automatic_storage_failed = False
         self._active_usage_ids: dict[str, str] = {}
         self._usage_models: dict[str, ToolUsageListModel] = {}
         self._usage_filters: dict[str, tuple[str, str, str, bool]] = {}
@@ -224,6 +232,8 @@ class ToolController(QObject):
         actor_no: str = "",
         user_id: str = "",
     ) -> None:
+        if self._read_only_acceptance:
+            return
         tool_id = str(tool_id or "").strip()
         if not tool_id:
             return
@@ -266,6 +276,8 @@ class ToolController(QObject):
         self.usageChanged.emit(tool_id)
 
     def record_finished(self, tool_id: str, status: str, result: str = "") -> None:
+        if self._read_only_acceptance:
+            return
         tool_id = str(tool_id or "").strip()
         entry_id = self._active_usage_ids.pop(tool_id, "")
         report = {"completed": "已完成", "failed": "失敗"}.get(str(status or ""), str(status or ""))
@@ -296,13 +308,145 @@ class ToolController(QObject):
         return any(
             entry.get("tool_name") == tool_id
             and entry.get("report") == "已完成"
-            and self._entry_business_date(entry) == business_date
+            and (tool_id == "daily_vehicle" or self._entry_business_date(entry) == business_date)
             and (
-                tool_id != "duty_sheet"
-                or str(entry.get("usage_period", "") or "").strip() == expected_usage_period
+                str(entry.get("usage_period", "") or "").strip() == expected_usage_period
+                or (tool_id == "daily_vehicle" and not entry.get("usage_period")
+                    and self._entry_business_date(entry) == business_date)
             )
             for entry in self._usage_history
         )
+
+    def current_calendar_roc_date(self) -> str:
+        current = self._now_factory()
+        return f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
+
+    def next_daily_automatic(self, now: datetime | None = None) -> dict | None:
+        """Catch up only the current fire day; persist every admission before running."""
+        if self._read_only_acceptance:
+            return None
+        if not self._usage_history_valid:
+            raise RuntimeError("工具完成紀錄無法讀取或保存，已停止每日自動執行，請人工確認。")
+        current = now or self._now_factory()
+        records = self._load_automatic_records()
+        business = business_roc_date(current)
+        day = date(int(business[:3]) + 1911, int(business[3:5]), int(business[5:7]))
+        changed = False
+        notices = []
+        for row in records.values():
+            if row["state"] == "pending" and current >= datetime.fromisoformat(row["expires_at"]):
+                row["state"] = "expired"
+                notices.append(f'{row["target_date"]} {row["label"]}已超過補跑期限，請人工確認。')
+                changed = True
+        for tool_id, label, hour, minute in (
+            ("daily_vehicle", "每日點車", 9, 0),
+            ("duty_sheet", "勤務表", 16, 25),
+        ):
+            due = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute)
+            expiry = due.replace(hour=0, minute=0) + timedelta(
+                days=1, hours=8 if tool_id == "duty_sheet" else 0
+            )
+            if current < due:
+                continue
+            key = f"{business}:{tool_id}"
+            if key not in records:
+                state = ("completed_manually" if self._is_daily_tool_completed_for_date(tool_id, business)
+                         else "expired" if current >= expiry else "pending")
+                records[key] = {
+                    "key": key, "tool_id": tool_id, "label": label,
+                    "business_date": business,
+                    "target_date": _next_roc_date(business) if tool_id == "duty_sheet" else business,
+                    "due_at": due.isoformat(), "expires_at": expiry.isoformat(), "state": state,
+                }
+                changed = True
+                if state == "expired":
+                    notices.append(f"{business} {label}已超過補跑期限，請人工確認。")
+            row = records[key]
+            if row["state"] == "pending" and self._is_daily_tool_completed_for_date(tool_id, business):
+                row["state"] = "completed_manually"
+                changed = True
+        if changed:
+            self._save_automatic_records()
+        for message in notices:
+            self.automaticNotice.emit(message)
+        pending = [row for row in records.values() if row["state"] == "pending"
+                   and row["business_date"] == business
+                   and datetime.fromisoformat(row["due_at"]) <= current]
+        return dict(min(pending, key=lambda row: row["due_at"])) if pending else None
+
+    def claim_daily_automatic(self, key: str, now: datetime | None = None) -> bool:
+        if self._read_only_acceptance:
+            return False
+        current = now or self._now_factory()
+        candidate = self.next_daily_automatic(current)
+        if candidate is None or candidate["key"] != key:
+            return False
+        row = self._load_automatic_records()[key]
+        row["state"] = "claimed"
+        row["started_at"] = current.isoformat()
+        self._save_automatic_records()
+        return True
+
+    def finish_daily_automatic(self, key: str, succeeded: bool) -> None:
+        row = self._load_automatic_records().get(key)
+        if row is not None and row["state"] == "claimed":
+            row["state"] = "completed" if succeeded else "failed"
+            self._save_automatic_records()
+
+    def _load_automatic_records(self) -> dict[str, dict]:
+        if self._automatic_storage_failed:
+            raise RuntimeError("每日自動執行紀錄無法可靠保存，已停止自動執行，請人工確認。")
+        if self._automatic_records is not None:
+            return self._automatic_records
+        try:
+            payload = json.loads(self._automatic_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = {"schema": 1, "records": {}}
+        except (OSError, ValueError) as exc:
+            self._automatic_storage_failed = True
+            raise RuntimeError("每日自動執行紀錄無法讀取，已停止自動執行，未覆寫原檔。") from exc
+        try:
+            if payload["schema"] != 1 or not isinstance(payload["records"], dict):
+                raise ValueError("schema")
+            for key, row in payload["records"].items():
+                if (row["tool_id"] not in DAILY_TOOL_IDS
+                        or key != f'{row["business_date"]}:{row["tool_id"]}'
+                        or row["key"] != key
+                        or row["state"] not in {"pending", "claimed", "completed", "completed_manually", "failed", "expired"}
+                        or not isinstance(row["label"], str)
+                        or not re.fullmatch(r"\d{7}", row["business_date"])
+                        or row["target_date"] != (_next_roc_date(row["business_date"])
+                                                if row["tool_id"] == "duty_sheet" else row["business_date"])):
+                    raise ValueError("record")
+                business = row["business_date"]
+                day = datetime(int(business[:3]) + 1911, int(business[3:5]), int(business[5:7]))
+                is_sheet = row["tool_id"] == "duty_sheet"
+                due = day.replace(hour=16 if is_sheet else 9, minute=25 if is_sheet else 0)
+                expiry = day + timedelta(days=1, hours=8 if is_sheet else 0)
+                if (datetime.fromisoformat(row["due_at"]) != due
+                        or datetime.fromisoformat(row["expires_at"]) != expiry):
+                    raise ValueError("schedule dates")
+        except (KeyError, TypeError, ValueError) as exc:
+            self._automatic_storage_failed = True
+            raise RuntimeError("每日自動執行紀錄格式不正確，請人工確認，未覆寫原檔。") from exc
+        self._automatic_records = payload["records"]
+        for row in self._automatic_records.values():
+            if row["state"] == "claimed":
+                self.automaticNotice.emit(f'{row["target_date"]} {row["label"]}上次執行結果未確認，不會重複自動執行。')
+        return self._automatic_records
+
+    def _save_automatic_records(self) -> None:
+        try:
+            self._automatic_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._automatic_path.with_suffix(f".{uuid4().hex}.tmp")
+            with temporary.open("x", encoding="utf-8") as output:
+                json.dump({"schema": 1, "records": self._automatic_records}, output, ensure_ascii=False)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self._automatic_path)
+        except OSError as exc:
+            self._automatic_storage_failed = True
+            raise RuntimeError("每日自動執行紀錄無法保存，已停止自動執行，請人工確認。") from exc
 
     @staticmethod
     def _entry_business_date(entry: dict[str, str]) -> str:
@@ -440,7 +584,7 @@ class ToolController(QObject):
         return ""
 
     def _rescue_video_path(self) -> Path:
-        return self._package_root / "rescue_video" / "救護影片分類GUI.py"
+        return self._package_root / "rescue_video" / "rescue_video_core.py"
 
     def _refresh_availability(self) -> None:
         if not self._rescue_video_path().is_file():
@@ -454,10 +598,16 @@ class ToolController(QObject):
     def _load_usage_history(self) -> list[dict[str, str]]:
         try:
             payload = json.loads(self._usage_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
         except (OSError, ValueError, TypeError):
+            self._usage_history_valid = False
             return []
         if not isinstance(payload, list):
+            self._usage_history_valid = False
             return []
+        if not all(isinstance(item, dict) for item in payload):
+            self._usage_history_valid = False
         return [dict(item) for item in payload if isinstance(item, dict)][-100:]
 
     def _save_usage_history(self) -> None:
@@ -468,6 +618,7 @@ class ToolController(QObject):
                 encoding="utf-8",
             )
         except OSError:
+            self._usage_history_valid = False
             return
 
     def _set_error(self, message: str) -> None:

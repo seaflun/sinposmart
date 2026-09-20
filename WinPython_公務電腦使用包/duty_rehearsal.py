@@ -794,6 +794,10 @@ def quit_driver(driver: webdriver.Chrome | None) -> None:
         return
     service = getattr(driver, "service", None)
     profile_dir = getattr(driver, "_sinposmart_duty_browser_profile", "")
+    profile_root = getattr(driver, "__dict__", {}).get(
+        _DUTY_BROWSER_PROFILE_ROOT_ATTRIBUTE,
+        "",
+    )
     quit_failed = False
     try:
         driver.quit()
@@ -807,7 +811,10 @@ def quit_driver(driver: webdriver.Chrome | None) -> None:
             except Exception:
                 pass
         if profile_dir:
-            cleanup_duty_browser_profile(Path(str(profile_dir)), terminate_processes=quit_failed)
+            cleanup_options: dict[str, Any] = {"terminate_processes": quit_failed}
+            if profile_root:
+                cleanup_options["root"] = Path(str(profile_root))
+            cleanup_duty_browser_profile(Path(str(profile_dir)), **cleanup_options)
 
 
 def set_work_log_content_fields(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:
@@ -3115,6 +3122,7 @@ def print_summary(today: DutySheet, yesterday: DutySheet | None, cases: list[Cas
 
 _DUTY_BROWSER_PROFILE_PREFIX = "duty_gui_"
 _DUTY_BROWSER_PROFILE_ATTRIBUTE = "_sinposmart_duty_browser_profile"
+_DUTY_BROWSER_PROFILE_ROOT_ATTRIBUTE = "_sinposmart_duty_browser_profile_root"
 _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH = Path("runtime_outputs") / "browser" / "browser_startup.jsonl"
 _CHROME_START_LOCK = threading.Lock()
 _DUTY_BROWSER_STARTUP_MESSAGE = (
@@ -3146,14 +3154,18 @@ class DutyBrowserSessionOpenError(WebDriverException):
         self.attempts = attempts
 
 
-def duty_browser_profile_root() -> Path:
-    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "SinpoSmart" / "duty_browser_profiles"
+def duty_browser_profile_root(root: Path | None = None) -> Path:
+    root = Path(root) if root is not None else (
+        Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        / "SinpoSmart"
+        / "duty_browser_profiles"
+    )
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def duty_browser_profile_dir() -> Path:
-    profile_dir = duty_browser_profile_root() / f"{_DUTY_BROWSER_PROFILE_PREFIX}{uuid4().hex}"
+def duty_browser_profile_dir(*, root: Path | None = None) -> Path:
+    profile_dir = duty_browser_profile_root(root) / f"{_DUTY_BROWSER_PROFILE_PREFIX}{uuid4().hex}"
     profile_dir.mkdir()
     return profile_dir
 
@@ -3325,10 +3337,15 @@ def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
     return value
 
 
-def cleanup_duty_browser_profile(profile_dir: Path, *, terminate_processes: bool = False) -> None:
+def cleanup_duty_browser_profile(
+    profile_dir: Path,
+    *,
+    terminate_processes: bool = False,
+    root: Path | None = None,
+) -> None:
     """Remove exactly one program-owned profile, optionally ending its Chrome process."""
 
-    if not _is_owned_duty_browser_profile(profile_dir):
+    if not _is_owned_duty_browser_profile(profile_dir, root=root):
         return
     if terminate_processes:
         profile_token = base64.b64encode(str(profile_dir).encode("utf-8")).decode("ascii")
@@ -3352,8 +3369,8 @@ def cleanup_duty_browser_profile(profile_dir: Path, *, terminate_processes: bool
         shutil.rmtree(profile_dir)
 
 
-def cleanup_duty_browser_startup_failure(profile_dir: Path) -> None:
-    cleanup_duty_browser_profile(profile_dir, terminate_processes=True)
+def cleanup_duty_browser_startup_failure(profile_dir: Path, *, root: Path | None = None) -> None:
+    cleanup_duty_browser_profile(profile_dir, terminate_processes=True, root=root)
 
 
 def _browser_startup_failure_category(error: BaseException) -> str:
@@ -3379,6 +3396,7 @@ def retry_duty_browser_session_open(
     *,
     cleanup: Callable[[webdriver.Chrome], None] = quit_driver,
     attempts: int = 2,
+    write_diagnostics: bool = True,
 ) -> webdriver.Chrome:
     """Create, log in, and open a read-only page with one fresh-session retry.
 
@@ -3400,25 +3418,27 @@ def retry_duty_browser_session_open(
                 raise
             last_error = exc
             if attempt < session_attempts:
+                if write_diagnostics:
+                    _write_duty_browser_startup_diagnostic(
+                        "session_open_retry",
+                        category="browser_session_open",
+                        attempts=attempt,
+                        profiles_pruned=0,
+                    )
+                continue
+            if write_diagnostics:
                 _write_duty_browser_startup_diagnostic(
-                    "session_open_retry",
+                    "session_open_failed",
                     category="browser_session_open",
-                    attempts=attempt,
+                    attempts=session_attempts,
                     profiles_pruned=0,
                 )
-                continue
-            _write_duty_browser_startup_diagnostic(
-                "session_open_failed",
-                category="browser_session_open",
-                attempts=session_attempts,
-                profiles_pruned=0,
-            )
             raise DutyBrowserSessionOpenError(attempts=session_attempts) from exc
         except BaseException:
             with suppress(Exception):
                 cleanup(driver)
             raise
-        if attempt > 1:
+        if write_diagnostics and attempt > 1:
             _write_duty_browser_startup_diagnostic(
                 "session_open_recovered",
                 category="browser_session_open",
@@ -3435,6 +3455,9 @@ def build_initialized_driver(
     *,
     option_arguments: tuple[str, ...] = (),
     page_load_strategy: str = "",
+    profile_root: Path | None = None,
+    prune_profiles: bool = True,
+    write_diagnostics: bool = True,
 ) -> webdriver.Chrome:
     """Build a private Driver and safely retry only its pre-write initialization."""
 
@@ -3443,8 +3466,12 @@ def build_initialized_driver(
             headless=headless,
             option_arguments=option_arguments,
             page_load_strategy=page_load_strategy,
+            profile_root=profile_root,
+            prune_profiles=prune_profiles,
+            write_diagnostics=write_diagnostics,
         ),
         initialize,
+        write_diagnostics=write_diagnostics,
     )
 
 
@@ -3465,12 +3492,27 @@ def build_driver(
     headless: bool,
     option_arguments: tuple[str, ...] = (),
     page_load_strategy: str = "",
+    profile_root: Path | None = None,
+    prune_profiles: bool = True,
+    write_diagnostics: bool = True,
 ) -> webdriver.Chrome:
     attempts = chrome_start_attempts()
-    profiles_pruned = prune_stale_duty_browser_profiles()
+    selected_profile_root = Path(profile_root) if profile_root is not None else None
+    if prune_profiles:
+        profiles_pruned = (
+            prune_stale_duty_browser_profiles(root=selected_profile_root)
+            if selected_profile_root is not None
+            else prune_stale_duty_browser_profiles()
+        )
+    else:
+        profiles_pruned = 0
     last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
-        profile_dir = duty_browser_profile_dir()
+        profile_dir = (
+            duty_browser_profile_dir(root=selected_profile_root)
+            if selected_profile_root is not None
+            else duty_browser_profile_dir()
+        )
         options = Options()
         options.add_argument(f"--user-data-dir={profile_dir}")
         if headless:
@@ -3485,17 +3527,21 @@ def build_driver(
             driver = create_webdriver_chrome_with_timeout(options)
         except (OSError, TimeoutError, WebDriverException) as exc:
             last_error = exc
-            cleanup_duty_browser_startup_failure(profile_dir)
+            if selected_profile_root is not None:
+                cleanup_duty_browser_startup_failure(profile_dir, root=selected_profile_root)
+            else:
+                cleanup_duty_browser_startup_failure(profile_dir)
             if attempt < attempts:
                 time.sleep(1)
                 continue
             category = _browser_startup_failure_category(exc)
-            _write_duty_browser_startup_diagnostic(
-                "startup_failed",
-                category=category,
-                attempts=attempts,
-                profiles_pruned=profiles_pruned,
-            )
+            if write_diagnostics:
+                _write_duty_browser_startup_diagnostic(
+                    "startup_failed",
+                    category=category,
+                    attempts=attempts,
+                    profiles_pruned=profiles_pruned,
+                )
             raise DutyBrowserStartupError(
                 category=category,
                 attempts=attempts,
@@ -3504,12 +3550,13 @@ def build_driver(
         break
     else:
         category = _browser_startup_failure_category(last_error or WebDriverException())
-        _write_duty_browser_startup_diagnostic(
-            "startup_failed",
-            category=category,
-            attempts=attempts,
-            profiles_pruned=profiles_pruned,
-        )
+        if write_diagnostics:
+            _write_duty_browser_startup_diagnostic(
+                "startup_failed",
+                category=category,
+                attempts=attempts,
+                profiles_pruned=profiles_pruned,
+            )
         raise DutyBrowserStartupError(
             category=category,
             attempts=attempts,
@@ -3526,7 +3573,13 @@ def build_driver(
     if not headless and not any(argument.startswith("--window-position=") for argument in option_arguments):
         position_duty_browser_at_top_right(driver)
     setattr(driver, _DUTY_BROWSER_PROFILE_ATTRIBUTE, str(profile_dir))
-    if profiles_pruned or attempt > 1:
+    selected_root = (
+        duty_browser_profile_root(selected_profile_root)
+        if selected_profile_root is not None
+        else duty_browser_profile_root()
+    )
+    setattr(driver, _DUTY_BROWSER_PROFILE_ROOT_ATTRIBUTE, str(selected_root))
+    if write_diagnostics and (profiles_pruned or attempt > 1):
         _write_duty_browser_startup_diagnostic(
             "startup_recovered",
             category="recovered",
