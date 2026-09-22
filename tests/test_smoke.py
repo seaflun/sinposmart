@@ -3902,6 +3902,36 @@ try {
             )
         )
 
+    def test_external_assignment_is_closed_by_generic_return_row(self) -> None:
+        module = package_module("compare_rehearsal_records")
+
+        rows = module.flatten_rows(
+            [
+                ["115/09/22", "08:01", "-", "劉家誠", "出", "救護品管會議"],
+                ["115/09/22", "12:00", "-", "劉家誠", "入", "返隊"],
+            ],
+            "1150922",
+            start_date="1150922",
+            end_date="1150922",
+        )
+        action = {
+            "target": "19",
+            "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+        }
+        staff = {"19": {"name": "劉家誠"}}
+
+        self.assertIsNone(
+            module.find_open_external_assignment(
+                rows,
+                "1150922",
+                staff,
+                action,
+                current_at=datetime(2026, 9, 22, 14, 0),
+                start_at=datetime(2026, 9, 22, 8, 0),
+                end_at=datetime(2026, 9, 22, 14, 0),
+            )
+        )
+
     def test_external_assignment_reversed_case_return_is_returned(self) -> None:
         module = package_module("compare_rehearsal_records")
         reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
