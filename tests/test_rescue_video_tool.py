@@ -147,7 +147,7 @@ class RescueVideoPackageTests(unittest.TestCase):
             source[close_start:],
         )
 
-    def test_daily_tools_include_rescue_video_as_third_action(self) -> None:
+    def test_rescue_video_and_civilpower_share_the_right_tool_card(self) -> None:
         source = (
             PACKAGE_ROOT / "qt_app" / "qml" / "pages" / "DutyQuickToolsPanel.qml"
         ).read_text(encoding="utf-8")
@@ -155,13 +155,15 @@ class RescueVideoPackageTests(unittest.TestCase):
             'text: "每月作業"', 1
         )[0]
 
-        self.assertLess(daily_tools.index('text: "勤務表登打"'), daily_tools.index('text: "車輛保養清點"'))
+        self.assertLess(daily_tools.index('text: "勤務表登打"'), daily_tools.index('text: "車輛保養"'))
+        self.assertNotIn('text: "救護行車紀錄器"', daily_tools)
+        other_tools = source.split('objectName: "otherToolsCard"', 1)[1]
         self.assertLess(
-            daily_tools.index('text: "車輛保養清點"'),
-            daily_tools.index('text: "救護行車紀錄器"'),
+            other_tools.index('text: "救護行車紀錄器"'),
+            other_tools.index('text: "民力系統"'),
         )
-        self.assertIn('tone: "review"', daily_tools)
-        self.assertIn("dutyQuickToolsPanel.rescueVideoWindow.open()", daily_tools)
+        self.assertIn('tone: "review"', other_tools)
+        self.assertIn("dutyQuickToolsPanel.rescueVideoWindow.open()", other_tools)
 
     def test_update_backup_keeps_rescue_video_sources(self) -> None:
         source = (PACKAGE_ROOT / "update_package.ps1").read_text(encoding="utf-8-sig")

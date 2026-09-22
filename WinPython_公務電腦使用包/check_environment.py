@@ -17,6 +17,7 @@ REQUIRED_MODULES = [
     "requests",
     "google.cloud.storage",
     "PySide6",
+    "ddddocr",
 ]
 
 

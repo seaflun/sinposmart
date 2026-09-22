@@ -12,6 +12,35 @@ Item {
 
     anchors.fill: parent
 
+    function openLogoutConfirmation() {
+        logoutConfirmation.open()
+    }
+
+    AppleDialog {
+        id: logoutConfirmation
+        objectName: "logoutConfirmation"
+        anchors.centerIn: parent
+        width: Math.min(actionConfirmations.hostWindow.width - 72, 460)
+        modal: true
+        title: "確認登出"
+        standardButtons: Dialog.Yes | Dialog.No
+        acceptText: actionConfirmations.backend.updateController.logoutActionText
+        onAccepted: {
+            if (actionConfirmations.backend.sessionController.isLoggedIn) {
+                actionConfirmations.backend.requestLogout()
+            }
+        }
+
+        Label {
+            width: parent.width
+            text: actionConfirmations.backend.updateController.logoutActionText === "登出並更新"
+                  ? "確定要登出目前的值班帳號並套用已準備的更新嗎？"
+                  : "確定要登出目前的值班帳號嗎？"
+            color: actionConfirmations.hostWindow.ink
+            wrapMode: Text.Wrap
+        }
+    }
+
     function openManualSubmissionConfirmation() {
         manualSubmissionConfirmation.open()
     }

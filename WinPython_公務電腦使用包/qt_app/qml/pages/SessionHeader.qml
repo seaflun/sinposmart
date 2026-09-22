@@ -12,6 +12,7 @@ ColumnLayout {
     property alias passwordText: passwordField.text
     signal accountManagerRequested
     signal workLogSettingsRequested
+    signal logoutRequested
     Layout.fillWidth: true
     spacing: 10
 
@@ -117,10 +118,10 @@ ColumnLayout {
                     objectName: "logoutButton"
                     implicitHeight: 30
                     implicitWidth: 104
-                    text: sessionHeader.backend.updateController.logoutActionText
                     visible: !sessionHeader.backend.offlineFixtureAcceptance
                     enabled: !sessionHeader.backend.offlineFixtureAcceptance
-                    onClicked: sessionHeader.backend.requestLogout()
+                    text: sessionHeader.backend.updateController.logoutActionText
+                    onClicked: sessionHeader.logoutRequested()
                 }
             }
         }

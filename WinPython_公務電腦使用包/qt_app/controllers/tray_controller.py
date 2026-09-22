@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Property, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, Property, QRunnable, QThread, QThreadPool, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -72,14 +72,35 @@ def configure_windows_notification_identity() -> None:
         pass
 
 
+class _NotificationShortcutJob(QThread):
+    def __init__(self) -> None:
+        super().__init__()
+        self.succeeded = False
+
+    def run(self) -> None:
+        self.succeeded = _create_windows_notification_shortcut()
+
+
 def ensure_windows_notification_shortcut() -> bool:
     """Create the Start-menu shortcut Windows uses to name the toast source."""
 
     if os.name != "nt" or not all((pythoncom, propsys, pscon, shell)):
         return False
+    # Shell COM teardown on the GUI thread can invalidate later QML window loads.
+    # Own both initialization and teardown on a dedicated apartment instead.
+    worker = _NotificationShortcutJob()
+    worker.setObjectName("SinpoSmart.NotificationShortcut")
+    worker.start()
+    worker.wait()
+    return worker.succeeded
+
+
+def _create_windows_notification_shortcut() -> bool:
     app_data = os.environ.get("APPDATA", "").strip()
     if not app_data:
         return False
+    com_initialized = False
+    shortcut = property_store = persist_file = None
     try:
         shortcut_dir = Path(app_data) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
         shortcut_dir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +109,8 @@ def ensure_windows_notification_shortcut() -> bool:
         target = pythonw if pythonw.exists() else Path(sys.executable)
         entrypoint = PACKAGE_ROOT / "duty_gui.pyw"
 
-        pythoncom.CoInitialize()
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        com_initialized = True
         shortcut = pythoncom.CoCreateInstance(
             shell.CLSID_ShellLink,
             None,
@@ -112,10 +134,10 @@ def ensure_windows_notification_shortcut() -> bool:
     except Exception:
         return False
     finally:
-        try:
+        # Release apartment-bound interfaces before balancing this initialization.
+        persist_file = property_store = shortcut = None
+        if com_initialized:
             pythoncom.CoUninitialize()
-        except Exception:
-            pass
 
 
 def show_windows_notification(title: str, message: str) -> bool:

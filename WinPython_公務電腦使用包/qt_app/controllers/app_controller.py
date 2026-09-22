@@ -35,6 +35,8 @@ from app_core.duty_task_projection import (
 )
 from app_core.login_verifier import LoginVerifier
 from app_core.operational_sync_service import OperationalSyncService
+from app_core.civilpower_service import CivilpowerService
+from qt_app.controllers.civilpower_controller import CivilpowerController
 from app_core.rescue_video_service import RescueVideoService
 from app_core.rest_monthly_service import RestMonthlyService
 from app_core.schedule_repository import ScheduleRepository
@@ -95,6 +97,7 @@ class AppController(QObject):
         duty_sheet_service: DutySheetService | None = None,
         rest_monthly_service: RestMonthlyService | None = None,
         daily_vehicle_service: DailyVehicleService | None = None,
+        civilpower_service: CivilpowerService | None = None,
         rescue_video_service: RescueVideoService | None = None,
         diagnostics_service: DiagnosticsService | None = None,
         operational_sync_service: OperationalSyncService | None = None,
@@ -176,6 +179,10 @@ class AppController(QObject):
             self._session_state,
             rest_monthly_service or RestMonthlyService(package_root),
             self,
+            read_only_acceptance=self._read_only_acceptance,
+        )
+        self._civilpower_controller = CivilpowerController(
+            self._session_state, civilpower_service or CivilpowerService(package_root), self,
             read_only_acceptance=self._read_only_acceptance,
         )
         self._daily_vehicle_controller = DailyVehicleController(
@@ -310,6 +317,15 @@ class AppController(QObject):
         self._rest_monthly_controller.runFailed.connect(
             lambda tool_id, message: self._tool_run_failed(tool_id, self._tool_label(tool_id), message)
         )
+        self._civilpower_controller.runStarted.connect(
+            lambda: self._tool_run_started("civilpower", "民力系統")
+        )
+        self._civilpower_controller.runSucceeded.connect(
+            lambda message: self._tool_run_finished("civilpower", "民力系統", message)
+        )
+        self._civilpower_controller.runFailed.connect(
+            lambda message: self._tool_run_failed("civilpower", "民力系統", message)
+        )
         self._daily_vehicle_controller.runStarted.connect(
             lambda: self._tool_run_started("daily_vehicle", "車輛保養清點")
         )
@@ -389,6 +405,10 @@ class AppController(QObject):
     @Property(QObject, constant=True)
     def restMonthlyController(self) -> RestMonthlyController:
         return self._rest_monthly_controller
+
+    @Property(QObject, constant=True)
+    def civilpowerController(self) -> CivilpowerController:
+        return self._civilpower_controller
 
     @Property(QObject, constant=True)
     def dailyVehicleController(self) -> DailyVehicleController:
@@ -535,6 +555,7 @@ class AppController(QObject):
             self._rest_monthly_controller,
             self._daily_vehicle_controller,
             self._rescue_video_controller,
+            self._civilpower_controller,
         ):
             prepare = getattr(controller, "prepare_shutdown_admission", None)
             if callable(prepare):
@@ -566,6 +587,7 @@ class AppController(QObject):
             (self._rest_monthly_controller.isRunning, "休息時間或勤務基準表登打"),
             (self._daily_vehicle_controller.isRunning, "車輛保養清點"),
             (self._rescue_video_controller.isRunning, "救護行車紀錄器處理"),
+            (self._civilpower_controller.isRunning, "民力系統登打"),
         )
         for is_running, label in running_tools:
             if is_running:
@@ -596,7 +618,8 @@ class AppController(QObject):
             return False
         # A future waiting chain is not a submitted/queued job and does not block.
         for controller in (self._duty_sheet_controller, self._daily_vehicle_controller,
-                           self._rest_monthly_controller, self._rescue_video_controller):
+                           self._rest_monthly_controller, self._rescue_video_controller,
+                           self._civilpower_controller):
             running = (bool(controller._workers) if controller is self._duty_sheet_controller
                        else controller.isRunning)
             if (running or getattr(controller, "_pending_request", None)
@@ -2505,6 +2528,8 @@ class AppController(QObject):
             "display_name": self._session_controller.displayName,
         }
         event_fields.update(fields)
+        if isinstance(fields.get("snapshot"), Mapping) and fields["snapshot"].get("tool_name") == "civilpower":
+            event_fields.update(self._civilpower_controller.run_actor)
         if record_type == "login":
             event_fields["snapshot"] = {
                 **dict(event_fields.get("snapshot") or {}),
@@ -2930,6 +2955,7 @@ class AppController(QObject):
         self._duty_sheet_controller.shutdown()
         self._rest_monthly_controller.shutdown()
         self._daily_vehicle_controller.shutdown()
+        self._civilpower_controller.shutdown()
         self._rescue_video_controller.shutdown()
         self._session_controller.shutdown()
         self._update_controller.shutdown()

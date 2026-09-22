@@ -58,10 +58,19 @@ TOOL_CATALOG = (
         "tone": "ready",
         "available": True,
     },
+    {
+        "toolId": "civilpower",
+        "label": "民力系統",
+        "description": "義消到勤與退勤出入登記",
+        "statusText": "原生表單可用",
+        "tone": "ready",
+        "available": True,
+    },
 )
 DAILY_TOOL_IDS = ("duty_sheet", "daily_vehicle")
 MONTHLY_TOOL_IDS = {"rest_time", "monthly_base"}
 TOOL_USAGE_RESULT_LABELS = {
+    "civilpower": "民力系統",
     "duty_sheet": "勤務表",
     "daily_vehicle": "車輛保養清點",
     "rest_time": "休息時間",

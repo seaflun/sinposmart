@@ -415,6 +415,11 @@ ApplicationWindow {
         controller: window.backend.dutySheetController
         onBrowseWorkbookRequested: dutyWorkbookDialog.open()
     }
+    CivilpowerToolPanel {
+        id: civilpowerDialog
+        hostWindow: window
+        controller: window.backend.civilpowerController
+    }
     RestTimeToolPanel {
         id: restTimeDialog
         objectName: "restTimeDialog"
@@ -650,6 +655,7 @@ ApplicationWindow {
             backend: window.backend
             hostWindow: window
             visible: modeTabs.currentIndex === 0
+            onLogoutRequested: actionConfirmations.openLogoutConfirmation()
             onAccountManagerRequested: {
                 if (!window.backend.readOnlyAcceptance) {
                     accountManagerWindow.open()
@@ -678,6 +684,7 @@ ApplicationWindow {
             rescueVideoWindow: rescueVideoDialog
             restTimePanel: restTimeDialog
             monthlyBasePanel: monthlyBaseDialog
+            civilpowerPanel: civilpowerDialog
         }
 
         DutyTaskArea {

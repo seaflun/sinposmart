@@ -6031,7 +6031,7 @@ class ToolControllerTests(unittest.TestCase):
             roles,
             {"toolId", "label", "description", "statusText", "tone", "available"},
         )
-        self.assertEqual(model.rowCount(), 5)
+        self.assertEqual(model.rowCount(), 6)
 
     def test_tool_controller_never_launches_external_tk_tool(self) -> None:
         from PySide6.QtTest import QSignalSpy
@@ -6368,6 +6368,37 @@ class TrayControllerTests(unittest.TestCase):
         next(action for action in controller._menu.actions() if action.text() == "縮小到背景").trigger()
         self.assertTrue(window.hidden)
         controller.shutdown()
+
+    def test_notification_shortcut_owns_com_on_a_separate_thread(self) -> None:
+        import threading
+        from qt_app.controllers import tray_controller as module
+
+        caller_thread = threading.get_ident()
+        execution_threads = []
+
+        def create_shortcut():
+            execution_threads.append(threading.get_ident())
+            return True
+
+        with patch.object(module.os, "name", "nt"), \
+                patch.object(module, "pythoncom", object()), \
+                patch.object(module, "propsys", object()), \
+                patch.object(module, "pscon", object()), \
+                patch.object(module, "shell", object()), \
+                patch.object(module, "_create_windows_notification_shortcut", side_effect=create_shortcut):
+            self.assertTrue(module.ensure_windows_notification_shortcut())
+        self.assertEqual(len(execution_threads), 1)
+        self.assertNotEqual(execution_threads[0], caller_thread)
+
+    def test_notification_shortcut_does_not_uninitialize_failed_com_apartment(self) -> None:
+        from qt_app.controllers import tray_controller as module
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {"APPDATA": temp_dir}), \
+                patch.object(module, "pythoncom") as com:
+            com.CoInitializeEx.side_effect = RuntimeError("apartment unavailable")
+            self.assertFalse(module._create_windows_notification_shortcut())
+            com.CoUninitialize.assert_not_called()
 
     def test_notification_prefers_native_windows_toast_then_uses_system_tray(self) -> None:
         from PySide6.QtWidgets import QApplication
@@ -8081,6 +8112,7 @@ class QtShellTests(unittest.TestCase):
                 "DutyQuickToolsPanel 1.0 DutyQuickToolsPanel.qml",
                 "DutyOperationBar 1.0 DutyOperationBar.qml",
                 "DutyTaskArea 1.0 DutyTaskArea.qml",
+                "CivilpowerToolPanel 1.0 CivilpowerToolPanel.qml",
             ],
         )
         self.assertIn('import "pages"', qml)
@@ -8332,10 +8364,11 @@ class QtShellTests(unittest.TestCase):
         quick_tools = (
             PACKAGE_ROOT / "qt_app" / "qml" / "pages" / "DutyQuickToolsPanel.qml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(quick_tools.count("Layout.preferredWidth: 1"), 5)
+        self.assertEqual(quick_tools.count("Layout.preferredWidth: 1\n"), 4)
+        self.assertIn("Layout.preferredWidth: 130", quick_tools)
         self.assertNotIn("Item { Layout.fillWidth: true }", quick_tools)
         self.assertIn('objectName: "dailyMonthlyOperationCard"', quick_tools)
-        self.assertEqual(quick_tools.count("border.width: Design.borderWidth"), 1)
+        self.assertEqual(quick_tools.count("border.width: Design.borderWidth"), 2)
         self.assertIn('objectName: "dailyOperationLabel"', quick_tools)
         self.assertIn('objectName: "dailyOperationLabelArea"', quick_tools)
         self.assertEqual(quick_tools.count("Layout.preferredWidth: 58"), 2)
@@ -9828,7 +9861,7 @@ class QtShellTests(unittest.TestCase):
         quick_tools = (qml_root / "pages" / "DutyQuickToolsPanel.qml").read_text(encoding="utf-8")
         self.assertEqual(
             quick_tools.count("enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance"),
-            5,
+            6,
         )
         for relative_path, binding in (
             ("pages/DutySheetToolPanel.qml", "!dutySheetDialog.hostWindow.backend.readOnlyAcceptance"),
@@ -12113,6 +12146,7 @@ if return_code != 0 or loaded:
             "dutySheetPanel": {"opened": False}, "dailyVehiclePanel": {"opened": False},
             "restTimePanel": {"opened": False}, "monthlyBasePanel": {"opened": False},
             "rescueVideoWindow": window,
+            "civilpowerPanel": {"opened": False},
         })
         self.assertIsNotNone(panel, [error.toString() for error in component.errors()])
         button = panel.findChild(QObject, "quickRescueVideoToolButton")

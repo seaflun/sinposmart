@@ -8,3 +8,4 @@ WorkLogSettingsPanel 1.0 WorkLogSettingsPanel.qml
 DutyQuickToolsPanel 1.0 DutyQuickToolsPanel.qml
 DutyOperationBar 1.0 DutyOperationBar.qml
 DutyTaskArea 1.0 DutyTaskArea.qml
+CivilpowerToolPanel 1.0 CivilpowerToolPanel.qml
