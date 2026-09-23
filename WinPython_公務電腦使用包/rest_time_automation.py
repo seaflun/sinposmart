@@ -26,7 +26,15 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from duty_rehearsal import build_initialized_driver, js_click, login, open_ap, quit_driver
+from duty_rehearsal import (
+    RETAINED_BROWSER_DRIVERS,
+    build_initialized_driver,
+    js_click,
+    login,
+    open_ap,
+    quit_driver,
+    retain_browser_for_seconds,
+)
 
 UI_FONT = "Microsoft JhengHei UI"
 UI_BG = "#f5f7fb"
@@ -53,8 +61,7 @@ CTK_COMBO_STYLE = {
 
 DUTY_BASE_AP = "wap119.RPS105010"
 REST_TIME_CONFIG = Path(__file__).resolve().with_name("rest_time_automation_config.json")
-RETAINED_DRIVERS: list[object] = []
-MAX_RETAINED_DRIVERS = 1
+RETAINED_DRIVERS = RETAINED_BROWSER_DRIVERS
 MONTHLY_BASE_SHEET_ID = "1m-zy4KNR8_GMO94dYtFotyWPIvuT_tt32J9l7hhGZt0"
 MONTHLY_BASE_SHEET_GID = "1587057625"
 MONTHLY_BASE_EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?{query}"
@@ -277,13 +284,7 @@ def save_last_workbook_path(path: Path) -> None:
 
 
 def retain_driver(driver: object) -> None:
-    RETAINED_DRIVERS.append(driver)
-    while len(RETAINED_DRIVERS) > MAX_RETAINED_DRIVERS:
-        old_driver = RETAINED_DRIVERS.pop(0)
-        try:
-            quit_driver(old_driver)
-        except Exception:
-            pass
+    retain_browser_for_seconds(driver)
 
 
 def submit_rest_entries(

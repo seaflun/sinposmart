@@ -17,6 +17,7 @@ from selenium.common.exceptions import NoSuchElementException, StaleElementRefer
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
+from duty_rehearsal import RETAINED_BROWSER_DRIVERS as RETAINED_DRIVERS, retain_browser_for_seconds
 
 from app_core.civilpower_service import AttendancePlan, AttendanceRequest, CivilpowerError, _write_json
 
@@ -85,6 +86,7 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         raise CivilpowerError("民力自動登入所需 OCR 未就緒，請確認公務電腦使用包依賴已安裝。") from None
     driver = None
     checkpoint = {}
+    record_verified = False
     try:
         options = Options()
         options.add_argument("--window-size=1280,900")
@@ -99,6 +101,7 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
 
         created = _ensure_io_record(driver, plan, plan.status, checkpoint, cancel_check=None,
                                     require_lookup_confirmation=True, progress=progress, before_save=before_save)
+        record_verified = True
         _write_json(ledger, {"state": "verified", "user_id": request.user_id,
                             "updated_at": datetime.now().isoformat(timespec="seconds")})
         return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：" + ("已儲存並回查確認。" if created else "網站已有相同紀錄，未重複新增。")
@@ -110,10 +113,13 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         raise CivilpowerError("民力登打未完成；請確認網站及人員資料。查詢不明時不會新增紀錄。") from None
     finally:
         if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            if record_verified:
+                retain_browser_for_seconds(driver)
+            else:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
 
 class _AmbiguousSelectionError(RuntimeError):

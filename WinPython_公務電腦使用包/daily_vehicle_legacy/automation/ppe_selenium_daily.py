@@ -28,7 +28,12 @@ PACKAGE_DIR = Path(__file__).resolve().parents[2]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from duty_rehearsal import build_driver, quit_driver, retry_duty_browser_session_open
+from duty_rehearsal import (
+    DEFAULT_BROWSER_RETENTION_SECONDS,
+    build_driver,
+    quit_driver,
+    retry_duty_browser_session_open,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -452,6 +457,8 @@ def main(argv: list[str] | None = None) -> None:
         print("[sinposmart-stage] equipment_check", flush=True)
         process_equip_checks(driver, wait)
         print("[done] automation finished")
+        if config["keep_browser_open"]:
+            time.sleep(DEFAULT_BROWSER_RETENTION_SECONDS)
     except Exception as error:
         if driver is not None:
             save_artifacts(driver, "error")
@@ -463,11 +470,19 @@ def main(argv: list[str] | None = None) -> None:
         print(traceback.format_exc())
         raise
     finally:
-        if driver is not None and not config["keep_browser_open"]:
+        if driver is not None:
             try:
                 quit_driver(driver)
-            except WebDriverException as error:
+            except Exception as error:
                 print(f"[driver] quit skipped: {error}")
+        runner_pid_path = str(os.environ.get("PPE_RUNNER_PID_FILE", "") or "").strip()
+        if runner_pid_path:
+            try:
+                path = Path(runner_pid_path)
+                if int(path.read_text(encoding="utf-8").strip()) == os.getpid():
+                    path.unlink()
+            except (OSError, ValueError):
+                pass
 
 
 if __name__ == "__main__":

@@ -95,6 +95,30 @@ def legacy_duty_sheet_module():
 
 
 class PackageSmokeTests(unittest.TestCase):
+    def test_retained_browser_is_scheduled_to_close_after_ten_minutes(self) -> None:
+        module = duty_rehearsal_module()
+        module.RETAINED_BROWSER_DRIVERS.clear()
+        driver = mock.Mock()
+        with mock.patch.object(module.threading, "Timer") as timer_factory:
+            module.retain_browser_for_seconds(driver)
+
+        timer_factory.assert_called_once()
+        self.assertEqual(timer_factory.call_args.args[0], 600)
+        timer = timer_factory.return_value
+        self.assertTrue(timer.daemon)
+        timer.start.assert_called_once()
+        timer_factory.call_args.args[1](*timer_factory.call_args.kwargs["args"])
+        driver.quit.assert_called_once_with()
+        self.assertNotIn(driver, module.RETAINED_BROWSER_DRIVERS)
+
+    def test_duty_driver_closes_unless_verified_success_is_retained(self) -> None:
+        module = legacy_duty_sheet_module()
+
+        self.assertTrue(module.should_close_duty_driver(True, True, False))
+        self.assertFalse(module.should_close_duty_driver(True, True, True))
+        self.assertTrue(module.should_close_duty_driver(True, False, True))
+        self.assertFalse(module.should_close_duty_driver(False, False, False))
+
     def test_updater_busy_handshake_wait_is_bounded_and_preserves_process_identity(self) -> None:
         source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("function Wait-UpdateLogoutEvent", source)
@@ -3292,10 +3316,13 @@ try {
         submission_source = (root / "app_core" / "duty_submission_service.py").read_text(encoding="utf-8-sig")
         login_source = (root / "app_core" / "login_verifier.py").read_text(encoding="utf-8-sig")
 
-        self.assertIn("from duty_rehearsal import build_driver", duty_sheet_source)
+        self.assertIn("from duty_rehearsal import (", duty_sheet_source)
+        self.assertIn("build_driver,", duty_sheet_source)
+        self.assertIn("retain_browser_for_seconds,", duty_sheet_source)
         self.assertIn("quit_driver(driver)", duty_sheet_source)
         self.assertIn("retry_duty_browser_session_open", duty_sheet_source)
-        self.assertIn("from duty_rehearsal import build_driver", vehicle_source)
+        self.assertIn("from duty_rehearsal import (", vehicle_source)
+        self.assertIn("build_driver,", vehicle_source)
         self.assertIn("quit_driver(driver)", vehicle_source)
         self.assertIn("retry_duty_browser_session_open", vehicle_source)
         self.assertIn("return build_driver(", vehicle_source)

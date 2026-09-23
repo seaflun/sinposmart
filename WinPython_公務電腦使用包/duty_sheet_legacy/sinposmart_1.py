@@ -25,7 +25,12 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from duty_rehearsal import build_driver, quit_driver, retry_duty_browser_session_open
+from duty_rehearsal import (
+    build_driver,
+    quit_driver,
+    retain_browser_for_seconds,
+    retry_duty_browser_session_open,
+)
 
 # ==========================================
 # [區塊一] 模組導入與全域設定 (Imports & Config)
@@ -1764,6 +1769,10 @@ def verify_mission_cells(driver, mission_map, timeout=10):
 # ==========================================
 
 # 6-1. 單次勤務登打流程
+def should_close_duty_driver(close_driver, keep_browser_open_on_success, submission_verified):
+    return close_driver and not (keep_browser_open_on_success and submission_verified)
+
+
 def start_automation(
     user_id,
     user_pwd,
@@ -1775,6 +1784,7 @@ def start_automation(
     error_callback=None,
     show_dialogs=True,
     close_driver=False,
+    keep_browser_open_on_success=False,
     raise_errors=False,
     stage_callback=None,
 ):
@@ -1790,6 +1800,7 @@ def start_automation(
     capture_executor = None
     capture_future = None
     driver = None
+    submission_verified = False
     # ---------------- 1. 解析 Excel ----------------
     report_stage("source_load")
     day_int = int(target_date[-2:])
@@ -2075,6 +2086,7 @@ def start_automation(
                 detail = "\n".join(verification_issues[:20])
                 raise RuntimeError(f"救災任務編組表儲存後資料驗證失敗，已停止完成流程。\n{detail}")
             log_status("✅ 救災任務編組表儲存後資料驗證通過")
+            submission_verified = True
             
             report_stage("report")
             notification_status = ""
@@ -2143,9 +2155,11 @@ def start_automation(
                 wait=bool(capture_future is not None and capture_future.done()),
                 cancel_futures=True,
             )
-        if close_driver:
+        if should_close_duty_driver(close_driver, keep_browser_open_on_success, submission_verified):
             try:
                 quit_driver(driver)
             except Exception:
                 pass
+        elif keep_browser_open_on_success and submission_verified and driver is not None:
+            retain_browser_for_seconds(driver)
         _runtime_status_callback = previous_status_callback

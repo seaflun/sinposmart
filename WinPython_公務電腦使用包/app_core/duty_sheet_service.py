@@ -460,6 +460,7 @@ class DutySheetService:
                     error_callback=errors.append,
                     show_dialogs=False,
                     close_driver=True,
+                    keep_browser_open_on_success=True,
                     raise_errors=True,
                     stage_callback=report_stage,
                 )

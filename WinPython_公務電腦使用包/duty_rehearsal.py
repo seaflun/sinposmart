@@ -52,6 +52,9 @@ ENTRY_OUTIN_VALUE_MAP = {
 WORK_LOG_AP = "wap119.RPS04060"
 CASE_QUERY_AP = "wap119.RPS04061"
 WORK_LOG_DEFAULTS_PATH = Path(__file__).with_name("work_log_defaults.json")
+DEFAULT_BROWSER_RETENTION_SECONDS = 600
+RETAINED_BROWSER_DRIVERS: list[webdriver.Chrome] = []
+_RETAINED_BROWSER_DRIVERS_LOCK = threading.Lock()
 DROWNING_PATROL_KEYWORD = "防溺車巡"
 DROWNING_PATROL_ENTRY_REASON = "防溺車巡"
 DROWNING_PATROL_RETURN_REASON = "防溺車巡返隊"
@@ -841,6 +844,32 @@ def quit_driver(driver: webdriver.Chrome | None) -> None:
             if profile_root:
                 cleanup_options["root"] = Path(str(profile_root))
             cleanup_duty_browser_profile(Path(str(profile_dir)), **cleanup_options)
+
+
+def _close_retained_browser(driver: webdriver.Chrome) -> None:
+    try:
+        quit_driver(driver)
+    except Exception:
+        pass
+    finally:
+        with _RETAINED_BROWSER_DRIVERS_LOCK:
+            RETAINED_BROWSER_DRIVERS[:] = [
+                retained for retained in RETAINED_BROWSER_DRIVERS if retained is not driver
+            ]
+
+
+def retain_browser_for_seconds(
+    driver: webdriver.Chrome,
+    seconds: int = DEFAULT_BROWSER_RETENTION_SECONDS,
+) -> threading.Timer:
+    """Keep a successful automation browser open, then close its owned driver."""
+
+    with _RETAINED_BROWSER_DRIVERS_LOCK:
+        RETAINED_BROWSER_DRIVERS.append(driver)
+    timer = threading.Timer(seconds, _close_retained_browser, args=(driver,))
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def set_work_log_content_fields(driver: webdriver.Chrome, fields: dict[str, Any]) -> dict[str, Any]:

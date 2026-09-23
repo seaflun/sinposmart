@@ -13,7 +13,7 @@ import zipfile
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -2052,7 +2052,7 @@ class DutySheetServiceTests(unittest.TestCase):
             self.assertNotIn(relay, after_relay_remove["car_options"]["stop"])
             self.assertIn(relay, after_relay_remove["hidden_car_options"]["stop"])
 
-    def test_execute_calls_legacy_engine_without_persisting_session_password(self) -> None:
+    def test_execute_calls_legacy_engine_and_keeps_browser_after_verified_success(self) -> None:
         from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2065,8 +2065,10 @@ class DutySheetServiceTests(unittest.TestCase):
             saved: list[dict] = []
 
             success_message = ["完成"]
+            automation_calls: list[dict] = []
 
             def start_automation(_uid, _pwd, _target, _excel, _cars, **kwargs):
+                automation_calls.append(kwargs)
                 status_callback = kwargs.get("status_callback")
                 if status_callback is not None:
                     status_callback("執行中")
@@ -2095,6 +2097,7 @@ class DutySheetServiceTests(unittest.TestCase):
             result = service.execute(request, status_callback=progress.append)
 
             self.assertEqual(result, "勤務表已登打完成：1150730")
+            self.assertTrue(automation_calls[0]["keep_browser_open_on_success"])
             success_message[0] = "已登打並存檔完畢！\n勤務表截圖保存失敗：測試訊息"
             screenshot_warning_result = service.execute(request)
             self.assertEqual(
@@ -4194,7 +4197,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
             )
             self.assertEqual(saved["workbook_path"], str(workbook.resolve()))
 
-    def test_execute_uses_existing_engines_and_closes_browser(self) -> None:
+    def test_execute_uses_existing_engines_and_keeps_browser_after_verified_success(self) -> None:
         from app_core.rest_monthly_service import (
             MonthlyBaseRequest,
             RestMonthlyService,
@@ -4240,14 +4243,15 @@ class RestMonthlyServiceTests(unittest.TestCase):
             self.assertEqual(rest_result, "休息完成")
             self.assertEqual(monthly_result, "勤務基準完成")
             self.assertEqual(progress, ["休息時間執行中", "勤務基準執行中"])
-            self.assertFalse(calls[0][2]["keep_browser_open"])
-            self.assertFalse(calls[1][2]["keep_browser_open"])
+            self.assertTrue(calls[0][2]["keep_browser_open"])
+            self.assertTrue(calls[1][2]["keep_browser_open"])
             self.assertNotIn("secret", repr(rest_request))
             self.assertNotIn("secret", repr(monthly_request))
 
     def test_rest_submission_parses_workbook_while_browser_opens(self) -> None:
         import rest_time_automation as module
 
+        module.RETAINED_DRIVERS.clear()
         parse_started = threading.Event()
         browser_started = threading.Event()
         events: list[str] = []
@@ -4287,7 +4291,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
                 patch.object(module, "fill_and_insert_entry"), \
                 patch.object(module, "close_current_popup"), \
                 patch.object(module, "click_person_save"), \
-                patch.object(module, "quit_driver"):
+                patch.object(module, "quit_driver") as quit_browser:
             result = module.submit_rest_entries(
                 "user10",
                 "secret",
@@ -4297,11 +4301,43 @@ class RestMonthlyServiceTests(unittest.TestCase):
                 actor_name="測試人員",
                 expected_roc_year=115,
                 expected_month=8,
+                keep_browser_open=True,
             )
 
         self.assertEqual(result, "完成：新增 1 筆，略過已存在 0 筆，刪除重複休息 0 筆，已按個人儲存。")
         self.assertEqual(events, ["browser_started", "parse_done"])
         self.assertTrue(any("同步" in message for message in progress))
+        quit_browser.assert_not_called()
+        self.assertIn(driver, module.RETAINED_DRIVERS)
+        module.RETAINED_DRIVERS.remove(driver)
+
+    def test_monthly_base_submission_keeps_browser_after_save(self) -> None:
+        import rest_time_automation as module
+
+        module.RETAINED_DRIVERS.clear()
+        driver = Mock()
+        plan = module.MonthlyBasePlan(115, 9, "25", "測試人員", {1: "○"})
+        with patch.object(module, "fetch_monthly_base_plan", return_value=plan), \
+                patch.object(module, "build_initialized_driver", return_value=driver), \
+                patch.object(module, "login"), \
+                patch.object(module, "open_ap"), \
+                patch.object(module, "select_base_month"), \
+                patch.object(module, "wait_for_person_name_row"), \
+                patch.object(module, "fill_monthly_base_row", return_value=1), \
+                patch.object(module, "click_person_row_save"), \
+                patch.object(module, "quit_driver") as quit_browser:
+            result = module.submit_monthly_base_entries(
+                "user25", "secret", "25", False,
+                keep_browser_open=True,
+                expected_roc_year=115,
+                expected_month=9,
+                actor_name="測試人員",
+            )
+
+        self.assertIn("已填入 1 格並個人儲存", result)
+        quit_browser.assert_not_called()
+        self.assertIn(driver, module.RETAINED_DRIVERS)
+        module.RETAINED_DRIVERS.remove(driver)
 
     def test_rest_entry_wraps_from_last_fire_day_to_next_month_first_day(self) -> None:
         import rest_time_automation as module
@@ -4744,6 +4780,132 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
 
 class DailyVehicleServiceTests(unittest.TestCase):
+    def test_vehicle_runner_retains_after_success_and_closes_after_failure(self) -> None:
+        import daily_vehicle_legacy.automation.ppe_selenium_daily as automation
+
+        config = {
+            "headless": False,
+            "timeout_seconds": 10,
+            "selenium_remote_url": "",
+            "selenium_remote_ready_timeout_seconds": 10,
+            "keep_browser_open": True,
+            "username": "user10",
+            "password": "secret",
+        }
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                options = Mock()
+                driver = Mock()
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    pid_marker = Path(temp_dir) / ".daily_vehicle_runner.pid"
+                    pid_marker.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+                    def open_session(create_driver, initialize, **_kwargs):
+                        candidate = create_driver()
+                        initialize(candidate)
+                        return candidate
+
+                    equip_check = RuntimeError("回查未確認") if fail else None
+                    with patch.dict(os.environ, {"PPE_RUNNER_PID_FILE": str(pid_marker)}), \
+                            patch.object(automation, "parse_args"), \
+                            patch.object(automation, "load_config", return_value=config), \
+                            patch.object(automation.webdriver, "ChromeOptions", return_value=options), \
+                            patch.object(automation, "ensure_requested_date"), \
+                            patch.object(automation, "build_driver", return_value=driver), \
+                            patch.object(automation, "retry_duty_browser_session_open", side_effect=open_session), \
+                            patch.object(automation, "WebDriverWait", return_value=Mock()), \
+                            patch.object(automation, "login"), \
+                            patch.object(automation, "process_maintain_checks"), \
+                            patch.object(automation, "process_equip_checks", side_effect=equip_check), \
+                            patch.object(automation, "save_artifacts"), \
+                            patch.object(automation.traceback, "format_exc", return_value=""), \
+                            patch.object(automation.time, "sleep") as retention_wait, \
+                            patch.object(automation, "quit_driver") as quit_driver:
+                        if fail:
+                            with self.assertRaisesRegex(RuntimeError, "回查未確認"):
+                                automation.main([])
+                        else:
+                            automation.main([])
+
+                    quit_driver.assert_called_once_with(driver)
+                    self.assertFalse(pid_marker.exists())
+                    if fail:
+                        retention_wait.assert_not_called()
+                    else:
+                        retention_wait.assert_called_once_with(600)
+
+    def test_service_returns_on_verified_marker_while_retention_runner_stays_alive(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            project_dir = package_root / "daily_vehicle_legacy"
+            script = project_dir / "automation" / "ppe_selenium_daily.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# placeholder\n", encoding="utf-8")
+            release_runner = threading.Event()
+
+            class CompletionStdout:
+                def __init__(self) -> None:
+                    self.read_marker = False
+
+                def readline(self):
+                    if not self.read_marker:
+                        self.read_marker = True
+                        return "[done] automation finished\n"
+                    release_runner.wait(2)
+                    return ""
+
+            class RetainingProcess:
+                pid = 56789
+                returncode = None
+
+                def __init__(self) -> None:
+                    self.stdout = CompletionStdout()
+
+                def poll(self):
+                    return 0 if release_runner.is_set() else None
+
+                def kill(self):
+                    raise AssertionError("verified retention process must not be killed")
+
+            process = RetainingProcess()
+            service = DailyVehicleService(
+                package_root,
+                process_factory=lambda *_args, **_kwargs: process,
+                process_checker=lambda _pid: True,
+            )
+            result: list[str] = []
+            progress: list[str] = []
+            failures: list[BaseException] = []
+            finished = threading.Event()
+
+            def execute() -> None:
+                try:
+                    result.append(
+                        service.execute(
+                            DailyVehicleRequest("user10", "secret"),
+                            status_callback=progress.append,
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    finished.set()
+
+            worker = threading.Thread(target=execute, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(finished.wait(1), "已驗證完成標記出現後不應等待瀏覽器計時結束")
+                self.assertEqual(result, ["車輛保養清點已完成。"])
+                self.assertIn("已完成；瀏覽器將保留 10 分鐘後自動關閉。", progress)
+                self.assertEqual((project_dir / ".daily_vehicle_runner.pid").read_text().strip(), "56789")
+            finally:
+                release_runner.set()
+                worker.join(1)
+            if failures:
+                raise failures[0]
+
     def test_execute_uses_existing_script_with_ephemeral_credentials_and_cleanup(self) -> None:
         from datetime import date
         from io import StringIO
@@ -4809,6 +4971,10 @@ class DailyVehicleServiceTests(unittest.TestCase):
             self.assertEqual(launches[0]["env"]["PPE_ACCOUNT"], "user10")
             self.assertEqual(launches[0]["env"]["PPE_PASSWORD"], "session-secret")
             self.assertEqual(launches[0]["env"]["KEEP_BROWSER_OPEN"], "true")
+            self.assertEqual(
+                launches[0]["env"]["PPE_RUNNER_PID_FILE"],
+                str(project_dir / ".daily_vehicle_runner.pid"),
+            )
             self.assertEqual(
                 launches[0]["creationflags"],
                 getattr(subprocess, "CREATE_NO_WINDOW", 0),

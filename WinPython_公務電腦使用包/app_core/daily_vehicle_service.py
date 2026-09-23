@@ -113,6 +113,7 @@ class DailyVehicleService:
                 "PPE_PASSWORD": request.password,
                 "HEADLESS": "false",
                 "KEEP_BROWSER_OPEN": "true",
+                "PPE_RUNNER_PID_FILE": str(self._pid_path(project_dir)),
                 "SELENIUM_REMOTE_URL": "",
                 "PPE_TARGET_DATE": parse_roc_date(request.target_date).isoformat() if request.target_date else "",
             }
@@ -120,6 +121,7 @@ class DailyVehicleService:
         if status_callback:
             status_callback("正在開啟瀏覽器執行車輛保養與器材清點…")
         process = None
+        retaining_runner = False
         try:
             report_stage("process_start")
             process = self.process_factory(
@@ -143,10 +145,13 @@ class DailyVehicleService:
                     "車輛保養清點執行逾時。",
                     failure_stage=stage,
                 ) from exc
-            if process.returncode != 0:
+            process_exited = process.poll() is not None
+            completion_verified = "[done] automation finished" in output
+            if process.returncode != 0 and not (not process_exited and completion_verified):
                 stage = self._failure_stage_from_output(output, stage)
                 message = self._browser_startup_safe_error(output) or self._safe_error(output)
                 raise DailyVehicleExecutionError(message, failure_stage=stage)
+            retaining_runner = not process_exited and completion_verified
             report_stage("result_evaluation")
             return f"車輛保養清點已完成：{request.target_date}" if request.target_date else "車輛保養清點已完成。"
         except DailyVehicleExecutionError:
@@ -157,7 +162,7 @@ class DailyVehicleService:
                 failure_stage=stage,
             ) from exc
         finally:
-            if process is not None:
+            if process is not None and not retaining_runner:
                 self._clear_running_pid(project_dir, process.pid)
 
     def _project_dir(self) -> Path | None:
@@ -207,7 +212,7 @@ class DailyVehicleService:
         process: subprocess.Popen,
         status_callback: Callable[[str], None] | None,
     ) -> str:
-        """Return when the automation Python process exits, not when retained Chrome closes stdout."""
+        """Return on verified completion or process exit without waiting on retained Chrome."""
         stdout = getattr(process, "stdout", None)
         if stdout is None:
             output, _ = process.communicate(timeout=self._timeout_seconds())
@@ -239,6 +244,8 @@ class DailyVehicleService:
                 continue
             if line is not None:
                 self._record_output_line(output_lines, line, status_callback)
+                if line.strip() == "[done] automation finished":
+                    return "".join(output_lines)
 
         while True:
             try:
@@ -269,6 +276,8 @@ class DailyVehicleService:
         }
         if stage is not None and stage.group(1) in messages:
             status_callback(messages[stage.group(1)])
+        elif line.strip() == "[done] automation finished":
+            status_callback("已完成；瀏覽器將保留 10 分鐘後自動關閉。")
 
     @staticmethod
     def _timeout_seconds() -> int:

@@ -162,9 +162,10 @@ class AttendanceTests(unittest.TestCase):
                     automation.run_attendance(Path(root), request, plan, Mock())
                 browser.assert_not_called()
 
-    def test_standalone_execution_logs_in_verifies_closes_and_remembers_success(self):
+    def test_standalone_execution_logs_in_verifies_keeps_browser_and_remembers_success(self):
         from app_core import civilpower_automation as automation
         with TemporaryDirectory() as root, ExitStack() as stack:
+            automation.RETAINED_DRIVERS.clear()
             driver = Mock()
             browser = stack.enter_context(patch("app_core.login_verifier.create_login_webdriver", return_value=driver))
             stack.enter_context(patch("app_core.login_verifier.configure_login_webdriver_timeouts"))
@@ -180,13 +181,32 @@ class AttendanceTests(unittest.TestCase):
             message = automation.run_attendance(Path(root), request, plan, Mock())
             self.assertIn("已儲存並回查確認", message)
             self.assertIs(login.call_args.args[1], request)
-            driver.quit.assert_called_once()
+            driver.quit.assert_not_called()
+            self.assertIn(driver, automation.RETAINED_DRIVERS)
             ledger = next((Path(root) / "runtime_outputs" / "civilpower").glob("*.json"))
             self.assertEqual(json.loads(ledger.read_text())["state"], "verified")
             self.assertNotIn(request.password, ledger.read_text())
             self.assertIn("未重複新增", automation.run_attendance(Path(root), request, plan, Mock()))
             browser.assert_called_once()
             save.assert_called_once()
+            automation.RETAINED_DRIVERS.remove(driver)
+
+    def test_failed_civilpower_readback_closes_browser(self):
+        from app_core import civilpower_automation as automation
+        with TemporaryDirectory() as root, ExitStack() as stack:
+            automation.RETAINED_DRIVERS.clear()
+            driver = Mock()
+            stack.enter_context(patch("app_core.login_verifier.create_login_webdriver", return_value=driver))
+            stack.enter_context(patch("app_core.login_verifier.configure_login_webdriver_timeouts"))
+            stack.enter_context(patch.dict(sys.modules, {"ddddocr": Mock()}))
+            stack.enter_context(patch.object(automation, "login_attendance"))
+            stack.enter_context(patch.object(automation, "_ensure_io_record", side_effect=RuntimeError("查詢未確認")))
+            request = self.request()
+            plan = CivilpowerService(PACKAGE).validate(request)
+            with self.assertRaises(CivilpowerError):
+                automation.run_attendance(Path(root), request, plan, Mock())
+            driver.quit.assert_called_once()
+            self.assertNotIn(driver, automation.RETAINED_DRIVERS)
 
     def test_incomplete_and_ambiguous_lookup_fail_closed(self):
         from app_core import civilpower_automation as automation
