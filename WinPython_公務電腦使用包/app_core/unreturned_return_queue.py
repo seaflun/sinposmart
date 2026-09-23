@@ -41,7 +41,22 @@ class UnreturnedReturnQueue:
             dict(record)
             for record in self._records.values()
             if record.get("record_type") in ("single", "handoff_group")
+            and not record.get("cancelled_at")
         ]
+
+    def cancelled_records(self) -> list[dict[str, Any]]:
+        return [dict(record) for record in self._records.values() if record.get("cancelled_at")]
+
+    def cancel(self, queue_id: str, cancellation_id: str) -> dict[str, Any] | None:
+        """Persist a tombstone; never interrupt an already claimed submission."""
+        record = self._records.get(queue_id)
+        if record is None or record.get("record_type") not in ("single", "handoff_group") or queue_id in self._inflight_ids:
+            return None
+        if not record.get("cancelled_at"):
+            record["cancelled_at"] = self._timestamp(self.now_factory())
+            record["cancellation_id"] = cancellation_id
+        self._write_records()
+        return dict(record)
 
     def bridge_history_records(self) -> list[dict[str, Any]]:
         """Return resolved bridge records that still suppress skipped handoff actions."""
@@ -268,6 +283,7 @@ class UnreturnedReturnQueue:
             record
             for record in self._records.values()
             if record.get("record_type") in ("single", "handoff_group")
+            and not record.get("cancelled_at")
             if record.get("queue_id") not in self._inflight_ids
             and self._parse_timestamp(record.get("next_retry_at")) <= current
         ]
@@ -292,6 +308,7 @@ class UnreturnedReturnQueue:
             record
             for record in self._records.values()
             if record.get("record_type") in ("single", "handoff_group")
+            and not record.get("cancelled_at")
             and record.get("queue_id") not in self._inflight_ids
         ]
         if not records:
@@ -305,7 +322,7 @@ class UnreturnedReturnQueue:
         """Claim a human-confirmed record without changing its fixed expiry point."""
 
         record = self._records.get(str(queue_id or ""))
-        if record is None or str(queue_id) in self._inflight_ids:
+        if record is None or record.get("cancelled_at") or str(queue_id) in self._inflight_ids:
             return None
         current = now or self.now_factory()
         record["last_owner_actor_no"] = str(actor_no or "").strip()
@@ -350,6 +367,7 @@ class UnreturnedReturnQueue:
             queue_id
             for queue_id, record in self._records.items()
             if record.get("record_type") in ("single", "handoff_group")
+            and not record.get("cancelled_at")
             if self._parse_timestamp(record.get("expires_at")) <= current
         ]
         expired = [dict(self._records.pop(queue_id)) for queue_id in expired_ids]

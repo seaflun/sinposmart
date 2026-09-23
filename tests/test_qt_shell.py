@@ -3516,6 +3516,28 @@ class DutySubmissionServiceTests(unittest.TestCase):
         self.assertEqual(queries, ["entry"])
         self.assertEqual(fills, [])
 
+    def test_cancelled_unreturned_record_survives_restart_and_cannot_be_claimed(self):
+        from datetime import datetime, timedelta
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime(2026, 9, 23, 8)
+            queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now)
+            action = {"kind": "entry_log", "time": "08:00", "actor": "10", "fields": {"出或入": "值退"}}
+            schedule = {"target_date": "1150923"}
+            record, _ = queue.pause(action, schedule, owner_actor_no="10")
+            key = record["queue_id"]
+            queue.claim_manual(key, "10")
+            self.assertIsNone(queue.cancel(key, "cancel-1"))
+            queue.defer(key, "10")
+            self.assertEqual(queue.cancel(key, "cancel-1")["cancellation_id"], "cancel-1")
+            restarted = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now)
+            self.assertEqual(restarted.active_records(), [])
+            self.assertIsNone(restarted.claim_manual(key, "10"))
+            self.assertIsNone(restarted.claim_due("11", now=now + timedelta(days=1)))
+            self.assertEqual(restarted.make_active_records_due(), [])
+            self.assertEqual(restarted.expire_due(now=now + timedelta(days=1)), [])
+            self.assertFalse(restarted.pause(action, schedule, owner_actor_no="10")[1])
+
     def test_unreturned_return_queue_keeps_fixed_expiry_and_changes_handoff_interval(self) -> None:
         from datetime import datetime
 
@@ -6575,7 +6597,8 @@ class UpdateControllerTests(unittest.TestCase):
             controller.accept_progress({"phase": "waiting_idle", "percent": 58})
             self.assertTrue(controller.updateView["busy"])
             self.assertIn("5 分鐘", controller.updateView["detail"])
-            controller.accept_progress({"phase": "setup", "percent": 85})
+            controller.accept_progress({"phase": "setup", "percent": 85, "elapsed_seconds": 125})
+            self.assertIn("2 分 5 秒", controller.updateView["detail"])
             controller.process_finished(1)
             self.assertTrue(next_attempt.tryLock(0))
             next_attempt.unlock()
@@ -6615,6 +6638,9 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertTrue(window.isVisible())
             self.assertFalse(window.close())
             self.assertTrue(window.isVisible())
+            from PySide6.QtCore import QObject
+            self.assertTrue(window.findChild(QObject, "updateDiagnosticsButton").property("visible"))
+            self.assertFalse(window.findChild(QObject, "updateDismissButton").property("visible"))
             controller.process_finished(1)
             QTest.qWait(20)
             self.assertEqual(window.height(), 344)
@@ -7615,6 +7641,67 @@ class QtShellTests(unittest.TestCase):
         for _ in range(2):
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             QCoreApplication.processEvents()
+
+    def test_nas_cancellation_blocks_manual_submission_only_on_original_date(self):
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+        from PySide6.QtTest import QSignalSpy
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = UnreturnedReturnQueue(root)
+            action = {"kind": "entry_log", "source": "外勤返隊", "time": "08:00", "actor": "10", "target": "10", "fields": {"出或入": "入"}}
+            record, _ = queue.pause(action, {"target_date": "1150923"}, owner_actor_no="10")
+            controller = DutyController(repository=ScheduleRepository(root), unreturned_return_queue=queue)
+            controller._clock_timer.stop()
+            controller._actions = [action]
+            controller._target_date_text = "1150923"
+            event_spy = QSignalSpy(controller.unreturnedReturnEvent)
+            controller.cancel_unreturned_records([{"queue_id": record["queue_id"], "request_id": "cancel-1", "status": "pending"}])
+            self.assertEqual(event_spy.count(), 1)
+            self.assertEqual(event_spy.at(0)[0]["status"], "cancelled")
+            self.assertIn(0, controller._blocked_indices)
+            self.assertFalse(controller._is_manual_submission_candidate(0))
+            controller._blocked_indices.clear()
+            controller._comparisons.clear()
+            controller._target_date_text = "1150924"
+            controller._refresh_queue_action_indices()
+            self.assertNotIn(0, controller._blocked_indices)
+            controller.deleteLater()
+
+    def test_combo_popup_uses_name_role_for_objects_and_plain_strings(self):
+        from qt_app import main as qt_main
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlComponent, QQmlEngine, QQmlExpression
+        from PySide6.QtQuick import QQuickWindow
+        engine = QQmlEngine()
+        component = QQmlComponent(engine, QUrl.fromLocalFile(str(PACKAGE_ROOT / "qt_app/qml/components/AppleComboBox.qml")))
+        for model, role, expected in (([{"label": "★ 測試義消", "id": "17"}], "label", "★ 測試義消"), (["到勤", "退勤"], "", "到勤")):
+            host = QQuickWindow()
+            combo = component.createWithInitialProperties({"model": model, "textRole": role, "currentIndex": 0})
+            self.assertIsNotNone(combo, [e.toString() for e in component.errors()])
+            combo.setParentItem(host.contentItem())
+            host.show()
+            def evaluate(expression):
+                query = QQmlExpression(engine.rootContext(), combo, expression)
+                result = query.evaluate()
+                self.assertFalse(query.hasError(), query.error().toString())
+                return result[0]
+            evaluate("popup.open()")
+            for _ in range(5):
+                self.app.processEvents()
+            visible_text = evaluate("""JSON.stringify((function collect(item) {
+                let result = item.text !== undefined ? [item.text] : [];
+                for (let child of item.children || []) result = result.concat(collect(child));
+                return result;
+            })(popup.contentItem))""")
+            self.assertIn(expected, json.loads(visible_text))
+            self.assertEqual(combo.property("currentText"), expected)
+            evaluate("popup.close()")
+            host.close()
+            combo.deleteLater()
+            host.deleteLater()
+            self._flush_qt_deferred_deletes()
 
     def test_qml_visual_literals_are_centralized_in_design_tokens(self) -> None:
         qml_path = PACKAGE_ROOT / "qt_app" / "qml" / "Main.qml"
@@ -9491,6 +9578,9 @@ class QtShellTests(unittest.TestCase):
         from qt_app.controllers.app_controller import AppController
 
         class NoWriteReturnQueue:
+            def cancelled_records(self) -> list[dict]:
+                return []
+
             def __init__(self) -> None:
                 self.defer_calls = 0
 
@@ -9590,6 +9680,9 @@ class QtShellTests(unittest.TestCase):
                 return blocked
 
         class NoWriteReturnQueue:
+            def cancelled_records(self) -> list[dict]:
+                return []
+
             def __init__(self) -> None:
                 self.write_calls: list[str] = []
 

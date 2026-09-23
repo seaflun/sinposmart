@@ -38,7 +38,7 @@ ComboBox {
         hoverEnabled: appleCombo.hoverEnabled
 
         contentItem: Text {
-            text: String(comboDelegate.modelData ?? "")
+            text: appleCombo.textAt(comboDelegate.index)
             color: appleCombo.enabled ? Design.text : Design.muted
             font: appleCombo.font
             verticalAlignment: Text.AlignVCenter

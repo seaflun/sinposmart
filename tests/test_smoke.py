@@ -129,6 +129,26 @@ if ($result -ne '{expected}' -or $script:calls -ne {calls}) {{ throw "Unexpected
 """ )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_hidden_process_streams_both_pipes_and_times_out(self):
+        import base64
+        source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        hidden = source[source.index("function Invoke-HiddenProcess"):source.index("function Start-DutyGui")]
+        for command, timeout, expected in (("[Console]::Out.WriteLine('first'); [Console]::Error.WriteLine('second')", 10, "ok"), ("Start-Sleep -Seconds 30", 1, "timed out")):
+            encoded = base64.b64encode(command.encode("utf-16-le")).decode()
+            result = run_powershell_contract(f"""
+$ErrorActionPreference='Stop'
+$packageDir=$env:TEMP
+{hidden}
+function Write-UpdateProgress {{ }}
+try {{
+$r=Invoke-HiddenProcess -FileName powershell -Arguments '-NoProfile -EncodedCommand {encoded}' -TimeoutSeconds {timeout} -ProgressPhase setup
+if ($r.Output -notmatch 'first' -or $r.Error -notmatch 'second') {{ throw 'missing output' }}
+'ok'
+}} catch {{ $_.Exception.Message }}
+""")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected, result.stdout)
+
     def test_hidden_python_discovery_preserves_chinese_paths(self) -> None:
         source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
         hidden = source[source.index("function Invoke-HiddenProcess"):source.index("function Start-DutyGui")]

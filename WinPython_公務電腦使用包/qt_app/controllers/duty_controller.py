@@ -704,6 +704,8 @@ class DutyController(QObject):
         if action_completion_key(action) in self._manual_waiting_action_keys:
             return False
         comparison = self._comparisons.get(index, {})
+        if comparison.get("cancelled"):
+            return False
         is_manual_external_review = (
             comparison.get("group") == "review"
             and str(action.get("source", "") or "").startswith("外勤")
@@ -2683,6 +2685,24 @@ class DutyController(QObject):
             if work_index is not None:
                 self.handoffWorkPrewarmRequested.emit(work_index)
 
+    @Slot(object)
+    def cancel_unreturned_records(self, commands) -> None:
+        if self._read_only_acceptance or not isinstance(commands, list):
+            return
+        for command in commands:
+            if not isinstance(command, dict) or command.get("status") != "pending":
+                continue
+            queue_id = str(command.get("queue_id") or "")
+            cancellation_id = str(command.get("request_id") or "")
+            if not queue_id or not cancellation_id:
+                continue
+            record = self._unreturned_return_queue.cancel(queue_id, cancellation_id)
+            if record is not None:
+                self._refresh_queue_action_indices()
+                self._refresh_projection()
+                self._publish_unreturned_return_event("cancelled", record, trigger_type="admin_cancel")
+                self.scheduleChanged.emit()
+
     def _refresh_unreturned_return_queue(self) -> None:
         if self._read_only_acceptance:
             return
@@ -3225,6 +3245,16 @@ class DutyController(QObject):
                         "group": "skipped",
                         "matched": [],
                     }
+
+        for record in self._unreturned_return_queue.cancelled_records():
+            if str(record.get("source_target_date") or "") != self._target_date_text:
+                continue
+            keys = {action_completion_key(action) for action in self._unreturned_return_queue.incomplete_actions(record)}
+            for index, action in enumerate(self._actions):
+                if action_completion_key(action) in keys:
+                    self._blocked_indices.add(index)
+                    self._selected_indices.discard(index)
+                    self._comparisons[index] = {"compare": "已人工取消，停止重查與補登", "group": "review", "matched": [], "cancelled": True}
 
     def _mark_expired_unreturned_return(self, record: Mapping[str, Any]) -> None:
         expired_keys = {

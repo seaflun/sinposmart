@@ -166,6 +166,7 @@ def _remote_update_worker_id() -> str:
 
 
 class UpdateController(UpdateWindowState):
+    unreturnedCancellationsReceived = Signal(object)
     stateChanged = Signal()
     errorOccurred = Signal(str)
     updateReady = Signal(str)
@@ -463,6 +464,9 @@ class UpdateController(UpdateWindowState):
     def _remote_poll_succeeded(self, request_id: int, response: object) -> None:
         if request_id not in self._remote_workers or not isinstance(response, dict):
             return
+        cancellations = response.get("unreturned_cancellations")
+        if isinstance(cancellations, list) and not self._read_only_acceptance:
+            self.unreturnedCancellationsReceived.emit(cancellations)
         command = response.get("command")
         if not isinstance(command, dict):
             self._check_remote_stage()
@@ -1074,7 +1078,11 @@ class UpdateProgressController(UpdateWindowState):
             if type(pid) is not int or pid <= 0:
                 return
             self._expected_pid = pid
-        self._show_view(phase=phase, progress=min(percent, 98), detail=UPDATE_PHASE_TEXT[phase])
+        detail = UPDATE_PHASE_TEXT[phase]
+        elapsed = record.get("elapsed_seconds")
+        if phase in ("setup", "environment") and type(elapsed) is int and elapsed > 0:
+            detail += f" 已等待 {elapsed // 60} 分 {elapsed % 60} 秒；可開啟更新紀錄查看安裝輸出。"
+        self._show_view(phase=phase, progress=min(percent, 98), detail=detail)
 
     def poll(self) -> None:
         if self._exit_code is None:

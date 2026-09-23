@@ -39,12 +39,13 @@ $zipPath = Join-Path $tempDir "package.zip"
 $extractDir = Join-Path $tempDir "extract"
 
 function Write-UpdateProgress {
-    param([string]$Phase, [int]$Percent)
+    param([string]$Phase, [int]$Percent, [int]$ElapsedSeconds = 0)
 
     if (-not $ProgressPath) { return }
     $Percent = [Math]::Max($script:lastProgressPercent, [Math]::Min(98, $Percent))
-    if ($Phase -eq $script:lastProgressPhase -and $Percent -eq $script:lastProgressPercent) { return }
+    if ($Phase -eq $script:lastProgressPhase -and $Percent -eq $script:lastProgressPercent -and $ElapsedSeconds -eq 0) { return }
     $record = @{ phase = $Phase; percent = $Percent; pid = $script:restartedProcessId }
+    if ($ElapsedSeconds -gt 0) { $record.elapsed_seconds = $ElapsedSeconds }
     $temporaryPath = $ProgressPath + ".partial"
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($temporaryPath, ($record | ConvertTo-Json -Compress), $utf8)
@@ -382,7 +383,7 @@ function Stop-RunningDutyGui {
 }
 
 function Invoke-HiddenProcess {
-    param([string]$FileName, [string]$Arguments)
+    param([string]$FileName, [string]$Arguments, [int]$TimeoutSeconds = 180, [string]$ProgressPhase = "", [int]$ProgressPercent = 85)
 
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $FileName
@@ -397,10 +398,43 @@ function Invoke-HiddenProcess {
     $info.EnvironmentVariables["PYTHONUTF8"] = "1"
     $process = [System.Diagnostics.Process]::Start($info)
     try {
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
+        $buffers = @((New-Object System.Text.StringBuilder), (New-Object System.Text.StringBuilder))
+        $readers = @($process.StandardOutput, $process.StandardError)
+        $pending = @($readers[0].ReadLineAsync(), $readers[1].ReadLineAsync())
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastHeartbeat = -1
+        while ($null -ne $pending[0] -or $null -ne $pending[1] -or -not $process.HasExited) {
+            for ($i = 0; $i -lt 2; $i++) {
+                if ($null -ne $pending[$i] -and $pending[$i].IsCompleted) {
+                    $line = $pending[$i].GetAwaiter().GetResult()
+                    if ($null -eq $line) {
+                        $pending[$i] = $null
+                    } else {
+                        [void]$buffers[$i].AppendLine($line)
+                        if ($ProgressPhase) { [Console]::Out.WriteLine($line) }
+                        $pending[$i] = $readers[$i].ReadLineAsync()
+                    }
+                }
+            }
+            $elapsed = [int]$clock.Elapsed.TotalSeconds
+            if ($ProgressPhase -and $elapsed -gt $lastHeartbeat) {
+                Write-UpdateProgress -Phase $ProgressPhase -Percent $ProgressPercent -ElapsedSeconds $elapsed
+                $lastHeartbeat = $elapsed
+            }
+            if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $killInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $killInfo.FileName = "taskkill.exe"
+                $killInfo.Arguments = "/PID $($process.Id) /T /F"
+                $killInfo.UseShellExecute = $false
+                $killInfo.CreateNoWindow = $true
+                $killer = [System.Diagnostics.Process]::Start($killInfo)
+                try { [void]$killer.WaitForExit(5000) } finally { $killer.Dispose() }
+                throw "Environment preparation timed out after $TimeoutSeconds seconds. See installer.log for the last installation output."
+            }
+            Start-Sleep -Milliseconds 20
+        }
         $process.WaitForExit()
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $stdout.Result; Error = $stderr.Result }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $buffers[0].ToString(); Error = $buffers[1].ToString() }
     } finally {
         $process.Dispose()
     }
@@ -473,9 +507,7 @@ function Invoke-SetupAfterUpdate {
     try {
         Write-UpdateProgress -Phase "setup" -Percent 85
         Write-Host "Installing or refreshing Python requirements..."
-        $setup = Invoke-HiddenProcess -FileName $python -Arguments ('-m pip install -r "{0}"' -f $requirementsPath)
-        [Console]::Out.Write($setup.Output)
-        [Console]::Error.Write($setup.Error)
+        $setup = Invoke-HiddenProcess -FileName $python -Arguments ('-u -m pip install --disable-pip-version-check --no-input --progress-bar off --timeout 30 --retries 2 -r "{0}"' -f $requirementsPath) -TimeoutSeconds 1200 -ProgressPhase "setup"
         if ($setup.ExitCode -ne 0) {
             throw "pip install failed with exit code $($setup.ExitCode)."
         }
@@ -484,9 +516,7 @@ function Invoke-SetupAfterUpdate {
         if (Test-Path -LiteralPath $environmentCheck -PathType Leaf) {
             Write-UpdateProgress -Phase "environment" -Percent 92
             Write-Host "Running environment check..."
-            $checked = Invoke-HiddenProcess -FileName $python -Arguments ('"{0}"' -f $environmentCheck)
-            [Console]::Out.Write($checked.Output)
-            [Console]::Error.Write($checked.Error)
+            $checked = Invoke-HiddenProcess -FileName $python -Arguments ('-u "{0}"' -f $environmentCheck) -TimeoutSeconds 180 -ProgressPhase "environment" -ProgressPercent 92
             if ($checked.ExitCode -ne 0) {
                 throw "Environment check failed with exit code $($checked.ExitCode)."
             }

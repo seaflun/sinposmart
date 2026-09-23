@@ -200,11 +200,10 @@ Window {
             x: 24
             y: 286
             width: parent.width - 48
-            visible: !updateWindow.busy
             spacing: 10
             AppleButton {
                 objectName: "updateDiagnosticsButton"
-                visible: updateWindow.view.phase === "failed" && updateWindow.view.diagnosticPath.length > 0
+                visible: updateWindow.view.diagnosticPath.length > 0
                 text: "查看紀錄"
                 tone: "ghost"
                 onClicked: updateWindow.controller.openUpdateDiagnostics()
@@ -212,6 +211,7 @@ Window {
             Item { Layout.fillWidth: true }
             AppleButton {
                 objectName: "updateDismissButton"
+                visible: !updateWindow.busy
                 text: updateWindow.view.canInstall ? "稍後" : "關閉"
                 onClicked: updateWindow.controller.dismissUpdateWindow()
             }

@@ -296,6 +296,7 @@ class AppController(QObject):
             self._enqueue_external_return_recovery
         )
         self._duty_controller.unreturnedReturnEvent.connect(self._publish_unreturned_return_event)
+        self._update_controller.unreturnedCancellationsReceived.connect(self._duty_controller.cancel_unreturned_records)
         self._duty_controller.scheduleChanged.connect(self._retry_pending_live_refresh)
         self._work_log_settings_controller.settingsSaved.connect(self._refresh_after_settings_save)
         self._duty_execution_controller.allLanesUnavailable.connect(self._handle_execution_unavailable)
@@ -1974,6 +1975,8 @@ class AppController(QObject):
             key: str(record.get(key) or "")
             for key in (
                 "queue_id",
+                "cancellation_id",
+                "cancelled_at",
                 "completion_key",
                 "source_target_date",
                 "origin_actor_no",
