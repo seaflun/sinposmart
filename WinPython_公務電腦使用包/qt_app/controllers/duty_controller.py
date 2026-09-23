@@ -149,6 +149,7 @@ class DutyController(QObject):
         self._pending_external_return_schedule_generation = 0
         self._external_return_confirmation_summary = ""
         self._external_return_queue_ids_by_action_index: dict[int, str] = {}
+        self._reported_recovery_attempts: dict[str, str] = {}
         self._pending_handoff_actual_times: dict[str, datetime] = {}
         self._handoff_preflight_groups: dict[str, dict[str, Any]] = {}
         self._prewarmed_handoff_group_ids: set[str] = set()
@@ -2703,6 +2704,24 @@ class DutyController(QObject):
                 self._publish_unreturned_return_event("cancelled", record, trigger_type="admin_cancel")
                 self.scheduleChanged.emit()
 
+    def report_external_return_recovery_started(
+        self,
+        queue_id: str,
+        *,
+        trigger_type: str = "recovery",
+    ) -> None:
+        queue_key = str(queue_id or "").strip()
+        if not queue_key:
+            return
+        record = self._unreturned_return_queue.get(queue_key)
+        if record is None or record.get("cancelled_at"):
+            return
+        attempt_at = str(record.get("last_attempt_at") or "").strip()
+        if not attempt_at or self._reported_recovery_attempts.get(queue_key) == attempt_at:
+            return
+        self._reported_recovery_attempts[queue_key] = attempt_at
+        self._publish_unreturned_return_event("retrying", record, trigger_type=trigger_type)
+
     def _refresh_unreturned_return_queue(self) -> None:
         if self._read_only_acceptance:
             return
@@ -2719,7 +2738,6 @@ class DutyController(QObject):
         record = self._unreturned_return_queue.claim_due(self._actor_no)
         if record is None:
             return
-        self._publish_unreturned_return_event("retrying", record, trigger_type="recovery")
         self.scheduleChanged.emit()
         self.externalReturnRecoveryDue.emit(record)
 

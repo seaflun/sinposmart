@@ -710,6 +710,32 @@ def wait_for_form_controls(
         return False
 
 
+def wait_for_any_form_control(
+    driver: webdriver.Chrome,
+    control_ids: tuple[str, ...],
+    *,
+    timeout: float,
+) -> bool:
+    """Wait until at least one alternative form control is available."""
+
+    alternatives = tuple(str(control_id) for control_id in control_ids if str(control_id))
+    if not alternatives:
+        return False
+
+    def control_ready(current_driver: webdriver.Chrome) -> bool:
+        return bool(
+            current_driver.execute_script(
+                "return arguments[0].some(id => Boolean(document.getElementById(id)));",
+                alternatives,
+            )
+        )
+
+    try:
+        return bool(WebDriverWait(driver, timeout, poll_frequency=0.1).until(control_ready))
+    except (TimeoutException, WebDriverException):
+        return False
+
+
 def click_insert_control(driver: webdriver.Chrome) -> dict[str, Any]:
     return driver.execute_script(
         """
@@ -1827,8 +1853,101 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
     return sheet
 
 
-def wait_for_query_completion(driver: webdriver.Chrome, expected_page: str = "") -> None:
-    """Wait for the duty system to confirm that its asynchronous query finished."""
+def arm_query_completion_tracking(driver: webdriver.Chrome) -> float | None:
+    """Track fresh query responses so an old completion message cannot be reused."""
+
+    state = driver.execute_script(
+        r"""
+        const completionPattern = /QUY-000\s*[:：]\s*查詢完成|QUY-500\s*[:：]\s*查無資料/;
+        const textOf = (node) => String(node?.textContent || '').trim();
+        const rowRoot = (node) => {
+          const element = node?.nodeType === Node.ELEMENT_NODE
+            ? node
+            : node?.parentElement;
+          return element?.closest?.('tr') || null;
+        };
+        const isCompletionNode = (element) => {
+          const text = textOf(element);
+          return text.length <= 240 && completionPattern.test(text);
+        };
+        const oldTracker = window.__sinpoDutyQueryTracker;
+        oldTracker?.observer?.disconnect();
+        const baseline = new Map(
+          Array.from(document.querySelectorAll('body *'))
+            .filter(isCompletionNode)
+            .map(element => [element, textOf(element)])
+        );
+        const tracker = {freshCompletion: false, freshRows: false, observer: null};
+        const candidateElements = (node) => {
+          let element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+          const candidates = [];
+          for (let depth = 0; element && depth < 8; depth += 1, element = element.parentElement) {
+            candidates.push(element);
+          }
+          if (node?.nodeType === Node.ELEMENT_NODE) {
+            candidates.push(...Array.from(node.querySelectorAll('*')));
+          }
+          return candidates;
+        };
+        tracker.observer = new MutationObserver(mutations => {
+          for (const mutation of mutations) {
+            const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
+              ? mutation.target
+              : mutation.target?.parentElement;
+            if (rowRoot(targetElement)) tracker.freshRows = true;
+            for (const addedNode of Array.from(mutation.addedNodes || [])) {
+              if (addedNode.nodeType === Node.ELEMENT_NODE
+                && (addedNode.matches?.('tr, tr *') || addedNode.querySelector?.('tr'))
+              ) {
+                tracker.freshRows = true;
+              } else if (rowRoot(addedNode)) {
+                tracker.freshRows = true;
+              }
+            }
+            const changedNodes = [mutation.target, ...Array.from(mutation.addedNodes || [])];
+            for (const node of changedNodes) {
+              for (const element of candidateElements(node)) {
+                if (!isCompletionNode(element)) continue;
+                const currentText = textOf(element);
+                const insertedCompletion = mutation.type === 'childList'
+                  && Array.from(mutation.addedNodes || []).some(added => completionPattern.test(textOf(added)));
+                const changedCompletionText = mutation.type === 'characterData'
+                  && completionPattern.test(textOf(mutation.target));
+                if (
+                  !baseline.has(element)
+                  || baseline.get(element) !== currentText
+                  || insertedCompletion
+                  || changedCompletionText
+                ) {
+                  tracker.freshCompletion = true;
+                  break;
+                }
+              }
+              if (tracker.freshCompletion) break;
+            }
+          }
+        });
+        tracker.observer.observe(document.body, {childList: true, characterData: true, subtree: true});
+        window.__sinpoDutyQueryTracker = tracker;
+        return {timeOrigin: Number(performance.timeOrigin || 0)};
+        """
+    )
+    if not isinstance(state, dict):
+        return None
+    try:
+        time_origin = float(state.get("timeOrigin") or 0)
+    except (TypeError, ValueError):
+        return None
+    return time_origin if time_origin > 0 else None
+
+
+def wait_for_query_completion(
+    driver: webdriver.Chrome,
+    expected_page: str = "",
+    *,
+    previous_time_origin: float | None = None,
+) -> None:
+    """Wait for a fresh completion marker or page response from this query."""
 
     expected_page = str(expected_page or "")
 
@@ -1837,19 +1956,36 @@ def wait_for_query_completion(driver: webdriver.Chrome, expected_page: str = "")
             r"""
             const text = document.body?.innerText || '';
             const pageSelect = document.querySelector("select[name='pageSelect']");
+            const tracker = window.__sinpoDutyQueryTracker;
             return {
               completed: /QUY-000\s*[:：]\s*查詢完成/.test(text)
                 || /QUY-500\s*[:：]\s*查無資料/.test(text),
               page: pageSelect?.value || '',
-              hasRows: Array.from(document.querySelectorAll('tr')).some(row => row.children.length >= 3)
+              hasRows: Array.from(document.querySelectorAll('tr')).some(row => row.children.length >= 3),
+              freshCompletion: Boolean(tracker?.freshCompletion),
+              freshRows: Boolean(tracker?.freshRows),
+              timeOrigin: Number(performance.timeOrigin || 0)
             };
             """
         )
         if not isinstance(state, dict):
             return False
+        try:
+            current_time_origin = float(state.get("timeOrigin") or 0)
+        except (TypeError, ValueError):
+            current_time_origin = 0
+        navigated = bool(
+            previous_time_origin is not None
+            and current_time_origin > 0
+            and current_time_origin != previous_time_origin
+        )
         if expected_page:
-            return str(state.get("page", "")) == expected_page and bool(state.get("hasRows"))
-        return bool(state.get("completed"))
+            return (
+                str(state.get("page", "")) == expected_page
+                and bool(state.get("hasRows"))
+                and (bool(state.get("freshCompletion")) or bool(state.get("freshRows")) or navigated)
+            )
+        return bool(state.get("completed")) and (bool(state.get("freshCompletion")) or navigated)
 
     WebDriverWait(driver, 8, poll_frequency=0.25).until(query_completed)
 
@@ -1896,6 +2032,7 @@ def query_visible_table(
     start_time: str = "00:00",
     end_roc_date: str | None = None,
     end_time: str = "23:59",
+    query_started_callback: Callable[[], None] | None = None,
 ) -> list[list[str]]:
     start_roc_date = start_roc_date or target_roc_date
     end_roc_date = end_roc_date or target_roc_date
@@ -1911,25 +2048,35 @@ def query_visible_table(
     start_hour, start_minute = [f"{int(part):02d}" for part in start_time.split(":", 1)]
     end_hour, end_minute = [f"{int(part):02d}" for part in end_time.split(":", 1)]
     open_ap(driver, ap_name)
-    wait_for_form_controls(driver, ("_btnQuery",), timeout=1)
+    if not wait_for_any_form_control(driver, ("_btnQuery", "_btnSearch"), timeout=5):
+        raise TimeoutException("出入查詢頁面未載入查詢按鈕。")
     suppress_window_open_for_background_query(driver)
-    for field_id in ("_txtSDATE", "_txtSdate", "_txtSDate"):
-        js_set(driver, field_id, start_roc_date)
-    for field_id in ("_txtEDATE", "_txtEDate", "_txtEndDate"):
-        js_set(driver, field_id, end_roc_date)
+    if not any(js_set(driver, field_id, start_roc_date) for field_id in ("_txtSDATE", "_txtSdate", "_txtSDate")):
+        raise NoSuchElementException("出入查詢找不到起始日期欄位。")
+    if not any(js_set(driver, field_id, end_roc_date) for field_id in ("_txtEDATE", "_txtEDate", "_txtEndDate")):
+        raise NoSuchElementException("出入查詢找不到結束日期欄位。")
     for field_id in ("_txtDate", "_txtTaskDate"):
         js_set(driver, field_id, target_roc_date)
-    js_set(driver, "_selSTIMEH", start_hour)
-    js_set(driver, "_selSTIMEM", start_minute)
-    js_set(driver, "_selETIMEH", end_hour)
-    js_set(driver, "_selETIMEM", end_minute)
+    for field_id, value in (
+        ("_selSTIMEH", start_hour),
+        ("_selSTIMEM", start_minute),
+        ("_selETIMEH", end_hour),
+        ("_selETIMEM", end_minute),
+    ):
+        if not js_set(driver, field_id, value):
+            raise NoSuchElementException(f"出入查詢找不到時間欄位：{field_id}。")
     js_set(driver, "_selQDept", "033006")
     js_set(driver, "_selDeptno", "033006")
     js_set(driver, "_txtPageNum", "200")
+    query_time_origin = arm_query_completion_tracking(driver)
     for button_id in ("_btnQuery", "_btnSearch"):
         if js_click(driver, button_id):
             break
-    wait_for_query_completion(driver)
+    else:
+        raise NoSuchElementException("出入查詢找不到可用的查詢按鈕。")
+    if query_started_callback is not None:
+        query_started_callback()
+    wait_for_query_completion(driver, previous_time_origin=query_time_origin)
     raw_rows = driver.execute_script(
         """
         return Array.from(document.querySelectorAll('tr')).map(tr =>
@@ -2055,7 +2202,8 @@ def capture_case_query_table(driver: webdriver.Chrome) -> dict[str, Any]:
 
 def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseRecord]:
     open_ap(driver, CASE_QUERY_AP)
-    wait_for_form_controls(driver, ("_btnQuery",), timeout=1)
+    if not wait_for_form_controls(driver, ("_btnQuery",), timeout=5):
+        raise TimeoutException("案件查詢頁面未載入查詢按鈕。")
     suppress_window_open_for_background_query(driver)
     for element_id, value in (
         ("_hidDeptno", "033006"),
@@ -2068,14 +2216,20 @@ def query_cases(driver: webdriver.Chrome, target_roc_date: str) -> list[CaseReco
     ):
         if not js_set(driver, element_id, value, dispatch_change=False):
             raise RuntimeError(f"案件查詢找不到欄位：{element_id}。")
+    query_time_origin = arm_query_completion_tracking(driver)
     if not native_click(driver, "_btnQuery") and not js_click(driver, "_btnQuery"):
         raise RuntimeError("案件查詢找不到查詢按鈕。")
-    wait_for_query_completion(driver)
+    wait_for_query_completion(driver, previous_time_origin=query_time_origin)
     captured_tables = [capture_case_query_table(driver)]
     pages = case_query_pages(driver)
     for page in pages[1:]:
+        page_time_origin = arm_query_completion_tracking(driver)
         select_case_query_page(driver, page)
-        wait_for_query_completion(driver, expected_page=page)
+        wait_for_query_completion(
+            driver,
+            expected_page=page,
+            previous_time_origin=page_time_origin,
+        )
         captured_tables.append(capture_case_query_table(driver))
 
     headers: list[str] = []

@@ -46,6 +46,7 @@ class DutySubmissionExecutionError(RuntimeError):
 
 RECENT_HANDOFF_SCHEDULE_SNAPSHOT_MAX_AGE = timedelta(minutes=2)
 ROUTINE_WORK_LOG_QUERY_WINDOW = timedelta(minutes=2)
+UNRETURNED_RETURN_QUERY_STARTED_STATUS = "正在確認未返隊人員是否已返隊…"
 
 
 @dataclass(frozen=True)
@@ -221,12 +222,22 @@ class DutySubmissionService:
             query_range = self._query_range(request, action, action_date)
             if status_callback:
                 status_callback("正在進行送出前防重複檢查…")
+            query_started_callback = None
+            if (
+                status_callback
+                and request.trigger_type in ("recovery", "manual")
+                and request.schedule_data.get("_unreturned_return_queue_id")
+            ):
+                query_started_callback = lambda: status_callback(
+                    UNRETURNED_RETURN_QUERY_STARTED_STATUS
+                )
             before = self._query_comparison(
                 automation,
                 driver,
                 action,
                 action_date,
                 query_range=query_range,
+                query_started_callback=query_started_callback,
             )
             staff = self._staff(comparison_source)
             time_order_warnings: list[str] = []
@@ -852,16 +863,21 @@ class DutySubmissionService:
         ap_name: str,
         action_date: str,
         query_kwargs: Mapping[str, str],
+        *,
+        query_started_callback: Callable[[], None] | None = None,
     ) -> list[Any]:
+        query_options = dict(query_kwargs)
+        if query_started_callback is not None:
+            query_options["query_started_callback"] = query_started_callback
         try:
             return automation.query_visible_table(
                 driver,
                 ap_name,
                 action_date,
-                **query_kwargs,
+                **query_options,
             )
         except TypeError as exc:
-            if not query_kwargs or "unexpected keyword argument" not in str(exc):
+            if not query_options or "unexpected keyword argument" not in str(exc):
                 raise
             return automation.query_visible_table(driver, ap_name, action_date)
 
@@ -873,6 +889,7 @@ class DutySubmissionService:
         action_date: str,
         *,
         query_range: Mapping[str, Any] | None = None,
+        query_started_callback: Callable[[], None] | None = None,
     ) -> dict[str, list[Any]]:
         query_kwargs = (
             {
@@ -891,6 +908,7 @@ class DutySubmissionService:
                 automation.ENTRY_LOG_AP,
                 action_date,
                 query_kwargs,
+                query_started_callback=query_started_callback,
             )
             return {"visible_entry_rows": rows, "visible_work_rows": []}
         rows = DutySubmissionService._query_visible_rows(

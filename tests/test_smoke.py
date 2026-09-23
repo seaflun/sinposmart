@@ -3851,7 +3851,7 @@ try {
             rows = module.query_visible_table(Driver(), module.ENTRY_LOG_AP, "1150807")
 
         set_value.assert_any_call(mock.ANY, "_txtPageNum", "200")
-        wait_for_completion.assert_called_once_with(mock.ANY)
+        wait_for_completion.assert_called_once_with(mock.ANY, previous_time_origin=None)
         self.assertEqual(len(rows), 1)
 
     def test_visible_table_accepts_cross_day_query_range(self) -> None:
@@ -4078,7 +4078,162 @@ try {
         class Driver:
             @staticmethod
             def execute_script(_script: str) -> dict[str, object]:
-                return {"completed": False, "page": "2", "hasRows": True}
+                return {
+                    "completed": False,
+                    "page": "2",
+                    "hasRows": True,
+                    "freshCompletion": False,
+                    "freshRows": True,
+                    "timeOrigin": 100.0,
+                }
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency) -> None:
+                self.driver = driver
+
+            def until(self, condition) -> bool:
+                if not condition(self.driver):
+                    raise module.TimeoutException()
+                return True
+
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(Driver(), expected_page="2")
+
+    def test_query_completion_rejects_old_success_marker_until_this_query_finishes(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def __init__(self, fresh: bool) -> None:
+                self.fresh = fresh
+
+            def execute_script(self, _script: str) -> dict[str, object]:
+                return {"completed": True, "page": "", "hasRows": False,
+                        "freshCompletion": self.fresh, "timeOrigin": 100.0}
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency) -> None:
+                self.driver = driver
+
+            def until(self, condition) -> bool:
+                if not condition(self.driver):
+                    raise module.TimeoutException()
+                return True
+
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            with self.assertRaises(module.TimeoutException):
+                module.wait_for_query_completion(Driver(False), previous_time_origin=100.0)
+            module.wait_for_query_completion(Driver(True), previous_time_origin=100.0)
+
+    def test_entry_query_stops_when_query_button_never_loads(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            pass
+
+        with mock.patch.object(module, "open_ap"), \
+             mock.patch.object(module, "wait_for_any_form_control", return_value=False), \
+             mock.patch.object(module, "suppress_window_open_for_background_query"), \
+             mock.patch.object(module, "js_set", return_value=True), \
+             mock.patch.object(module, "js_click", return_value=False), \
+             mock.patch.object(module, "wait_for_query_completion"):
+            with self.assertRaises(module.TimeoutException):
+                module.query_visible_table(Driver(), module.ENTRY_LOG_AP, "1150923")
+
+    def test_entry_query_stops_when_query_button_cannot_be_clicked(self) -> None:
+        module = duty_rehearsal_module()
+        query_started: list[bool] = []
+
+        class Driver:
+            @staticmethod
+            def execute_script(script: str) -> dict[str, float] | list[object]:
+                if "performance.timeOrigin" in script:
+                    return {"timeOrigin": 100.0}
+                return []
+
+        with mock.patch.object(module, "open_ap"), \
+             mock.patch.object(module, "wait_for_any_form_control", return_value=True), \
+             mock.patch.object(module, "suppress_window_open_for_background_query"), \
+             mock.patch.object(module, "js_set", return_value=True), \
+             mock.patch.object(module, "js_click", return_value=False), \
+             mock.patch.object(module, "wait_for_query_completion"):
+            with self.assertRaises(module.NoSuchElementException):
+                module.query_visible_table(
+                    Driver(),
+                    module.ENTRY_LOG_AP,
+                    "1150923",
+                    query_started_callback=lambda: query_started.append(True),
+                )
+        self.assertEqual(query_started, [])
+
+    def test_entry_query_reports_start_after_successful_click(self) -> None:
+        module = duty_rehearsal_module()
+        events: list[str] = []
+
+        class Driver:
+            @staticmethod
+            def execute_script(script: str) -> dict[str, float] | list[object]:
+                if "performance.timeOrigin" in script:
+                    return {"timeOrigin": 100.0}
+                return []
+
+        with mock.patch.object(module, "open_ap"), \
+             mock.patch.object(module, "wait_for_any_form_control", return_value=True), \
+             mock.patch.object(module, "suppress_window_open_for_background_query"), \
+             mock.patch.object(module, "js_set", return_value=True), \
+             mock.patch.object(module, "js_click", side_effect=lambda *_args: events.append("click") or True), \
+             mock.patch.object(module, "wait_for_query_completion"):
+            module.query_visible_table(
+                Driver(),
+                module.ENTRY_LOG_AP,
+                "1150923",
+                query_started_callback=lambda: events.append("query_started"),
+            )
+        self.assertEqual(events, ["click", "query_started"])
+
+    def test_entry_query_keeps_search_button_fallback(self) -> None:
+        module = duty_rehearsal_module()
+        clicked: list[str] = []
+
+        class Driver:
+            @staticmethod
+            def execute_script(script: str) -> dict[str, float] | list[object]:
+                if "performance.timeOrigin" in script:
+                    return {"timeOrigin": 100.0}
+                return []
+
+        def click(_driver, button_id: str) -> bool:
+            clicked.append(button_id)
+            return button_id == "_btnSearch"
+
+        with mock.patch.object(module, "open_ap"), \
+             mock.patch.object(module, "wait_for_any_form_control", return_value=True), \
+             mock.patch.object(module, "suppress_window_open_for_background_query"), \
+             mock.patch.object(module, "js_set", return_value=True), \
+             mock.patch.object(module, "js_click", side_effect=click), \
+             mock.patch.object(module, "wait_for_query_completion"):
+            module.query_visible_table(Driver(), module.ENTRY_LOG_AP, "1150923")
+
+        self.assertEqual(clicked, ["_btnQuery", "_btnSearch"])
+
+    def test_case_query_stops_when_query_form_never_loads(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            pass
+
+        with mock.patch.object(module, "open_ap"), \
+             mock.patch.object(module, "wait_for_form_controls", return_value=False), \
+             mock.patch.object(module, "suppress_window_open_for_background_query"):
+            with self.assertRaises(module.TimeoutException):
+                module.query_cases(Driver(), "1150923")
+
+    def test_any_query_button_wait_accepts_search_alias(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            @staticmethod
+            def execute_script(script: str, control_ids: tuple[str, ...]) -> bool:
+                return ".some(" in script and "_btnSearch" in control_ids
 
         class ImmediateWait:
             def __init__(self, driver, _timeout, *, poll_frequency) -> None:
@@ -4088,7 +4243,13 @@ try {
                 return condition(self.driver)
 
         with mock.patch.object(module, "WebDriverWait", ImmediateWait):
-            module.wait_for_query_completion(Driver(), expected_page="2")
+            self.assertTrue(
+                module.wait_for_any_form_control(
+                    Driver(),
+                    ("_btnQuery", "_btnSearch"),
+                    timeout=1,
+                )
+            )
 
     def test_query_completion_treats_no_records_as_a_finished_query(self) -> None:
         module = duty_rehearsal_module()
@@ -4098,7 +4259,14 @@ try {
 
             def execute_script(self, script: str) -> dict[str, object]:
                 self.scripts.append(script)
-                return {"completed": True, "page": "", "hasRows": False}
+                return {
+                    "completed": True,
+                    "page": "",
+                    "hasRows": False,
+                    "freshCompletion": True,
+                    "freshRows": False,
+                    "timeOrigin": 100.0,
+                }
 
         class ImmediateWait:
             def __init__(self, driver, _timeout, *, poll_frequency) -> None:
@@ -4170,7 +4338,10 @@ try {
         self.assertEqual([case.report_time for case in cases], ["21:01:00", "22:01:00"])
         self.assertEqual(
             wait_for_completion.call_args_list,
-            [mock.call(driver), mock.call(driver, expected_page="2")],
+            [
+                mock.call(driver, previous_time_origin=None),
+                mock.call(driver, expected_page="2", previous_time_origin=None),
+            ],
         )
 
     def test_0800_handoff_uses_yesterday_2200_duty_when_today_0608_row_absent(self) -> None:

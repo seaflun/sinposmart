@@ -22,7 +22,12 @@ from app_core.credential_sync_service import CredentialSyncService
 from app_core.daily_vehicle_service import DailyVehicleService
 from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot
 from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
-from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult, DutySubmissionService
+from app_core.duty_submission_service import (
+    UNRETURNED_RETURN_QUERY_STARTED_STATUS,
+    DutySubmissionRequest,
+    DutySubmissionResult,
+    DutySubmissionService,
+)
 from app_core.duty_task_projection import (
     AUTO_DUE_CATCH_UP_WINDOW,
     action_datetime,
@@ -369,6 +374,7 @@ class AppController(QObject):
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
         self._duty_execution_controller.submissionStarted.connect(self._submission_started)
+        self._duty_execution_controller.submissionProgress.connect(self._submission_progress)
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
         self._duty_execution_controller.submissionFailed.connect(self._submission_failed)
         self._duty_execution_controller.submissionCancelled.connect(self._submission_cancelled)
@@ -1931,7 +1937,7 @@ class AppController(QObject):
     ) -> bool:
         if not self._is_unreturned_recovery_request(request):
             return True
-        return status in {"submitted", "skipped_duplicate", "cancelled"}
+        return status in {"submitted", "skipped_duplicate", "cancelled", "failed"}
 
     @Slot(object)
     def _publish_unreturned_return_event(self, event: Mapping) -> None:
@@ -2098,6 +2104,20 @@ class AppController(QObject):
                 "開始登打",
             ),
         )
+
+    @Slot(object, str)
+    def _submission_progress(self, request: DutySubmissionRequest, message: str) -> None:
+        if (
+            message != UNRETURNED_RETURN_QUERY_STARTED_STATUS
+            or request.trigger_type not in ("recovery", "manual")
+        ):
+            return
+        queue_id = self._external_return_queue_id(request)
+        if queue_id:
+            self._duty_controller.report_external_return_recovery_started(
+                queue_id,
+                trigger_type=request.trigger_type,
+            )
 
     @Slot(object)
     def _submission_queued(self, request: DutySubmissionRequest) -> None:
@@ -2299,7 +2319,7 @@ class AppController(QObject):
                 self.dutyActionFailed.emit(action_key, str(message or "").strip())
         if (
             not is_handoff_preflight
-            and self._should_send_operational_submission_event(request)
+            and self._should_send_operational_submission_event(request, status="failed")
         ):
             self._send_operational_event(
                 "action_result",

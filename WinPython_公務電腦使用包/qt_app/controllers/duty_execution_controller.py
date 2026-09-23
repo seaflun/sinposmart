@@ -44,6 +44,7 @@ class DutyExecutionController(QObject):
     actionFailed = Signal(int, str, str)
     submissionQueued = Signal(object)
     submissionStarted = Signal(object)
+    submissionProgress = Signal(object, str)
     submissionFinished = Signal(object, object)
     submissionFailed = Signal(object, str, str, str)
     submissionCancelled = Signal(object, str, str)
@@ -341,6 +342,7 @@ class DutyExecutionController(QObject):
         if request is not None and self._request_matches_current_session(request):
             self._status_text = message
             self.stateChanged.emit()
+            self.submissionProgress.emit(request, str(message or ""))
 
     @Slot(int, object)
     def _succeeded(self, request_id: int, result: DutySubmissionResult) -> None:

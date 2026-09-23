@@ -2209,6 +2209,64 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    def test_unreturned_recovery_reports_query_start_from_query_button_callback(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import (
+            UNRETURNED_RETURN_QUERY_STARTED_STATUS,
+            DutySubmissionRequest,
+            DutySubmissionService,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            callbacks: list[str] = []
+
+            def query_visible_table(_driver, _ap_name, _target_date, **kwargs):
+                callback = kwargs.get("query_started_callback")
+                if callback:
+                    callback()
+                return []
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work",
+                ENTRY_LOG_AP="entry",
+                build_driver=lambda *_args, **_kwargs: object(),
+                login=lambda *_args: None,
+                query_visible_table=query_visible_table,
+                fill_entry_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                fill_work_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+                quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(
+                Path(temp_dir),
+                module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 8, 7, 8, 0),
+            )
+            action = {
+                "kind": "entry_log",
+                "target": "10",
+                "actor": "10",
+                "time": "08:00",
+                "fields": {"出或入": "值退", "領用事由及地點": "退勤"},
+            }
+            request = DutySubmissionRequest(
+                "user10",
+                "secret",
+                0,
+                {
+                    "target_date": "1150807",
+                    "actions": [action],
+                    "_unreturned_return_queue_id": "queue-1",
+                },
+                trigger_type="recovery",
+                save=False,
+            )
+
+            result = service.execute(request, status_callback=callbacks.append)
+
+        self.assertEqual(result.status, "filled")
+        self.assertEqual(callbacks.count(UNRETURNED_RETURN_QUERY_STARTED_STATUS), 1)
+
     def test_due_submission_skips_a_stale_fire_day_before_opening_browser(self) -> None:
         from datetime import datetime
 
@@ -13209,6 +13267,10 @@ if return_code != 0 or loaded:
         controller._send_operational_event = (
             lambda *args, **kwargs: operational_events.append((args, kwargs))
         )
+        recovery_attempt_starts: list[str] = []
+        controller._duty_controller.report_external_return_recovery_started = (
+            lambda queue_id, **_kwargs: recovery_attempt_starts.append(queue_id)
+        )
         actual_action = {
             "kind": "entry_log",
             "target": "8",
@@ -13349,6 +13411,12 @@ if return_code != 0 or loaded:
             notifications.clear()
             controller._submission_queued(recovery_request)
             controller._submission_started(recovery_request)
+            self.assertEqual(recovery_attempt_starts, [])
+            controller._submission_progress(
+                recovery_request,
+                "正在確認未返隊人員是否已返隊…",
+            )
+            self.assertEqual(recovery_attempt_starts, ["retrying-queue"])
             controller._submission_finished(
                 recovery_request,
                 DutySubmissionResult(
@@ -13362,10 +13430,13 @@ if return_code != 0 or loaded:
             )
             controller._submission_failed(
                 recovery_request,
-                "人員尚未返隊",
-                "unknown_error",
-                "",
+                "網頁等待逾時，請檢查網站狀態。",
+                "timeout",
+                "recovery-failure.json",
             )
+            failed_event = next(fields for args, fields in operational_events if args == ("action_result",) and fields.get("status") == "failed")
+            self.assertEqual(failed_event["snapshot"]["error_code"], "timeout")
+            self.assertEqual(failed_event["result_ref"], "recovery-failure.json")
             self.assertEqual(notifications, [])
             controller._submission_finished(
                 recovery_request,
@@ -13529,7 +13600,6 @@ if return_code != 0 or loaded:
                     action,
                 ),
             )
-            controller._submission_failed(request, "人員尚未返隊", "unknown_error", "")
             self.assertEqual(events, [])
 
             controller._submission_finished(
@@ -16168,6 +16238,7 @@ if return_code != 0 or loaded:
         controller.set_session_context(3, "user27")
         controller.set_actor_no("27")
         recovery_spy = QSignalSpy(controller.externalReturnRecoveryDue)
+        retry_event_spy = QSignalSpy(controller.unreturnedReturnEvent)
 
         controller.resume_unreturned_return_recovery_after_verified_login()
 
@@ -16180,6 +16251,11 @@ if return_code != 0 or loaded:
         controller.enable_auto_execution()
 
         self.assertEqual(recovery_spy.count(), 1)
+        self.assertEqual(retry_event_spy.count(), 0)
+        controller.report_external_return_recovery_started(record["queue_id"])
+        controller.report_external_return_recovery_started(record["queue_id"])
+        self.assertEqual(retry_event_spy.count(), 1)
+        self.assertEqual(retry_event_spy.at(0)[0]["status"], "retrying")
         retried = queue.get(record["queue_id"])
         self.assertEqual(retried["last_attempt_at"], "2026-09-07T08:30:00")
         self.assertEqual(retried["next_retry_at"], "2026-09-07T08:40:00")
