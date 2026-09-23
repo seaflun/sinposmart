@@ -9,6 +9,7 @@
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 $script:restartedProcessId = 0
 $script:lastProgressPercent = -1
 $script:lastProgressPhase = ""

@@ -40,10 +40,10 @@ class AttendanceTests(unittest.TestCase):
 
     def test_arrival_departure_and_calendar_dates(self):
         service = CivilpowerService(PACKAGE)
-        for action, status in (("到勤", "入"), ("退勤", "出")):
+        for action, status in (("到勤", "服勤"), ("退勤", "退勤")):
             plan = service.validate(self.request(action))
-            self.assertEqual((plan.status, plan.reason, plan.date_text, plan.time_text),
-                             (status, action, "2026/09/23", "0905"))
+            self.assertEqual((plan.home_unit, plan.status, plan.reason, plan.date_text, plan.time_text),
+                             ("大園救護分隊", status, action, "2026/09/23", "0905"))
         self.assertEqual(service.validate(self.request("退勤", date_text="2026-09-24")).date_text,
                          "2026/09/24")
 
@@ -114,7 +114,7 @@ class AttendanceTests(unittest.TestCase):
 
     def test_new_record_writes_correct_fields_and_requires_readback(self):
         from app_core import civilpower_automation as automation
-        for action, status in (("到勤", "入"), ("退勤", "出")):
+        for action, status in (("到勤", "服勤"), ("退勤", "退勤")):
             plan = CivilpowerService(PACKAGE).validate(self.request(action))
             checkpoint = {}
             with self.subTest(action=action), ExitStack() as stack:
@@ -199,16 +199,16 @@ class AttendanceTests(unittest.TestCase):
                 stack.enter_context(patch.object(automation, "_wait_for_io_query_result_grid", return_value=ready))
                 stack.enter_context(patch.object(automation, "_find_paginated_table_rows", return_value=rows))
                 with self.assertRaises(RuntimeError):
-                    automation._find_io_record_row(Mock(), plan, "入", require_query_confirmation=True)
+                    automation._find_io_record_row(Mock(), plan, "服勤", require_query_confirmation=True)
 
     def test_localized_times_are_exact_to_minute(self):
         from app_core.civilpower_automation import _token_matches
         self.assertTrue(_token_matches("2026/09/23 上午 12:05:10", "2026/09/23 00:05"))
         self.assertTrue(_token_matches("2026/09/23 下午 12:05:10", "2026/09/23 12:05"))
         self.assertFalse(_token_matches("2026/09/23 下午 01:05:10", "2026/09/23 01:05"))
-        self.assertTrue(_token_matches("測試義消 入 到勤", "到勤"))
-        self.assertFalse(_token_matches("測試義消 入 未到勤", "到勤"))
-        self.assertFalse(_token_matches("測試義消 出 退勤", "入"))
+        self.assertTrue(_token_matches("測試義消 服勤 到勤", "服勤"))
+        self.assertTrue(_token_matches("測試義消 退勤 退勤", "退勤"))
+        self.assertFalse(_token_matches("測試義消 服勤 到勤", "退勤"))
 
     def test_controller_runs_in_background_and_rejects_double_submit(self):
         from PySide6.QtWidgets import QApplication
@@ -363,6 +363,9 @@ class AttendanceTests(unittest.TestCase):
             self.assertTrue(panel.property("opened"))
             self.assertGreater(root.width(), 550)
             self.assertFalse(find("civilpowerSubmitButton").isEnabled())
+            self.assertEqual(find("civilpowerHomeUnitField").property("text"), "大園救護分隊")
+            self.assertTrue(find("civilpowerDateCalendarButton").isVisible())
+            self.assertTrue(find("civilpowerTimeClockButton").isVisible())
             controller.civilpowerController._roster_loaded({"members": [{**MEMBER, "label": "★ 測試義消"}],
                                                            "cached": False, "last_success_at": "2026-09-23T09:00:00"})
             QTest.qWait(20)

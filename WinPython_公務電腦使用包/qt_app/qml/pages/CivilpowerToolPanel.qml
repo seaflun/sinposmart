@@ -33,6 +33,16 @@ ToolSidePanel {
                     wrapMode: Text.Wrap
                 }
                 RowLayout {
+                    ToolFieldLabel { text: "所屬單位" }
+                    AppleTextField {
+                        objectName: "civilpowerHomeUnitField"
+                        Layout.fillWidth: true
+                        text: "大園救護分隊"
+                        readOnly: true
+                        enabled: panel.editable
+                    }
+                }
+                RowLayout {
                     ToolFieldLabel { text: "日期" }
                     AppleTextField {
                         id: dateField
@@ -40,7 +50,19 @@ ToolSidePanel {
                         Layout.fillWidth: true
                         text: panel.controller.dateText
                         placeholderText: "YYYY-MM-DD"
+                        readOnly: true
+                        clickAction: function() { dateCalendar.openForCurrentDate() }
                         enabled: panel.editable
+                    }
+                    AppleCalendarButton {
+                        id: dateCalendar
+                        objectName: "civilpowerDateCalendarButton"
+                        dateText: dateField.text
+                        dateFormat: "iso"
+                        anchorItem: dateField
+                        popupParent: Overlay.overlay
+                        enabled: panel.editable
+                        onDateSelected: function(value) { dateField.text = value }
                     }
                 }
                 RowLayout {
@@ -51,7 +73,43 @@ ToolSidePanel {
                         Layout.fillWidth: true
                         text: panel.controller.timeText
                         placeholderText: "HH:MM"
+                        readOnly: true
+                        clickAction: function() { timePicker.openForCurrentTime() }
                         enabled: panel.editable
+                    }
+                    AppleButton {
+                        objectName: "civilpowerTimeClockButton"
+                        Layout.preferredWidth: 36
+                        Layout.preferredHeight: 34
+                        tone: "info"
+                        Accessible.name: "選擇時間"
+                        enabled: panel.editable
+                        onClicked: timePicker.openForCurrentTime()
+                        contentItem: Item {
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: 17
+                                height: 17
+                                radius: width / 2
+                                color: Design.transparent
+                                border.width: Design.borderWidth
+                                border.color: parent.parent.foregroundColor
+                            }
+                            Rectangle {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: parent.height / 2 - 5
+                                width: Design.borderWidth
+                                height: 6
+                                color: parent.parent.foregroundColor
+                            }
+                            Rectangle {
+                                x: parent.width / 2
+                                y: parent.height / 2
+                                width: 5
+                                height: Design.borderWidth
+                                color: parent.parent.foregroundColor
+                            }
+                        }
                     }
                 }
                 RowLayout {
@@ -71,7 +129,7 @@ ToolSidePanel {
                     }
                 }
                 RowLayout {
-                    ToolFieldLabel { text: "出入" }
+                    ToolFieldLabel { text: "狀態" }
                     AppleComboBox {
                         id: actionCombo
                         objectName: "civilpowerActionCombo"
@@ -107,6 +165,113 @@ ToolSidePanel {
             enabled: panel.editable && memberCombo.currentIndex >= 0
             onClicked: panel.controller.prepareRun(dateField.text, timeField.text,
                 String(memberCombo.currentValue || ""), actionCombo.currentText)
+        }
+    }
+
+    Popup {
+        id: timePicker
+        objectName: "civilpowerTimePickerPopup"
+        parent: Overlay.overlay
+        x: {
+            const point = timeField.mapToItem(parent, timeField.width - width, timeField.height + 6)
+            return Math.max(8, Math.min(point.x, parent.width - width - 8))
+        }
+        y: {
+            const below = timeField.mapToItem(parent, 0, timeField.height + 6)
+            if (below.y + height <= parent.height - 8)
+                return below.y
+            return Math.max(8, timeField.mapToItem(parent, 0, -height - 6).y)
+        }
+        width: 228
+        padding: 12
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle {
+            radius: Design.radiusMedium
+            color: Design.panel
+            border.width: Design.borderWidth
+            border.color: Design.border
+        }
+        function openForCurrentTime() {
+            const match = String(timeField.text || "").match(/^(\d{2}):(\d{2})$/)
+            hourTumbler.currentIndex = match ? Number(match[1]) : 0
+            minuteTumbler.currentIndex = match ? Number(match[2]) : 0
+            open()
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: "選擇時間"
+                color: Design.infoText
+                font.pixelSize: Design.bodySize
+                font.bold: true
+                horizontalAlignment: Text.AlignHCenter
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignHCenter
+                spacing: 8
+                Tumbler {
+                    id: hourTumbler
+                    objectName: "civilpowerHourTumbler"
+                    Layout.preferredWidth: 66
+                    Layout.preferredHeight: 108
+                    model: 24
+                    visibleItemCount: 3
+                    wrap: true
+                    delegate: Label {
+                        required property var modelData
+                        text: String(modelData).padStart(2, "0")
+                        opacity: 1.0 - Math.abs(Tumbler.displacement) / (hourTumbler.visibleItemCount / 2)
+                        color: Tumbler.displacement === 0 ? Design.text : Design.muted
+                        font.pixelSize: Design.bodySize
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                Label {
+                    text: ":"
+                    color: Design.text
+                    font.pixelSize: Design.bodySize
+                    font.bold: true
+                }
+                Tumbler {
+                    id: minuteTumbler
+                    objectName: "civilpowerMinuteTumbler"
+                    Layout.preferredWidth: 66
+                    Layout.preferredHeight: 108
+                    model: 60
+                    visibleItemCount: 3
+                    wrap: true
+                    delegate: Label {
+                        required property var modelData
+                        text: String(modelData).padStart(2, "0")
+                        opacity: 1.0 - Math.abs(Tumbler.displacement) / (minuteTumbler.visibleItemCount / 2)
+                        color: Tumbler.displacement === 0 ? Design.text : Design.muted
+                        font.pixelSize: Design.bodySize
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                AppleButton {
+                    Layout.fillWidth: true
+                    text: "取消"
+                    tone: "neutralStrong"
+                    onClicked: timePicker.close()
+                }
+                AppleButton {
+                    Layout.fillWidth: true
+                    text: "套用"
+                    tone: "primary"
+                    onClicked: {
+                        timeField.text = String(hourTumbler.currentIndex).padStart(2, "0")
+                                + ":" + String(minuteTumbler.currentIndex).padStart(2, "0")
+                        timePicker.close()
+                    }
+                }
+            }
         }
     }
 

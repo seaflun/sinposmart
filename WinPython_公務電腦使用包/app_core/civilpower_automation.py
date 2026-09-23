@@ -918,7 +918,7 @@ def _token_matches(text: str, token: str) -> bool:
     expected = _clean_text(token)
     if not expected:
         return True
-    if expected in {"入", "出", "到勤", "退勤"}:
+    if expected in {"入", "出", "服勤", "到勤", "退勤"}:
         return expected in actual.split()
     expected_datetime = _DATETIME_PATTERN.fullmatch(expected)
     if expected_datetime:

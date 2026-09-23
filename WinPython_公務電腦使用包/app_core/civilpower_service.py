@@ -12,6 +12,9 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 
+HOME_UNIT = "大園救護分隊"
+
+
 class CivilpowerError(RuntimeError):
     """User-facing error without credentials or raw browser diagnostics."""
 
@@ -70,12 +73,12 @@ class CivilpowerService:
             raise CivilpowerError("請輸入有效日期 YYYY-MM-DD 與時間 HH:MM。") from exc
         member = request.member
         if (not isinstance(member, dict) or not member.get("member_id") or not member.get("name")
-                or member.get("unit") != "大園救護分隊" or "顧問" in str(member.get("title", ""))):
+                or member.get("unit") != HOME_UNIT or "顧問" in str(member.get("title", ""))):
             raise CivilpowerError("請從救護台名冊選擇有效義消。")
         return AttendancePlan(str(member["member_id"]), str(member["name"]),
-                              str(member.get("title", "")), str(member["unit"]),
+                              str(member.get("title", "")), HOME_UNIT,
                               when.strftime("%Y/%m/%d"), when.strftime("%H%M"),
-                              "入" if request.action == "到勤" else "出", request.action)
+                              "服勤" if request.action == "到勤" else "退勤", request.action)
 
     def confirmation_summary(self, request: AttendanceRequest) -> str:
         plan = self.validate(request)
