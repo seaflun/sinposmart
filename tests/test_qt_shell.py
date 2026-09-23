@@ -2212,6 +2212,86 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    def test_returned_off_duty_recovery_ignores_emergency_departure(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for trigger in ("manual", "recovery"):
+            for reason in ("退勤", "休息後退勤"):
+                with self.subTest(trigger=trigger, reason=reason), tempfile.TemporaryDirectory() as temp_dir:
+                    rows = [
+                        ["115/09/24 05:36", "新坡分隊", "測試員", "隊員", "出", "否", "案件類別：緊急救護-車禍"],
+                        ["115/09/24 06:11", "新坡分隊", "測試員", "隊員", "入", "是", "案件類別：緊急救護-車禍"],
+                    ]
+                    fills = []
+
+                    def fill_entry(_driver, action, *_args, **_kwargs):
+                        fills.append(action)
+                        rows.append(["115/09/24 06:24", "新坡分隊", "測試員", "隊員", "出", reason])
+                        return {}
+
+                    automation = SimpleNamespace(
+                        WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                        build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                        query_visible_table=lambda *_args, **_kwargs: list(rows),
+                        fill_entry_log_form_for_test=fill_entry, quit_driver=lambda *_args: None,
+                    )
+                    service = DutySubmissionService(
+                        Path(temp_dir), module_loader=lambda: automation,
+                        now_factory=lambda: datetime(2026, 9, 24, 6, 24),
+                    )
+                    action = {
+                        "kind": "entry_log", "time": "06:24", "actor": "21", "target": "8",
+                        "source": reason,
+                        "fields": {"出或入": "出", "領用事由及地點": reason},
+                    }
+                    data = {
+                        "target_date": "1150924", "today": {"staff": {"8": {"name": "測試員"}}},
+                        "actions": [action], "_unreturned_return_queue_id": "returned-queue",
+                        "_unreturned_return_query_start_at": "2026-09-24T05:36:00",
+                    }
+
+                    result = service.execute(DutySubmissionRequest("user21", "test-secret", 0, data, trigger_type=trigger))
+
+                    self.assertEqual(result.status, "submitted")
+                    self.assertEqual(len(fills), 1)
+
+    def test_off_duty_recovery_preserves_real_duplicate_and_near_guards(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for existing_reason in ("退勤", "休息後退勤"):
+            for existing_time, expected in (("06:23", "skipped_duplicate"), ("06:10", "review_required")):
+                with self.subTest(reason=existing_reason, time=existing_time), tempfile.TemporaryDirectory() as temp_dir:
+                    fills = []
+                    rows = [[f"115/09/24 {existing_time}", "新坡分隊", "測試員", "隊員", "出", existing_reason]]
+                    automation = SimpleNamespace(
+                        WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                        build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                        query_visible_table=lambda *_args, **_kwargs: rows,
+                        fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append(True),
+                        quit_driver=lambda *_args: None,
+                    )
+                    service = DutySubmissionService(
+                        Path(temp_dir), module_loader=lambda: automation,
+                        now_factory=lambda: datetime(2026, 9, 24, 6, 24),
+                    )
+                    data = {
+                        "target_date": "1150924", "today": {"staff": {"8": {"name": "測試員"}}},
+                        "_unreturned_return_queue_id": "returned-queue",
+                        "actions": [{
+                            "kind": "entry_log", "time": "06:24", "actor": "21", "target": "8",
+                            "source": "休息後退勤", "fields": {"出或入": "出", "領用事由及地點": "休息後退勤"},
+                        }],
+                    }
+
+                    result = service.execute(DutySubmissionRequest("user21", "test-secret", 0, data, trigger_type="manual"))
+
+                    self.assertEqual(result.status, expected)
+                    self.assertEqual(fills, [])
+
     def test_unreturned_recovery_reports_query_start_from_query_button_callback(self) -> None:
         from datetime import datetime
 
@@ -17124,6 +17204,46 @@ if return_code != 0 or loaded:
             [controller._external_return_queue_ids_by_action_index[0]],
         )
         self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_return_recovery_review_status_survives_refresh_and_restart(self) -> None:
+        from app_core.duty_task_projection import audit_status_text
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = UnreturnedReturnQueue(Path(temp_dir))
+            action = {
+                "kind": "entry_log", "time": "06:00", "actor": "21", "target": "8",
+                "source": "休息後退勤", "fields": {"出或入": "出", "領用事由及地點": "休息後退勤"},
+            }
+            data = {"target_date": "1150924", "today": {"staff": {"8": {"name": "測試員"}}}, "actions": [action]}
+            controller = DutyController(unreturned_return_queue=queue)
+            controller.set_actor_no("21")
+            controller.replace_schedule_data(data)
+            controller.handle_submission_result(0, "paused_external", "人員尚未返隊", "", {})
+            queue_id = controller._external_return_queue_ids_by_action_index[0]
+            controller.handle_external_return_queue_result(queue_id, action, "review_required", trigger_type="manual")
+
+            restored = DutyController(unreturned_return_queue=UnreturnedReturnQueue(Path(temp_dir)))
+            restored.set_actor_no("21")
+            restored.replace_schedule_data(data)
+            for current in (controller, restored):
+                with self.subTest(restored=current is restored):
+                    current._refresh_queue_action_indices()
+                    current._refresh_projection()
+                    self.assertEqual(
+                        current.taskModel.data(current.taskModel.index(0, 0), current.taskModel.StatusTextRole),
+                        "登打待確認",
+                    )
+                    self.assertEqual(audit_status_text(action, current._comparisons[0]), "登打待確認")
+                    current.toggleTaskSelection(0)
+                    self.assertTrue(current.canConfirmExternalReturnManualSubmissionSelected)
+
+            restored.handle_external_return_queue_result(queue_id, action, "paused_external")
+            self.assertEqual(
+                restored.taskModel.data(restored.taskModel.index(0, 0), restored.taskModel.StatusTextRole),
+                "未返隊暫停",
+            )
 
     def test_external_return_pause_mixed_selection_disables_confirmation(self) -> None:
         from qt_app.controllers.duty_controller import DutyController

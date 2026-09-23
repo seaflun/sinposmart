@@ -3175,7 +3175,9 @@ class DutyController(QObject):
     def _refresh_queue_action_indices(self) -> None:
         queue_ids_by_completion_key: dict[str, str] = {}
         completed_statuses: dict[str, str] = {}
+        pending_statuses: dict[str, str] = {}
         for record in self._unreturned_return_queue.active_records():
+            pending_statuses.update(dict(record.get("pending_statuses", {})))
             record_completed = {
                 str(key): str(value)
                 for key, value in dict(record.get("completed_statuses", {})).items()
@@ -3192,10 +3194,12 @@ class DutyController(QObject):
             if action_completion_key(action) in queue_ids_by_completion_key
         }
         for index in self._external_return_queue_ids_by_action_index:
+            pending_status = pending_statuses.get(action_completion_key(self._actions[index]), "")
             self._comparisons[index] = {
-                "compare": "未返隊，暫停登打",
+                "compare": "登打待確認" if pending_status == "review_required" else "未返隊，暫停登打",
                 "group": "paused",
                 "matched": [],
+                "recovery_status": pending_status,
             }
         for index, action in enumerate(self._actions):
             status = completed_statuses.get(action_completion_key(action))

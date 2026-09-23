@@ -579,7 +579,7 @@ def audit_status_text(
     comparison: Mapping[str, Any],
 ) -> str:
     if comparison.get("group") == "paused":
-        return "未返隊暫停"
+        return "登打待確認" if comparison.get("recovery_status") == "review_required" else "未返隊暫停"
     if _is_external_rest_manual_submission(action, comparison):
         return "外勤休息手動"
     return _display_status(comparison.get("compare", "未比對"))
@@ -618,7 +618,7 @@ def _task_status(
     if index in state.comparison_wait_statuses:
         return state.comparison_wait_statuses[index], "manual"
     if index in state.paused_indices:
-        return "未返隊暫停", "manual"
+        return audit_status_text(action, comparison), "manual"
     if index in state.executed_indices:
         return ("已手動登打" if index in state.manual_completed_indices else "已登打"), "triggered"
     if comparison.get("group") in ("near", "adjust", "review"):

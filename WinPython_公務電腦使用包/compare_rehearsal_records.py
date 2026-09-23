@@ -272,6 +272,9 @@ def find_entry_matches(
             continue
         if not row_has_outin(row, outin, external_entry=external_entry):
             continue
+        if outin == "出" and reason in ("退勤", "休息後退勤"):
+            if not any(cell in ("退勤", "休息後退勤") for cell in row_cells(row)):
+                continue
         if external_entry and reason and reason not in row:
             continue
         if strict_time:

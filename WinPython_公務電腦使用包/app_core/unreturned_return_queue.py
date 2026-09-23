@@ -210,12 +210,17 @@ class UnreturnedReturnQueue:
         record = self._records.get(queue_id)
         if record is None:
             return None, False
+        completion_key = str(completion_key or action_completion_key(action))
+        pending_statuses = dict(record.get("pending_statuses", {}))
         if status not in ("submitted", "skipped_duplicate"):
+            pending_statuses[completion_key] = status
+            record["pending_statuses"] = pending_statuses
             return self.defer(queue_id, str(record.get("last_owner_actor_no") or "")), False
+        pending_statuses.pop(completion_key, None)
+        record["pending_statuses"] = pending_statuses
         if record.get("record_type") != "handoff_group":
             return self.resolve(queue_id), True
 
-        completion_key = str(completion_key or action_completion_key(action))
         completed = {str(key) for key in record.get("completed_keys", [])}
         completed.add(completion_key)
         record["completed_keys"] = sorted(completed)
