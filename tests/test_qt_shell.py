@@ -6769,6 +6769,193 @@ class UpdateControllerTests(unittest.TestCase):
         QQuickStyle.setStyle("Basic")
         cls.app = QApplication.instance() or QApplication(["test_update_controller"])
 
+    def test_update_history_and_pending_notice_are_cleared_only_after_dismissal(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            version = root / "VERSION.txt"
+            version.write_text("2026.09.24.1200", encoding="utf-8")
+            history_path = root / "update_history.json"
+            history_path.write_text(json.dumps({
+                "history_floor_version": "2026.09.24.1000",
+                "major_history": [{
+                    "period": "2026/06",
+                    "title": "勤務工具擴充",
+                    "items": ["新增勤務表登打"],
+                }],
+                "releases": [
+                    {
+                        "version": "2026.09.24.1100",
+                        "date": "2026/09/24",
+                        "title": "前一版更新摘要",
+                        "items": ["增加一項主要功能"],
+                    },
+                    {
+                        "version": "2026.09.24.1200",
+                        "date": "2026/09/24",
+                        "title": "更新日誌與登入提醒",
+                        "items": ["新增系統更新日誌", "成功更新後登入顯示摘要"],
+                    },
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            marker_path = root / "pending_update_notice.json"
+            marker_path.write_text(json.dumps({
+                "schema_version": 1,
+                "pending_versions": ["2026.09.24.1200"],
+                "pending_releases": [{
+                    "version": "2026.09.24.1200",
+                    "period": "2026/09/24",
+                    "title": "安裝時保存的更新摘要",
+                    "items": ["新增系統更新日誌", "成功更新後登入顯示摘要"],
+                }],
+            }), encoding="utf-8")
+
+            controller = UpdateController(
+                UpdateRepository(version),
+                history_path=history_path,
+                pending_notice_path=marker_path,
+            )
+            try:
+                self.assertEqual(controller.updateHistory["major_history"][0]["title"], "勤務工具擴充")
+                self.assertTrue(controller.showPendingUpdateNotice())
+                self.assertEqual(
+                    controller.pendingUpdateNotice["releases"][-1]["items"],
+                    ["新增系統更新日誌", "成功更新後登入顯示摘要"],
+                )
+                self.assertEqual(
+                    [release["version"] for release in controller.pendingUpdateNotice["releases"]],
+                    ["2026.09.24.1100", "2026.09.24.1200"],
+                )
+                self.assertTrue(controller.showPendingUpdateNotice())
+                self.assertEqual(
+                    json.loads(marker_path.read_text(encoding="utf-8"))["pending_versions"],
+                    ["2026.09.24.1200"],
+                )
+                self.assertEqual(
+                    controller.pendingUpdateNotice["releases"][-1]["title"],
+                    "安裝時保存的更新摘要",
+                )
+
+                controller.dismissPendingUpdateNotice()
+
+                self.assertFalse(controller.pendingUpdateNotice["visible"])
+                self.assertEqual(
+                    json.loads(marker_path.read_text(encoding="utf-8"))["pending_versions"],
+                    [],
+                )
+                self.assertEqual(
+                    json.loads(marker_path.read_text(encoding="utf-8"))["pending_releases"],
+                    [],
+                )
+                self.assertEqual(
+                    json.loads(marker_path.read_text(encoding="utf-8"))["last_seen_version"],
+                    "2026.09.24.1200",
+                )
+            finally:
+                controller.shutdown()
+
+    def test_update_notice_uses_installed_version_when_legacy_updater_wrote_no_marker(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            version = root / "VERSION.txt"
+            version.write_text("2026.09.24.1200", encoding="utf-8")
+            history_path = root / "update_history.json"
+            history_path.write_text(json.dumps({
+                "major_history": [],
+                "releases": [{
+                    "version": "2026.09.24.1200",
+                    "period": "2026/09/24",
+                    "title": "更新日誌",
+                    "items": ["成功更新後顯示更新摘要"],
+                }],
+            }, ensure_ascii=False), encoding="utf-8")
+            marker_path = root / "pending_update_notice.json"
+            controller = UpdateController(
+                UpdateRepository(version),
+                history_path=history_path,
+                pending_notice_path=marker_path,
+            )
+            try:
+                self.assertTrue(controller.showPendingUpdateNotice())
+                self.assertEqual(
+                    controller.pendingUpdateNotice["releases"][0]["version"],
+                    "2026.09.24.1200",
+                )
+                controller.dismissPendingUpdateNotice()
+                self.assertFalse(controller.showPendingUpdateNotice())
+            finally:
+                controller.shutdown()
+
+    def test_update_history_dialog_loads_as_a_modal_dialog(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtQuick import QQuickWindow
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        engine = QQmlEngine()
+        host = QQuickWindow()
+        controller = UpdateController(UpdateRepository(PACKAGE_ROOT / "VERSION.txt"))
+        component = QQmlComponent(
+            engine,
+            QUrl.fromLocalFile(str(PACKAGE_ROOT / "qt_app/qml/dialogs/UpdateHistoryDialog.qml")),
+        )
+        dialog = component.createWithInitialProperties(
+            {"updateController": controller, "parent": host.contentItem}
+        )
+        self.assertIsNotNone(dialog, [error.toString() for error in component.errors()])
+        self.assertTrue(dialog.property("modal"))
+        self.assertEqual(dialog.objectName(), "updateHistoryDialog")
+        dialog.deleteLater()
+        host.deleteLater()
+        engine.deleteLater()
+        controller.shutdown()
+
+    def test_updater_records_pending_notice_after_restart_success_path(self) -> None:
+        source = (PACKAGE_ROOT / "update_package.ps1").read_text(encoding="utf-8-sig")
+        install_start = source.rindex('$packageVersion | Set-Content -LiteralPath $localVersionPath')
+        install_end = source.index('Write-UpdateProgress -Phase "installed"', install_start)
+        install_section = source[install_start:install_end]
+
+        self.assertIn('Join-Path $env:LOCALAPPDATA "SinpoSmart"', source)
+        self.assertIn('pending_update_notice.json', source)
+        self.assertIn('$lastSeenVersion = [string]$existingNotice.last_seen_version', source)
+        self.assertIn('pending_releases = @($pendingReleases)', source)
+        self.assertIn('$historyPath = Join-Path $packageDir "update_history.json"', source)
+        self.assertIn("Add-PendingUpdateNotice -Version $packageVersion", install_section)
+        self.assertLess(
+            install_section.index('throw "Updated files were installed, but SinpoSmart could not restart."'),
+            install_section.index("Add-PendingUpdateNotice -Version $packageVersion"),
+        )
+
+    def test_main_qml_opens_pending_update_notice_after_login(self) -> None:
+        main = (PACKAGE_ROOT / "qt_app/qml/Main.qml").read_text(encoding="utf-8")
+        operation_bar = (PACKAGE_ROOT / "qt_app/qml/pages/DutyOperationBar.qml").read_text(
+            encoding="utf-8"
+        )
+        dialog = (PACKAGE_ROOT / "qt_app/qml/dialogs/UpdateHistoryDialog.qml").read_text(
+            encoding="utf-8"
+        )
+        history = json.loads((PACKAGE_ROOT / "update_history.json").read_text(encoding="utf-8"))
+        milestone_items = [
+            item
+            for milestone in history["major_history"]
+            for item in milestone["items"]
+        ]
+
+        self.assertIn('objectName: "updateHistoryMenuItem"', operation_bar)
+        self.assertIn("onUpdateHistoryRequested: updateHistoryDialog.openHistory()", main)
+        self.assertIn("window.updateHistoryDialog.openPendingUpdateNotice()", main)
+        self.assertIn("closePolicy: Popup.NoAutoClose", dialog)
+        self.assertIn('closeText: updateNoticeMode ? "我已閱讀，進入系統"', dialog)
+        self.assertTrue(any("勤務表登打" in item for item in milestone_items))
+        self.assertTrue(any("防溺車巡" in item for item in milestone_items))
+
     def test_remote_update_apply_uses_qml_and_preserves_staged_request(self) -> None:
         from unittest.mock import patch, Mock
         from qt_app.controllers import update_controller as module
@@ -8478,6 +8665,7 @@ class QtShellTests(unittest.TestCase):
                 "ActionConfirmations 1.0 ActionConfirmations.qml",
                 "ErrorDetailDialog 1.0 ErrorDetailDialog.qml",
                 "UpdateProgressWindow 1.0 UpdateProgressWindow.qml",
+                "UpdateHistoryDialog 1.0 UpdateHistoryDialog.qml",
             ],
         )
         self.assertIn('import "dialogs"', qml)
@@ -8486,6 +8674,7 @@ class QtShellTests(unittest.TestCase):
             "RescueVideoWindow",
             "ActionConfirmations",
             "ErrorDetailDialog",
+            "UpdateHistoryDialog",
         ):
             self.assertTrue((dialogs_path / f"{dialog_name}.qml").is_file())
             self.assertIn(f"{dialog_name} {{", qml)

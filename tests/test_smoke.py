@@ -4883,6 +4883,7 @@ if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -R
         self.assertIn("$requiredQtPackageFiles", script)
         for relative in (
             "duty_gui.pyw",
+            "update_history.json",
             "qt_app\\main.py",
             "qt_app\\qml\\Main.qml",
             "qt_app\\qml\\components\\AppleButton.qml",
@@ -4923,6 +4924,7 @@ if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -R
             "qt_app\\qml\\dialogs\\AccountManagerWindow.qml",
             "qt_app\\qml\\dialogs\\RescueVideoWindow.qml",
             "qt_app\\qml\\dialogs\\ActionConfirmations.qml",
+            "qt_app\\qml\\dialogs\\UpdateHistoryDialog.qml",
             "qt_app\\qml\\dialogs\\ErrorDetailDialog.qml",
             "qt_app\\qml\\dialogs\\qmldir",
             "qt_app\\qml\\pages\\DutySheetToolPanel.qml",

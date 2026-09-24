@@ -727,6 +727,63 @@ function Write-RemoteStageManifest {
     Move-Item -LiteralPath $tempManifestPath -Destination $stagingManifestPath -Force
 }
 
+function Add-PendingUpdateNotice {
+    param([string]$Version)
+
+    try {
+        if (-not $Version) {
+            return
+        }
+        $noticeRoot = Join-Path $env:LOCALAPPDATA "SinpoSmart"
+        New-Item -ItemType Directory -Path $noticeRoot -Force | Out-Null
+        $noticePath = Join-Path $noticeRoot "pending_update_notice.json"
+        $pendingVersions = @()
+        $pendingReleases = @()
+        $lastSeenVersion = ""
+        if (Test-Path -LiteralPath $noticePath -PathType Leaf) {
+            try {
+                $existingNotice = Get-Content -LiteralPath $noticePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $lastSeenVersion = [string]$existingNotice.last_seen_version
+                if ($existingNotice.pending_versions) {
+                    $pendingVersions = @($existingNotice.pending_versions | ForEach-Object { [string]$_ })
+                }
+                if ($existingNotice.pending_releases) {
+                    $pendingReleases = @($existingNotice.pending_releases)
+                }
+            } catch {
+                Write-Warning "Could not read the previous pending update notice."
+            }
+        }
+        if ($pendingVersions -notcontains $Version) {
+            $pendingVersions += $Version
+        }
+        $historyPath = Join-Path $packageDir "update_history.json"
+        if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
+            try {
+                $history = Get-Content -LiteralPath $historyPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $releaseNote = @($history.releases | Where-Object { [string]$_.version -eq $Version } | Select-Object -First 1)
+                if ($releaseNote.Count -gt 0 -and -not ($pendingReleases | Where-Object { [string]$_.version -eq $Version })) {
+                    $pendingReleases += $releaseNote[0]
+                }
+            } catch {
+                Write-Warning "Could not read this release's update summary."
+            }
+        }
+        $notice = [ordered]@{
+            schema_version = 1
+            last_seen_version = $lastSeenVersion
+            pending_versions = @($pendingVersions)
+            pending_releases = @($pendingReleases)
+            updated_at = (Get-Date).ToString("o")
+        }
+        $tempNoticePath = Join-Path $noticeRoot ".pending_update_notice.$([guid]::NewGuid().ToString('N')).tmp"
+        $notice | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempNoticePath -Encoding UTF8
+        Move-Item -LiteralPath $tempNoticePath -Destination $noticePath -Force
+    } catch {
+        Write-Warning "The update was installed, but the login notice could not be recorded: $($_.Exception.Message)"
+    }
+}
+
 function Copy-RemoteStagePackage {
     param([string]$SourceDir)
 
@@ -838,6 +895,7 @@ try {
     $requiredQtPackageFiles = @(
         "duty_gui.py",
         "duty_gui.pyw",
+        "update_history.json",
         "rest_time_automation.py",
         "duty_sheet_legacy\sinposmart_1.py",
         "rescue_video\classify_rescue_video.py",
@@ -891,6 +949,7 @@ try {
         "qt_app\qml\dialogs\ActionConfirmations.qml",
         "qt_app\qml\dialogs\ErrorDetailDialog.qml",
         "qt_app\qml\dialogs\UpdateProgressWindow.qml",
+        "qt_app\qml\dialogs\UpdateHistoryDialog.qml",
         "qt_app\qml\dialogs\qmldir",
         "qt_app\qml\pages\DutySheetToolPanel.qml",
         "qt_app\qml\pages\RestTimeToolPanel.qml",
@@ -982,6 +1041,7 @@ try {
             throw "Updated files were installed, but SinpoSmart could not restart."
         }
     }
+    Add-PendingUpdateNotice -Version $packageVersion
 
     if ($ApplyStaged) {
         Write-RemoteStageManifest -Status "completed" -RemoteVersion $remoteVersion -RemoteSha256 $remoteSha256 -InstalledVersion $packageVersion -Detail "遠端更新已完成，值班台已重新啟動。"

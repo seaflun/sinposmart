@@ -10,6 +10,7 @@ RowLayout {
     required property var hostWindow
     property int modeIndex: 0
     signal modeChangeRequested(int index)
+    signal updateHistoryRequested()
 
     Layout.preferredWidth: implicitWidth
     Layout.preferredHeight: Design.appTitleMenuButtonHeight
@@ -238,6 +239,11 @@ RowLayout {
             border.color: Design.border
         }
 
+        CommandMenuItem {
+            objectName: "updateHistoryMenuItem"
+            text: "更新日誌"
+            onTriggered: dutyOperationBar.updateHistoryRequested()
+        }
         CommandMenuItem {
             objectName: "checkForUpdatesMenuItem"
             text: dutyOperationBar.backend.updateController.updateDeferred

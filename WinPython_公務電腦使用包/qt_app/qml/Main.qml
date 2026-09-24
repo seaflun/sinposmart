@@ -256,8 +256,12 @@ ApplicationWindow {
                     modeTabs.currentIndex = 0
             }
             window.syncLegacyWindowGeometry()
-            if (isLoggedIn)
+            if (isLoggedIn) {
                 Qt.callLater(window.positionDutyWindowAtTopLeft)
+                Qt.callLater(function() {
+                    window.updateHistoryDialog.openPendingUpdateNotice()
+                })
+            }
         }
 
         function onCredentialSyncConfirmationRequested() {
@@ -342,6 +346,11 @@ ApplicationWindow {
         anchors.centerIn: parent
         width: Math.min(window.width - 48, 620)
         height: Math.min(window.height - 96, 560)
+    }
+
+    UpdateHistoryDialog {
+        id: updateHistoryDialog
+        updateController: window.backend.updateController
     }
 
     AppleDialog {
@@ -500,6 +509,7 @@ ApplicationWindow {
                 onModeChangeRequested: function(index) {
                     modeTabs.currentIndex = index
                 }
+                onUpdateHistoryRequested: updateHistoryDialog.openHistory()
             }
         }
 
@@ -854,6 +864,8 @@ ApplicationWindow {
     Component.onCompleted: {
         Qt.callLater(function() {
             window.backend.sessionController.restoreSavedAccountSelection()
+            if (window.backend.sessionController.isLoggedIn)
+                window.updateHistoryDialog.openPendingUpdateNotice()
         })
         window.syncLegacyWindowGeometry()
         window.positionInAvailableWorkArea()

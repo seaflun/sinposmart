@@ -165,6 +165,19 @@ def _remote_update_worker_id() -> str:
     )
 
 
+def _default_pending_update_notice_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    root = Path(local_app_data) if local_app_data else Path.home()
+    return root / "SinpoSmart" / "pending_update_notice.json"
+
+
+def _version_order_key(version: str) -> tuple[int, ...] | None:
+    parts = str(version or "").split(".")
+    if len(parts) != 4 or any(not part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
 class UpdateController(UpdateWindowState):
     unreturnedCancellationsReceived = Signal(object)
     stateChanged = Signal()
@@ -181,10 +194,16 @@ class UpdateController(UpdateWindowState):
         remote_update_enabled: bool | None = None,
         stop_guard: Callable[[], str] | None = None,
         read_only_acceptance: bool = False,
+        history_path: Path | None = None,
+        pending_notice_path: Path | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._repository = repository
+        self._history_path = history_path or repository.version_path.with_name("update_history.json")
+        self._pending_notice_path = pending_notice_path or _default_pending_update_notice_path()
+        self._update_history = self._load_update_history()
+        self._pending_update_notice: dict[str, Any] = {"visible": False, "releases": []}
         self._process_launcher = process_launcher
         self._remote_process_launcher = remote_process_launcher
         self._stop_guard = stop_guard
@@ -249,6 +268,112 @@ class UpdateController(UpdateWindowState):
     @Property(str, notify=stateChanged)
     def currentVersion(self) -> str:
         return self._current_version
+
+    @Property("QVariantMap", notify=stateChanged)
+    def updateHistory(self) -> dict[str, Any]:
+        return dict(self._update_history)
+
+    @Property("QVariantMap", notify=stateChanged)
+    def pendingUpdateNotice(self) -> dict[str, Any]:
+        return dict(self._pending_update_notice)
+
+    def _load_update_history(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self._history_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        major_history = value.get("major_history")
+        releases = value.get("releases")
+        return {
+            "history_floor_version": str(value.get("history_floor_version", "")),
+            "major_history": major_history if isinstance(major_history, list) else [],
+            "releases": releases if isinstance(releases, list) else [],
+            "entries": (
+                releases if isinstance(releases, list) else []
+            ) + (
+                major_history if isinstance(major_history, list) else []
+            ),
+        }
+
+    @Slot(result=bool)
+    def showPendingUpdateNotice(self) -> bool:
+        try:
+            marker = json.loads(self._pending_notice_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            marker = {}
+        if not isinstance(marker, dict):
+            marker = {}
+        versions = marker.get("pending_versions")
+        if not isinstance(versions, list):
+            versions = []
+        releases_by_version = {
+            str(release.get("version", "")): release
+            for release in self._update_history["releases"]
+            if isinstance(release, dict)
+        }
+        snapshots = marker.get("pending_releases")
+        snapshots_by_version = {
+            str(release.get("version", "")): release
+            for release in snapshots
+            if isinstance(release, dict)
+        } if isinstance(snapshots, list) else {}
+        pending_releases_by_version = {}
+        for version in versions:
+            version = str(version)
+            release = snapshots_by_version.get(version, releases_by_version.get(version))
+            if release is not None:
+                pending_releases_by_version[version] = release
+        current_key = _version_order_key(self._current_version)
+        if current_key is None:
+            return False
+        last_seen_key = _version_order_key(marker.get("last_seen_version", ""))
+        history_floor_key = _version_order_key(self._update_history["history_floor_version"])
+        cutoff_key = last_seen_key or history_floor_key
+        if cutoff_key is None:
+            current_release = releases_by_version.get(self._current_version)
+            if current_release is not None:
+                pending_releases_by_version[self._current_version] = current_release
+        else:
+            for version, release in releases_by_version.items():
+                release_key = _version_order_key(version)
+                if release_key is not None and cutoff_key < release_key <= current_key:
+                    pending_releases_by_version.setdefault(version, release)
+        pending_releases = sorted(
+            pending_releases_by_version.values(),
+            key=lambda release: _version_order_key(release.get("version", "")) or (),
+        )
+        if not pending_releases:
+            return False
+        self._pending_update_notice = {"visible": True, "releases": pending_releases}
+        self.stateChanged.emit()
+        return True
+
+    @Slot()
+    def dismissPendingUpdateNotice(self) -> None:
+        marker = {
+            "schema_version": 1,
+            "last_seen_version": self._current_version,
+            "pending_versions": [],
+            "pending_releases": [],
+        }
+        temporary_path = self._pending_notice_path.with_suffix(
+            self._pending_notice_path.suffix + ".tmp"
+        )
+        try:
+            self._pending_notice_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(marker, ensure_ascii=False), encoding="utf-8"
+            )
+            temporary_path.replace(self._pending_notice_path)
+        except OSError:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._pending_update_notice = {"visible": False, "releases": []}
+        self.stateChanged.emit()
 
     @Property(str, notify=stateChanged)
     def latestVersion(self) -> str:

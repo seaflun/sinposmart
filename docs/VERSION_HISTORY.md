@@ -4,10 +4,13 @@
 
 維護方式：每次建立新的正式更新包時，在表格最上方新增一列，摘要記錄該版可見變更並連到對應 GitHub Release。不要把未發布、本機設定或暫存檔列入此紀錄。
 
+公務電腦內的「更新日誌」另由 `WinPython_公務電腦使用包/update_history.json` 提供；`major_history` 僅保留主要功能里程碑，`releases` 記錄各版摘要。每次正式發布都要更新該檔並保留既有版本摘要，讓尚未登入的電腦可在後續登入時逐版顯示更新內容；已讀版本比對也會補足舊更新器未寫入提醒標記的首次升級。
+
 ## 正式版本索引
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.09.24.1818` | 2026-09-24 18:18（台北時間） | 新增主要功能更新日誌；成功更新後登入會顯示版本摘要，關閉後才能進入系統。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.24.1818) |
 | `2026.09.23.2132` | 2026-09-23 21:32（台北時間） | 勤務表、車輛保養清點、休息時間、勤務基準表與民力系統完成後保留瀏覽器 10 分鐘並自動關閉；失敗時立即關閉。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.23.2132) |
 | `2026.09.07.2203` | 2026-09-07 22:03（台北時間） | 勤務基準表開頁及月份查詢的網站提示自動確認後繼續，避免彈窗被誤判為瀏覽器中斷。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.07.2203) |
 | `2026.08.27.1655` | 2026-08-27 16:55（台北時間） | 勤務基準表新增消防節假「消」：Google Sheet 標記「消」時，系統也登打「消」。新增完整版本紀錄索引。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.08.27.1655) |
