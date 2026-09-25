@@ -38,6 +38,8 @@ TS_PTS_WRAP = 1 << 33
 TS_DURATION_SAMPLE_BYTES = 2 * 1024 * 1024
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
 CASE_TRANSFER_WORKERS = 2
+TWO_CASE_TRANSFER_WORKERS = 4
+SINGLE_CASE_TRANSFER_WORKERS = 6
 DEFAULT_WORK_LOG_ROOT = Path(
     r"E:\SINPOSMART\WinPython_公務電腦使用包\runtime_outputs\comparison"
 )
@@ -955,6 +957,13 @@ def _transfer_results(
         if result.case is not None:
             case_groups.setdefault(result.case.path, []).append((index, result))
 
+    if len(case_groups) <= 1:
+        case_transfer_workers = SINGLE_CASE_TRANSFER_WORKERS
+    elif len(case_groups) <= 2:
+        case_transfer_workers = TWO_CASE_TRANSFER_WORKERS
+    else:
+        case_transfer_workers = CASE_TRANSFER_WORKERS
+
     if transfer_workers is None:
         worker_count = len(case_groups)
     else:
@@ -970,7 +979,7 @@ def _transfer_results(
 
         if not getattr(args, "apply", False) or len(group) == 1:
             return [transfer_item(item) for item in group]
-        with ThreadPoolExecutor(max_workers=min(CASE_TRANSFER_WORKERS, len(group))) as executor:
+        with ThreadPoolExecutor(max_workers=min(case_transfer_workers, len(group))) as executor:
             return list(executor.map(transfer_item, group))
 
     if not getattr(args, "apply", False) or worker_count == 1 or len(case_groups) == 1:

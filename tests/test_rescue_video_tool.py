@@ -279,6 +279,72 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertEqual(updates, [(4, 10), (8, 10), (10, 10)])
 
+    def test_case_count_selects_case_transfer_lanes(self) -> None:
+        classifier = self._classifier_module()
+        for case_count, lanes_per_case in ((1, 6), (2, 4), (3, 2)):
+            with self.subTest(case_count=case_count):
+                cases = [
+                    classifier.CaseFolder(
+                        path=Path(f"case-{case_index}"),
+                        name=f"case-{case_index}",
+                        vehicle="92",
+                        start=datetime(2026, 8, 15, 8, case_index),
+                    )
+                    for case_index in range(case_count)
+                ]
+                results = [
+                    classifier.Result(
+                        source=Path(f"video-{case_index}-{video_index}.TS"),
+                        source_time=case.start,
+                        adjusted_time=case.start,
+                        case=case,
+                        destination=case.path / "車" / f"video-{video_index}.TS",
+                        status="預計複製",
+                    )
+                    for case_index, case in enumerate(cases)
+                    for video_index in range(lanes_per_case)
+                ]
+                expected_active = case_count * lanes_per_case
+                barrier = threading.Barrier(expected_active)
+                lock = threading.Lock()
+                active_total = 0
+                maximum_total = 0
+                active_by_case: dict[Path, int] = {}
+                maximum_by_case: dict[Path, int] = {}
+
+                def tracked_transfer(result, _args, _callback):
+                    nonlocal active_total, maximum_total
+                    case_path = result.case.path
+                    with lock:
+                        active_total += 1
+                        maximum_total = max(maximum_total, active_total)
+                        active_by_case[case_path] = active_by_case.get(case_path, 0) + 1
+                        maximum_by_case[case_path] = max(
+                            maximum_by_case.get(case_path, 0), active_by_case[case_path]
+                        )
+                    try:
+                        try:
+                            barrier.wait(timeout=2)
+                        except threading.BrokenBarrierError:
+                            pass
+                        return result
+                    finally:
+                        with lock:
+                            active_total -= 1
+                            active_by_case[case_path] -= 1
+
+                with mock.patch.object(classifier, "_transfer_result", side_effect=tracked_transfer):
+                    completed = classifier._transfer_results(
+                        results,
+                        SimpleNamespace(apply=True),
+                        None,
+                        None,
+                    )
+
+                self.assertEqual(completed, results)
+                self.assertEqual(maximum_total, expected_active)
+                self.assertEqual(list(maximum_by_case.values()), [lanes_per_case] * case_count)
+
     def test_work_log_classification_assigns_two_transfer_lanes_to_each_case_folder(self) -> None:
         classifier = self._classifier_module()
         with TemporaryDirectory() as temp_dir:
