@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.09.25.1646` | 2026-09-25 16:46（台北時間） | 修正未返隊暫停手動確認後，最後一筆交接工作成功卻顯示到點待執行；班表重整保留完成狀態，單筆退勤已存在時也正確顯示。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.25.1646) |
 | `2026.09.24.1818` | 2026-09-24 18:18（台北時間） | 新增主要功能更新日誌；成功更新後登入會顯示版本摘要，關閉後才能進入系統。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.24.1818) |
 | `2026.09.23.2132` | 2026-09-23 21:32（台北時間） | 勤務表、車輛保養清點、休息時間、勤務基準表與民力系統完成後保留瀏覽器 10 分鐘並自動關閉；失敗時立即關閉。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.23.2132) |
 | `2026.09.07.2203` | 2026-09-07 22:03（台北時間） | 勤務基準表開頁及月份查詢的網站提示自動確認後繼續，避免彈窗被誤判為瀏覽器中斷。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.09.07.2203) |

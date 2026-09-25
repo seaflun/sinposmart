@@ -17531,6 +17531,20 @@ if return_code != 0 or loaded:
                 request.schedule_data["_unreturned_return_query_start_at"],
                 "2026-08-06T23:50",
             )
+            self.assertTrue(
+                controller.handle_external_return_queue_result(
+                    queue_id,
+                    queued_action,
+                    "skipped_duplicate",
+                    request.schedule_data["_unreturned_return_component_key"],
+                    trigger_type="manual",
+                )
+            )
+            self.assertEqual(queue.active_records(), [])
+            self.assertEqual(controller._comparisons[0]["compare"], "已存在")
+            self.assertEqual(controller._comparisons[0]["group"], "done")
+            self.assertIn(0, controller._executed_indices)
+            self.assertFalse(controller._is_manual_submission_candidate(0))
 
     def test_handoff_external_pause_groups_three_items_and_manual_uses_actual_time(self) -> None:
         from datetime import datetime
@@ -17538,12 +17552,14 @@ if return_code != 0 or loaded:
 
         from PySide6.QtTest import QSignalSpy
 
+        from app_core.schedule_repository import ScheduleRepository
         from app_core.unreturned_return_queue import UnreturnedReturnQueue
         from qt_app.controllers.duty_controller import DutyController
 
         temporary_queue_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_queue_dir.cleanup)
         controller = DutyController(
+            repository=ScheduleRepository(Path(temporary_queue_dir.name)),
             unreturned_return_queue=UnreturnedReturnQueue(Path(temporary_queue_dir.name))
         )
         controller.set_actor_no("10")
@@ -17645,6 +17661,42 @@ if return_code != 0 or loaded:
         work_action = stamped_actions[2]
         self.assertEqual(work_action["fields"]["工作時間"], "18:25")
         self.assertEqual(work_action["fields"]["處理情形"].splitlines()[0], "一、時間:16:00-18:25")
+
+        def task_status(index: int) -> str:
+            return controller.taskModel.data(
+                controller.taskModel.index(index, 0), controller.taskModel.StatusTextRole
+            )
+
+        with (
+            patch("qt_app.controllers.duty_controller.datetime", FixedDateTime),
+            patch("app_core.duty_task_projection.datetime", FixedDateTime),
+        ):
+            for index, request in enumerate(requests):
+                self.assertTrue(
+                    controller.handle_external_return_queue_result(
+                        queue_id,
+                        request.schedule_data["actions"][0],
+                        "submitted",
+                        request.schedule_data["_unreturned_return_component_key"],
+                        trigger_type="manual",
+                    )
+                )
+                self.assertEqual(task_status(index), "已登打")
+                if index < 2:
+                    self.assertEqual(task_status(2), "未返隊暫停")
+
+            self.assertEqual(controller._unreturned_return_queue.active_records(), [])
+            self.assertEqual(controller._due_task_indices, [])
+            self.assertEqual(controller.due_submission_requests("user10", "secret", [0, 1, 2]), [])
+
+            refreshed_schedule = {
+                **controller._schedule_data,
+                "actions": list(reversed(controller._actions)),
+            }
+            controller.replace_schedule_data(refreshed_schedule)
+            self.assertEqual([task_status(i) for i in range(3)], ["已登打"] * 3)
+            self.assertEqual(controller._due_task_indices, [])
+            self.assertFalse(any(controller._is_manual_submission_candidate(i) for i in range(3)))
 
     def test_resolved_handoff_adjusts_following_work_period_start(self) -> None:
         from datetime import datetime

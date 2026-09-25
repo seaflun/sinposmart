@@ -1996,8 +1996,18 @@ class DutyController(QObject):
             completion_key=completion_key,
         )
         action_index = self._queue_component_action_index(queue_id, action, completion_key)
-        if action_index is not None and status in ("submitted", "skipped_duplicate"):
+        if record is not None and action_index is not None and status in ("submitted", "skipped_duplicate"):
+            # Resolving the last component removes the queue before its next refresh.
+            self._executed_indices.add(action_index)
+            self._submitting_indices.discard(action_index)
+            self._retry_after.pop(action_index, None)
             self._task_errors.pop(action_index, None)
+            self._comparisons[action_index] = {
+                "compare": "已登打" if status == "submitted" else "已存在",
+                "group": "done",
+                "matched": [],
+                "submission_trigger": trigger_type,
+            }
         if (
             record is not None
             and status in ("submitted", "skipped_duplicate")
