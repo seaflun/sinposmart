@@ -333,6 +333,8 @@ def find_work_matches(
     is_radio_test = source in ("無線電試話", "無線電測試")
     is_drowning_patrol = source == "防溺車巡"
     reason = fields.get("事由", "")
+    expected_people = {clean(name) for name in names_for(staff, fields.get("服勤人員", [])) if name}
+    people_unresolved = bool(fields.get("服勤人員")) and len(expected_people) != len(set(fields["服勤人員"]))
     matches = []
     for row in rows:
         c = clean(row)
@@ -349,6 +351,22 @@ def find_work_matches(
         if is_radio_test:
             if "無線電" not in c:
                 continue
+        else:
+            if reason and clean(reason) not in row_cells(row):
+                continue
+            if fields.get("服勤人員"):
+                if people_unresolved:
+                    continue
+                # Personnel must occupy a separate cell; overview prose is not identity proof.
+                personnel_cells = []
+                for cell in row.split("|"):
+                    people = {
+                        clean(re.sub(r"^\s*(?:\d+番\s*)?(?:(?:副小隊長|小隊長|分隊長|副中隊長|中隊長|大隊長|隊員)\s*)?", "", part))
+                        for part in re.split(r"[、,，;；\n]+", cell.strip()) if part.strip()
+                    }
+                    personnel_cells.append(people)
+                if expected_people not in personnel_cells:
+                    continue
         if is_drowning_patrol:
             expected_overview_time = re.search(
                 r"一、時間[：:](\d{4})-(\d{4})",

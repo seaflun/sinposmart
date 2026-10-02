@@ -283,6 +283,8 @@ class DailyAutomaticAdmissionTests(unittest.TestCase):
             read_only_acceptance=True, automatic_tools_enabled=True,
         )
         self.addCleanup(self.controller.shutdown)
+        self.controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+        self.controller.dutyController.refresh_live_comparisons = lambda *_args, **_kwargs: False
         self.controller._read_only_acceptance = False
         self.events = patch.object(self.controller, "_send_operational_event")
         self.events.start()
@@ -2212,6 +2214,130 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    def test_work_duplicate_requires_reason_and_exact_personnel(self) -> None:
+        from compare_rehearsal_records import find_work_matches
+
+        staff = {"10": {"name": "測試甲"}, "11": {"name": "測試乙"}}
+        action = {
+            "time": "17:00", "source": "在隊訓練",
+            "fields": {"勤務項目": "在隊訓練", "事由": "車輛清洗保養", "服勤人員": ["10"]},
+        }
+        rows = [
+            "115/10/01 17:00 | 在隊訓練 | 常年訓練 | 測試甲",
+            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試乙",
+            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試甲乙",
+            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試甲、測試乙",
+            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 隊員 測試甲",
+        ]
+        self.assertEqual(find_work_matches(rows, "1151001", staff, action), [rows[-1]])
+
+    def test_due_submission_rechecks_fire_day_after_query_and_before_save(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for kind in ("work_log", "entry_log"):
+            for phase in ("query", "fill"):
+                with self.subTest(kind=kind, phase=phase), tempfile.TemporaryDirectory() as temp_dir:
+                    clock = [datetime(2026, 10, 2, 7, 59, 59)]
+                    saved = []
+                    queries = []
+
+                    def query(*_args, **_kwargs):
+                        queries.append(True)
+                        if phase == "query":
+                            clock[0] = datetime(2026, 10, 2, 8, 0, 15)
+                        if len(queries) == 1:
+                            return []
+                        return [
+                            "115/10/02 07:55 | 巡邏"
+                            if kind == "work_log"
+                            else "115/10/02 07:55 | 勤務 | 測試員 | 入 | 到勤"
+                        ]
+
+                    def fill(*_args, save, before_save=None):
+                        clock[0] = datetime(2026, 10, 2, 8, 0, 15)
+                        if before_save is not None:
+                            before_save()
+                        saved.append(save)
+                        return {"ok": True}
+
+                    automation = SimpleNamespace(
+                        WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                        build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                        query_visible_table=query, fill_work_log_form_for_test=fill,
+                        fill_entry_log_form_for_test=fill, quit_driver=lambda *_args: None,
+                    )
+                    data = {
+                        "target_date": "1151001",
+                        "today": {"staff": {"10": {"name": "測試員"}}},
+                        "actions": [{
+                            "kind": kind, "time": "07:55", "date_offset": 1, "target": "10",
+                            "fields": {"勤務項目": "巡邏", "出或入": "入", "領用事由及地點": "到勤"},
+                        }],
+                    }
+                    service = DutySubmissionService(
+                        Path(temp_dir), module_loader=lambda: automation, now_factory=lambda: clock[0],
+                        comparison_builder=lambda *_args, **_kwargs: {0: {"group": "todo"}},
+                        sleeper=lambda _seconds: None,
+                    )
+                    result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+                    self.assertEqual(result.status, "skipped_stale_schedule")
+                    self.assertEqual(saved, [])
+                    self.assertEqual(json.loads(result.result_path.read_text(encoding="utf-8"))["stage"], result.status)
+
+    def test_real_form_helpers_stop_before_save_when_guard_rejects(self) -> None:
+        from contextlib import ExitStack
+        from unittest.mock import Mock
+        import duty_rehearsal as automation
+
+        for helper, save_control in (
+            (automation.fill_work_log_form_for_test, "click_save_control"),
+            (automation.fill_entry_log_form_for_test, "click_entry_insert_control"),
+        ):
+            with self.subTest(helper=helper.__name__), ExitStack() as stack:
+                for name in ("ensure_ap", "control_snapshot", "accept_pending_alerts", "set_work_log_reason_field", "set_work_log_content_fields"):
+                    stack.enter_context(patch.object(automation, name, return_value={} if name != "ensure_ap" else False))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={"ok": True}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                save = stack.enter_context(patch.object(automation, save_control))
+                driver = SimpleNamespace(execute_script=lambda script, *_args: True if "return Boolean" in script else {"missing": []})
+                guard = Mock(side_effect=RuntimeError("消防日已切換"))
+                with self.assertRaisesRegex(RuntimeError, "消防日已切換"):
+                    helper(driver, {"time": "07:55", "fields": {}}, {}, "1151001", save=True, before_save=guard)
+                guard.assert_called_once()
+                save.assert_not_called()
+
+    def test_verification_failure_persists_terminal_result(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+        )
+
+        automation = SimpleNamespace(
+            WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+            build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+            query_visible_table=lambda *_args, **_kwargs: [],
+            fill_work_log_form_for_test=lambda *_args, **_kwargs: {"ok": True},
+            quit_driver=lambda *_args: None,
+        )
+        data = {
+            "target_date": "1151001",
+            "actions": [{"kind": "work_log", "time": "12:00", "fields": {"勤務項目": "巡邏"}}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = DutySubmissionService(
+                Path(temp_dir), module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 10, 1, 12), sleeper=lambda _seconds: None,
+                comparison_builder=lambda *_args, **_kwargs: {0: {"group": "todo"}},
+            )
+            with self.assertRaises(DutySubmissionExecutionError) as raised:
+                service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+            saved = json.loads(raised.exception.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "failed")
+        self.assertEqual(saved["updated_at"], "2026-10-01T12:00:00")
+
     def test_returned_off_duty_recovery_ignores_emergency_departure(self) -> None:
         from datetime import datetime
 
@@ -10601,6 +10727,8 @@ class QtShellTests(unittest.TestCase):
         from qt_app.controllers.app_controller import AppController
 
         controller = AppController(read_only_acceptance=True)
+        controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: True
+        controller.dutyController.refresh_live_comparisons = lambda *_args, **_kwargs: False
         try:
             attempt_id = controller._session_state.begin_login()
             controller._session_state.complete_login(
@@ -11944,6 +12072,7 @@ if return_code != 0 or loaded:
 
             self.assertFalse(controller._duty_mode_active)
             self.assertFalse(controller.dutyController._auto_execution_enabled)
+            self.assertFalse(controller._duty_execution_controller._automatic_execution_enabled)
             self.assertEqual(generated_requests, [])
         finally:
             controller.shutdown()
@@ -11975,6 +12104,13 @@ if return_code != 0 or loaded:
             args, kwargs = calls[0]
             self.assertEqual(args[:3], ("user10", "session-secret", "10"))
             self.assertEqual(kwargs["target_roc_date"], business_roc_date())
+            self.assertFalse(controller._duty_execution_controller._automatic_execution_enabled)
+            controller._start_operational_sync = lambda *_args, **_kwargs: None
+            controller._live_schedule_captured({
+                "target_date": business_roc_date(), "today": {"staff": {}},
+                "_authenticated_actor": {"actor_no": "10"},
+            })
+            self.assertTrue(controller._duty_execution_controller._automatic_execution_enabled)
         finally:
             controller.shutdown()
 
@@ -12776,6 +12912,85 @@ if return_code != 0 or loaded:
             defaults_date="2026-09-04",
             defaults_vehicle="93",
         )
+
+    def test_audit_pause_releases_cancelled_handoff_preflight_group(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.duty_task_projection import action_completion_key
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        duty = controller.dutyController
+        action = {"kind": "entry_log", "time": "08:00", "actor": "10", "target": "10", "source": "值班交接", "fields": {"出或入": "值班"}}
+        duty.set_session_context(1, "user10")
+        duty.set_actor_no("10")
+        duty.replace_schedule_data({"target_date": "1151001", "actions": [action]})
+        key = action_completion_key(action)
+        duty._handoff_preflight_groups["audit-preflight"] = {
+            "indices": (0,), "action_keys": (key,), "actions": [action],
+            "pending_keys": {key}, "paused": False, "queue_id": "",
+        }
+        duty.mark_submission_enqueued(0)
+        request = DutySubmissionRequest("user10", "secret", 0, {
+            "target_date": "1151001", "actions": [{**action, "kind": "handoff_preflight"}],
+            "_handoff_preflight_group_id": "audit-preflight", "_handoff_preflight_component_key": key,
+        }, session_generation=1, session_actor_no="10", action_key=key)
+        try:
+            controller.setDutyModeActive(False)
+            controller._submission_cancelled(request, "自動執行已暫停", "automation_paused")
+            self.assertNotIn("audit-preflight", duty._handoff_preflight_groups)
+            self.assertNotIn(0, duty._submitting_indices)
+        finally:
+            controller.shutdown()
+
+    def test_audit_pause_cancels_queued_automatic_jobs_but_preserves_manual_and_active(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from qt_app.controllers.duty_execution_controller import DutyExecutionController
+
+        for kind in ("entry_log", "work_log"):
+            with self.subTest(kind=kind):
+                started = threading.Event()
+                release = threading.Event()
+                executed = []
+                cancelled = []
+
+                class FakeService:
+                    def validate(self, request):
+                        return request
+
+                    def execute(self, request, **_kwargs):
+                        executed.append(request.action_index)
+                        if request.action_index == 0:
+                            started.set()
+                            release.wait(3)
+                        return DutySubmissionResult(request.action_index, "submitted", "完成", Path("result.json"), {})
+
+                data = {"target_date": "1151001", "actions": [
+                    {"kind": kind, "time": f"17:0{i}", "actor": "10"} for i in range(4)
+                ]}
+                controller = DutyExecutionController(FakeService())
+                controller.submissionCancelled.connect(lambda request, *_args: cancelled.append(request.action_index))
+                try:
+                    self.assertTrue(controller.enqueue(DutySubmissionRequest("user", "secret", 0, data, trigger_type="due")))
+                    self.assertTrue(started.wait(2))
+                    QTest.qWait(10)
+                    self.assertTrue(controller.enqueue(DutySubmissionRequest("user", "secret", 1, data, trigger_type="due")))
+                    self.assertTrue(controller.enqueue(DutySubmissionRequest("user", "secret", 2, data, trigger_type="manual")))
+                    controller.set_automatic_execution_enabled(False)
+                    self.assertFalse(controller.enqueue(DutySubmissionRequest("user", "secret", 3, data, trigger_type="recovery")))
+                    self.assertFalse(controller.enqueue_background(DutySubmissionRequest("user", "secret", 3, data, trigger_type="recovery", background=True)))
+                    # Resuming must not revive the old queued due job.
+                    controller.set_automatic_execution_enabled(True)
+                    release.set()
+                    for _ in range(80):
+                        QTest.qWait(10)
+                        if not controller.isBusy:
+                            break
+                    self.assertEqual(executed, [0, 2])
+                    self.assertEqual(cancelled, [1])
+                finally:
+                    release.set()
+                    controller.shutdown()
 
     def test_duty_execution_controller_runs_single_entry_lane_and_work_lane_and_deduplicates_queue(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
@@ -15360,7 +15575,8 @@ if return_code != 0 or loaded:
 
             controller._check_background_manual_chains(RealDateTime(2026, 8, 9, 10, 0))
             for _ in range(100):
-                if not controller._background_manual_workers:
+                if (not controller._background_manual_workers
+                        and not controller.dutyExecutionController.hasPendingSubmissions):
                     break
                 QTest.qWait(10)
 
@@ -16193,6 +16409,38 @@ if return_code != 0 or loaded:
         self.assertEqual(operational_sync.events[0][1]["trigger_type"], "schedule")
         self.assertEqual(operational_sync.events[0][1]["snapshot"]["error_code"], "login_failed")
         self.assertEqual(operational_sync.events[1][1]["trigger_type"], "login")
+
+    def test_tool_terminal_events_preserve_start_identity_after_logout(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            events = []
+            controller._send_operational_event = lambda kind, **fields: events.append((kind, fields))
+            try:
+                for terminal in ("completed", "failed"):
+                    attempt = controller._session_state.begin_login()
+                    controller._session_state.complete_login(attempt, LoginSession("10", "test-user", "secret", verified=True, actor_name="測試甲"))
+                    controller._tool_run_started("duty_sheet", "勤務表登打")
+                    controller._session_state.clear_session()
+                    if terminal == "completed":
+                        controller._tool_run_finished("duty_sheet", "勤務表登打", "完成", notify=False)
+                    else:
+                        controller._tool_run_failed("duty_sheet", "勤務表登打", "失敗", notify=False)
+                for start, finish in (events[:2], events[2:]):
+                    self.assertTrue(start[1]["snapshot"].get("run_id"))
+                    self.assertEqual(start[1]["snapshot"]["run_id"], finish[1]["snapshot"]["run_id"])
+                    self.assertEqual(finish[1]["actor_no"], "10")
+                    self.assertEqual(finish[1]["user_id"], "test-user")
+                self.assertNotEqual(events[0][1]["snapshot"]["run_id"], events[2][1]["snapshot"]["run_id"])
+            finally:
+                controller.shutdown()
 
     def test_app_controller_preserves_legacy_tool_failure_event_contract(self) -> None:
         from app_core.credential_repository import CredentialRepository
@@ -21208,6 +21456,9 @@ if return_code != 0 or loaded:
             controller.workLogSettingsController.settingsSaved.disconnect(
                 controller._refresh_after_settings_save
             )
+            # This QML fixture must never create a real Selenium/login worker.
+            controller.dutyController.refresh_live_schedule = lambda *_args, **_kwargs: False
+            controller.dutyController.refresh_live_comparisons = lambda *_args, **_kwargs: False
             attempt_id = controller._session_state.begin_login()
             controller._session_state.complete_login(
                 attempt_id,

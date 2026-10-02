@@ -7,6 +7,7 @@ import importlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta
+from inspect import signature
 from pathlib import Path
 from time import sleep
 from types import ModuleType
@@ -28,6 +29,10 @@ from compare_rehearsal_records import (
 
 class DutySubmissionValidationError(ValueError):
     """A safe request-validation message for Qt controllers."""
+
+
+class _StaleDutyScheduleError(RuntimeError):
+    """Stop a due request before its form can be saved."""
 
 
 class DutySubmissionExecutionError(RuntimeError):
@@ -175,14 +180,7 @@ class DutySubmissionService:
         action_date = action_target_roc_date(action, base_target_date)
         result_path = self._create_result_path(request, action)
         if self.is_stale_due_request(request):
-            return self._finish(
-                request,
-                action,
-                result_path,
-                "skipped_stale_schedule",
-                "消防日已切換，已略過前一消防日的自動登打。",
-                {"group": "stale", "matched": []},
-            )
+            return self._finish_stale_request(request, action, result_path)
         automation = None
         driver = None
         try:
@@ -345,22 +343,20 @@ class DutySubmissionService:
 
             if status_callback:
                 status_callback("正在填寫勤務系統表單…")
-            if action.get("kind") == "entry_log":
-                form_result = automation.fill_entry_log_form_for_test(
-                    driver,
-                    action,
-                    staff,
-                    action_date,
-                    save=request.save,
-                )
-            else:
-                form_result = automation.fill_work_log_form_for_test(
-                    driver,
-                    action,
-                    staff,
-                    action_date,
-                    save=request.save,
-                )
+            def before_save() -> None:
+                if self.is_stale_due_request(request):
+                    raise _StaleDutyScheduleError()
+
+            before_save()
+            fill_form = (
+                automation.fill_entry_log_form_for_test
+                if action.get("kind") == "entry_log"
+                else automation.fill_work_log_form_for_test
+            )
+            fill_kwargs = {"save": request.save}
+            if "before_save" in signature(fill_form).parameters:
+                fill_kwargs["before_save"] = before_save
+            form_result = fill_form(driver, action, staff, action_date, **fill_kwargs)
             if not request.save:
                 return self._finish(
                     request,
@@ -437,11 +433,12 @@ class DutySubmissionService:
                     reconciled,
                     time_order_warnings=time_order_warnings,
                 )
+        except _StaleDutyScheduleError:
+            return self._finish_stale_request(request, action, result_path)
         except DutySubmissionValidationError:
             raise
         except DutySubmissionExecutionError as exc:
-            if not result_path.is_file():
-                self._write_failure(request, action, result_path)
+            self._write_failure(request, action, result_path)
             exc.result_path = result_path
             raise
         except Exception as exc:
@@ -454,6 +451,18 @@ class DutySubmissionService:
                     automation.quit_driver(driver)
                 except Exception:
                     pass
+
+    def _finish_stale_request(
+        self,
+        request: DutySubmissionRequest,
+        action: Mapping[str, Any],
+        result_path: Path,
+    ) -> DutySubmissionResult:
+        return self._finish(
+            request, action, result_path, "skipped_stale_schedule",
+            "消防日已切換，已略過前一消防日的自動登打。",
+            {"group": "stale", "matched": []},
+        )
 
     def is_stale_due_request(self, request: DutySubmissionRequest) -> bool:
         request = self.validate(request)

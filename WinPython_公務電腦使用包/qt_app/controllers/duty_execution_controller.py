@@ -75,6 +75,7 @@ class DutyExecutionController(QObject):
         self._request_id = 0
         self._session_generation = 0
         self._session_closing = False
+        self._automatic_execution_enabled = True
         self._status_text = "勤務登打待命中"
         self._idle_cleanup_timer = QTimer(self)
         self._idle_cleanup_timer.setInterval(60_000)
@@ -124,6 +125,8 @@ class DutyExecutionController(QObject):
         return self._enqueue(request, allow_background=True)
 
     def _enqueue(self, request: DutySubmissionRequest, *, allow_background: bool) -> bool:
+        if not self._automatic_execution_enabled and request.trigger_type != "manual":
+            return False
         if not allow_background and (
             self._session_closing or not self._request_matches_current_session(request)
         ):
@@ -179,6 +182,12 @@ class DutyExecutionController(QObject):
             self._status_text = f"準備登打，佇列尚有 {self.queuedCount} 項。"
             self.stateChanged.emit()
         return True
+
+    def set_automatic_execution_enabled(self, enabled: bool) -> None:
+        self._automatic_execution_enabled = bool(enabled)
+        for worker in (self._entry_worker, self._work_worker):
+            if worker is not None:
+                worker.set_automatic_execution_enabled(enabled)
 
     def prewarm_entry_browser(self, request: DutySubmissionRequest) -> bool:
         """Prepare the persistent entry browser without adding a duty action."""
@@ -267,6 +276,7 @@ class DutyExecutionController(QObject):
             return None if self._entry_stopping else self._entry_worker
 
         worker = DutyEntryQueueWorker(self._service, lane_label="出入")
+        worker.set_automatic_execution_enabled(self._automatic_execution_enabled)
         thread = _EntryWorkerThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -289,6 +299,7 @@ class DutyExecutionController(QObject):
             return None if self._work_stopping else self._work_worker
 
         worker = DutyEntryQueueWorker(self._service, lane_label="工作")
+        worker.set_automatic_execution_enabled(self._automatic_execution_enabled)
         thread = _EntryWorkerThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -410,7 +421,7 @@ class DutyExecutionController(QObject):
         error_code: str,
     ) -> None:
         request = self._requests.get(request_id)
-        if error_code == "session_ended":
+        if error_code in {"session_ended", "automation_paused"}:
             if request is not None:
                 self.submissionCancelled.emit(request, message, error_code)
             return

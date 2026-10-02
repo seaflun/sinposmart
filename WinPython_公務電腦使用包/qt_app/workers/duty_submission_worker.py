@@ -119,6 +119,10 @@ class DutyEntryQueueWorker(QObject):
         self._sequence = count()
         self._sequence_lock = Lock()
         self._stop_requested = Event()
+        self._automatic_execution_lock = Lock()
+        self._automatic_execution_enabled = True
+        self._pending_automatic_request_ids: set[int] = set()
+        self._paused_request_ids: set[int] = set()
         self._cancelled_request_ids: set[int] = set()
         self._cancelled_request_ids_lock = Lock()
         self._browser_session: DutySubmissionBrowserSession | None = None
@@ -131,8 +135,21 @@ class DutyEntryQueueWorker(QObject):
         priority = self._priority_for_request(request)
         with self._sequence_lock:
             sequence = next(self._sequence)
-        self._queue.put((priority, sequence, request_id, request, False))
+        with self._automatic_execution_lock:
+            if request.trigger_type != "manual":
+                if not self._automatic_execution_enabled:
+                    return False
+                self._pending_automatic_request_ids.add(request_id)
+            self._queue.put((priority, sequence, request_id, request, False))
         return True
+
+    def set_automatic_execution_enabled(self, enabled: bool) -> None:
+        """Cancel unstarted automatic jobs permanently, retaining active/manual work."""
+
+        with self._automatic_execution_lock:
+            self._automatic_execution_enabled = bool(enabled)
+            if not enabled:
+                self._paused_request_ids.update(self._pending_automatic_request_ids)
 
     def prewarm_browser_session(
         self,
@@ -231,6 +248,15 @@ class DutyEntryQueueWorker(QObject):
                     continue
                 if self._stop_requested.is_set():
                     self._emit_request_cancelled(request_id, request)
+                    continue
+                with self._automatic_execution_lock:
+                    self._pending_automatic_request_ids.discard(request_id)
+                    paused = request_id in self._paused_request_ids or (
+                        request.trigger_type != "manual" and not self._automatic_execution_enabled
+                    )
+                    self._paused_request_ids.discard(request_id)
+                if paused:
+                    self._emit_request_cancelled(request_id, request, "automation_paused")
                     continue
                 self.requestStarted.emit(request_id, request.action_index)
                 try:
@@ -409,12 +435,17 @@ class DutyEntryQueueWorker(QObject):
         self,
         request_id: int,
         request: DutySubmissionRequest,
+        error_code: str = "session_ended",
     ) -> None:
+        with self._automatic_execution_lock:
+            self._pending_automatic_request_ids.discard(request_id)
+            self._paused_request_ids.discard(request_id)
         self.requestCancelled.emit(
             request_id,
             request.action_index,
-            f"{self._lane_label}登打因登入階段結束而取消。",
-            "session_ended",
+            f"{self._lane_label}登打因自動執行暫停而取消。" if error_code == "automation_paused"
+            else f"{self._lane_label}登打因登入階段結束而取消。",
+            error_code,
         )
         self.requestFinished.emit(request_id)
 

@@ -996,6 +996,7 @@ def fill_work_log_form_for_test(
     staff: dict[str, dict[str, str]],
     target_roc_date: str,
     save: bool = False,
+    before_save: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Fill the work-log form. Save only when explicitly requested."""
 
@@ -1117,6 +1118,8 @@ def fill_work_log_form_for_test(
     fill_result["content"] = content_result
 
     people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
+    if save and before_save is not None:
+        before_save()
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}
     if save:
         time.sleep(2)
@@ -1140,6 +1143,7 @@ def fill_entry_log_form_for_test(
     staff: dict[str, dict[str, str]],
     target_roc_date: str,
     save: bool = False,
+    before_save: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Fill the entry-log form. Save only when explicitly requested."""
 
@@ -1457,6 +1461,8 @@ def fill_entry_log_form_for_test(
     )
     time.sleep(1)
 
+    if save and before_save is not None:
+        before_save()
     save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}
     if save:
         time.sleep(2)

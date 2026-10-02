@@ -146,6 +146,7 @@ class AppController(QObject):
         self._automatic_verified_context: tuple | None = None
         self._automatic_prepare_id = 0
         self._automatic_prepare_workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
+        self._tool_run_actors: dict[str, dict[str, str]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
@@ -1167,8 +1168,7 @@ class AppController(QObject):
 
     @Slot()
     def openAuditMode(self) -> None:
-        self._duty_controller.disable_auto_execution()
-        self._duty_mode_active = False
+        self.setDutyModeActive(False)
         self._duty_controller.setAuditStatusFilter("需處理")
         self._duty_controller.setAuditKindFilter("全部")
         self.refreshAuditDate(self._duty_controller.targetDateText or business_roc_date())
@@ -1474,6 +1474,7 @@ class AppController(QObject):
         self._duty_mode_active = bool(active)
         if not self._duty_mode_active:
             self._duty_controller.disable_auto_execution()
+            self._duty_execution_controller.set_automatic_execution_enabled(False)
 
     @Slot(object)
     def _cached_schedule_loaded(self, schedule_data: dict) -> None:
@@ -1508,6 +1509,7 @@ class AppController(QObject):
         session = self._session_state.session
         if str(schedule_data.get("target_date") or "") != business_roc_date():
             self._duty_controller.disable_auto_execution()
+            self._duty_execution_controller.set_automatic_execution_enabled(False)
             return
         resolved_actor_no = ""
         actor_identity_unresolved = False
@@ -1564,6 +1566,11 @@ class AppController(QObject):
         if self._read_only_acceptance:
             QTimer.singleShot(0, self._duty_controller.disable_auto_execution)
             return
+        current_session = self._session_state.session
+        self._duty_execution_controller.set_automatic_execution_enabled(bool(
+            self._duty_mode_active and current_session and current_session.verified
+            and current_session.actor_no and not actor_identity_unresolved
+        ))
         if resolved_actor_no and actor_was_unresolved:
             self._send_operational_event("login", status="ok", trigger_type="login")
         if str(schedule_data.get("target_date") or "") == business_roc_date():
@@ -2150,7 +2157,11 @@ class AppController(QObject):
         if queue_id:
             self._duty_controller.release_external_return_recovery(queue_id)
         if self._duty_controller.is_handoff_preflight_request(request):
+            if error_code == "automation_paused":
+                self._duty_controller.handle_handoff_preflight_failure(request, message, error_code)
             return
+        if error_code == "automation_paused" and self._duty_controller.request_matches_current_session(request):
+            self._duty_controller.handle_submission_request_result(request, "cancelled", message, "")
         if not self._should_send_operational_submission_event(request, status="cancelled"):
             return
         action = self._submission_action(request)
@@ -2368,6 +2379,11 @@ class AppController(QObject):
         self._active_tool_runs[tool_name] = (tool_label, mode, run_id)
         self._shutdown_terminal_tool_runs.discard(tool_name)
         session = self._session_state.session
+        self._tool_run_actors[tool_name] = {
+            "actor_no": str(session.actor_no or "") if session else self._session_controller.actorNo,
+            "user_id": str(session.user_id or "") if session else self._session_controller.userId,
+            "display_name": self._session_controller.displayName or (str(session.actor_name or "") if session else ""),
+        }
         actor_no = self._session_controller.actorNo
         actor_name = str(session.actor_name or "").strip() if session is not None else ""
         operator = (
@@ -2398,6 +2414,7 @@ class AppController(QObject):
             status="started",
             trigger_type="tool_start",
             snapshot=snapshot,
+            **self._tool_run_actors[tool_name],
         )
 
     def _tool_run_finished(
@@ -2415,6 +2432,7 @@ class AppController(QObject):
         if tool_name in self._shutdown_terminal_tool_runs:
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
+        run_actor = self._tool_run_actors.pop(tool_name, {})
         self._tool_controller.record_finished(tool_name, "completed", message)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
@@ -2429,6 +2447,7 @@ class AppController(QObject):
             trigger_type="tool_finish",
             content=message,
             snapshot=snapshot,
+            **run_actor,
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
@@ -2449,6 +2468,7 @@ class AppController(QObject):
         if tool_name in self._shutdown_terminal_tool_runs and not force:
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
+        run_actor = self._tool_run_actors.pop(tool_name, {})
         self._tool_controller.record_finished(tool_name, "failed", message)
         self._finish_automatic_tool(tool_name, False)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
@@ -2469,6 +2489,7 @@ class AppController(QObject):
             trigger_type="tool_finish",
             error=message,
             snapshot=snapshot,
+            **run_actor,
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
