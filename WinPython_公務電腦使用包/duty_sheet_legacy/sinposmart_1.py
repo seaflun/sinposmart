@@ -1246,13 +1246,16 @@ def ensure_existing_duty_delete(driver):
     )
 
 
-def wait_for_duty_result_grid(driver, wait):
+def wait_for_duty_result_grid(driver, wait, *, expected_columns=1):
     log_status("⏳ 等待勤務設定後的表格載入...")
     try:
-        wait.until(lambda candidate: super_js_execute(candidate, "_pln_8_1", "exists"))
+        wait.until(lambda candidate: all(
+            super_js_execute(candidate, f"_pln_8_{index}", "exists")
+            for index in range(1, expected_columns + 1)
+        ))
     except TimeoutException as error:
         raise RuntimeError(
-            "勤務基準表格逾時，尚未開始填寫或儲存。"
+            f"勤務基準表格逾時或欄位不完整（預期 {expected_columns} 欄），尚未開始填寫或儲存。"
         ) from error
     return True
 
@@ -1565,8 +1568,12 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
                 # 給小視窗一點時間載入，避免被系統清空
                 time.sleep(1.5)
 
+                item_inputs = {
+                    i: wait.until(EC.presence_of_element_located((By.ID, f"_txtNAME{i}")))
+                    for i in range(2, 9)
+                }
                 for i in range(2, 8):
-                    inp = wait.until(EC.presence_of_element_located((By.ID, f"_txtNAME{i}")))
+                    inp = item_inputs[i]
                     inp.clear()
                     if (i-2) < len(out_duty_names):
                         raw_name = out_duty_names[i-2]
@@ -1574,6 +1581,9 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
                         if task_name != str(raw_name or ""):
                             log_status(f"外勤項目超過 12 個中文字限制，已截短：{task_name}")
                         inp.send_keys(task_name)
+
+                item_inputs[8].clear()
+                item_inputs[8].send_keys("救護")
 
                 time.sleep(0.5)
                 driver.find_element(By.ID, "_btnSave").click()
@@ -1844,6 +1854,8 @@ def start_automation(
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
     report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
+    if num_out > 6:
+        preflight_issues.append(f"{sheet.title}：外勤項目超過 6 項，無法對應勤務設定第 2–7 欄，已停止登打。")
     if not daily_standby_numbers:
         preflight_issues.append(f"{sheet.title}：找不到第 22 列「備勤」欄位人員，無法比對勤務番號維護休假別。")
     if preflight_issues:
@@ -1944,6 +1956,7 @@ def start_automation(
             wait_for_duty_result_grid(
                 driver,
                 WebDriverWait(driver, 60, poll_frequency=0.5),
+                expected_columns=web_idx["休息"],
             )
             
             log_status("🧠 勤務基準表計算中...")

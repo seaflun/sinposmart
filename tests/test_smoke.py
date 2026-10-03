@@ -3114,6 +3114,103 @@ try {
 
         driver.find_element.assert_not_called()
 
+    def test_external_popup_sets_eighth_rescue_item_and_clears_unused_fields(self) -> None:
+        module = legacy_duty_sheet_module()
+        for names in (["勤務一", "勤務二", "勤務三", "勤務四", "勤務五", "勤務六"], ["勤務一"]):
+            with self.subTest(items=len(names)):
+                driver = mock.Mock()
+                driver.window_handles = ["main", "popup"]
+                fields = {f"_txtNAME{i}": mock.Mock() for i in range(2, 9)}
+                def find_element(_by, field_id):
+                    if field_id == "_btnSave":
+                        return mock.Mock()
+                    return fields[field_id]
+                driver.find_element.side_effect = find_element
+                wait = mock.Mock()
+                wait.until.side_effect = lambda predicate: predicate(driver)
+                with mock.patch.object(module, "save_duty_number_popup"), mock.patch.object(
+                    module, "step_prepare_content", return_value=True
+                ), mock.patch.object(module, "click_duty_external_setup_button_when_ready"), mock.patch.object(
+                    module, "wait_for_popup_close_and_return_to_main"
+                ), mock.patch.object(module, "accept_pending_alerts"), mock.patch.object(module.time, "sleep"):
+                    module.step_config_popups(driver, wait, names, "2", "main")
+                for index, name in enumerate(names, start=2):
+                    fields[f"_txtNAME{index}"].clear.assert_called_once()
+                    fields[f"_txtNAME{index}"].send_keys.assert_called_once_with(name)
+                for index in range(2 + len(names), 8):
+                    fields[f"_txtNAME{index}"].clear.assert_called_once()
+                    fields[f"_txtNAME{index}"].send_keys.assert_not_called()
+                fields["_txtNAME8"].clear.assert_called_once()
+                fields["_txtNAME8"].send_keys.assert_called_once_with("救護")
+
+    def test_external_popup_missing_eighth_field_stops_before_any_write(self) -> None:
+        from selenium.common.exceptions import NoSuchElementException
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.window_handles = ["main", "popup"]
+        fields = {f"_txtNAME{i}": mock.Mock() for i in range(2, 8)}
+        def find_element(_by, field_id):
+            if field_id not in fields:
+                raise NoSuchElementException("設定勤務項目缺少第八欄")
+            return fields[field_id]
+        driver.find_element.side_effect = find_element
+        wait = mock.Mock()
+        wait.until.side_effect = lambda predicate: predicate(driver)
+        with mock.patch.object(module, "save_duty_number_popup"), mock.patch.object(
+            module, "step_prepare_content", return_value=True
+        ), mock.patch.object(module, "click_duty_external_setup_button_when_ready"), mock.patch.object(
+            module, "wait_for_popup_close_and_return_to_main"
+        ), mock.patch.object(module, "accept_pending_alerts"), mock.patch.object(module.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "外勤設定儲存失敗"):
+                module.step_config_popups(driver, wait, ["勤務一"] * 6, "2", "main")
+        for field in fields.values():
+            field.clear.assert_not_called()
+            field.send_keys.assert_not_called()
+
+    def test_duty_sheet_excess_external_items_stop_before_website_changes(self) -> None:
+        import openpyxl
+        module = legacy_duty_sheet_module()
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "3號"
+        sheet.cell(5, 3, "值班")
+        for column in range(4, 11):
+            sheet.cell(5, column, f"外勤{column - 3}")
+        for column, label in ((11, "休息"), (12, "備勤緊急救護"), (14, "備勤救災"), (16, "指揮官")):
+            sheet.cell(5, column, label)
+        sheet.cell(10, 16, "2")
+        error = mock.Mock()
+        with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+            module, "trainee_numbers_from_workbook", return_value=set()
+        ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["2"]), mock.patch.object(
+            module, "validate_daily_sheet_assignments", return_value=[]
+        ), mock.patch.object(module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")) as build_driver, mock.patch.object(
+            module, "capture_duty_sheet_images", return_value=[]
+        ):
+            result = module.start_automation("test-user", "test-password", "1151003", "test.xlsm", {},
+                error_callback=error, show_dialogs=False)
+        self.assertFalse(result)
+        self.assertIn("外勤項目超過 6 項", error.call_args.args[0])
+        build_driver.assert_not_called()
+
+    def test_duty_result_grid_missing_rescue_column_is_rejected(self) -> None:
+        from selenium.common.exceptions import TimeoutException
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        class WaitOnce:
+            def until(self, predicate):
+                if not predicate(driver):
+                    raise TimeoutException("勤務表少一欄")
+                return True
+        with mock.patch.object(module, "super_js_execute", side_effect=lambda _driver, element_id, action:
+            element_id != "_pln_8_8"):
+            with self.assertRaisesRegex(RuntimeError, "欄位不完整"):
+                module.wait_for_duty_result_grid(driver, WaitOnce(), expected_columns=10)
+        with mock.patch.object(module, "super_js_execute", return_value=True) as exists:
+            self.assertTrue(module.wait_for_duty_result_grid(driver, WaitOnce(), expected_columns=10))
+            self.assertEqual([call.args[1] for call in exists.call_args_list],
+                [f"_pln_8_{index}" for index in range(1, 11)])
+
     def test_visible_driver_is_positioned_at_top_right_without_explicit_position(self) -> None:
         module = duty_rehearsal_module()
         driver = mock.Mock()
