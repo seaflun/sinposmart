@@ -3796,9 +3796,11 @@ class DutyController(QObject):
         if not self._auto_execution_enabled or self._session_closing or not self._actor_no:
             return False
         current = datetime.now()
+        auto_return_indices = self._auto_return_indices()
         return any(
             str(action.get("actor") or "") == self._actor_no
             and is_fire_day_closing_action(action, self._target_date_text, current)
+            and (is_auto_duty_action(action) or index in auto_return_indices)
             and index not in self._executed_indices
             and index not in self._blocked_indices
             and index not in self._external_return_queue_ids_by_action_index

@@ -125,6 +125,14 @@ def is_fire_day_closing_action(action: Mapping[str, Any], target_roc_date: str, 
     if action.get("source") == "值班交接":
         return action.get("kind") in ("entry_log", "work_log", "handoff_preflight")
     fields = action.get("fields", {})
+    if not isinstance(fields, Mapping):
+        return False
+    if is_external_or_rest_return(action):
+        return fields.get("出或入") == "入" and fields.get("領用事由及地點") in (
+            "返隊", "休息返隊", "防溺車巡返隊"
+        )
+    if action.get("kind") == "work_log" and action.get("source") == "防溺車巡":
+        return fields.get("勤務項目") == "車巡" and fields.get("事由") == "防溺"
     return bool(
         action.get("kind") == "entry_log" and isinstance(fields, Mapping)
         and fields.get("出或入") in ("出", "值退")

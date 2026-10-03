@@ -147,6 +147,7 @@ class AppController(QObject):
         self._automatic_prepare_id = 0
         self._automatic_prepare_workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
         self._tool_run_actors: dict[str, dict[str, str]] = {}
+        self._tool_run_contexts: dict[str, dict[str, str]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
@@ -2403,8 +2404,27 @@ class AppController(QObject):
             user_id=self._session_controller.userId,
         )
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        run_context = {}
+        if tool_name == "duty_sheet":
+            automatic_record = getattr(self, "_automatic_tool_record", None)
+            automatic = bool(automatic_record and automatic_record["tool_id"] == tool_name)
+            if automatic and not self._duty_sheet_controller.isRunning:
+                prepared = getattr(self, "_automatic_prepared_request", None)
+                workbook_path = prepared.workbook_path if prepared else ""
+                target_date = prepared.target_date if prepared else automatic_record["target_date"]
+            else:
+                workbook_path = self._duty_sheet_controller.workbookPath
+                target_date = self._duty_sheet_controller.targetDate
+            run_context = {
+                "workbook_name": Path(workbook_path).name if workbook_path else "",
+                "target_date": str(target_date or ""),
+                "execution_mode": "automatic" if automatic else "manual",
+            }
+        self._tool_run_contexts[tool_name] = run_context
+        snapshot.update(run_context)
         if self._automatic_tool_record and self._automatic_tool_record["tool_id"] == tool_name:
-            snapshot.update(automatic=True, target_date=self._automatic_tool_record["target_date"])
+            snapshot["automatic"] = True
+            snapshot.setdefault("target_date", self._automatic_tool_record["target_date"])
         if run_id:
             snapshot["run_id"] = run_id
         if mode:
@@ -2433,9 +2453,11 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
+        run_context = self._tool_run_contexts.pop(tool_name, {})
         self._tool_controller.record_finished(tool_name, "completed", message)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
         if run_id:
             snapshot["run_id"] = run_id
@@ -2469,9 +2491,18 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
+        run_context = self._tool_run_contexts.pop(tool_name, {})
+        if tool_name == "duty_sheet" and (run_context.get("workbook_name") or run_context.get("target_date")):
+            execution_mode = "自動" if run_context.get("execution_mode") == "automatic" else "手動"
+            message = (
+                f"Excel：{run_context.get('workbook_name') or '尚未選定'}\n"
+                f"登打日期：{run_context.get('target_date') or '未知'}\n"
+                f"執行方式：{execution_mode}\n\n{message}"
+            )
         self._tool_controller.record_finished(tool_name, "failed", message)
         self._finish_automatic_tool(tool_name, False)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
+        snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
         if run_id:
             snapshot["run_id"] = run_id

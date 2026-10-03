@@ -2229,6 +2229,124 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    def test_work_duplicate_uses_reason_and_personnel_columns_only(self) -> None:
+        from compare_rehearsal_records import find_work_matches, flatten_rows
+
+        staff = {"10": {"name": "測試甲"}, "11": {"name": "測試乙"}}
+        action = {"kind": "work_log", "time": "17:00", "source": "在隊訓練",
+                  "fields": {"勤務項目": "在隊訓練", "事由": "車輛清洗保養", "服勤人員": ["10"]}}
+        good = ["1151003\n17:00", "第三大隊", "新坡分隊", "在隊訓練", "車輛清洗保養",
+                "工作概述", "處理情形", "測試甲", "1", "0", "無", "測試乙", ""]
+        wrong_people = [*good]; wrong_people[7] = "測試乙"; wrong_people[11] = "測試甲"
+        wrong_reason = [*good]; wrong_reason[4] = "裝備器材保養"; wrong_reason[5] = "車輛清洗保養"
+        wrong_item = [*good]; wrong_item[3] = "宣導教育"; wrong_item[5] = "在隊訓練"
+        rows = flatten_rows([wrong_people, wrong_reason, wrong_item, good], "1151003")
+        self.assertEqual(find_work_matches(rows, "1151003", staff, action), [rows[-1]])
+        unresolved = {**action, "fields": {**action["fields"], "服勤人員": ["99"]}}
+        self.assertEqual(find_work_matches(rows, "1151003", staff, unresolved), [])
+
+    def test_work_duplicate_retains_blank_reason_and_personnel_position(self) -> None:
+        from compare_rehearsal_records import find_work_matches, flatten_rows
+
+        row = ["1151003\n08:00", "第三大隊", "新坡分隊", "值班(宿)", "", "工作概述",
+               "處理情形", "隊員 測試甲", "1", "0", "無", "測試乙", ""]
+        rows = flatten_rows([row], "1151003")
+        self.assertEqual(len(rows[0].split("|")), len(row))
+        action = {"time": "08:00", "source": "值班交接", "fields": {"勤務項目": "值班(宿)", "服勤人員": ["10"]}}
+        self.assertEqual(find_work_matches(rows, "1151003", {"10": {"name": "測試甲"}}, action), rows)
+
+    def test_previous_sheet_returns_survive_crossing_0800_before_save(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        for source, reason in (("外勤簽入", "返隊"), ("休息結束", "休息返隊"),
+                               ("外勤簽入", "防溺車巡返隊")):
+            with self.subTest(source=source, reason=reason), tempfile.TemporaryDirectory() as directory:
+                clock = [datetime(2026, 10, 3, 7, 59, 59)]; saved = []
+                fields = {"出或入": "入", "領用事由及地點": reason, "系統寫入時間": "08:00"}
+                if reason == "防溺車巡返隊":
+                    fields.update({"勤務項目": "車巡", "事由": "防溺"})
+                action = {"kind": "entry_log", "time": "08:00", "date_offset": 1, "actor": "9",
+                          "target": "10", "source": source, "return_pair_key": "night-return", "fields": fields}
+                data = {"target_date": "1151002", "today": {"staff": {"10": {"name": "測試甲"}}}, "actions": [action]}
+                def fill(_driver, _action, _staff, _date, save, before_save):
+                    clock[0] = datetime(2026, 10, 3, 8, 0, 1); before_save(); saved.append(save)
+                    return {"ok": True}
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                    build_driver=lambda **kw: object(), login=lambda *args: None, quit_driver=lambda *args: None,
+                    query_visible_table=lambda *args, **kw: [["115/10/03", "08:00", "-", "測試甲", "入", reason]] if saved else [],
+                    fill_entry_log_form_for_test=fill)
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                    now_factory=lambda: clock[0], sleeper=lambda seconds: None,
+                    comparison_builder=lambda *args, **kw: {0: {"group": "todo"}})
+                result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+                self.assertEqual(result.status, "submitted"); self.assertEqual(saved, [True])
+                state = DueTaskSelectionState(actor_no="9", target_roc_date="1151002", auto_return_indices=frozenset({0}))
+                self.assertEqual(select_due_task_indices([action], state, now=clock[0]), [0])
+                for changes in ({"date_offset": 0}, {"date_offset": 2}, {"time": "07:55"}, {"submit_target_date": "1151002"},
+                                {"source": "外勤簽出", "fields": {"出或入": "出", "領用事由及地點": "返隊"}}):
+                    self.assertTrue(service.is_stale_due_request(DutySubmissionRequest(
+                        "test-user", "test-password", 0, {**data, "actions": [{**action, **changes}]})))
+                clock[0] = datetime(2026, 10, 3, 10, 0, 1)
+                self.assertTrue(service.is_stale_due_request(DutySubmissionRequest("test-user", "test-password", 0, data)))
+
+    def test_unpaired_manual_return_does_not_block_fire_day_rollover(self) -> None:
+        from datetime import datetime as RealDateTime
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        class Clock(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return RealDateTime(2026, 10, 3, 8, 0)
+        with tempfile.TemporaryDirectory() as directory, patch("qt_app.controllers.duty_controller.datetime", Clock):
+            controller = DutyController(repository=ScheduleRepository(Path(directory)))
+            try:
+                controller.set_actor_no("9")
+                controller.replace_schedule_data({"target_date": "1151002", "actions": [{
+                    "kind": "entry_log", "source": "外勤簽入", "time": "08:00", "date_offset": 1,
+                    "actor": "9", "target": "10", "fields": {"出或入": "入", "領用事由及地點": "返隊"}}]})
+                controller._auto_execution_enabled = True
+                self.assertFalse(controller.has_pending_fire_day_closing_tasks())
+                controller._actions[0]["return_pair_key"] = "night-return"
+                controller._manual_departure_pair_keys.add("night-return")
+                self.assertTrue(controller.has_pending_fire_day_closing_tasks())
+                controller._executed_indices.add(0)
+                self.assertFalse(controller.has_pending_fire_day_closing_tasks())
+            finally:
+                controller.shutdown()
+
+    def test_previous_sheet_drowning_work_survives_0800_before_save(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [datetime(2026, 10, 3, 7, 59, 59)]; saved = []
+            action = {"kind": "work_log", "time": "08:00", "date_offset": 1, "actor": "9",
+                      "source": "防溺車巡", "fields": {"勤務項目": "車巡", "事由": "防溺",
+                      "工作概述": "一、時間：2200-0800", "服勤人員": ["10"]}}
+            data = {"target_date": "1151002", "today": {"staff": {"10": {"name": "測試甲"}}}, "actions": [action]}
+            def fill(_driver, _action, _staff, _date, save, before_save):
+                clock[0] = datetime(2026, 10, 3, 8, 0, 1); before_save(); saved.append(save)
+                return {"ok": True}
+            automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                build_driver=lambda **kw: object(), login=lambda *args: None, quit_driver=lambda *args: None,
+                query_visible_table=lambda *args, **kw: [["1151003\n08:00", "大隊", "分隊", "車巡", "防溺",
+                    "一、時間：2200-0800", "情形", "測試甲", "1", "0", "無", "測試乙", ""]] if saved else [],
+                fill_work_log_form_for_test=fill)
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                now_factory=lambda: clock[0], sleeper=lambda seconds: None,
+                comparison_builder=lambda *args, **kw: {0: {"group": "todo"}})
+            result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+            self.assertEqual(result.status, "submitted"); self.assertEqual(saved, [True])
+            state = DueTaskSelectionState(actor_no="9", target_roc_date="1151002")
+            self.assertEqual(select_due_task_indices([action], state, now=clock[0]), [0])
+            for fields in ({"勤務項目": "在隊訓練", "事由": "防溺"}, {"勤務項目": "車巡", "事由": "巡邏"}):
+                self.assertTrue(service.is_stale_due_request(DutySubmissionRequest(
+                    "test-user", "test-password", 0, {**data, "actions": [{**action, "fields": fields}]})))
+
     def test_work_duplicate_requires_reason_and_exact_personnel(self) -> None:
         from compare_rehearsal_records import find_work_matches
 
@@ -2238,11 +2356,11 @@ class DutySubmissionServiceTests(unittest.TestCase):
             "fields": {"勤務項目": "在隊訓練", "事由": "車輛清洗保養", "服勤人員": ["10"]},
         }
         rows = [
-            "115/10/01 17:00 | 在隊訓練 | 常年訓練 | 測試甲",
-            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試乙",
-            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試甲乙",
-            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 測試甲、測試乙",
-            "115/10/01 17:00 | 在隊訓練 | 車輛清洗保養 | 隊員 測試甲",
+            "115/10/01 17:00 | 大隊 | 分隊 | 在隊訓練 | 常年訓練 | 概述 | 情形 | 測試甲",
+            "115/10/01 17:00 | 大隊 | 分隊 | 在隊訓練 | 車輛清洗保養 | 概述 | 情形 | 測試乙",
+            "115/10/01 17:00 | 大隊 | 分隊 | 在隊訓練 | 車輛清洗保養 | 概述 | 情形 | 測試甲乙",
+            "115/10/01 17:00 | 大隊 | 分隊 | 在隊訓練 | 車輛清洗保養 | 概述 | 情形 | 測試甲、測試乙",
+            "115/10/01 17:00 | 大隊 | 分隊 | 在隊訓練 | 車輛清洗保養 | 概述 | 情形 | 隊員 測試甲",
         ]
         self.assertEqual(find_work_matches(rows, "1151001", staff, action), [rows[-1]])
 
@@ -16663,6 +16781,84 @@ if return_code != 0 or loaded:
         self.assertEqual(operational_sync.events[0][1]["trigger_type"], "schedule")
         self.assertEqual(operational_sync.events[0][1]["snapshot"]["error_code"], "login_failed")
         self.assertEqual(operational_sync.events[1][1]["trigger_type"], "login")
+
+    def test_duty_sheet_events_keep_source_file_and_date_from_start(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            events = []
+            controller._send_operational_event = lambda kind, **fields: events.append((kind, fields))
+            controller._finish_automatic_tool = lambda *_args: None
+            try:
+                for mode, terminal in ((mode, terminal) for mode in ("manual", "automatic")
+                                       for terminal in ("completed", "failed", "shutdown")):
+                    sheet = controller.dutySheetController
+                    sheet._workbook_path = r"C:\private\115年10月勤務表.xlsx"
+                    sheet._target_date = "2026/10/03"
+                    controller._automatic_tool_record = (
+                        {"tool_id": "duty_sheet", "target_date": "1151003"} if mode == "automatic" else None
+                    )
+                    # A real worker is registered before runStarted; no browser is needed here.
+                    if mode == "automatic":
+                        sheet._workers[1] = (None, None)
+                    sheet.runStarted.emit()
+                    sheet._workers.clear()
+                    sheet._workbook_path = r"C:\different\另一份.xlsx"
+                    sheet._target_date = "2026/10/04"
+                    if terminal == "completed":
+                        sheet.runSucceeded.emit("完成")
+                    elif terminal == "failed":
+                        sheet.runFailed.emit("勤務表檢查未通過")
+                    else:
+                        controller._finalize_active_tool_runs_for_shutdown()
+                    start, finish = events[-2:]
+                    for _, fields in (start, finish):
+                        self.assertEqual(fields["snapshot"]["workbook_name"], "115年10月勤務表.xlsx")
+                        self.assertEqual(fields["snapshot"]["target_date"], "2026/10/03")
+                        self.assertEqual(fields["snapshot"]["execution_mode"], mode)
+                        self.assertNotIn("private", json.dumps(fields, ensure_ascii=False))
+                        self.assertNotIn("另一份", json.dumps(fields, ensure_ascii=False))
+                    self.assertEqual(start[1]["snapshot"]["run_id"], finish[1]["snapshot"]["run_id"])
+                    if terminal != "completed":
+                        self.assertIn("115年10月勤務表.xlsx", finish[1]["error"])
+                        self.assertIn("2026/10/03", finish[1]["error"])
+            finally:
+                controller.shutdown()
+
+    def test_automatic_duty_sheet_preparation_failure_does_not_report_previous_file(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved.json", "SinpoSmart", None),
+                tool_controller=ToolController(Path(temp_dir)),
+            )
+            events = []
+            controller._send_operational_event = lambda kind, **fields: events.append((kind, fields))
+            controller._finish_automatic_tool = lambda *_args: None
+            try:
+                controller.dutySheetController._workbook_path = "昨日的檔案.xlsx"
+                controller.dutySheetController._target_date = "2026/10/02"
+                controller._automatic_tool_record = {
+                    "tool_id": "duty_sheet", "label": "勤務表登打", "target_date": "1151003",
+                }
+                controller._automatic_preflight_failed(0, "找不到可用的 Excel")
+                for _, fields in events:
+                    self.assertEqual(fields["snapshot"]["workbook_name"], "")
+                    self.assertEqual(fields["snapshot"]["target_date"], "1151003")
+                    self.assertEqual(fields["snapshot"]["execution_mode"], "automatic")
+                    self.assertNotIn("昨日的檔案", json.dumps(fields, ensure_ascii=False))
+                self.assertIn("尚未選定", events[-1][1]["error"])
+            finally:
+                controller.shutdown()
 
     def test_tool_terminal_events_preserve_start_identity_after_logout(self) -> None:
         from app_core.credential_repository import CredentialRepository

@@ -2112,13 +2112,33 @@ def query_visible_table(
     if query_started_callback is not None:
         query_started_callback()
     wait_for_query_completion(driver, previous_time_origin=query_time_origin)
-    raw_rows = driver.execute_script(
-        """
-        return Array.from(document.querySelectorAll('tr')).map(tr =>
-          Array.from(tr.children).map(td => (td.innerText || td.value || '').trim()).filter(Boolean)
-        ).filter(row => row.length);
-        """
-    )
+    if ap_name == WORK_LOG_AP:
+        raw_rows = driver.execute_script(
+            r"""
+            const rows = Array.from(document.querySelectorAll('tr'));
+            const labels = ['日期時間', '單位分類', '單位名稱', '勤務項目', '事由',
+              '工作概述', '處理情形', '服勤人員', '服勤人數', '被宣導人數', '附件', '建檔者', '簽核者'];
+            const header = rows.find(tr => {
+              const texts = Array.from(tr.children).map(td => (td.innerText || '').replace(/\s/g, ''));
+              return labels.slice(0, 8).every(label => texts.includes(label));
+            });
+            if (!header) throw new Error('工作紀錄查詢欄位不完整，停止比對。');
+            const headers = Array.from(header.children).map(td => (td.innerText || '').replace(/\s/g, ''));
+            const indices = labels.map(label => headers.indexOf(label));
+            return rows.map(tr => {
+              const cells = Array.from(tr.children).map(td => (td.innerText || td.value || '').trim());
+              return indices.map(index => index >= 0 ? (cells[index] || '') : '');
+            }).filter(row => /^\d{3}\/?\d{2}\/?\d{2}\s+\d{1,2}:\d{2}$/.test(row[0]));
+            """
+        )
+    else:
+        raw_rows = driver.execute_script(
+            """
+            return Array.from(document.querySelectorAll('tr')).map(tr =>
+              Array.from(tr.children).map(td => (td.innerText || td.value || '').trim()).filter(Boolean)
+            ).filter(row => row.length);
+            """
+        )
     def row_in_query_range(row: list[str]) -> bool:
         if not row or start_at is None or end_at is None:
             return False

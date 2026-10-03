@@ -74,7 +74,7 @@ def flatten_rows(
         if isinstance(row, str):
             text = row
         else:
-            text = " | ".join(str(x) for x in row if str(x).strip())
+            text = " | ".join(str(x) for x in row)
         parts = [part.strip() for part in text.replace("\xa0", " ").split("|")]
         if (
             len(parts) >= 2
@@ -346,26 +346,27 @@ def find_work_matches(
             near_minutes=near_minutes,
         ):
             continue
-        if item and item not in row:
+        cells = [clean(part) for part in row.split("|")]
+        full_work_row = len(cells) >= 8
+        item_cell = cells[3] if full_work_row else cells[1] if len(cells) > 1 else ""
+        reason_cell = cells[4] if full_work_row else cells[2] if len(cells) > 2 else ""
+        if item and clean(item) != item_cell:
             continue
         if is_radio_test:
             if "無線電" not in c:
                 continue
         else:
-            if reason and clean(reason) not in row_cells(row):
+            if reason and clean(reason) != reason_cell:
                 continue
             if fields.get("服勤人員"):
-                if people_unresolved:
+                if people_unresolved or not full_work_row:
                     continue
-                # Personnel must occupy a separate cell; overview prose is not identity proof.
-                personnel_cells = []
-                for cell in row.split("|"):
-                    people = {
-                        clean(re.sub(r"^\s*(?:\d+番\s*)?(?:(?:副小隊長|小隊長|分隊長|副中隊長|中隊長|大隊長|隊員)\s*)?", "", part))
-                        for part in re.split(r"[、,，;；\n]+", cell.strip()) if part.strip()
-                    }
-                    personnel_cells.append(people)
-                if expected_people not in personnel_cells:
+                # WORK_LOG query preserves columns: personnel is column 7, author is not proof.
+                personnel = {
+                    clean(re.sub(r"^\s*(?:\d+番\s*)?(?:(?:副小隊長|小隊長|分隊長|副中隊長|中隊長|大隊長|隊員)\s*)?", "", part))
+                    for part in re.split(r"[、,，;；\n]+", row.split("|")[7].strip()) if part.strip()
+                }
+                if expected_people != personnel:
                     continue
         if is_drowning_patrol:
             expected_overview_time = re.search(
