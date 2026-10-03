@@ -1694,6 +1694,21 @@ class DutyTaskProjectionTests(unittest.TestCase):
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 7, 59)), [])
         self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 8, 7, 8, 0)), [0])
 
+    def test_rollover_due_selection_keeps_closing_actions_and_rejects_other_old_jobs(self) -> None:
+        from datetime import datetime
+        from app_core.duty_task_projection import DueTaskSelectionState, select_due_task_indices
+
+        actions = [
+            {"kind": "entry_log", "time": "08:00", "date_offset": 1, "actor": "9", "target": "10",
+             "source": "昨日在勤且今日未在勤", "fields": {"出或入": "出", "領用事由及地點": "退勤"}},
+            {"kind": "work_log", "time": "07:30", "date_offset": 1, "actor": "9", "source": "在隊訓練"},
+            {"kind": "entry_log", "time": "07:55", "date_offset": 1, "actor": "9",
+             "fields": {"出或入": "入", "領用事由及地點": "到勤"}},
+            {"kind": "work_log", "time": "08:00", "date_offset": 1, "actor": "9", "source": "值班交接"},
+        ]
+        state = DueTaskSelectionState(actor_no="9", target_roc_date="1151002")
+        self.assertEqual(select_due_task_indices(actions, state, now=datetime(2026, 10, 3, 8, 0)), [0, 3])
+
     def test_due_selection_limits_automatic_catch_up_to_two_hours(self) -> None:
         from datetime import datetime, timedelta
 
@@ -3950,6 +3965,55 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "submitted")
             self.assertEqual(events, ["driver:True", "login", "fill:08:05:True", "quit"])
 
+    def test_due_previous_sheet_checkout_survives_rollover_and_verifies_saved_0805(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [datetime(2026, 10, 3, 8, 0)]
+            saved = []
+            queried = []
+
+            def query(_driver, _ap, target_date):
+                queried.append(target_date)
+                return [] if not saved else [["115/10/03", "08:05", "-", "測試員", "出", "退勤"]]
+
+            def fill(_driver, action, _staff, target_date, save, before_save):
+                clock[0] = datetime(2026, 10, 3, 8, 1)
+                before_save()
+                saved.append((target_date, action["fields"]["系統寫入時間"], save))
+                return {"ok": True}
+
+            automation = SimpleNamespace(
+                ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kwargs: object(),
+                login=lambda *_args: None, query_visible_table=query,
+                fill_entry_log_form_for_test=fill, quit_driver=lambda *_args: None,
+            )
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                now_factory=lambda: clock[0], sleeper=lambda _seconds: None,
+                comparison_builder=lambda *_args, **_kwargs: {0: {"group": "todo"}})
+            action = {"kind": "entry_log", "time": "08:00", "date_offset": 1, "actor": "9", "target": "10",
+                      "source": "昨日在勤且今日未在勤", "fields": {"登打時間": "08:00", "系統寫入時間": "08:05",
+                      "出或入": "出", "領用事由及地點": "退勤"}}
+            data = {"target_date": "1151002", "today": {"staff": {"10": {"name": "測試員"}}}, "actions": [action]}
+            result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+            self.assertEqual(result.status, "submitted")
+            self.assertEqual(saved, [("1151003", "08:05", True)])
+            self.assertEqual(queried, ["1151003", "1151003"])
+            for kind in ("entry_log", "work_log", "handoff_preflight"):
+                with self.subTest(handoff_kind=kind):
+                    handoff = {**action, "source": "值班交接", "kind": kind}
+                    self.assertFalse(service.is_stale_due_request(DutySubmissionRequest(
+                        "test-user", "test-password", 0, {**data, "actions": [handoff]})))
+            for changes in ({"date_offset": 0}, {"date_offset": 2}, {"source": "在隊訓練", "kind": "work_log"},
+                            {"time": "07:55", "fields": {"出或入": "入", "領用事由及地點": "到勤"}},
+                            {"submit_target_date": "1151002"}):
+                with self.subTest(changes=changes):
+                    request = DutySubmissionRequest("test-user", "test-password", 0, {**data, "actions": [{**action, **changes}]})
+                    self.assertTrue(service.is_stale_due_request(request))
+            clock[0] = datetime(2026, 10, 3, 10, 0, 1)
+            self.assertTrue(service.is_stale_due_request(DutySubmissionRequest("test-user", "test-password", 0, data)))
+
     def test_manual_external_review_action_can_submit_after_confirmation(self) -> None:
         from datetime import datetime
 
@@ -5668,6 +5732,41 @@ class ScheduleRepositoryTests(unittest.TestCase):
 
 
 class ScheduleCaptureServiceTests(unittest.TestCase):
+    def test_rollover_capture_keeps_authenticated_outgoing_person_missing_from_today_sheet(self) -> None:
+        from dataclasses import dataclass
+        from datetime import date, datetime
+        from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
+
+        @dataclass
+        class Sheet:
+            date: str
+            staff: dict
+            rows: list
+
+        def query(_driver, value):
+            staff = {"9": {"name": "前班人員"}} if value == "1151002" else {"3": {"name": "接班人員"}}
+            return Sheet(value, staff, [])
+
+        automation = SimpleNamespace(
+            parse_roc_date=lambda _value: date(2026, 10, 3),
+            roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+            query_duty_sheet=query, query_cases=lambda *_args: [], planned_actions=lambda *_args: [],
+        )
+        driver = SimpleNamespace(
+            execute_script=lambda script: "接班人員" if "const hints" in script else "前班人員，您好\n接班人員",
+            find_elements=lambda *_args: [],
+            switch_to=SimpleNamespace(default_content=lambda: None),
+        )
+
+        for name in ("前班人員", ""):
+            with self.subTest(actor_name=name), tempfile.TemporaryDirectory() as directory:
+                service = ScheduleCaptureService(Path(directory), module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 10, 3, 8, 0))
+                request = ScheduleCaptureRequest("same-verified-account", "test-password", "9", "1151003", name)
+                snapshot = service.capture_schedule(request, _driver=driver)
+                self.assertEqual(snapshot.authenticated_actor_no, "9")
+                self.assertEqual(snapshot.authenticated_actor_name, "前班人員")
+
     def test_validation_allows_initial_capture_before_actor_no_is_known(self) -> None:
         from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
 
@@ -12221,6 +12320,161 @@ if return_code != 0 or loaded:
         finally:
             controller.shutdown()
 
+    def test_clock_rollover_drains_all_previous_shift_checkouts_before_switching_fire_day(self) -> None:
+        from contextlib import ExitStack
+        from datetime import datetime as RealDateTime
+        from PySide6.QtCore import QDateTime
+        from app_core.schedule_repository import ScheduleRepository, business_roc_date
+        from qt_app.controllers.duty_controller import DutyController
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+
+        clock = [RealDateTime(2026, 10, 3, 7, 59, 59)]
+        class Clock(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            for module in ("qt_app.controllers.duty_controller", "app_core.duty_task_projection"):
+                stack.enter_context(patch(module + ".datetime", Clock))
+            stack.enter_context(patch("qt_app.controllers.duty_controller.business_roc_date",
+                side_effect=lambda: business_roc_date(clock[0])))
+            controller = DutyController(repository=ScheduleRepository(Path(directory)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(directory)))
+            stack.callback(controller.shutdown)
+            controller._observed_fire_day = "1151002"
+            controller.set_actor_no("9")
+            controller.set_session_context(1, "test-user")
+            actions = [{"kind": "entry_log", "time": "08:00", "date_offset": 1, "actor": "9", "target": str(number),
+                        "source": "昨日在勤且今日未在勤", "duplicate_key": "closing:" + str(number),
+                        "fields": {"登打時間": "08:00", "系統寫入時間": "08:05", "出或入": "出", "領用事由及地點": "退勤"}}
+                       for number in range(10, 16)]
+            controller.replace_schedule_data({"target_date": "1151002", "actions": actions})
+            controller.enable_auto_execution()
+            requested = []
+            changes = []
+            controller.fireDayChanged.connect(changes.append)
+            def enqueue(indices):
+                for request in controller.due_submission_requests("test-user", "test-password", indices):
+                    if any(existing.action_index == request.action_index for existing in requested):
+                        continue
+                    requested.append(request)
+                    controller.mark_submission_enqueued(request.action_index)
+            controller.dueTasksAvailable.connect(enqueue)
+            clock[0] = RealDateTime(2026, 10, 3, 8, 0)
+            self.assertFalse(controller.refresh_live_schedule("test-user", "test-password", "9"))
+            self.assertTrue(controller._auto_execution_enabled)
+            self.assertFalse(controller._capture_workers)
+            qt_clock = stack.enter_context(patch("qt_app.controllers.duty_controller.QDateTime"))
+            qt_clock.currentDateTime.return_value = QDateTime(2026, 10, 3, 8, 0, 0)
+            controller._update_clock()
+            self.assertEqual([r.action_index for r in requested], list(range(6)))
+            self.assertEqual(changes, [])
+            controller._refresh_due_tasks()
+            self.assertEqual(len(requested), 6)
+            clock[0] = RealDateTime(2026, 10, 3, 8, 0, 1)
+            qt_clock.currentDateTime.return_value = QDateTime(2026, 10, 3, 8, 0, 1)
+            controller._update_clock()
+            self.assertEqual(changes, [])
+            for request in requested:
+                status = "skipped_duplicate" if request.action_index == 0 else "submitted"
+                controller.handle_submission_request_result(request, status, "完成", "result.json")
+            clock[0] = RealDateTime(2026, 10, 3, 8, 0, 2)
+            qt_clock.currentDateTime.return_value = QDateTime(2026, 10, 3, 8, 0, 2)
+            controller._update_clock()
+            self.assertEqual(changes, ["1151003"])
+            self.assertFalse(controller._auto_execution_enabled)
+
+    def test_rollover_paused_checkout_is_preserved_in_recovery_before_fire_day_switch(self) -> None:
+        from datetime import datetime as RealDateTime
+        from PySide6.QtCore import QDateTime
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        class Clock(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 3, 8, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            try:
+                controller.set_actor_no("9")
+                controller.set_session_context(1, "test-user")
+                action = {"kind": "entry_log", "time": "08:00", "date_offset": 1, "actor": "9", "target": "10",
+                          "source": "昨日在勤且今日未在勤", "duplicate_key": "closing:paused",
+                          "fields": {"出或入": "出", "領用事由及地點": "退勤", "系統寫入時間": "08:05"}}
+                with patch("qt_app.controllers.duty_controller.datetime", Clock), patch("app_core.duty_task_projection.datetime", Clock):
+                    controller.replace_schedule_data({"target_date": "1151002", "actions": [action]})
+                    controller.enable_auto_execution()
+                    request = controller.due_submission_requests("test-user", "test-password", [0])[0]
+                    controller.mark_submission_enqueued(0)
+                    self.assertTrue(controller.has_pending_fire_day_closing_tasks())
+                    controller.handle_submission_request_result(request, "paused_external", "未返隊，暫停退勤", "result.json")
+                    self.assertFalse(controller.has_pending_fire_day_closing_tasks())
+                    self.assertEqual(len(queue.active_records()), 1)
+                    self.assertEqual(queue.active_records()[0]["source_target_date"], "1151002")
+                    controller._observed_fire_day = "1151002"
+                    changes = []
+                    controller.fireDayChanged.connect(changes.append)
+                    with patch("qt_app.controllers.duty_controller.business_roc_date", return_value="1151003"), patch("qt_app.controllers.duty_controller.QDateTime") as clock:
+                        clock.currentDateTime.return_value = QDateTime(2026, 10, 3, 8, 0, 0)
+                        controller._update_clock()
+                    self.assertEqual(changes, ["1151003"])
+                    self.assertEqual(len(queue.active_records()), 1)
+            finally:
+                controller.shutdown()
+
+    def test_rollover_handoff_preflight_releases_deferred_0805_retirements(self) -> None:
+        from datetime import datetime as RealDateTime
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        class Clock(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 3, 8, 0)
+
+        with tempfile.TemporaryDirectory() as directory, patch("qt_app.controllers.duty_controller.datetime", Clock), patch("app_core.duty_task_projection.datetime", Clock):
+            controller = DutyController(repository=ScheduleRepository(Path(directory)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(directory)))
+            try:
+                controller.set_actor_no("9")
+                controller.set_session_context(1, "test-user")
+                base = {"time": "08:00", "date_offset": 1, "actor": "9"}
+                actions = [{**base, "kind": "entry_log", "target": str(number), "source": "昨日在勤且今日未在勤",
+                            "duplicate_key": "closing:" + str(number), "fields": {"出或入": "出", "領用事由及地點": "退勤",
+                            "登打時間": "08:00", "系統寫入時間": "08:05"}} for number in range(10, 16)]
+                actions += [
+                    {**base, "kind": "entry_log", "source": "值班交接", "target": "9", "duplicate_key": "handoff:out", "fields": {"出或入": "值退"}},
+                    {**base, "kind": "entry_log", "source": "值班交接", "target": "3", "duplicate_key": "handoff:in", "fields": {"出或入": "值班"}},
+                    {**base, "kind": "work_log", "source": "值班交接", "target": "9", "duplicate_key": "handoff:work", "fields": {"工作時間": "08:00"}},
+                ]
+                controller.replace_schedule_data({"target_date": "1151002", "actions": actions})
+                controller.enable_auto_execution()
+                preflight = controller.due_submission_requests("test-user", "test-password", list(range(9)))
+                self.assertEqual(len(preflight), 1)
+                controller.mark_submission_enqueued(preflight[0].action_index)
+                self.assertTrue(controller.has_pending_fire_day_closing_tasks())
+                self.assertTrue(controller.handle_handoff_preflight_ready(preflight[0]))
+                handoff = controller.handoff_group_submission_requests("test-user", "test-password", preflight[0])
+                self.assertEqual([r.action_index for r in handoff], [6, 7, 8])
+                for request in handoff:
+                    controller.mark_submission_enqueued(request.action_index)
+                controller.finish_handoff_preflight_group(preflight[0])
+                retirement = controller.due_submission_requests("test-user", "test-password", controller._due_task_indices)
+                self.assertEqual([r.action_index for r in retirement], list(range(6)))
+                for request in retirement:
+                    controller.mark_submission_enqueued(request.action_index)
+                for request in handoff + retirement:
+                    controller.handle_submission_request_result(request, "submitted", "完成", "result.json")
+                self.assertFalse(controller.has_pending_fire_day_closing_tasks())
+            finally:
+                controller.shutdown()
+
     def test_duty_sheet_controller_adds_and_removes_vehicle_options(self) -> None:
         from app_core.duty_sheet_service import DutySheetDefaults
         from app_core.session import SessionState
@@ -17813,7 +18067,7 @@ if return_code != 0 or loaded:
         controller.set_actor_no("10")
         controller.replace_schedule_data(
             {
-                "target_date": "1150807",
+                "target_date": "1150806",
                 "today": {
                     "staff": {
                         "10": {"name": "原值班"},
@@ -17824,6 +18078,7 @@ if return_code != 0 or loaded:
                     {
                         "kind": "entry_log",
                         "time": "00:00",
+                        "date_offset": 1,
                         "actor": "10",
                         "target": "10",
                         "source": "值班交接",
@@ -17833,6 +18088,7 @@ if return_code != 0 or loaded:
                     {
                         "kind": "entry_log",
                         "time": "00:00",
+                        "date_offset": 1,
                         "actor": "10",
                         "target": "11",
                         "source": "值班交接",
@@ -17842,6 +18098,7 @@ if return_code != 0 or loaded:
                     {
                         "kind": "work_log",
                         "time": "00:00",
+                        "date_offset": 1,
                         "actor": "10",
                         "target": "10",
                         "source": "值班交接",

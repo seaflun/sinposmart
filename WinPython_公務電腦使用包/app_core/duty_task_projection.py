@@ -109,6 +109,29 @@ def action_target_roc_date(action: Mapping[str, Any], target_roc_date: str) -> s
     return f"{target_date.year - 1911:03d}{target_date.month:02d}{target_date.day:02d}"
 
 
+def is_fire_day_closing_action(action: Mapping[str, Any], target_roc_date: str, now: datetime) -> bool:
+    """Recognize the preceding sheet's next-morning 08:00 closing work only."""
+
+    try:
+        previous_date = parse_roc_date(target_roc_date)
+        action_at = action_datetime(action, target_roc_date)
+    except (TypeError, ValueError):
+        return False
+    if (previous_date + timedelta(days=1) != now.date()
+            or action_at != datetime.combine(now.date(), datetime.min.time()).replace(hour=8)
+            or not action_at <= now <= action_at + AUTO_DUE_CATCH_UP_WINDOW
+            or action_target_roc_date(action, target_roc_date) != f"{now.year - 1911:03d}{now.month:02d}{now.day:02d}"):
+        return False
+    if action.get("source") == "值班交接":
+        return action.get("kind") in ("entry_log", "work_log", "handoff_preflight")
+    fields = action.get("fields", {})
+    return bool(
+        action.get("kind") == "entry_log" and isinstance(fields, Mapping)
+        and fields.get("出或入") in ("出", "值退")
+        and fields.get("領用事由及地點") in ("退勤", "休息後退勤")
+    )
+
+
 def action_return_pair_key(action: Mapping[str, Any]) -> str:
     return str(action.get("return_pair_key", "") or "").strip()
 
@@ -401,11 +424,17 @@ def _select_due_task_indices(
     """Return due auto-task indexes, optionally limited to confirmed existing work."""
 
     current = now or datetime.now()
+    fire_date = current.date() if current.hour >= 8 else current.date() - timedelta(days=1)
+    current_fire_day = f"{fire_date.year - 1911:03d}{fire_date.month:02d}{fire_date.day:02d}"
     due: list[int] = []
     for index, action in enumerate(actions):
         if action.get("kind") not in ("work_log", "entry_log"):
             continue
         if str(action.get("actor", "") or "") != str(state.actor_no or ""):
+            continue
+        if state.target_roc_date != current_fire_day and not is_fire_day_closing_action(
+            action, state.target_roc_date, current
+        ):
             continue
         if index in state.executed_indices or index in state.submitting_indices:
             continue

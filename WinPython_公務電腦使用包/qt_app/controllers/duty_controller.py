@@ -23,6 +23,7 @@ from app_core.duty_task_projection import (
     build_schedule_comparisons,
     drowning_patrol_group_indices,
     is_auto_duty_action,
+    is_fire_day_closing_action,
     is_external_or_rest_departure,
     is_external_or_rest_entry,
     is_external_or_rest_return,
@@ -1191,6 +1192,11 @@ class DutyController(QObject):
             self.scheduleChanged.emit()
             return False
         if not user_id or not password:
+            return False
+        if ((target_roc_date or business_roc_date()) != self._target_date_text
+                and self.has_pending_fire_day_closing_tasks()):
+            self._schedule_status = "08:00 交接退勤尚未收尾，完成後再更新消防日。"
+            self.scheduleChanged.emit()
             return False
         self._capture_request_id += 1
         request_id = self._capture_request_id
@@ -3786,6 +3792,23 @@ class DutyController(QObject):
         self.release_capture_lane(lane_owner)
         self.scheduleChanged.emit()
 
+    def has_pending_fire_day_closing_tasks(self) -> bool:
+        if not self._auto_execution_enabled or self._session_closing or not self._actor_no:
+            return False
+        current = datetime.now()
+        return any(
+            str(action.get("actor") or "") == self._actor_no
+            and is_fire_day_closing_action(action, self._target_date_text, current)
+            and index not in self._executed_indices
+            and index not in self._blocked_indices
+            and index not in self._external_return_queue_ids_by_action_index
+            and not self._is_paused_handoff_group_index(index)
+            and self._comparisons.get(index, {}).get("group") not in (
+                "done", "manual", "near", "adjust", "review", "skipped"
+            )
+            for index, action in enumerate(self._actions)
+        )
+
     def _update_clock(self) -> None:
         now = QDateTime.currentDateTime()
         weekdays = "一二三四五六日"
@@ -3798,6 +3821,9 @@ class DutyController(QObject):
         self.clockChanged.emit()
         current_fire_day = business_roc_date()
         if current_fire_day != self._observed_fire_day:
+            if self.has_pending_fire_day_closing_tasks():
+                self._refresh_due_tasks()
+                return
             self._observed_fire_day = current_fire_day
             self.disable_auto_execution()
             self.fireDayChanged.emit(current_fire_day)

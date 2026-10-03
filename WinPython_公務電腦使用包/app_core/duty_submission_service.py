@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 from app_core.duty_task_projection import (
     action_completion_key,
     action_target_roc_date,
+    is_fire_day_closing_action,
     build_schedule_comparisons,
     compare_submission_action,
 )
@@ -466,9 +467,13 @@ class DutySubmissionService:
 
     def is_stale_due_request(self, request: DutySubmissionRequest) -> bool:
         request = self.validate(request)
+        current = self.now_factory()
+        target_date = str(request.schedule_data["target_date"])
+        action = request.schedule_data["actions"][request.action_index]
         return (
             request.trigger_type == "due"
-            and str(request.schedule_data["target_date"]) != business_roc_date(self.now_factory())
+            and target_date != business_roc_date(current)
+            and not is_fire_day_closing_action(action, target_date, current)
         )
 
     def open_browser_session(

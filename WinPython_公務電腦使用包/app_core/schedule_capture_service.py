@@ -242,15 +242,19 @@ class ScheduleCaptureService:
             target = automation.parse_roc_date(request.target_roc_date)
             stage = "today_duty_sheet"
             today_sheet = automation.query_duty_sheet(driver, automation.roc_date(target))
+            yesterday = target - timedelta(days=1)
+            stage = "yesterday_duty_sheet"
+            yesterday_sheet = automation.query_duty_sheet(driver, automation.roc_date(yesterday))
+            identity_staff = {**yesterday_sheet.staff, **today_sheet.staff}
             authenticated_actor_no, authenticated_actor_name = actor_identity_from_name(
-                today_sheet.staff,
+                identity_staff,
                 request.actor_name,
             )
             if not authenticated_actor_no:
                 try:
                     authenticated_actor_no, authenticated_actor_name = self.identity_resolver(
                         driver,
-                        today_sheet.staff,
+                        identity_staff,
                     )
                 except Exception:
                     pass
@@ -261,15 +265,12 @@ class ScheduleCaptureService:
                         request.user_id,
                     )
                     authenticated_actor_no, authenticated_actor_name = actor_identity_from_name(
-                        today_sheet.staff,
+                        identity_staff,
                         site_actor_name,
                     )
                 except Exception:
                     pass
-            yesterday = target - timedelta(days=1)
             tomorrow = target + timedelta(days=1)
-            stage = "yesterday_duty_sheet"
-            yesterday_sheet = automation.query_duty_sheet(driver, automation.roc_date(yesterday))
             try:
                 stage = "tomorrow_duty_sheet"
                 tomorrow_sheet = automation.query_duty_sheet(driver, automation.roc_date(tomorrow))
