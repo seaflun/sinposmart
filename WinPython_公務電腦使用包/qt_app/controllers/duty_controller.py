@@ -2335,6 +2335,17 @@ class DutyController(QObject):
         next_target_date = str(data.get("target_date", "") or "")
         same_schedule_date = bool(next_target_date) and next_target_date == self._target_date_text
         target_date_changed = bool(self._target_date_text) and next_target_date != self._target_date_text
+        preserve_auto_logout = bool(
+            target_date_changed
+            and self._auto_logout_actor_no
+            and self._auto_logout_actor_no == self._actor_no
+            and self._auto_logout_handoff_at is not None
+            and (
+                self._auto_logout_pending_handoff_queue_id
+                or self._auto_logout_handoff_completed
+                or self._auto_logout_handoff_is_complete()
+            )
+        )
         previous_unique_indices = self._unique_action_indices_by_key()
         previous_executed_keys = {
             key for key, index in previous_unique_indices.items() if index in self._executed_indices
@@ -2423,7 +2434,11 @@ class DutyController(QObject):
             self._external_return_confirmation_summary = ""
             self._handoff_preflight_groups.clear()
             self._prewarmed_handoff_group_ids.clear()
-            self._cancel_auto_logout()
+            if preserve_auto_logout:
+                if not self._auto_logout_pending_handoff_queue_id:
+                    self._auto_logout_handoff_completed = True
+            else:
+                self._cancel_auto_logout()
         self._append_active_queue_actions()
         self._apply_actual_handoff_time_adjustments()
         self._schedule_generation += 1
@@ -3437,6 +3452,21 @@ class DutyController(QObject):
             return
         actor_no = self._auto_logout_actor_no
         self._emit_auto_logout_request(actor_no)
+
+    def _auto_logout_handoff_is_complete(self) -> bool:
+        group = [
+            index
+            for index, action in enumerate(self._actions)
+            if action.get("kind") in ("entry_log", "work_log")
+            and is_auto_duty_action(action)
+            and str(action.get("actor", "") or "") == self._auto_logout_actor_no
+            and action_datetime(action, self._target_date_text) == self._auto_logout_handoff_at
+        ]
+        return bool(group) and all(
+            index in self._executed_indices
+            or self._comparisons.get(index, {}).get("group") == "done"
+            for index in group
+        )
 
     def _is_paused_handoff_group_index(self, index: int) -> bool:
         queue_id = self._external_return_queue_ids_by_action_index.get(index, "")

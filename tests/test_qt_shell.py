@@ -17669,6 +17669,89 @@ if return_code != 0 or loaded:
         self.assertEqual(requested_spy.count(), 1)
         self.assertEqual(requested_spy.at(0)[0], [1])
 
+    def test_handoff_logout_survives_fire_day_reload_without_old_actions(self) -> None:
+        from datetime import datetime
+        from unittest.mock import Mock
+
+        from PySide6.QtTest import QSignalSpy
+
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        actions = [
+            {
+                "kind": kind,
+                "time": "08:00",
+                "date_offset": 1,
+                "actor": "23",
+                "target": target,
+                "source": "值班交接",
+                "fields": fields,
+            }
+            for kind, target, fields in [
+                ("entry_log", "23", {"出或入": "值退"}),
+                ("entry_log", "15", {"出或入": "值班"}),
+                ("work_log", "23", {"勤務項目": "值班(宿)"}),
+            ]
+        ]
+        for scenario in ["complete", "incomplete", "new_session", "paused"]:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                queue = UnreturnedReturnQueue(Path(directory))
+                controller = DutyController(
+                    repository=ScheduleRepository(Path(directory)),
+                    unreturned_return_queue=queue,
+                    capture_service=Mock(),
+                )
+                controller.set_session_context(1, "test23")
+                controller.set_actor_no("23")
+                controller._login_started_at = datetime(2026, 10, 4, 0, 41)
+                controller.replace_schedule_data({"target_date": "1151003", "actions": actions})
+                logout_spy = QSignalSpy(controller.autoLogoutRequested)
+                if scenario == "paused":
+                    record, _ = queue.pause_group(
+                        actions,
+                        controller._schedule_data,
+                        owner_actor_no="23",
+                        now=datetime(2026, 10, 4, 8),
+                    )
+                    controller._schedule_auto_logout_for_handoff_indices({0, 1, 2})
+                    controller._pause_auto_logout_for_handoff_queue(record["queue_id"], {0, 1, 2})
+                else:
+                    indices = [0] if scenario == "incomplete" else [0, 1, 2]
+                    for index in indices:
+                        controller.handle_submission_result(index, "submitted", "完成", "")
+                deadline = controller._auto_logout_deadline
+                controller.replace_schedule_data({"target_date": "1151004", "actions": []})
+                if scenario == "complete":
+                    self.assertEqual(controller._auto_logout_deadline, deadline)
+                    self.assertTrue(controller._auto_logout_timer.isActive())
+                if scenario == "new_session":
+                    controller.set_session_context(2, "test15")
+                    controller.set_actor_no("15")
+                controller._check_auto_logout()
+                self.assertEqual(logout_spy.count(), 1 if scenario == "complete" else 0)
+                if scenario == "complete":
+                    self.assertEqual(deadline, datetime(2026, 10, 4, 8, 10))
+                    self.assertEqual(controller.take_auto_logout_successor_actor_no(), "15")
+                elif scenario == "paused":
+                    self.assertEqual(controller._auto_logout_pending_handoff_queue_id, record["queue_id"])
+                    self.assertFalse(controller._auto_logout_timer.isActive())
+                    for action in actions:
+                        controller.handle_external_return_queue_result(
+                            record["queue_id"],
+                            action,
+                            "submitted",
+                            action_completion_key(action),
+                            trigger_type="manual",
+                        )
+                    self.assertTrue(controller._auto_logout_timer.isActive())
+                    controller._check_auto_logout()
+                    self.assertEqual(logout_spy.count(), 1)
+                    self.assertEqual(controller.take_auto_logout_successor_actor_no(), "15")
+                controller.shutdown()
+
     def test_auto_logout_requires_post_login_handoff_and_completed_group(self) -> None:
         from datetime import datetime
 
