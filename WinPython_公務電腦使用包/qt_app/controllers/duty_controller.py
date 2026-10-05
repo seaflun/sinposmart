@@ -836,6 +836,17 @@ class DutyController(QObject):
         except OSError:
             return
 
+    def has_saved_departure_for_return(self, action: Mapping[str, Any]) -> bool:
+        """Allow an idle restart only when the paired departure is on disk."""
+
+        if not is_external_or_rest_return(action):
+            return False
+        pair_key = action_return_pair_key(action)
+        saved = self._load_return_policy_pair_keys("manual_departure_pair_keys")
+        saved.update(self._load_return_policy_pair_keys("background_manual_departure_pair_keys"))
+        completed = self._load_return_policy_pair_keys("completed_return_pair_keys")
+        return bool(pair_key and pair_key in saved and pair_key not in completed)
+
     def _auto_return_indices(self) -> set[int]:
         return {
             index

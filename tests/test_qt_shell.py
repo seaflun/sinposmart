@@ -15714,6 +15714,138 @@ if return_code != 0 or loaded:
         self.assertEqual(fields["display_name"], "10番 測試員")
         self.assertTrue(fields["durable_only"])
 
+    def test_update_shutdown_preserves_future_background_return_across_restart(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.duty_task_projection import (
+            DueTaskSelectionState, action_completion_key, select_due_task_indices,
+        )
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+        from qt_app.controllers.duty_controller import DutyController
+
+        departure = {
+            "kind": "entry_log", "time": "16:00", "actor": "8", "target": "8",
+            "source": "休息簽出", "return_pair_key": "rest:1151005:8:16-18",
+            "fields": {"出或入": "出", "領用事由及地點": "休息"},
+        }
+        returning = {
+            "kind": "entry_log", "time": "18:00", "actor": "23", "target": "8",
+            "source": "休息結束", "return_pair_key": departure["return_pair_key"],
+            "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+        }
+        data = {"target_date": "1151005", "actions": [departure, returning]}
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScheduleRepository(Path(directory))
+            controller = AppController(schedule_repository=repository)
+            try:
+                controller._background_manual_timer.stop()
+                controller._send_operational_event = lambda *_args, **_kwargs: None
+                controller._operational_sync_service = SimpleNamespace(enqueue_event=lambda *_a, **_k: {})
+                controller._session_state.session = LoginSession("8", "user8", "secret", verified=True)
+                duty = controller.dutyController
+                duty.set_session_context(1, "user8")
+                duty.set_actor_no("8")
+                duty.replace_schedule_data(data)
+                request = DutySubmissionRequest(
+                    "user8", "secret", 0, data, trigger_type="manual", background=True,
+                    session_generation=1, schedule_generation=duty.schedule_generation,
+                    session_actor_no="8", action_key=action_completion_key(departure),
+                )
+                chain = _BackgroundManualChain(request, 1, phase="departure_submitting", active_request_id=1)
+                controller._background_manual_chains["rest"] = chain
+                controller._background_manual_workers[1] = ("rest", "departure", request)
+                comparison = {"compare": "已登打", "group": "done"}
+                self.assertTrue(duty.handle_submission_request_result(request, "submitted", "完成", "", comparison))
+                controller._background_manual_submission_succeeded(
+                    request, DutySubmissionResult(0, "submitted", "完成", Path("result.json"), comparison, departure),
+                )
+                with patch("qt_app.controllers.app_controller.datetime") as clock:
+                    clock.now.return_value = datetime(2026, 10, 5, 16, 1)
+                    self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+                self.assertEqual(chain.phase, "return_waiting")
+                saved = (Path(directory) / "duty_return_policy.json").read_text(encoding="utf-8")
+                self.assertNotIn("secret", saved)
+                self.assertNotIn("user8", saved)
+            finally:
+                controller.shutdown()
+
+            restarted = DutyController(repository=repository)
+            try:
+                restarted.set_session_context(1, "user23")
+                restarted.set_actor_no("23")
+                restarted.replace_schedule_data(data)
+                self.assertIn(0, restarted._executed_indices)
+                state = DueTaskSelectionState(
+                    actor_no="23", target_roc_date="1151005",
+                    auto_return_indices=frozenset(restarted._auto_return_indices()),
+                )
+                self.assertEqual(select_due_task_indices(data["actions"], state, now=datetime(2026, 10, 5, 17)), [])
+                self.assertEqual(select_due_task_indices(data["actions"], state, now=datetime(2026, 10, 5, 18)), [1])
+                from dataclasses import replace
+                self.assertEqual(select_due_task_indices(data["actions"], replace(state, actor_no="8"), now=datetime(2026, 10, 5, 18)), [])
+            finally:
+                restarted.shutdown()
+
+    def test_update_guard_keeps_due_active_and_unsaved_background_tasks_blocked(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        for case in ("future_saved", "due", "active", "departure", "unsaved", "corrupt"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                controller = AppController(schedule_repository=ScheduleRepository(Path(directory)))
+                try:
+                    controller._background_manual_timer.stop()
+                    controller._send_operational_event = lambda *_args, **_kwargs: None
+                    action = {
+                        "kind": "entry_log", "time": "18:00", "actor": "23", "target": "8",
+                        "source": "休息結束", "return_pair_key": "rest:1151005:8:16-18",
+                        "fields": {"出或入": "入", "領用事由及地點": "休息返隊"},
+                    }
+                    request = DutySubmissionRequest("user8", "secret", 0, {"target_date": "1151005", "actions": [action]}, background=True)
+                    chain = _BackgroundManualChain(request, 0, phase="return_waiting")
+                    controller._background_manual_chains["rest"] = chain
+                    if case != "unsaved":
+                        controller.dutyController._background_manual_departure_pair_keys.add(action["return_pair_key"])
+                        controller.dutyController._save_manual_departure_pair_keys()
+                    if case == "corrupt":
+                        controller.dutyController._return_policy_state_path.write_text("{", encoding="utf-8")
+                    if case == "active":
+                        chain.active_request_id = 1
+                        chain.phase = "return_submitting"
+                    if case == "departure":
+                        chain.phase = "departure_waiting"
+                    with patch("qt_app.controllers.app_controller.datetime") as clock:
+                        clock.now.return_value = datetime(2026, 10, 5, 18 if case == "due" else 16, 1)
+                        reason = controller._stop_block_reason()
+                    if case == "future_saved":
+                        self.assertEqual(reason, "")
+                    else:
+                        self.assertIn("1 筆到點自動登打", reason)
+                finally:
+                    controller.shutdown()
+
+    def test_update_shutdown_retries_closed_admissions_without_duplicate_logout(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        events = []
+        controller._session_state.session = LoginSession("8", "user8", "secret", verified=True)
+        controller._operational_sync_service = SimpleNamespace(enqueue_event=lambda kind, **fields: events.append((kind, fields)))
+        try:
+            with patch.object(controller.dutyExecutionController, "prepare_session_end", side_effect=[False, True]):
+                self.assertEqual(controller.prepareUpdateShutdown(), "busy")
+                self.assertTrue(controller._worker_admissions_closed)
+                self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+                self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+            self.assertEqual([kind for kind, _fields in events], ["logout"])
+        finally:
+            controller.shutdown()
+
     def test_update_shutdown_is_busy_during_submission_and_durably_records_logout(self) -> None:
         from app_core.duty_submission_service import DutySubmissionRequest
         from app_core.session import LoginSession

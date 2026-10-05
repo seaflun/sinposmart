@@ -238,6 +238,7 @@ class AppController(QObject):
         self._pending_update_logout = False
         self._auto_login_marker_path = self._auto_login_marker_file(package_root)
         self._restore_auto_login_marker()
+        self._update_shutdown_started = False
         self._update_shutdown_prepared = False
         self._worker_admissions_closed = False
         self._allow_shutdown_operational_sync = False
@@ -525,23 +526,25 @@ class AppController(QObject):
             return "failed"
         if self._update_shutdown_prepared:
             return "ready"
-        block_reason = self._stop_block_reason()
-        if block_reason:
-            self._update_controller.deferUpdate(block_reason)
-            return "busy"
-        session = self._session_state.session
-        has_identity = bool(
-            (session is not None and session.verified)
-            or self._last_login_actor_no
-            or self._last_login_user_id
-        )
-        if has_identity:
-            try:
-                if not self.recordUpdateLogout():
+        if not self._update_shutdown_started:
+            block_reason = self._stop_block_reason()
+            if block_reason:
+                self._update_controller.deferUpdate(block_reason)
+                return "busy"
+            session = self._session_state.session
+            has_identity = bool(
+                (session is not None and session.verified)
+                or self._last_login_actor_no
+                or self._last_login_user_id
+            )
+            if has_identity:
+                try:
+                    if not self.recordUpdateLogout():
+                        return "failed"
+                except Exception:
                     return "failed"
-            except Exception:
-                return "failed"
-        self._pending_live_refresh_generation = None
+            self._pending_live_refresh_generation = None
+            self._update_shutdown_started = True
         if not self._close_worker_admissions():
             return "busy"
         self._update_shutdown_prepared = True
@@ -571,7 +574,23 @@ class AppController(QObject):
                 prepare()
         duty_ready = self._duty_controller.prepare_session_end()
         execution_ready = self._duty_execution_controller.prepare_session_end()
-        return duty_ready and execution_ready
+        return duty_ready and execution_ready and not self._duty_execution_controller.hasPendingSubmissions
+
+    def _background_return_can_resume_after_restart(
+        self, chain: _BackgroundManualChain, current: datetime
+    ) -> bool:
+        if (
+            chain.phase != "return_waiting"
+            or chain.active_request_id is not None
+            or chain.return_action_index is None
+        ):
+            return False
+        index = chain.return_action_index
+        action_at = self._background_action_datetime(chain.request, index, current)
+        if action_at is None or action_at <= current:
+            return False
+        action = chain.request.schedule_data["actions"][index]
+        return self._duty_controller.has_saved_departure_for_return(action)
 
     def _stop_block_reason(self) -> str:
         """Describe the first activity that makes quit or update unsafe."""
@@ -583,7 +602,13 @@ class AppController(QObject):
         if self._background_manual_workers:
             return "到點自動登打正在執行"
         if self._background_manual_chains:
-            return f"尚有 {len(self._background_manual_chains)} 筆到點自動登打等待中"
+            current = datetime.now()
+            waiting_count = sum(
+                not self._background_return_can_resume_after_restart(chain, current)
+                for chain in self._background_manual_chains.values()
+            )
+            if waiting_count:
+                return f"尚有 {waiting_count} 筆到點自動登打等待中"
         if (self._duty_execution_controller.isBusy
                 or self._duty_execution_controller.hasPendingSubmissions or self._logout_pending):
             return "勤務登打尚未完成"
