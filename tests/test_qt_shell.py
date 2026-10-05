@@ -3474,6 +3474,89 @@ class DutySubmissionServiceTests(unittest.TestCase):
         self.assertEqual(refreshed["fields"]["處理情形"], "一、時間:10:00-12:20")
         self.assertEqual(refreshed_scheduled["fields"]["處理情形"], "一、時間:10:00-12:20")
 
+    def test_delayed_handoff_refresh_updates_cases_before_form_fill(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        from duty_rehearsal import CaseRecord, case_counts, work_handoff_status_text
+
+        cases = [
+            CaseRecord("08:30:50", "09:34:52", "緊急救護-急病", []),
+            CaseRecord("09:04:20", "10:50:50", "緊急救護-急病", []),
+        ]
+        latest_status = work_handoff_status_text("08-10", case_counts(cases, 8, 10))
+        latest_status += "\n四、最新補充"
+        expected_status = latest_status.replace("08-10", "08:00-10:50", 1)
+        for trigger, stamped, cached in (
+            ("recovery", True, False),
+            ("manual", True, False),
+            ("due", False, False),
+            ("due", False, True),
+        ):
+            with self.subTest(trigger=trigger, stamped=stamped, cached=cached), tempfile.TemporaryDirectory() as temp_dir:
+                filled_fields = []
+                original = {
+                    "kind": "work_log",
+                    "time": "10:50" if stamped else "10:00",
+                    "actor": "19",
+                    "target": "19",
+                    "source": "值班交接",
+                    "duplicate_key": "work:2026-10-05:10:值班交接:19",
+                    "fields": {
+                        "工作時間": "10:50" if stamped else "10:00",
+                        "處理情形": work_handoff_status_text("08:00-10:50", {"救護": 1, "火警": 0}),
+                    },
+                }
+                if stamped:
+                    original["submit_target_date"] = "1151005"
+                else:
+                    original["_actual_handoff_adjusted"] = True
+                latest = {
+                    **original,
+                    "time": "10:00",
+                    "fields": {"工作時間": "10:00", "處理情形": latest_status},
+                }
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work",
+                    ENTRY_LOG_AP="entry",
+                    build_driver=lambda **_kwargs: object(),
+                    login=lambda *_args: None,
+                    query_visible_table=lambda *_args, **_kwargs: [],
+                    fill_work_log_form_for_test=lambda _driver, action, *_args, **_kwargs: filled_fields.append(dict(action["fields"])) or {},
+                    quit_driver=lambda *_args: None,
+                    parse_roc_date=lambda _value: date(2026, 10, 5),
+                    roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}",
+                    query_duty_sheet=lambda *_args: object(),
+                    query_cases=lambda *_args: cases,
+                    planned_actions=lambda *_args: [latest],
+                )
+                service = DutySubmissionService(
+                    Path(temp_dir),
+                    module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 10, 5, 10, 50),
+                    comparison_builder=lambda *_args, **_kwargs: {
+                        0: {"compare": "未找到", "group": "todo", "matched": []}
+                    },
+                )
+                if cached:
+                    snapshot_path = Path(temp_dir) / "runtime_outputs" / "schedule" / "schedule_output_1151005.json"
+                    snapshot_path.parent.mkdir(parents=True)
+                    snapshot_path.write_text(json.dumps({
+                        "target_date": "1151005",
+                        "created_at": "2026-10-05T10:49:59",
+                        "actions": [latest],
+                    }, ensure_ascii=False), encoding="utf-8")
+                    automation.query_cases = Mock(side_effect=AssertionError("Recent snapshot should be used"))
+                result = service.execute(DutySubmissionRequest(
+                    "test-user", "test-password", 0,
+                    {"target_date": "1151005", "actions": [original]},
+                    trigger_type=trigger, save=False,
+                ))
+
+                self.assertEqual(result.status, "filled")
+                self.assertEqual(filled_fields[0]["工作時間"], original["fields"]["工作時間"])
+                self.assertEqual(filled_fields[0]["處理情形"], expected_status)
+
     def test_due_off_duty_action_pauses_when_external_assignment_is_open(self) -> None:
         from datetime import datetime
 
@@ -17698,7 +17781,9 @@ if return_code != 0 or loaded:
         ]
         for scenario in ["complete", "incomplete", "new_session", "paused"]:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
-                queue = UnreturnedReturnQueue(Path(directory))
+                queue = UnreturnedReturnQueue(
+                    Path(directory), now_factory=lambda: datetime(2026, 10, 4, 8, 11),
+                )
                 controller = DutyController(
                     repository=ScheduleRepository(Path(directory)),
                     unreturned_return_queue=queue,

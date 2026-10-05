@@ -659,25 +659,29 @@ class DutySubmissionService:
         latest_mapping: Mapping[str, Any],
     ) -> dict[str, Any]:
         merged = dict(latest_mapping)
+        if not (action.get("submit_target_date") or action.get("_actual_handoff_adjusted")):
+            return merged
+        latest_fields = dict(merged.get("fields", {}))
+        original_fields = action.get("fields", {})
         if action.get("submit_target_date"):
-            latest_fields = dict(merged.get("fields", {}))
-            original_fields = action.get("fields", {})
             if isinstance(original_fields, Mapping):
-                preserved_keys = ("工作時間", "登打時間", "系統寫入時間")
-                if action.get("submit_target_date") or action.get("_actual_handoff_adjusted"):
-                    preserved_keys += ("處理情形",)
-                for key in preserved_keys:
+                for key in ("工作時間", "登打時間", "系統寫入時間"):
                     if key in original_fields:
                         latest_fields[key] = original_fields[key]
-            merged["fields"] = latest_fields
             merged["time"] = action.get("time", merged.get("time", ""))
             merged["submit_target_date"] = action["submit_target_date"]
-        elif action.get("_actual_handoff_adjusted"):
-            latest_fields = dict(merged.get("fields", {}))
-            original_fields = action.get("fields", {})
-            if isinstance(original_fields, Mapping) and "處理情形" in original_fields:
-                latest_fields["處理情形"] = original_fields["處理情形"]
-            merged["fields"] = latest_fields
+        if isinstance(original_fields, Mapping):
+            original_status = str(original_fields.get("處理情形", "") or "").splitlines()
+            latest_status = str(latest_fields.get("處理情形", "") or "").splitlines()
+            if (
+                original_status and latest_status
+                and original_status[0].startswith("一、時間:")
+                and latest_status[0].startswith("一、時間:")
+            ):
+                # Keep actual handoff bounds without restoring stale case counts.
+                latest_status[0] = original_status[0]
+                latest_fields["處理情形"] = "\n".join(latest_status)
+        merged["fields"] = latest_fields
         return merged
 
     def _open_assignment_pause_details(
