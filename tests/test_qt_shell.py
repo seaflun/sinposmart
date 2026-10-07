@@ -2229,6 +2229,147 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    @staticmethod
+    def _training_readback_fixture():
+        action = {
+            "kind": "work_log", "time": "17:00", "actor": "10", "source": "在隊訓練",
+            "fields": {"工作時間": "17:00", "勤務項目": "在隊訓練", "事由": "體技能訓練",
+                       "訓練項目": "常訓體技能訓練", "工作概述": "常訓體技能訓練\n一、時間：14-17",
+                       "處理情形": "訓練完成", "服勤人員": ["10"]},
+        }
+        row = ["1151007\n17:00", "大隊", "分隊", "在隊訓練", "", action["fields"]["工作概述"],
+               "訓練完成", "測試甲", "1", "0", "無", "測試乙", ""]
+        data = {"target_date": "1151007", "today": {"staff": {"10": {"name": "測試甲"}}}, "actions": [action]}
+        return action, row, data
+
+    def test_training_with_missing_reason_is_reviewed_without_resending(self) -> None:
+        from datetime import datetime
+        from app_core.duty_task_projection import build_schedule_comparisons, compare_submission_action
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        action, row, data = self._training_readback_fixture()
+        comparison_data = {"visible_work_rows": [row]}
+        self.assertEqual(compare_submission_action(data, action, "1151007", comparison_data)["group"], "review")
+        self.assertEqual(build_schedule_comparisons(data, [action], {"1151007": comparison_data})[0]["group"], "review")
+        for column, replacement in ((5, "救護訓練"), (6, "不同處理情形"), (7, "測試乙"), (4, "搶救訓練")):
+            different = list(row)
+            different[column] = replacement
+            self.assertEqual(compare_submission_action(data, action, "1151007", {"visible_work_rows": [different]})["group"], "todo")
+        valid = list(row)
+        valid[4] = "體技能訓練"
+        self.assertEqual(compare_submission_action(data, action, "1151007", {"visible_work_rows": [valid]})["group"], "done")
+        for trigger in ("due", "manual", "recovery"):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as temp_dir:
+                fill = Mock()
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work", ENTRY_LOG_AP="entry", build_driver=lambda **_kwargs: object(),
+                    login=lambda *_args: None, query_visible_table=lambda *_args, **_kwargs: [row],
+                    fill_work_log_form_for_test=fill, quit_driver=lambda *_args: None,
+                )
+                service = DutySubmissionService(Path(temp_dir), module_loader=lambda: automation,
+                                                now_factory=lambda: datetime(2026, 10, 7, 17, 1))
+                result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data, trigger_type=trigger))
+                self.assertEqual(result.status, "review_required")
+                fill.assert_not_called()
+
+    def test_training_reason_waits_and_stays_selected_before_save(self) -> None:
+        from contextlib import ExitStack
+        import duty_rehearsal as automation
+
+        class ImmediateWait:
+            def __init__(self, driver, *_args, **_kwargs):
+                self.driver = driver
+
+            def until(self, predicate):
+                for _attempt in range(3):
+                    result = predicate(self.driver)
+                    if result:
+                        return result
+                raise automation.TimeoutException("reason not ready")
+
+        action, _row, data = self._training_readback_fixture()
+        ready = {"set": [{"id": "_selReason", "value": "體技能訓練"}], "missing": []}
+        missing = {"set": [], "missing": ["reason"]}
+        for scenario in ("missing", "delayed", "reset"):
+            with self.subTest(scenario=scenario), ExitStack() as stack:
+                for name in ("ensure_ap", "control_snapshot", "accept_pending_alerts", "set_work_log_content_fields"):
+                    stack.enter_context(patch.object(automation, name, return_value=False if name == "ensure_ap" else {}))
+                stack.enter_context(patch.object(automation, "WebDriverWait", ImmediateWait))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                stack.enter_context(patch.object(automation, "set_work_people", return_value={"ok": True}))
+                setter = stack.enter_context(patch.object(automation, "set_work_log_reason_field",
+                    side_effect=([missing, ready, ready] if scenario == "delayed" else None),
+                    return_value=missing if scenario == "missing" else ready))
+                stack.enter_context(patch.object(automation, "verify_work_log_reason_field", create=True,
+                                               return_value={"ok": scenario != "reset"}))
+                save = stack.enter_context(patch.object(automation, "click_save_control", return_value={"ok": True}))
+                driver = SimpleNamespace(execute_script=lambda script, *_args: True if "return Boolean" in script else {"missing": []})
+                if scenario == "delayed":
+                    automation.fill_work_log_form_for_test(driver, action, data["today"]["staff"], "1151007", save=True)
+                    save.assert_called_once()
+                    self.assertGreaterEqual(setter.call_count, 2)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "事由"):
+                        automation.fill_work_log_form_for_test(driver, action, data["today"]["staff"], "1151007", save=True)
+                    save.assert_not_called()
+
+    def test_unconfirmed_work_save_survives_restart_without_resending(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        _action, row, data = self._training_readback_fixture()
+        rows = []
+        saves = []
+        def fill(_driver, _action, _staff, _date, save, before_save=None):
+            if before_save:
+                before_save()
+            saves.append(save)
+            return {"ok": True, "save": {"ok": True}}
+        automation = SimpleNamespace(
+            WORK_LOG_AP="work", ENTRY_LOG_AP="entry", build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+            query_visible_table=lambda *_args, **_kwargs: rows, fill_work_log_form_for_test=fill, quit_driver=lambda *_args: None,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def restarted_service():
+                return DutySubmissionService(Path(temp_dir), module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 10, 7, 17, 1), sleeper=lambda _seconds: None)
+            request = DutySubmissionRequest("test-user", "test-password", 0, data)
+            first = restarted_service().execute(request)
+            self.assertEqual(first.status, "review_required")
+            self.assertEqual(first.comparison["confirmation_state"], "saved_not_verified")
+            self.assertTrue(first.comparison["form_result"]["save"]["ok"])
+            second = restarted_service().execute(request)
+            self.assertEqual(second.status, "review_required")
+            self.assertEqual(saves, [True])
+            valid = list(row)
+            valid[4] = "體技能訓練"
+            rows.append(valid)
+            confirmed = restarted_service().execute(request)
+            self.assertEqual(confirmed.status, "skipped_duplicate")
+            self.assertEqual(saves, [True])
+
+    def test_work_save_exception_keeps_confirmation_hold_across_restart(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        _action, _row, data = self._training_readback_fixture()
+        saves = []
+        def fill(_driver, _action, _staff, _date, save, before_save=None):
+            before_save()
+            saves.append(save)
+            raise TimeoutError("response lost after save")
+        automation = SimpleNamespace(
+            WORK_LOG_AP="work", ENTRY_LOG_AP="entry", build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+            query_visible_table=lambda *_args, **_kwargs: [], fill_work_log_form_for_test=fill, quit_driver=lambda *_args: None,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for _restart in range(2):
+                service = DutySubmissionService(Path(temp_dir), module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 10, 7, 17, 1), sleeper=lambda _seconds: None)
+                result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+                self.assertEqual(result.status, "review_required")
+            self.assertEqual(saves, [True])
+
     def test_work_duplicate_uses_reason_and_personnel_columns_only(self) -> None:
         from compare_rehearsal_records import find_work_matches, flatten_rows
 
@@ -2445,7 +2586,7 @@ class DutySubmissionServiceTests(unittest.TestCase):
         from datetime import datetime
 
         from app_core.duty_submission_service import (
-            DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+            DutySubmissionRequest, DutySubmissionService,
         )
 
         automation = SimpleNamespace(
@@ -2465,10 +2606,10 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 now_factory=lambda: datetime(2026, 10, 1, 12), sleeper=lambda _seconds: None,
                 comparison_builder=lambda *_args, **_kwargs: {0: {"group": "todo"}},
             )
-            with self.assertRaises(DutySubmissionExecutionError) as raised:
-                service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
-            saved = json.loads(raised.exception.result_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["stage"], "failed")
+            result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+            saved = json.loads(result.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], "review_required")
+        self.assertEqual(saved["comparison"]["confirmation_state"], "saved_not_verified")
         self.assertEqual(saved["updated_at"], "2026-10-01T12:00:00")
 
     def test_returned_off_duty_recovery_ignores_emergency_departure(self) -> None:

@@ -13,6 +13,7 @@ from compare_rehearsal_records import (
     find_arrival_entry_exists,
     find_case_work_matches,
     find_entry_matches,
+    find_incomplete_training_work_matches,
     find_work_matches,
     flatten_rows,
     is_future_action,
@@ -1099,6 +1100,11 @@ def compare_submission_action(
 
     if matches:
         return {"compare": "已存在", "group": "done", "matched": matches[:1]}
+    if current_action.get("kind") == "work_log":
+        incomplete = find_incomplete_training_work_matches(work_rows, action_date, staff, current_action)
+        if incomplete:
+            return {"compare": "已存在相同訓練但事由缺漏", "group": "review", "matched": incomplete[:1],
+                    "confirmation_state": "existing_work_missing_reason"}
     return {"compare": "未找到", "group": "todo", "matched": []}
 
 
@@ -1202,6 +1208,9 @@ def build_schedule_comparisons(
             )
             if matches:
                 result[index] = {"compare": "已存在", "group": "done", "matched": matches[:1]}
+            elif incomplete := find_incomplete_training_work_matches(work_rows, action_date, staff, dict(action)):
+                result[index] = {"compare": "已存在相同訓練但事由缺漏", "group": "review", "matched": incomplete[:1],
+                                 "confirmation_state": "existing_work_missing_reason"}
             elif is_future_action(target_date, dict(action)):
                 result[index] = {"compare": "尚未到點", "group": "future", "matched": []}
             else:

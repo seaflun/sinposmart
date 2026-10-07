@@ -7,6 +7,7 @@ import importlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 from inspect import signature
 from pathlib import Path
 from time import sleep
@@ -308,6 +309,8 @@ class DutySubmissionService:
                 )
             )
             if submission_comparison.get("group") == "done":
+                if self._work_save_state(action, action_date) == "pending":
+                    self._work_save_state(action, action_date, "confirmed")
                 return self._finish(
                     request,
                     action,
@@ -315,6 +318,14 @@ class DutySubmissionService:
                     "skipped_duplicate",
                     "已存在相同紀錄，已略過重複登打。",
                     submission_comparison,
+                    time_order_warnings=time_order_warnings,
+                )
+            if submission_comparison.get("group") == "review" or self._work_save_state(action, action_date) == "pending":
+                return self._finish(
+                    request, action, result_path, "review_required",
+                    "已存在相同訓練但事由缺漏，或先前送出尚待確認；已停止重複送出。",
+                    {**submission_comparison, "group": "review",
+                     "confirmation_state": submission_comparison.get("confirmation_state") or "saved_not_verified"},
                     time_order_warnings=time_order_warnings,
                 )
             if group in ("near", "adjust", "review", "manual") and not allows_manual_submission:
@@ -347,8 +358,11 @@ class DutySubmissionService:
             def before_save() -> None:
                 if self.is_stale_due_request(request):
                     raise _StaleDutyScheduleError()
+                if request.save and action.get("kind") == "work_log":
+                    self._work_save_state(action, action_date, "pending")
 
-            before_save()
+            if self.is_stale_due_request(request):
+                raise _StaleDutyScheduleError()
             fill_form = (
                 automation.fill_entry_log_form_for_test
                 if action.get("kind") == "entry_log"
@@ -368,6 +382,8 @@ class DutySubmissionService:
                     {"group": "filled", "matched": [], "form_result": form_result},
                     time_order_warnings=time_order_warnings,
                 )
+            if action.get("kind") == "work_log":
+                self._work_save_state(action, action_date, "pending")
 
             try:
                 if status_callback:
@@ -396,7 +412,17 @@ class DutySubmissionService:
                             status_callback(f"登打後資料尚未顯示，正在第 {attempt + 2} 次確認。")
                         self.sleeper(1.0)
                 if verified.get("group") != "done":
+                    if action.get("kind") == "work_log":
+                        return self._finish(
+                            request, action, result_path, "review_required",
+                            "已嘗試送出，但回查尚未確認；已停止自動重送，請核對勤務系統紀錄。",
+                            {**verified, "group": "review", "confirmation_state": "saved_not_verified",
+                             "form_result": {key: form_result[key] for key in ("save", "fill", "people") if key in form_result}},
+                            time_order_warnings=time_order_warnings,
+                        )
                     raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料。")
+                if action.get("kind") == "work_log":
+                    self._work_save_state(action, action_date, "confirmed")
                 verified = {**verified, "form_result": form_result}
                 return self._finish(
                     request,
@@ -424,6 +450,8 @@ class DutySubmissionService:
                 )
                 if reconciled is None:
                     raise
+                if action.get("kind") == "work_log":
+                    self._work_save_state(action, action_date, "confirmed")
                 reconciled = {**reconciled, "form_result": form_result}
                 return self._finish(
                     request,
@@ -439,10 +467,17 @@ class DutySubmissionService:
         except DutySubmissionValidationError:
             raise
         except DutySubmissionExecutionError as exc:
+            if self._work_save_state(action, action_date) == "pending":
+                return self._finish_work_review(request, action, action_date, result_path, exc)
             self._write_failure(request, action, result_path)
             exc.result_path = result_path
             raise
         except Exception as exc:
+            if (
+                getattr(exc, "diagnostic_category", "") == "work_form_incomplete"
+                or self._work_save_state(action, action_date) == "pending"
+            ):
+                return self._finish_work_review(request, action, action_date, result_path, exc)
             self._write_failure(request, action, result_path)
             message, error_code = self._safe_error(exc)
             raise DutySubmissionExecutionError(message, error_code, result_path) from exc
@@ -452,6 +487,41 @@ class DutySubmissionService:
                     automation.quit_driver(driver)
                 except Exception:
                     pass
+
+    def _work_save_state(
+        self, action: Mapping[str, Any], action_date: str, stage: str | None = None,
+    ) -> str:
+        if action.get("kind") != "work_log":
+            return ""
+        key = f"{action_date}:{action_completion_key(action)}"
+        digest = sha256(key.encode("utf-8")).hexdigest()
+        path = self.package_root / "runtime_outputs" / "work_submission_holds" / f"{digest}.json"
+        if stage is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pending = path.with_suffix(".tmp")
+            pending.write_text(json.dumps({"completion_key": key, "stage": stage}, ensure_ascii=False), encoding="utf-8")
+            pending.replace(path)
+            return stage
+        if not path.exists():
+            return ""
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return "confirmed" if value.get("completion_key") == key and value.get("stage") == "confirmed" else "pending"
+        except (OSError, ValueError, AttributeError):
+            return "pending"
+
+    def _finish_work_review(
+        self, request: DutySubmissionRequest, action: Mapping[str, Any], action_date: str,
+        result_path: Path, exc: Exception,
+    ) -> DutySubmissionResult:
+        pending = self._work_save_state(action, action_date) == "pending"
+        return self._finish(
+            request, action, result_path, "review_required",
+            "送出狀態尚待確認，已停止自動重送。" if pending else "工作表單事由或必填欄位未填妥，已停止送出。",
+            {"group": "review", "matched": [],
+             "confirmation_state": "saved_not_verified" if pending else "form_not_submitted",
+             "confirmation_error_code": str(getattr(exc, "diagnostic_category", "") or self._safe_error(exc)[1])},
+        )
 
     def _finish_stale_request(
         self,

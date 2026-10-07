@@ -990,6 +990,37 @@ def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) 
     )
 
 
+def verify_work_log_reason_field(
+    driver: webdriver.Chrome,
+    fields: dict[str, Any],
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Read the selected reason again after the rest of the form was filled."""
+
+    return driver.execute_script(
+        """
+        const target = String(arguments[0] || '').trim();
+        const selected = arguments[1] || [];
+        for (const record of selected) {
+          const el = (record.id && document.getElementById(record.id)) ||
+            (record.name && document.getElementsByName(record.name)[0]);
+          if (!el) continue;
+          const value = String(el.value || '').trim();
+          const text = String(el.tagName === 'SELECT' ? el.options[el.selectedIndex]?.text || '' : value).trim();
+          if (value === target || text === target || (target && text.includes(target)))
+            return {ok: true, id: el.id || '', value, text};
+        }
+        return {ok: false, missing: ['reason']};
+        """,
+        fields.get("事由", ""),
+        selection.get("set", []),
+    )
+
+
+class WorkLogFormValidationError(RuntimeError):
+    diagnostic_category = "work_form_incomplete"
+
+
 def fill_work_log_form_for_test(
     driver: webdriver.Chrome,
     action: dict[str, Any],
@@ -1106,18 +1137,31 @@ def fill_work_log_form_for_test(
         },
     )
     fill_result["item_alerts"] = accept_pending_alerts(driver)
-    reason_result = set_work_log_reason_field(driver, fields)
+    time.sleep(1)
+    reason_result = {"set": [], "missing": [], "skipped": True}
+    if fields.get("事由"):
+        def reason_ready(current_driver):
+            selected = set_work_log_reason_field(current_driver, fields)
+            return selected if selected.get("set") and not selected.get("missing") else False
+
+        try:
+            reason_result = WebDriverWait(driver, 5, poll_frequency=0.2).until(reason_ready)
+        except TimeoutException as exc:
+            raise WorkLogFormValidationError("工作表單事由未填妥，已停止送出。") from exc
     fill_result["reason"] = reason_result
     fill_result["reason_alerts"] = accept_pending_alerts(driver)
-    if action.get("source") == DROWNING_PATROL_KEYWORD:
-        missing = list(fill_result.get("missing", [])) + list(reason_result.get("missing", []))
-        if missing:
-            raise RuntimeError("drowning patrol work-log field selection failed: " + ", ".join(missing))
-    time.sleep(1)
+    missing = list(fill_result.get("missing", [])) + list(reason_result.get("missing", []))
+    if missing:
+        raise WorkLogFormValidationError("工作表單必填欄位未填妥，已停止送出：" + ", ".join(missing))
     content_result = set_work_log_content_fields(driver, fields)
     fill_result["content"] = content_result
 
     people_result = set_work_people(driver, people, fallback_popup=True) if people else {"ok": False, "missing": []}
+    if fields.get("事由"):
+        verification = verify_work_log_reason_field(driver, fields, reason_result)
+        fill_result["reason_verification"] = verification
+        if not verification.get("ok"):
+            raise WorkLogFormValidationError("工作表單事由未保留，已停止送出。")
     if save and before_save is not None:
         before_save()
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}

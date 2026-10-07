@@ -384,6 +384,39 @@ def find_work_matches(
     return matches
 
 
+def find_incomplete_training_work_matches(
+    rows: list[str],
+    target_date: str,
+    staff: dict[str, dict[str, str]],
+    action: dict[str, Any],
+) -> list[str]:
+    """Keep a saved training with a missing reason from being submitted again."""
+
+    fields = action.get("fields", {})
+    if (
+        action.get("source") != "在隊訓練"
+        or not fields.get("事由")
+        or not fields.get("訓練項目")
+        or not fields.get("工作概述")
+        or not fields.get("處理情形")
+        or not fields.get("服勤人員")
+    ):
+        return []
+    candidate = {**action, "fields": {**fields, "事由": ""}}
+    candidates = find_work_matches(rows, target_date, staff, candidate, allow_near=True, near_minutes=2)
+    matches = []
+    for row in candidates:
+        cells = [clean(part) for part in row.split("|")]
+        if (
+            len(cells) >= 8
+            and not cells[4]
+            and cells[5] == clean(fields["工作概述"])
+            and cells[6] == clean(fields["處理情形"])
+        ):
+            matches.append(row)
+    return matches
+
+
 def find_open_external_assignment(
     rows: list[str],
     target_date: str,
