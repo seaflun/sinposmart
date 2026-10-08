@@ -18,6 +18,13 @@ def clean(value: str) -> str:
     return re.sub(r"\s+", "", (value or "").replace("\xa0", ""))
 
 
+def work_log_reason_variants(value: str) -> tuple[str, ...]:
+    """Accept the official physical-training label and existing planned spelling."""
+
+    training = ("體技能訓練", "體(技)能訓練", "體（技）能訓練")
+    return training if clean(value) in training else (str(value or "").strip(),)
+
+
 def hhmm(value: str) -> str:
     return value.replace(":", "")
 
@@ -356,7 +363,7 @@ def find_work_matches(
             if "無線電" not in c:
                 continue
         else:
-            if reason and clean(reason) != reason_cell:
+            if reason and reason_cell not in {clean(value) for value in work_log_reason_variants(reason)}:
                 continue
             if fields.get("服勤人員"):
                 if people_unresolved or not full_work_row:

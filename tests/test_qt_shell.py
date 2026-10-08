@@ -2242,6 +2242,77 @@ class DutySubmissionServiceTests(unittest.TestCase):
         data = {"target_date": "1151007", "today": {"staff": {"10": {"name": "測試甲"}}}, "actions": [action]}
         return action, row, data
 
+    def test_training_reason_spelling_is_recognized_without_resending(self) -> None:
+        from datetime import datetime
+        from app_core.duty_task_projection import build_schedule_comparisons, compare_submission_action
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        action, row, data = self._training_readback_fixture()
+        for reason in ("體技能訓練", "體(技)能訓練", "體（技）能訓練"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                saved = list(row)
+                saved[4] = reason
+                comparison = {"visible_work_rows": [saved]}
+                self.assertEqual(compare_submission_action(data, action, "1151007", comparison)["group"], "done")
+                self.assertEqual(build_schedule_comparisons(data, [action], {"1151007": comparison})[0]["group"], "done")
+                fill = Mock()
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work", ENTRY_LOG_AP="entry", build_driver=lambda **_kwargs: object(),
+                    login=lambda *_args: None, query_visible_table=lambda *_args, **_kwargs: [saved],
+                    fill_work_log_form_for_test=fill, quit_driver=lambda *_args: None,
+                )
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                                                now_factory=lambda: datetime(2026, 10, 7, 17, 1))
+                result = service.execute(DutySubmissionRequest("test-user", "test-password", 0, data))
+                self.assertEqual(result.status, "skipped_duplicate")
+                fill.assert_not_called()
+        for reason in ("救護訓練", "其他體技能訓練"):
+            with self.subTest(reason=reason):
+                different = list(row)
+                different[4] = reason
+                self.assertEqual(compare_submission_action(data, action, "1151007", {"visible_work_rows": [different]})["group"], "todo")
+
+    @unittest.skipUnless(os.environ.get("SINPOSMART_FORM_TEST_CHROMEDRIVER"), "未設定本機表單測試 ChromeDriver")
+    def test_browser_selects_and_verifies_official_training_reason_spelling(self) -> None:
+        from urllib.parse import quote
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        import duty_rehearsal as automation
+
+        options = Options()
+        options.add_argument("--headless=new")
+        service = Service(executable_path=os.environ["SINPOSMART_FORM_TEST_CHROMEDRIVER"],
+                          log_output=subprocess.DEVNULL)
+        driver = webdriver.Chrome(service=service, options=options)
+        self.addCleanup(driver.quit)
+        driver.get("data:text/html;charset=utf-8," + quote("""
+            <input id="_txtDATE">
+            <select id="_selTIMEH"><option value="17">17</option></select>
+            <select id="_selTIMEM"><option value="00">00</option></select>
+            <select id="_selList"><option value="42">在隊訓練</option></select>
+            <select id="_selList2"><option value="">請選擇</option>
+              <option value="49">救護訓練</option><option value="50">體(技)能訓練</option></select>
+            <textarea id="_areDescription"></textarea><textarea id="_areStatus"></textarea>
+        """))
+        action, _row, _data = self._training_readback_fixture()
+        action["fields"]["服勤人員"] = []
+        for reason in ("體技能訓練", "體(技)能訓練", "體（技）能訓練"):
+            with self.subTest(reason=reason), patch.object(automation, "ensure_ap", return_value=False):
+                action["fields"]["事由"] = reason
+                before_save = Mock()
+                result = automation.fill_work_log_form_for_test(
+                    driver, action, {}, "1151007", save=False, before_save=before_save,
+                )
+                self.assertTrue(result["fill"]["reason_verification"]["ok"])
+                self.assertEqual(driver.find_element("id", "_selList2").get_attribute("value"), "50")
+                self.assertTrue(result["save"]["skipped"])
+                before_save.assert_not_called()
+                driver.execute_script("document.getElementById('_selList2').value = '49';")
+                self.assertFalse(automation.verify_work_log_reason_field(
+                    driver, action["fields"], result["fill"]["reason"],
+                )["ok"])
+
     def test_training_with_missing_reason_is_reviewed_without_resending(self) -> None:
         from datetime import datetime
         from app_core.duty_task_projection import build_schedule_comparisons, compare_submission_action

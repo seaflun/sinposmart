@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from compare_rehearsal_records import work_log_reason_variants
+
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
@@ -919,15 +921,19 @@ def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) 
         """
         const values = arguments[0];
         const result = {set: [], missing: [], confirms: []};
+        const targets = arguments[1];
+        function optionMatches(opt, partial = false) {
+          const text = String(opt.text || '').trim();
+          const value = String(opt.value || '').trim();
+          return targets.some(target => text === target || value === target ||
+            (partial && targets.length === 1 && target && text.includes(target)));
+        }
         function setControl(el, value) {
           if (!el) return false;
           if (el.tagName.toLowerCase() === 'select') {
-            const target = String(value || '').trim();
             const options = Array.from(el.options || []);
-            const option = options.find(opt =>
-              String(opt.text || '').trim() === target ||
-              String(opt.value || '').trim() === target
-            ) || options.find(opt => String(opt.text || '').includes(target));
+            const option = options.find(opt => optionMatches(opt)) ||
+              options.find(opt => optionMatches(opt, true));
             if (!option) return false;
             el.value = option.value;
           } else {
@@ -958,13 +964,8 @@ def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) 
           return false;
         }
         function byOptionText(value) {
-          const target = String(value || '').trim();
           const el = Array.from(document.querySelectorAll('select')).find(control =>
-            Array.from(control.options || []).some(opt =>
-              String(opt.text || '').trim() === target ||
-              String(opt.value || '').trim() === target ||
-              String(opt.text || '').includes(target)
-            )
+            Array.from(control.options || []).some(opt => optionMatches(opt, true))
           );
           return setControl(el, value);
         }
@@ -987,6 +988,7 @@ def set_work_log_reason_field(driver: webdriver.Chrome, fields: dict[str, Any]) 
         return result;
         """,
         {"reason": reason},
+        work_log_reason_variants(reason),
     )
 
 
@@ -999,7 +1001,7 @@ def verify_work_log_reason_field(
 
     return driver.execute_script(
         """
-        const target = String(arguments[0] || '').trim();
+        const targets = arguments[0] || [];
         const selected = arguments[1] || [];
         for (const record of selected) {
           const el = (record.id && document.getElementById(record.id)) ||
@@ -1007,12 +1009,13 @@ def verify_work_log_reason_field(
           if (!el) continue;
           const value = String(el.value || '').trim();
           const text = String(el.tagName === 'SELECT' ? el.options[el.selectedIndex]?.text || '' : value).trim();
-          if (value === target || text === target || (target && text.includes(target)))
+          if (targets.some(target => value === target || text === target ||
+              (targets.length === 1 && target && text.includes(target))))
             return {ok: true, id: el.id || '', value, text};
         }
         return {ok: false, missing: ['reason']};
         """,
-        fields.get("事由", ""),
+        work_log_reason_variants(fields.get("事由", "")),
         selection.get("set", []),
     )
 
