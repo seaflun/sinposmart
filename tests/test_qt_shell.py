@@ -21877,7 +21877,7 @@ if return_code != 0 or loaded:
                 self.assertEqual(controller.sessionController.displayName, "10番 測試員")
                 self.assertEqual(
                     controller.sessionController.loginStatus,
-                    "已登入：隊員 測試員，今日值班時段：08 - 10。",
+                    "已登入：隊員 測試員，今日值班時段：08 - 10。；尚未設定 NAS 帳密同步 URL 或 token。",
                 )
                 self.assertEqual(password_field.property("text"), "")
                 self.assertFalse(controller.sessionController.isBusy)
@@ -23769,7 +23769,7 @@ if return_code != 0 or loaded:
             self.assertEqual(state.session.actor_name, "測試員")
             self.assertEqual(controller.actorNo, "10")
             self.assertEqual(controller.displayName, "10番 測試員")
-            self.assertEqual(controller.loginStatus, "已登入：測試員，正在查詢今日勤務表。")
+            self.assertEqual(controller.loginStatus, "已登入：測試員，正在查詢今日勤務表。；尚未設定 NAS 帳密同步 URL 或 token。")
 
     def test_verified_login_queues_current_account_for_credential_sync(self) -> None:
         from PySide6.QtTest import QTest
@@ -24034,6 +24034,147 @@ if return_code != 0 or loaded:
             self.assertFalse(controller.isBusy)
             self.assertFalse(controller._pending_credentials)
             self.assertFalse(controller._credential_sync_workers)
+
+
+class SavedLoginPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["saved_login_tests"])
+
+    def setUp(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.credential_sync_service import CredentialSyncService
+        from tests.test_credential_repository import FakeDpapi
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "saved_login.json"
+        self.repository = CredentialRepository(self.path, "SinpoSmart", FakeDpapi)
+        self.posted = []
+        self.nas_result = {"ok": True}
+        self.sync_service = CredentialSyncService(poster=self.post)
+
+    def post(self, payload):
+        self.posted.append(payload)
+        return self.nas_result
+
+    def controller(self, *, repository=None, sync_service=None):
+        from qt_app.controllers.session_controller import SessionController
+
+        controller = SessionController(
+            repository=repository or self.repository,
+            credential_sync_service=sync_service or self.sync_service,
+        )
+        self.addCleanup(controller.shutdown)
+        return controller
+
+    def succeed(self, controller, *, remember=True, actor_no="7", user_id="probe-user"):
+        from app_core.login_verifier import LoginResult
+
+        attempt = controller._state.begin_login()
+        controller._pending_credentials[attempt] = (user_id, "synthetic-password", remember, "manual")
+        controller._login_succeeded(attempt, LoginResult(actor_no, user_id, "測試人員"))
+
+    def wait_sync(self, controller):
+        from PySide6.QtTest import QTest
+
+        for _ in range(100):
+            if not controller._credential_sync_workers:
+                return
+            QTest.qWait(10)
+        self.fail("模擬 NAS 同步未完成")
+
+    def test_missing_dpapi_warns_without_blocking_nas_or_claiming_local_save(self):
+        from app_core.credential_repository import CredentialRepository
+
+        controller = self.controller(repository=CredentialRepository(self.path, "SinpoSmart", None))
+        self.succeed(controller)
+        self.wait_sync(controller)
+        self.assertTrue(controller.isLoggedIn)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(controller.savedAccountsModel.rowCount(), 0)
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "failed")
+        self.assertIn("本機帳密未儲存", controller.loginStatus)
+        self.assertIn("NAS 已收到", controller.loginStatus)
+        self.assertEqual(controller.loginStatusTone, "warning")
+        controller.set_logged_in_status("測試人員", "16–18")
+        self.assertIn("本機帳密未儲存", controller.loginStatus)
+
+    def test_write_denial_keeps_original_and_still_sends_current_login(self):
+        self.repository.save([{"actor_no": "2", "user_id": "old-user", "password": "old-password"}], "old-user")
+        controller = self.controller()
+        original = self.path.read_bytes()
+        with patch.object(Path, "replace", side_effect=PermissionError("synthetic denied")):
+            self.succeed(controller)
+        self.wait_sync(controller)
+        self.assertTrue(controller.isLoggedIn)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(controller.savedAccountsModel.rowCount(), 1)
+        self.assertEqual([row["user_id"] for row in controller._accounts], ["old-user"])
+        self.assertEqual(self.posted[0]["accounts"][0]["user_id"], "probe-user")
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "failed")
+        self.assertEqual(self.posted[0]["accounts"][1]["duty_pc_save_status"], "saved")
+
+    def test_successful_save_reports_saved_and_reopens_selection(self):
+        controller = self.controller()
+        self.succeed(controller)
+        self.wait_sync(controller)
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "saved")
+        self.assertEqual(controller.savedAccountsModel.rowCount(), 1)
+        reopened = self.controller()
+        selected = []
+        reopened.savedAccountSelected.connect(lambda a, u, p: selected.append((a, u, p)))
+        reopened.restoreSavedAccountSelection()
+        self.assertEqual(selected[-1], ("7", "probe-user", "synthetic-password"))
+
+    def test_unchecked_new_account_reports_not_saved_to_nas(self):
+        controller = self.controller()
+        self.succeed(controller, remember=False)
+        self.wait_sync(controller)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "not_saved")
+
+    def test_deferred_actor_resolution_saves_and_reports_status(self):
+        controller = self.controller()
+        self.succeed(controller, actor_no="")
+        self.assertFalse(self.path.exists())
+        self.assertTrue(controller.resolve_actor_no("7", "測試人員"))
+        self.wait_sync(controller)
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "saved")
+
+    def test_nas_failure_survives_schedule_status_and_successful_retry_clears_it(self):
+        self.nas_result = {"ok": False}
+        controller = self.controller()
+        self.succeed(controller)
+        self.wait_sync(controller)
+        controller.set_logged_in_status("測試人員", "16–18")
+        self.assertIn("NAS 帳密同步未回報成功", controller.loginStatus)
+        self.assertEqual(controller.loginStatusTone, "warning")
+        self.nas_result = {"ok": True}
+        controller.syncSavedAccounts()
+        self.wait_sync(controller)
+        controller.set_logged_in_status("測試人員", "16–18")
+        self.assertNotIn("未回報成功", controller.loginStatus)
+        self.assertEqual(controller.loginStatusTone, "success")
+
+    def test_unconfigured_nas_warning_is_not_overwritten(self):
+        controller = self.controller(sync_service=SimpleNamespace(enabled=False))
+        self.succeed(controller)
+        self.assertIn("尚未設定 NAS", controller.loginStatus)
+        controller.set_logged_in_status("測試人員", "16–18")
+        self.assertIn("尚未設定 NAS", controller.loginStatus)
+        self.assertEqual(controller.loginStatusTone, "warning")
+
+    def test_startup_rewrite_denial_keeps_loaded_accounts_and_opens_controller(self):
+        self.repository.save([{"actor_no": "7", "user_id": "probe-user", "password": "synthetic-password"}], "probe-user")
+        original = self.path.read_bytes()
+        with patch.object(Path, "replace", side_effect=PermissionError("synthetic denied")):
+            controller = self.controller()
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(controller.savedAccountsModel.rowCount(), 1)
+        self.assertIn("本機帳密未儲存", controller.loginStatus)
 
 
 if __name__ == "__main__":

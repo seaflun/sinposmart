@@ -14,7 +14,7 @@ from uuid import uuid4
 
 
 CredentialPoster = Callable[[dict[str, Any]], dict[str, Any]]
-ACCOUNT_FIELDS = ("actor_no", "user_id", "password", "display_name", "name", "id_number")
+ACCOUNT_FIELDS = ("actor_no", "user_id", "password", "display_name", "name", "id_number", "duty_pc_save_status")
 
 
 class CredentialSyncError(RuntimeError):
@@ -48,6 +48,8 @@ class CredentialSyncService:
         seen = set()
         for raw in accounts:
             account = {field: str(raw.get(field, "") or "") for field in ACCOUNT_FIELDS}
+            if account["duty_pc_save_status"] not in {"saved", "not_saved", "failed"}:
+                account["duty_pc_save_status"] = "unknown"
             identity = account["user_id"] or account["actor_no"]
             if not identity or identity in seen or not account["user_id"] or not account["password"]:
                 continue

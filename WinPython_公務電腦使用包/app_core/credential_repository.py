@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,8 @@ class CredentialRepository:
         self.dpapi = dpapi
         self.can_persist = dpapi is not None
         self.needs_backup = False
+        self._decryption_failed = False
+        self.last_error = ""
 
     @staticmethod
     def account_identity(account: dict[str, str]) -> str:
@@ -69,6 +72,7 @@ class CredentialRepository:
             password = self.unprotect_password(encrypted_password)
             if not password:
                 self.can_persist = False
+                self._decryption_failed = True
             return password
         return str(account.get("password", "") or "")
 
@@ -83,6 +87,7 @@ class CredentialRepository:
         }
 
     def load(self) -> SavedAccountsSnapshot:
+        self._decryption_failed = False
         self.can_persist = self.dpapi is not None
         if not self.path.exists():
             return SavedAccountsSnapshot([], "", self.can_persist)
@@ -138,7 +143,7 @@ class CredentialRepository:
         )
 
     def enable_persistence(self) -> None:
-        if self.dpapi is not None:
+        if self.dpapi is not None and not self._decryption_failed:
             self.can_persist = True
 
     def backup_invalid_file(self) -> None:
@@ -152,15 +157,46 @@ class CredentialRepository:
         self.needs_backup = False
 
     def save(self, accounts: list[dict[str, str]], last_selected: str = "") -> bool:
-        if self.dpapi is None or not self.can_persist:
+        self.last_error = ""
+        if self.dpapi is None:
+            self.last_error = "Windows DPAPI 不可用。"
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.backup_invalid_file()
-        payload = {
-            "last_selected": last_selected,
-            "accounts": [self.account_payload(account) for account in accounts],
-        }
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not self.can_persist:
+            self.last_error = "既有帳密無法解密，原帳號檔已保留。"
+            return False
+        try:
+            payload = {
+                "last_selected": last_selected,
+                "accounts": [self.account_payload(account) for account in accounts],
+            }
+        except Exception:
+            self.last_error = "帳密加密失敗，原帳號檔已保留。"
+            return False
+        temporary: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.backup_invalid_file()
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                json.dump(payload, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(self.path)
+        except PermissionError:
+            self.last_error = "無法寫入帳號檔，請檢查檔案權限。"
+            return False
+        except OSError:
+            self.last_error = "無法寫入帳號檔，請檢查磁碟與檔案狀態。"
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return True
 
 

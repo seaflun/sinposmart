@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,73 @@ class CredentialRepositoryTests(unittest.TestCase):
 
             self.assertFalse(repository.save([], ""))
             self.assertFalse(path.exists())
+            self.assertIn("DPAPI", repository.last_error)
+
+    def test_encryption_failure_preserves_original_file_and_hides_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            repository = self.repository(path)
+            self.assertTrue(repository.save([], ""))
+            original = path.read_bytes()
+            with patch.object(FakeDpapi, "CryptProtectData", side_effect=RuntimeError("secret-value")):
+                saved = repository.save([{"user_id": "new-user", "password": "secret-value"}], "new-user")
+            self.assertFalse(saved)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertIn("加密", repository.last_error)
+            self.assertNotIn("secret-value", repository.last_error)
+
+    def test_replace_failure_preserves_original_file_and_cleans_owned_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            repository = self.repository(path)
+            self.assertTrue(repository.save([], ""))
+            original = path.read_bytes()
+            with patch.object(Path, "replace", side_effect=PermissionError("secret-value")):
+                saved = repository.save([{"user_id": "new-user", "password": "secret-value"}], "new-user")
+            self.assertFalse(saved)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            self.assertIn("權限", repository.last_error)
+            self.assertNotIn("secret-value", repository.last_error)
+
+    def test_partial_write_failure_preserves_original_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            repository = self.repository(path)
+            self.assertTrue(repository.save([], ""))
+            original = path.read_bytes()
+
+            def interrupted_dump(_payload, stream, **_kwargs):
+                stream.write("{partial")
+                raise OSError("synthetic disk full")
+
+            with patch("app_core.credential_repository.json.dump", side_effect=interrupted_dump):
+                self.assertFalse(repository.save([], ""))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_unreadable_saved_password_cannot_be_overwritten_by_enabling_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            repository = self.repository(path)
+            self.assertTrue(repository.save([{"user_id": "old-user", "password": "old-secret"}], "old-user"))
+            original = path.read_bytes()
+            with patch.object(FakeDpapi, "CryptUnprotectData", side_effect=RuntimeError("synthetic decrypt failure")):
+                snapshot = repository.load()
+            self.assertFalse(snapshot.can_persist)
+            repository.enable_persistence()
+            self.assertFalse(repository.save([{"user_id": "new-user", "password": "new-secret"}], "new-user"))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertIn("無法解密", repository.last_error)
+
+    def test_successful_retry_clears_previous_save_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            repository = self.repository(path)
+            with patch.object(Path, "replace", side_effect=PermissionError("synthetic denied")):
+                self.assertFalse(repository.save([], ""))
+            self.assertTrue(repository.save([], ""))
+            self.assertEqual(repository.last_error, "")
 
 
 if __name__ == "__main__":

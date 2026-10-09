@@ -52,6 +52,11 @@ class SessionController(QObject):
         self._offline_fixture_acceptance = bool(offline_fixture_acceptance)
         self._login_status = "未登入"
         self._login_status_tone = "neutral"
+        self._status_base_message = "未登入"
+        self._status_base_tone = "neutral"
+        self._local_save_warning = ""
+        self._credential_sync_warning = ""
+        self._credential_sync_result = ""
         self._display_name = ""
         self._accounts: list[dict[str, str]] = []
         self._last_selected_identity = ""
@@ -124,6 +129,9 @@ class SessionController(QObject):
         attempt_id = self._state.begin_login()
         if attempt_id is None:
             return
+        self._local_save_warning = ""
+        self._credential_sync_warning = ""
+        self._credential_sync_result = ""
         method = "automatic" if login_method == "automatic" else "manual"
         self._pending_credentials[attempt_id] = (
             user_id, password, bool(remember) and not self._read_only_acceptance, method
@@ -291,9 +299,9 @@ class SessionController(QObject):
         normalized = str(message or "").strip()
         if not self.isLoggedIn or not normalized:
             return
-        self._login_status = normalized
-        self._login_status_tone = str(tone or "warning")
-        self.statusChanged.emit()
+        self._status_base_message = normalized
+        self._status_base_tone = str(tone or "warning")
+        self._refresh_status(notify_session=False)
 
     @Slot()
     def logout(self) -> None:
@@ -302,6 +310,9 @@ class SessionController(QObject):
             return
         self._state.clear_session()
         self._display_name = ""
+        self._local_save_warning = ""
+        self._credential_sync_warning = ""
+        self._credential_sync_result = ""
         self._set_status("未登入", tone="neutral")
 
     def systemLogout(self, message: str = "系統已登出") -> None:
@@ -309,6 +320,9 @@ class SessionController(QObject):
 
         self._state.clear_session()
         self._display_name = ""
+        self._local_save_warning = ""
+        self._credential_sync_warning = ""
+        self._credential_sync_result = ""
         self._set_status(str(message or "系統已登出"), tone="warning")
 
     @Slot()
@@ -336,6 +350,7 @@ class SessionController(QObject):
             self._finalize_credential_sync_thread(request_id)
 
     def _reload_accounts(self) -> None:
+        self._local_save_warning = ""
         snapshot = self._repository.load()
         if snapshot.invalid_file:
             self._accounts = []
@@ -346,7 +361,12 @@ class SessionController(QObject):
         self._last_selected_identity = str(snapshot.last_selected or "")
         self._saved_accounts_model.replace_accounts(self._accounts)
         if not self._read_only_acceptance and snapshot.can_persist and snapshot.needs_rewrite:
-            self._repository.save(self._accounts, snapshot.last_selected)
+            if not self._repository.save(self._accounts, snapshot.last_selected):
+                self._local_save_warning = self._save_failure_message()
+        elif snapshot.accounts and not snapshot.can_persist:
+            self._local_save_warning = "本機帳密無法解密，原帳號檔已保留。"
+        if self._local_save_warning:
+            self._set_status(self._status_base_message, tone="warning")
 
     def _account_by_identity(self, identity: str) -> dict[str, str] | None:
         identity = str(identity or "").strip()
@@ -511,13 +531,22 @@ class SessionController(QObject):
             "name": actor_name or str(existing.get("name", "") or ""),
             "id_number": str(existing.get("id_number", "") or ""),
         }
-        self._accounts = self._sorted_accounts([
+        accounts = self._sorted_accounts([
             updated if item is existing else item
             for item in self._accounts
         ] if existing else [*self._accounts, updated])
         self._repository.enable_persistence()
-        if self._repository.save(self._accounts, user_id):
+        if self._repository.save(accounts, user_id):
+            self._accounts = accounts
+            self._last_selected_identity = user_id
+            self._local_save_warning = ""
             self._saved_accounts_model.replace_accounts(self._accounts)
+        else:
+            self._local_save_warning = self._save_failure_message()
+
+    def _save_failure_message(self) -> str:
+        reason = getattr(self._repository, "last_error", "") or "Windows DPAPI 不可用或帳號檔無法寫入。"
+        return f"本機帳密未儲存：{reason}"
 
     @Slot(int)
     def _worker_finished(self, attempt_id: int) -> None:
@@ -561,13 +590,21 @@ class SessionController(QObject):
             return
         if not self._credential_sync_service.enabled:
             message = "尚未設定 NAS 帳密同步 URL 或 token。"
+            self._credential_sync_warning = message
+            self._credential_sync_result = ""
             if notify_user:
                 self._set_status(message, error=True)
             elif self.isLoggedIn:
                 self._set_status(f"登入成功；{message}", tone="warning")
             return
-        accounts = [dict(account) for account in self._accounts]
+        accounts = [dict(account, duty_pc_save_status="saved") for account in self._accounts]
         if extra_account and extra_account.get("user_id") and extra_account.get("password"):
+            extra_account = dict(extra_account)
+            stored = self._account_by_user_id(extra_account["user_id"])
+            saved = stored is not None and stored.get("password") == extra_account["password"]
+            extra_account["duty_pc_save_status"] = (
+                "saved" if saved else "failed" if self._local_save_warning else "not_saved"
+            )
             accounts = [
                 account
                 for account in accounts
@@ -615,17 +652,26 @@ class SessionController(QObject):
     def _credential_sync_succeeded(self, request_id: int, count: int, notify_user: bool) -> None:
         if not self._credential_sync_is_current(request_id):
             return
+        self._credential_sync_warning = ""
+        self._credential_sync_result = f"NAS 已收到 {count} 組帳密。"
         if notify_user:
             self._set_status(f"已同步 {count} 組帳密。")
+        else:
+            self._refresh_status()
 
     @Slot(int, str, bool)
     def _credential_sync_failed(self, request_id: int, message: str, notify_user: bool) -> None:
         if not self._credential_sync_is_current(request_id):
             return
+        self._credential_sync_warning = message
+        self._credential_sync_result = ""
         if notify_user:
             self._set_status(message, error=True)
         elif self.isLoggedIn:
-            self._set_status(f"登入成功；{message}", tone="warning")
+            if self._status_base_message == "未登入":
+                self._status_base_message = "登入成功"
+                self._status_base_tone = "success"
+            self._refresh_status()
 
     @Slot(int)
     def _credential_sync_worker_finished(self, request_id: int) -> None:
@@ -668,12 +714,30 @@ class SessionController(QObject):
         error: bool = False,
         tone: str = "success",
     ) -> None:
-        self._login_status = message
-        self._login_status_tone = "error" if error else tone
-        self.statusChanged.emit()
-        self.sessionChanged.emit()
+        self._status_base_message = message
+        self._status_base_tone = "error" if error else tone
+        self._refresh_status()
         if error:
             self.errorOccurred.emit(message)
+
+    def _refresh_status(self, *, notify_session: bool = True) -> None:
+        message = self._status_base_message
+        tone = self._status_base_tone
+        warnings = [self._local_save_warning]
+        if self.isLoggedIn:
+            warnings.append(self._credential_sync_warning)
+        details = [warning for warning in warnings if warning and warning not in message]
+        if self.isLoggedIn and self._local_save_warning and self._credential_sync_result:
+            details.append(self._credential_sync_result)
+        if details:
+            message = "；".join([message, *details])
+        if any(warnings) and tone != "error":
+            tone = "warning"
+        self._login_status = message
+        self._login_status_tone = tone
+        self.statusChanged.emit()
+        if notify_session:
+            self.sessionChanged.emit()
 
     def _login_identity(self) -> str:
         session = self._state.session
