@@ -19223,6 +19223,110 @@ if return_code != 0 or loaded:
         restored.enable_auto_execution()
         self.assertEqual(restored._due_task_indices, [])
 
+    def test_recovery_bridge_keeps_scheduled_time_after_retry_and_restart(self) -> None:
+        from datetime import datetime, timedelta
+
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        def handoff_actions(at: datetime, actor: str, incoming: str, start: str) -> list[dict]:
+            target_date = at.strftime("%Y-%m-%d")
+            time_text = at.strftime("%H:%M")
+            return [
+                {
+                    "kind": "entry_log",
+                    "time": time_text,
+                    "actor": actor,
+                    "target": target,
+                    "source": "值班交接",
+                    "duplicate_key": f"entry:{target_date}:{at.hour}:{direction}:{target}",
+                    "fields": {"出或入": direction, "勤務項目": "值班(宿)"},
+                }
+                for target, direction in ((actor, "值退"), (incoming, "值班"))
+            ] + [
+                {
+                    "kind": "work_log",
+                    "time": time_text,
+                    "actor": actor,
+                    "target": actor,
+                    "source": "值班交接",
+                    "duplicate_key": f"work:{target_date}:{at.hour}:值班交接:{actor}",
+                    "fields": {"處理情形": f"一、時間:{start}-{time_text}\n二、救護3件"},
+                }
+            ]
+
+        for original_at, scheduled_at, start in (
+            (datetime(2026, 10, 13, 18), datetime(2026, 10, 13, 20), "16:00"),
+            (datetime(2026, 10, 13, 22), datetime(2026, 10, 14, 0), "20:00"),
+        ):
+            with self.subTest(scheduled_at=scheduled_at), tempfile.TemporaryDirectory() as temp_dir:
+                retry_at = scheduled_at + timedelta(minutes=1, seconds=3)
+                target_date = f"{original_at.year - 1911:03d}{original_at.month:02d}{original_at.day:02d}"
+                original = handoff_actions(original_at, "24", "5", start)
+                scheduled = handoff_actions(scheduled_at, "5", "8", original_at.strftime("%H:%M"))
+                for action in scheduled:
+                    action["date_offset"] = (scheduled_at.date() - original_at.date()).days
+                schedule_data = {"target_date": target_date, "actions": original + scheduled}
+                queue = UnreturnedReturnQueue(Path(temp_dir), now_factory=lambda: retry_at)
+                record, _created = queue.pause_group(
+                    original, schedule_data, owner_actor_no="24", now=original_at
+                )
+                controller = DutyController(
+                    repository=ScheduleRepository(Path(temp_dir)), unreturned_return_queue=queue
+                )
+                self.addCleanup(controller.shutdown)
+                controller.set_actor_no("8")
+                controller.replace_schedule_data(schedule_data)
+                preflight = controller.recovery_submission_requests(
+                    "user8", "secret", record, submit_at=retry_at
+                )[0]
+                self.assertTrue(controller.handle_handoff_preflight_ready(preflight))
+                requests = controller.handoff_group_submission_requests(
+                    "user8", "secret", preflight, submit_at=retry_at
+                )
+                self.assertEqual(len(requests), 3)
+                expected_date = f"{scheduled_at.year - 1911:03d}{scheduled_at.month:02d}{scheduled_at.day:02d}"
+                expected_time = scheduled_at.strftime("%H:%M")
+                for request in requests:
+                    action = request.schedule_data["actions"][request.action_index]
+                    self.assertEqual(action["time"], expected_time)
+                    self.assertEqual(action["submit_target_date"], expected_date)
+                    self.assertEqual(request.schedule_data["target_date"], expected_date)
+                    if action["kind"] == "entry_log":
+                        self.assertEqual(action["fields"]["登打時間"], expected_time)
+                        self.assertEqual(action["fields"]["系統寫入時間"], expected_time)
+                work = requests[2].schedule_data["actions"][0]
+                self.assertEqual(work["fields"]["工作時間"], expected_time)
+                self.assertEqual(work["fields"]["處理情形"], f"一、時間:{start}-{expected_time}\n二、救護3件")
+                first = requests[0]
+                controller.handle_external_return_queue_result(
+                    record["queue_id"], first.schedule_data["actions"][0], "submitted",
+                    first.schedule_data["_unreturned_return_component_key"],
+                )
+                controller.shutdown()
+                later_at = retry_at + timedelta(hours=4)
+                restored_queue = UnreturnedReturnQueue(Path(temp_dir), now_factory=lambda: later_at)
+                restored = DutyController(
+                    repository=ScheduleRepository(Path(temp_dir)), unreturned_return_queue=restored_queue
+                )
+                self.addCleanup(restored.shutdown)
+                restored.set_actor_no("8")
+                restored.replace_schedule_data(schedule_data)
+                retry_preflight = restored.recovery_submission_requests(
+                    "user8", "secret", restored_queue.get(record["queue_id"]), submit_at=later_at
+                )[0]
+                self.assertTrue(restored.handle_handoff_preflight_ready(retry_preflight))
+                remaining = restored.handoff_group_submission_requests(
+                    "user8", "secret", retry_preflight, submit_at=later_at
+                )
+                self.assertEqual(len(remaining), 2)
+                for request in remaining:
+                    action = request.schedule_data["actions"][0]
+                    self.assertEqual(action["time"], expected_time)
+                    self.assertEqual(action["submit_target_date"], expected_date)
+                    self.assertEqual(request.schedule_data["target_date"], expected_date)
+
     def test_recovery_bridge_from_outgoing_actor_uses_next_scheduled_successor(self) -> None:
         from datetime import datetime
 
@@ -19261,7 +19365,7 @@ if return_code != 0 or loaded:
             ]
 
         at_ten = datetime(2026, 8, 7, 10, 0)
-        at_twelve = datetime(2026, 8, 7, 12, 0)
+        at_twelve = datetime(2026, 8, 7, 12, 1)
         old_group = handoff_actions(10, "6", "7", "08:00")
         scheduled_group = handoff_actions(12, "7", "8", "10:00")
         temporary_queue_dir = tempfile.TemporaryDirectory()
@@ -19311,6 +19415,9 @@ if return_code != 0 or loaded:
         actual_actions = [request.schedule_data["actions"][request.action_index] for request in actual_requests]
         self.assertEqual([action["kind"] for action in actual_actions], ["entry_log", "entry_log", "work_log"])
         self.assertEqual([action["target"] for action in actual_actions[:2]], ["6", "8"])
+        self.assertEqual([action["time"] for action in actual_actions], ["12:00"] * 3)
+        self.assertEqual(actual_actions[2]["fields"]["工作時間"], "12:00")
+        self.assertEqual(actual_actions[2]["fields"]["處理情形"], "一、時間:08:00-12:00")
 
         for request, action in zip(actual_requests, actual_actions):
             controller.handle_external_return_queue_result(

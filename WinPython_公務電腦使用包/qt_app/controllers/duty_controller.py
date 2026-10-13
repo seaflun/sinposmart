@@ -1733,6 +1733,8 @@ class DutyController(QObject):
         ]
         work_actions = [dict(action) for action in actions if action.get("kind") == "work_log"]
         bridge_actions = outgoing_actions + bridge_incoming + work_actions
+        for action in bridge_actions:
+            action["_bridge_handoff_at"] = scheduled_at.isoformat(timespec="seconds")
         bridge_action_keys = {action_completion_key(action) for action in bridge_actions}
         skipped_action_keys = {action_completion_key(action) for action in original_incoming}
         skipped_actor_nos = set(original_targets)
@@ -2950,14 +2952,14 @@ class DutyController(QObject):
         submit_at: datetime,
     ) -> list[DutySubmissionRequest]:
         queue_id = str(record.get("queue_id") or "")
-        target_date = f"{submit_at.year - 1911:03d}{submit_at.month:02d}{submit_at.day:02d}"
         requests: list[DutySubmissionRequest] = []
         for original_action in self._unreturned_return_queue.incomplete_actions(record):
-            action = self._stamped_submission_action(original_action, submit_at)
+            handoff_at = self._parse_actual_handoff_time(original_action.get("_bridge_handoff_at"))
+            action = self._stamped_submission_action(original_action, handoff_at or submit_at)
             if action is None:
                 continue
             schedule_data = dict(record.get("schedule_context", {}))
-            schedule_data["target_date"] = target_date
+            schedule_data["target_date"] = action["submit_target_date"]
             schedule_data["actions"] = [action]
             schedule_data["_unreturned_return_queue_id"] = queue_id
             schedule_data["_unreturned_return_component_key"] = action_completion_key(original_action)
