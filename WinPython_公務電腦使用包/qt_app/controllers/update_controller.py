@@ -286,15 +286,17 @@ class UpdateController(UpdateWindowState):
             value = {}
         major_history = value.get("major_history")
         releases = value.get("releases")
+        major_history = major_history if isinstance(major_history, list) else []
+        releases = sorted(
+            [release for release in releases if isinstance(release, dict)]
+            if isinstance(releases, list) else [],
+            key=lambda release: _version_order_key(release.get("version", "")) or (),
+        )
         return {
             "history_floor_version": str(value.get("history_floor_version", "")),
-            "major_history": major_history if isinstance(major_history, list) else [],
-            "releases": releases if isinstance(releases, list) else [],
-            "entries": (
-                releases if isinstance(releases, list) else []
-            ) + (
-                major_history if isinstance(major_history, list) else []
-            ),
+            "major_history": major_history,
+            "releases": releases,
+            "entries": major_history + releases,
         }
 
     @Slot(result=bool)

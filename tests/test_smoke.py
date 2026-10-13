@@ -4076,6 +4076,103 @@ try {
             )
         )
 
+    def test_same_minute_case_return_is_independent_of_row_order(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        for suffix in ("", " 梯次：2"):
+            reason = "案件類別：緊急救護-創傷 案發地點：測試路段" + suffix
+            records = [
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "入", reason.replace(" ", "&nbsp;")],
+            ]
+            for raw_rows in (records, list(reversed(records)), records + records):
+                with self.subTest(suffix=suffix, rows=raw_rows):
+                    self.assertIsNone(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151013"), "1151013",
+                        {"10": {"name": "測試員"}}, {"target": "10"},
+                        current_at=datetime(2026, 10, 13, 22, 0),
+                    ))
+
+    def test_same_minute_return_requires_matching_person_case_and_wave(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"
+        for stamp, name, incoming_reason in (
+            ("115/10/13 17:42", "另一人", reason),
+            ("115/10/13 17:42", "測試員", reason.replace("創傷", "急病")),
+            ("115/10/13 17:42", "測試員", reason.replace("測試路段", "其他路段")),
+            ("115/10/13 17:42", "測試員", reason.replace("梯次：2", "梯次：1")),
+            ("115/10/13 17:42", "測試員", reason.replace(" 梯次：2", "")),
+            ("115/10/12 17:42", "測試員", reason),
+            ("115/10/13 17:42", "測試員", "返隊"),
+            ("115/10/13 17:42", "測試員", "救護返隊"),
+        ):
+            records = [
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+                [stamp, "新坡分隊", name, "隊員", "入", incoming_reason],
+            ]
+            for raw_rows in (records, list(reversed(records))):
+                with self.subTest(stamp=stamp, name=name, reason=incoming_reason, rows=raw_rows):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151013", start_date="1151012"), "1151013",
+                        {"10": {"name": "測試員"}}, {"target": "10"},
+                        current_at=datetime(2026, 10, 13, 22, 0),
+                    ), "2026-10-13T17:42")
+
+    def test_same_minute_case_return_preserves_other_departures(self) -> None:
+        from itertools import permutations
+
+        module = package_module("compare_rehearsal_records")
+        base_reason = "案件類別：緊急救護-創傷 案發地點：測試路段"
+        for reason, extra_reason, extra_time in (
+            (base_reason, base_reason.replace("測試路段", "其他路段"), "17:42"),
+            (base_reason + " 梯次：2", base_reason + " 梯次：3", "17:42"),
+            (base_reason, base_reason, "17:43"),
+        ):
+            records = [
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "入", reason],
+                [f"115/10/13 {extra_time}", "新坡分隊", "測試員", "隊員", "出", extra_reason],
+            ]
+            for raw_rows in permutations(records):
+                with self.subTest(time=extra_time, reason=extra_reason, rows=raw_rows):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(list(raw_rows), "1151013"), "1151013",
+                        {"10": {"name": "測試員"}}, {"target": "10"},
+                        current_at=datetime(2026, 10, 13, 22, 0),
+                    ), f"2026-10-13T{extra_time}")
+
+    def test_same_minute_case_return_is_conservative_for_repeated_trips(self) -> None:
+        from itertools import permutations
+
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段"
+        for extra_direction, extra_time in (("出", "17:40"), ("入", "17:41")):
+            records = [
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+                ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "入", reason],
+                [f"115/10/13 {extra_time}", "新坡分隊", "測試員", "隊員", extra_direction, reason],
+            ]
+            for raw_rows in permutations(records):
+                with self.subTest(direction=extra_direction, rows=raw_rows):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(list(raw_rows), "1151013"), "1151013",
+                        {"10": {"name": "測試員"}}, {"target": "10"},
+                        current_at=datetime(2026, 10, 13, 22, 0),
+                    ), "2026-10-13T17:42")
+
+    def test_no_wave_case_does_not_close_an_earlier_return(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段"
+        records = [
+            ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+            ["115/10/13 17:41", "新坡分隊", "測試員", "隊員", "入", reason],
+        ]
+        for raw_rows in (records, list(reversed(records))):
+            self.assertEqual(module.find_open_external_assignment(
+                module.flatten_rows(raw_rows, "1151013"), "1151013",
+                {"10": {"name": "測試員"}}, {"target": "10"},
+                current_at=datetime(2026, 10, 13, 22, 0),
+            ), "2026-10-13T17:42")
+
     def test_external_assignment_reversed_case_return_is_returned(self) -> None:
         module = package_module("compare_rehearsal_records")
         reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"

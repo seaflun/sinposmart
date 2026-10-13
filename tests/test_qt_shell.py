@@ -4108,6 +4108,48 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 saved = json.loads(result.result_path.read_text(encoding="utf-8"))
                 self.assertEqual(saved["comparison"]["external_time_order_warnings"], warnings)
 
+    def test_handoff_preflight_accepts_same_minute_case_return_in_either_row_order(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        reason = "案件類別：緊急救護-創傷 案發地點：測試路段"
+        records = [
+            ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "出", reason],
+            ["115/10/13 17:42", "新坡分隊", "測試員", "隊員", "入", reason],
+        ]
+        for trigger in ("due", "recovery"):
+            for visible_rows in (records, list(reversed(records))):
+                with self.subTest(trigger=trigger, rows=visible_rows), tempfile.TemporaryDirectory() as temp_dir:
+                    fills: list[str] = []
+                    automation = SimpleNamespace(
+                        ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                        build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                        query_visible_table=lambda *_args, **_kwargs: visible_rows,
+                        fill_entry_log_form_for_test=lambda *_args, **_kwargs: fills.append("entry"),
+                        fill_work_log_form_for_test=lambda *_args, **_kwargs: fills.append("work"),
+                        quit_driver=lambda _driver: None,
+                    )
+                    service = DutySubmissionService(
+                        Path(temp_dir), module_loader=lambda: automation,
+                        now_factory=lambda: datetime(2026, 10, 13, 22, 1),
+                    )
+                    data = {
+                        "target_date": "1151013",
+                        "today": {"staff": {"10": {"name": "測試員"}}},
+                        "actions": [{
+                            "kind": "handoff_preflight", "time": "22:00", "actor": "8",
+                            "target": "10", "source": "值班交接",
+                            "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                        }],
+                    }
+                    if trigger == "recovery":
+                        data["_unreturned_return_query_start_at"] = "2026-10-13T17:42:00"
+                    result = service.execute(DutySubmissionRequest(
+                        "test-user", "test-password", 0, data, trigger_type=trigger,
+                    ))
+                    self.assertEqual(result.status, "handoff_preflight_ready")
+                    self.assertEqual(fills, [])
+
     def test_handoff_preflight_checks_incoming_staff_without_writing_a_form(self) -> None:
         from datetime import datetime
 
@@ -7406,6 +7448,49 @@ class UpdateControllerTests(unittest.TestCase):
 
         QQuickStyle.setStyle("Basic")
         cls.app = QApplication.instance() or QApplication(["test_update_controller"])
+
+    def test_update_history_lists_milestones_then_releases_in_ascending_order(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            version = root / "VERSION.txt"
+            version.write_text("2026.10.13.2039", encoding="utf-8")
+            history_path = root / "update_history.json"
+            history_path.write_text(json.dumps({
+                "major_history": [{"period": "2026/06", "title": "早期功能", "items": ["建立勤務工具"]}],
+                "releases": [
+                    {"version": "2026.10.13.2039", "title": "新版交接修正", "items": ["保留班表時間"]},
+                    {"version": "2026.09.25.1646", "title": "前版完成狀態", "items": ["保留完成狀態"]},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            controller = UpdateController(
+                UpdateRepository(version), history_path=history_path,
+                pending_notice_path=root / "pending_update_notice.json", remote_update_enabled=False,
+            )
+            try:
+                self.assertEqual(
+                    [entry["title"] for entry in controller.updateHistory["entries"]],
+                    ["早期功能", "前版完成狀態", "新版交接修正"],
+                )
+            finally:
+                controller.shutdown()
+
+    def test_current_package_has_a_release_history_entry(self) -> None:
+        from app_core.update_repository import version_key
+
+        history = json.loads((PACKAGE_ROOT / "update_history.json").read_text(encoding="utf-8-sig"))
+        current = (PACKAGE_ROOT / "VERSION.txt").read_text(encoding="utf-8-sig").strip()
+        releases = history["releases"]
+        versions = [release["version"] for release in releases]
+        self.assertIn(current, versions, "每次發布前必須補入目前版本的更新日誌。")
+        self.assertEqual(versions, sorted(versions, key=version_key))
+        self.assertEqual(len(versions), len(set(versions)))
+        for release in releases:
+            self.assertTrue(release["title"].strip())
+            self.assertTrue(release["items"])
+            self.assertTrue(all(str(item).strip() for item in release["items"]))
 
     def test_update_history_and_pending_notice_are_cleared_only_after_dismissal(self) -> None:
         from app_core.update_repository import UpdateRepository

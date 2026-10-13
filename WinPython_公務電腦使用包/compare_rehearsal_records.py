@@ -479,33 +479,37 @@ def find_open_external_assignment(
         case_key = None
         for cell in row.split("|"):
             match = re.fullmatch(
-                r"案件類別:(.+?)案發地點:(.+?)梯次:(\d+)",
+                r"案件類別:(.+?)案發地點:(.+?)(?:梯次:(\d+))?",
                 clean(unescape(cell)).replace("：", ":"),
             )
             if match:
                 case_key = (
-                    row_at.date().isoformat(), match[1], match[2], str(int(match[3])),
+                    row_at.date().isoformat(), match[1], match[2],
+                    str(int(match[3])) if match[3] else "",
                 )
                 departures, returns = case_events.setdefault(case_key, (set(), set()))
                 (departures if is_out else returns).add(row_at)
                 break
         events.append((row_at, is_out, case_key))
-    reversed_departures: set[tuple[datetime, tuple[str, ...]]] = set()
+    closed_departures: set[tuple[datetime, tuple[str, ...]]] = set()
     for case_key, (departures, returns) in case_events.items():
-        # Only one distinct pair can prove this known source-system ordering bug.
+        # Only one distinct pair can prove a case has returned.
         if len(departures) != 1 or len(returns) != 1:
             continue
         departure, returned = next(iter(departures)), next(iter(returns))
-        if returned < departure:
-            reversed_departures.add((departure, case_key))
+        if returned == departure:
+            closed_departures.add((departure, case_key))
+        elif case_key[-1] and returned < departure:
+            closed_departures.add((departure, case_key))
             if time_order_warnings is not None:
                 time_order_warnings.append(
                     f"出入時間異常（梯次 {case_key[-1]}）："
                     f"入 {returned:%m/%d %H:%M}／出 {departure:%m/%d %H:%M}，已視為返隊。"
                 )
     active_at: datetime | None = None
-    for row_at, is_active, case_key in sorted(events, key=lambda item: item[0]):
-        if is_active and (row_at, case_key) in reversed_departures:
+    # At equal minute precision, unmatched departures must remain open.
+    for row_at, is_active, case_key in sorted(events, key=lambda item: (item[0], item[1])):
+        if is_active and (row_at, case_key) in closed_departures:
             continue
         if is_active:
             active_at = row_at
