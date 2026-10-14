@@ -291,12 +291,13 @@ class UpdateController(UpdateWindowState):
             [release for release in releases if isinstance(release, dict)]
             if isinstance(releases, list) else [],
             key=lambda release: _version_order_key(release.get("version", "")) or (),
+            reverse=True,
         )
         return {
             "history_floor_version": str(value.get("history_floor_version", "")),
             "major_history": major_history,
             "releases": releases,
-            "entries": major_history + releases,
+            "entries": releases + major_history,
         }
 
     @Slot(result=bool)
@@ -345,6 +346,7 @@ class UpdateController(UpdateWindowState):
         pending_releases = sorted(
             pending_releases_by_version.values(),
             key=lambda release: _version_order_key(release.get("version", "")) or (),
+            reverse=True,
         )
         if not pending_releases:
             return False

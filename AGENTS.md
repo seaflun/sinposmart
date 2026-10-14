@@ -134,7 +134,7 @@
 ## 更新日誌發布檢查
 
 - 每次發布 SinpoSmart 公務電腦更新包前，必須在 `WinPython_公務電腦使用包/update_history.json` 新增該版本的日期、標題與具體更新摘要；GitHub Release notes 不能取代 GUI 更新日誌。
-- 歷史里程碑放在版本紀錄前；版本紀錄依版本時間由舊到新排列，最新版本放在最下面。
+- 版本紀錄依版本時間由新到舊排列，最新版本放在最上面；歷史里程碑放在版本紀錄後，亦由新到舊排列。
 - 打包後必須執行 `py -m unittest tests.test_qt_shell.UpdateControllerTests.test_current_package_has_a_release_history_entry -v`，確認包內 `VERSION.txt` 對應版本已有日誌條目。檢查失敗時不得發布或送出遠端更新。
 
 ## Git commit rules

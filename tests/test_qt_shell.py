@@ -7449,7 +7449,7 @@ class UpdateControllerTests(unittest.TestCase):
         QQuickStyle.setStyle("Basic")
         cls.app = QApplication.instance() or QApplication(["test_update_controller"])
 
-    def test_update_history_lists_milestones_then_releases_in_ascending_order(self) -> None:
+    def test_update_history_lists_releases_in_descending_order_before_milestones(self) -> None:
         from app_core.update_repository import UpdateRepository
         from qt_app.controllers.update_controller import UpdateController
 
@@ -7463,6 +7463,7 @@ class UpdateControllerTests(unittest.TestCase):
                 "releases": [
                     {"version": "2026.10.13.2039", "title": "新版交接修正", "items": ["保留班表時間"]},
                     {"version": "2026.09.25.1646", "title": "前版完成狀態", "items": ["保留完成狀態"]},
+                    {"version": "2026.10.13.2240", "title": "最新返隊修正", "items": ["正確判定返隊"]},
                 ],
             }, ensure_ascii=False), encoding="utf-8")
             controller = UpdateController(
@@ -7472,7 +7473,7 @@ class UpdateControllerTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     [entry["title"] for entry in controller.updateHistory["entries"]],
-                    ["早期功能", "前版完成狀態", "新版交接修正"],
+                    ["最新返隊修正", "新版交接修正", "前版完成狀態", "早期功能"],
                 )
             finally:
                 controller.shutdown()
@@ -7485,7 +7486,7 @@ class UpdateControllerTests(unittest.TestCase):
         releases = history["releases"]
         versions = [release["version"] for release in releases]
         self.assertIn(current, versions, "每次發布前必須補入目前版本的更新日誌。")
-        self.assertEqual(versions, sorted(versions, key=version_key))
+        self.assertEqual(versions, sorted(versions, key=version_key, reverse=True))
         self.assertEqual(len(versions), len(set(versions)))
         for release in releases:
             self.assertTrue(release["title"].strip())
@@ -7544,12 +7545,12 @@ class UpdateControllerTests(unittest.TestCase):
                 self.assertEqual(controller.updateHistory["major_history"][0]["title"], "勤務工具擴充")
                 self.assertTrue(controller.showPendingUpdateNotice())
                 self.assertEqual(
-                    controller.pendingUpdateNotice["releases"][-1]["items"],
+                    controller.pendingUpdateNotice["releases"][0]["items"],
                     ["新增系統更新日誌", "成功更新後登入顯示摘要"],
                 )
                 self.assertEqual(
                     [release["version"] for release in controller.pendingUpdateNotice["releases"]],
-                    ["2026.09.24.1100", "2026.09.24.1200"],
+                    ["2026.09.24.1200", "2026.09.24.1100"],
                 )
                 self.assertTrue(controller.showPendingUpdateNotice())
                 self.assertEqual(
@@ -7557,7 +7558,7 @@ class UpdateControllerTests(unittest.TestCase):
                     ["2026.09.24.1200"],
                 )
                 self.assertEqual(
-                    controller.pendingUpdateNotice["releases"][-1]["title"],
+                    controller.pendingUpdateNotice["releases"][0]["title"],
                     "安裝時保存的更新摘要",
                 )
 
