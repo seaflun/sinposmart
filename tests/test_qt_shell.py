@@ -477,6 +477,225 @@ class SessionStateTests(unittest.TestCase):
 
 
 class LoginVerifierTests(unittest.TestCase):
+    class DiagnosticDriver:
+        def __init__(self, *, text="密碼已到期，請更換密碼", password_fields=3, redacted=True, png=None):
+            import base64
+
+            self.current_url = "https://user:pass@dutymgt.tyfd.gov.tw/change?token=private#secret"
+            self.title = "更新密碼 user10 secret"
+            self.text = text
+            self.password_fields = password_fields
+            self.redacted = redacted
+            self.events = []
+            self.switch_to = LoginVerifierTests.SwitchTo()
+            self.png = png if png is not None else base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+
+        def find_elements(self, *_args):
+            return []
+
+        def execute_script(self, script, *args):
+            if "login-diagnostic-probe" in script:
+                return {"page_text": self.text + " user10 secret", "password_fields": self.password_fields}
+            if "login-diagnostic-redact" in script:
+                self.events.append("redact")
+                return self.redacted
+            return "勤務系統\n測試員，您好"
+
+        def get_screenshot_as_png(self):
+            self.events.append("screenshot")
+            return self.png
+
+    def test_password_expiry_alert_is_classified_and_captured_before_cleanup(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        driver = self.DiagnosticDriver()
+        verifier = LoginVerifier(
+            options_factory=object, driver_factory=lambda _options: driver,
+            configure_driver=lambda _driver: None,
+            login_function=lambda *_args: (_ for _ in ()).throw(RuntimeError("user10 密碼已到期，請更換密碼 secret")),
+            driver_cleanup=lambda _driver: driver.events.append("cleanup"),
+        )
+        with self.assertRaises(LoginVerificationError) as caught:
+            verifier.verify(typed_actor_no="", user_id="user10", password="secret",
+                            actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={})
+        diagnostic = caught.exception.login_diagnostic
+        self.assertEqual(diagnostic["reason_code"], "password_change_required")
+        self.assertEqual(diagnostic["stage"], "login")
+        self.assertEqual(diagnostic["page_url"], "https://dutymgt.tyfd.gov.tw/change")
+        self.assertEqual(diagnostic["capture_status"], "captured")
+        self.assertTrue(diagnostic["image_redacted"])
+        self.assertTrue(diagnostic["image_png"])
+        self.assertEqual(driver.events, ["redact", "screenshot", "cleanup"])
+        safe = json.dumps(diagnostic, ensure_ascii=False) + str(caught.exception)
+        for secret in ("user10", "secret", "private", "user:pass"):
+            self.assertNotIn(secret, safe)
+
+    def test_forced_password_form_blocks_login_but_change_password_menu_does_not(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        for text, fields, blocked in (("請設定新密碼", 3, True), ("修改密碼", 0, False),
+                                      ("密碼將於30日後到期", 0, False), ("Password has expired", 0, True),
+                                      ("舊密碼 新密碼 確認新密碼", 3, True), ("請定期修改密碼", 0, False),
+                                      ("密碼將於3日後到期，請修改密碼", 0, False),
+                                      ("為安全請定期更換密碼。您的密碼必須更新，請先更新密碼後繼續。", 0, True)):
+            with self.subTest(text=text):
+                driver = self.DiagnosticDriver(text=text, password_fields=fields)
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+                    driver_cleanup=lambda _driver: driver.events.append("cleanup"), defer_actor_resolution=True,
+                )
+                arguments = dict(typed_actor_no="", user_id="user10", password="secret",
+                                 actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={})
+                if blocked:
+                    with self.assertRaises(LoginVerificationError) as caught:
+                        verifier.verify(**arguments)
+                    self.assertEqual(caught.exception.login_diagnostic["reason_code"], "password_change_required")
+                    self.assertEqual(caught.exception.login_diagnostic["stage"], "post_login")
+                else:
+                    self.assertEqual(verifier.verify(**arguments).actor_name, "測試員")
+                    self.assertNotIn("screenshot", driver.events)
+                self.assertEqual(driver.events.count("cleanup"), 1)
+
+    def test_failed_redaction_and_invalid_or_oversize_images_keep_safe_reason(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        cases = ((False, None, "unavailable"), ("true", None, "unavailable"), (True, b"not png", "unavailable"),
+                 (True, b"x" * (512 * 1024 + 1), "oversize"))
+        for redacted, png, status in cases:
+            with self.subTest(redacted=redacted, status=status):
+                driver = self.DiagnosticDriver(redacted=redacted, png=png)
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None,
+                    login_function=lambda *_args: (_ for _ in ()).throw(RuntimeError("帳號或密碼錯誤 secret")),
+                    driver_cleanup=lambda _driver: driver.events.append("cleanup"),
+                )
+                with self.assertRaises(LoginVerificationError) as caught:
+                    verifier.verify(typed_actor_no="", user_id="user10", password="secret",
+                                    actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={})
+                diagnostic = caught.exception.login_diagnostic
+                self.assertEqual(diagnostic["reason_code"], "invalid_credentials")
+                self.assertEqual(diagnostic["capture_status"], status)
+                self.assertNotIn("image_png", diagnostic)
+                if redacted is not True:
+                    self.assertNotIn("screenshot", driver.events)
+                self.assertEqual(driver.events[-1], "cleanup")
+
+    def test_login_worker_preserves_safe_diagnostic_and_existing_failure_signal(self):
+        from app_core.login_verifier import LoginVerificationError
+        from qt_app.workers.login_worker import LoginWorker
+
+        diagnostic = {"reason_code": "password_change_required", "stage": "login",
+                      "reason": "密碼已到期，請更換密碼", "capture_status": "unavailable", "image_redacted": False}
+        verifier = SimpleNamespace(verify=Mock(side_effect=LoginVerificationError(
+            diagnostic["reason"], login_diagnostic=diagnostic, reason_code="password_change_required")))
+        worker = LoginWorker(attempt_id=7, verifier=verifier, actor_no="", user_id="user10", password="secret",
+                             actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={})
+        failed = []
+        worker.failed.connect(lambda attempt, message: failed.append((attempt, message)))
+        worker.run()
+        self.assertEqual(worker.failure_diagnostic, diagnostic)
+        self.assertEqual(failed[0][0], 7)
+        self.assertIn("密碼須更新", failed[0][1])
+        self.assertEqual(worker.password, "")
+
+    def test_browser_factory_failure_has_safe_unavailable_evidence(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        verifier = LoginVerifier(
+            options_factory=object,
+            driver_factory=lambda _: (_ for _ in ()).throw(OSError("cannot open user10 secret https://u:p@host/start?token=private")),
+        )
+        with self.assertRaises(LoginVerificationError) as caught:
+            verifier.verify(typed_actor_no="", user_id="user10", password="secret",
+                            actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={})
+        diagnostic = caught.exception.login_diagnostic
+        self.assertEqual(diagnostic["reason_code"], "browser_start_failed")
+        self.assertEqual(diagnostic["capture_status"], "unavailable")
+        safe = json.dumps(diagnostic)
+        for secret in ("user10", "secret", "private", "u:p"):
+            self.assertNotIn(secret, safe)
+
+    def test_login_capture_sanitizes_embedded_urls_and_sensitive_text_parameters(self):
+        from app_core.login_verifier import capture_login_diagnostic
+
+        driver = self.DiagnosticDriver(text='https://u:p@example.test/page?token=hidden#fragment\n"password": "unknown secret value"\ntoken="other token value"\nAuthorization: Bearer dummy-token')
+        diagnostic = capture_login_diagnostic(
+            driver, 'USER10 SECRET https://u:p@example.test/error?token=reason-value#fragment',
+            user_id='user10', password='secret',
+        )
+        safe = json.dumps(diagnostic, ensure_ascii=False)
+        for secret in ('USER10', 'SECRET', 'u:p', 'hidden', 'fragment', 'unknown', 'other token value', 'dummy-token', 'reason-value'):
+            self.assertNotIn(secret, safe)
+        self.assertIn('https://example.test/error', diagnostic['reason'])
+
+    def test_page_capture_failure_never_replaces_original_login_reason(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        class BrokenDriver:
+            @property
+            def current_url(self):
+                raise RuntimeError('reading URL failed')
+
+            @property
+            def title(self):
+                raise RuntimeError('reading title failed')
+
+            def execute_script(self, *_args):
+                raise RuntimeError('reading or redacting page failed')
+
+        cleaned = []
+        verifier = LoginVerifier(
+            options_factory=object, driver_factory=lambda _: BrokenDriver(), configure_driver=lambda _: None,
+            login_function=lambda *_: (_ for _ in ()).throw(RuntimeError('密碼已到期，請更換密碼')),
+            driver_cleanup=lambda _: cleaned.append(True),
+        )
+        with self.assertRaises(LoginVerificationError) as caught:
+            verifier.verify(typed_actor_no='', user_id='user10', password='secret',
+                            actor_no_from_user_id=lambda _: '', actor_no_from_name=lambda _: '', staff={})
+        self.assertEqual(caught.exception.login_diagnostic['reason'], '密碼已到期，請更換密碼')
+        self.assertEqual(caught.exception.login_diagnostic['capture_status'], 'unavailable')
+        self.assertEqual(cleaned, [True])
+
+    def test_capture_does_not_screenshot_if_top_level_context_cannot_be_confirmed(self):
+        from app_core.login_verifier import capture_login_diagnostic
+
+        driver = self.DiagnosticDriver()
+        driver.switch_to = SimpleNamespace(default_content=Mock(side_effect=RuntimeError('frame switch failed')))
+        diagnostic = capture_login_diagnostic(driver, '密碼已到期', user_id='user10', password='secret')
+        self.assertEqual(diagnostic['capture_status'], 'unavailable')
+        self.assertFalse(diagnostic['image_redacted'])
+        self.assertNotIn('screenshot', driver.events)
+
+    def test_configuration_and_login_timeout_keep_distinct_safe_diagnostics(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        for phase, expected in (('configure', 'browser_start_failed'), ('login', 'login_timeout')):
+            with self.subTest(phase=phase):
+                driver = self.DiagnosticDriver()
+
+                def fail(*_args):
+                    raise TimeoutError('user10 secret request timed out')
+
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _: driver,
+                    configure_driver=fail if phase == 'configure' else lambda _: None,
+                    login_function=fail if phase == 'login' else lambda *_: None,
+                    driver_cleanup=lambda _: driver.events.append('cleanup'),
+                )
+                with self.assertRaises(LoginVerificationError) as caught:
+                    verifier.verify(typed_actor_no='', user_id='user10', password='secret',
+                                    actor_no_from_user_id=lambda _: '', actor_no_from_name=lambda _: '', staff={})
+                diagnostic = caught.exception.login_diagnostic
+                self.assertEqual(diagnostic['reason_code'], expected)
+                self.assertEqual(diagnostic['stage'], 'login')
+                self.assertNotIn('user10', diagnostic['reason'])
+                self.assertNotIn('secret', diagnostic['reason'])
+                self.assertEqual(driver.events.count('cleanup'), 1)
+
     class SwitchTo:
         def default_content(self) -> None:
             pass
@@ -17190,6 +17409,64 @@ if return_code != 0 or loaded:
         self.assertEqual(record_type, "action_result")
         self.assertEqual(fields["result_ref"], "result.json")
         self.assertEqual(fields["snapshot"]["error_code"], "timeout")
+
+    def test_login_failure_evidence_reaches_nas_snapshot_only_for_current_attempt(self):
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+
+        class FakeOperationalSyncService:
+            def __init__(self):
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+        diagnostic = {"reason_code": "password_change_required", "stage": "post_login",
+                      "reason": "密碼須更新", "page_text": "請更換密碼", "capture_status": "unavailable", "image_redacted": False}
+        with tempfile.TemporaryDirectory() as directory:
+            sync = FakeOperationalSyncService()
+            app = AppController(repository=CredentialRepository(Path(directory) / "saved.json", "SinpoSmart", None),
+                                operational_sync_service=sync)
+            session = app.sessionController
+            try:
+                attempt = session._state.begin_login()
+                session._pending_credentials[attempt] = ("user10", "secret", False, "manual")
+                session._login_workers[attempt] = (None, SimpleNamespace(failure_diagnostic=diagnostic))
+                session._login_failed(attempt, "密碼須更新：請手動更換密碼後重新登入。")
+                session._login_workers.pop(attempt)
+                self.assertEqual(session.take_login_diagnostic(), {})
+                session._login_failed(attempt, "過期回覆")
+            finally:
+                session._login_workers.clear()
+                app.shutdown()
+        self.assertEqual(len(sync.events), 1)
+        self.assertEqual(sync.events[0][0], "login_failed")
+        self.assertEqual(sync.events[0][1]["snapshot"]["login_diagnostic"], diagnostic)
+
+    def test_login_timeout_uses_own_evidence_and_late_attempt_cannot_reuse_it(self):
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.session_controller import SessionController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = SessionController(repository=CredentialRepository(Path(directory) / "saved.json", "SinpoSmart", None))
+            try:
+                observed = []
+                controller.loginAttemptFailed.connect(lambda *_args: observed.append(controller.take_login_diagnostic()))
+                old_attempt = controller._state.begin_login()
+                controller._pending_credentials[old_attempt] = ("old-user", "old-secret", False, "manual")
+                controller._login_timed_out(old_attempt)
+                self.assertEqual(observed[0]["reason_code"], "login_timeout")
+                self.assertEqual(observed[0]["capture_status"], "unavailable")
+                new_attempt = controller._state.begin_login()
+                controller._pending_credentials[new_attempt] = ("new-user", "new-secret", False, "manual")
+                controller._login_failed(old_attempt, "舊結果")
+                self.assertEqual(len(observed), 1)
+                controller._login_failed(new_attempt, "登入失敗")
+                self.assertEqual(observed[1]["reason_code"], "login_failed")
+                self.assertEqual(controller.take_login_diagnostic(), {})
+            finally:
+                controller.shutdown()
 
     def test_app_controller_reports_safe_login_failure_without_password(self) -> None:
         from app_core.credential_repository import CredentialRepository

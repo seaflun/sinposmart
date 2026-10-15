@@ -8,7 +8,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from app_core.login_verifier import LoginVerificationError, LoginVerifier
+from app_core.login_verifier import LoginVerificationError, LoginVerifier, capture_login_diagnostic
 
 
 class LoginWorker(QObject):
@@ -37,9 +37,11 @@ class LoginWorker(QObject):
         self.actor_no_from_user_id = actor_no_from_user_id
         self.actor_no_from_name = actor_no_from_name
         self.staff = staff
+        self.failure_diagnostic: dict = {}
 
     @Slot()
     def run(self) -> None:
+        self.failure_diagnostic = {}
         try:
             result = self.verifier.verify(
                 typed_actor_no=self.actor_no,
@@ -50,8 +52,19 @@ class LoginWorker(QObject):
                 staff=self.staff,
             )
         except LoginVerificationError as exc:
-            self.failed.emit(self.attempt_id, str(exc))
+            self.failure_diagnostic = dict(exc.login_diagnostic) or capture_login_diagnostic(
+                None, str(exc), user_id=self.user_id, password=self.password, reason_code=exc.reason_code,
+            )
+            message = self.failure_diagnostic['reason']
+            if self.failure_diagnostic.get('reason_code') == 'password_change_required':
+                message = '密碼須更新：請至勤務網站手動完成密碼變更後，再重新登入。'
+            self.failed.emit(self.attempt_id, message)
         except Exception as exc:
+            self.failure_diagnostic = dict(getattr(exc, 'login_diagnostic', {}) or {}) or capture_login_diagnostic(
+                None, str(exc).splitlines()[0] if str(exc) else '登入失敗。',
+                user_id=self.user_id, password=self.password,
+                reason_code='browser_start_failed' if getattr(exc, 'diagnostic_category', '') else 'login_failed',
+            )
             if getattr(exc, "diagnostic_category", ""):
                 self.failed.emit(
                     self.attempt_id,

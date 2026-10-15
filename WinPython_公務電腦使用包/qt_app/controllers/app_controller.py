@@ -1655,13 +1655,17 @@ class AppController(QObject):
     def _login_attempt_failed(self, user_id: str, message: str, error_code: str, login_method: str = "unknown") -> None:
         if self._read_only_acceptance:
             return
+        snapshot = {"error_code": error_code, "login_method": login_method}
+        diagnostic = self._session_controller.take_login_diagnostic()
+        if diagnostic:
+            snapshot['login_diagnostic'] = diagnostic
         self._send_operational_event(
             "login_failed",
             status="failed",
             trigger_type="login",
             user_id=str(user_id or "").strip(),
             error=message,
-            snapshot={"error_code": error_code, "login_method": login_method},
+            snapshot=snapshot,
         )
 
     @Slot(str, str)

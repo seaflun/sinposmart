@@ -12,7 +12,7 @@ from app_core.credential_repository import (
     create_default_credential_repository,
 )
 from app_core.credential_sync_service import CredentialSyncService
-from app_core.login_verifier import LoginResult, LoginVerifier
+from app_core.login_verifier import LoginResult, LoginVerifier, capture_login_diagnostic
 from app_core.session import LoginSession, SessionState
 from qt_app.models.saved_account_model import SavedAccountListModel
 from qt_app.workers.credential_sync_worker import CredentialSyncWorker
@@ -63,6 +63,7 @@ class SessionController(QObject):
         self._saved_accounts_model = SavedAccountListModel(self)
         self._pending_credentials: dict[int, tuple[str, str, bool, str]] = {}
         self._login_workers: dict[int, tuple[QThread, LoginWorker]] = {}
+        self._login_failure_diagnostic: dict = {}
         self._credential_sync_request_id = 0
         self._credential_sync_workers: dict[int, tuple[QThread, CredentialSyncWorker]] = {}
         self._credential_sync_contexts: dict[int, tuple[int, str]] = {}
@@ -491,12 +492,30 @@ class SessionController(QObject):
     @Slot(int, str)
     def _login_failed(self, attempt_id: int, message: str) -> None:
         pending = self._pending_credentials.pop(attempt_id, None)
-        if not self._state.fail_login(attempt_id):
+        if pending is None or not self._state.fail_login(attempt_id):
             return
         self._display_name = ""
         self._set_status(message, error=True)
         user_id = pending[0] if pending is not None else ""
-        self.loginAttemptFailed.emit(user_id, message, "login_failed", pending[3] if pending else "unknown")
+        worker_pair = self._login_workers.get(attempt_id)
+        diagnostic = dict(getattr(worker_pair[1], 'failure_diagnostic', {}) or {}) if worker_pair else {}
+        if not diagnostic:
+            diagnostic = capture_login_diagnostic(
+                None, message, user_id=user_id, password=pending[1] if pending else '',
+            )
+        self._emit_login_failure(user_id, message, 'login_failed', pending[3] if pending else 'unknown', diagnostic)
+
+    def take_login_diagnostic(self) -> dict:
+        diagnostic, self._login_failure_diagnostic = self._login_failure_diagnostic, {}
+        return dict(diagnostic)
+
+    def _emit_login_failure(self, user_id: str, message: str, error_code: str, method: str, diagnostic: dict) -> None:
+        # Only the accepted attempt's synchronous signal delivery may consume this evidence.
+        self._login_failure_diagnostic = dict(diagnostic)
+        try:
+            self.loginAttemptFailed.emit(user_id, message, error_code, method)
+        finally:
+            self._login_failure_diagnostic = {}
 
     def _login_timed_out(self, attempt_id: int) -> None:
         pending = self._pending_credentials.pop(attempt_id, None)
@@ -509,7 +528,8 @@ class SessionController(QObject):
         message = "登入逾時：請確認帳號密碼或勤務系統是否有回應。"
         self._set_status(message, error=True)
         user_id = pending[0] if pending is not None else ""
-        self.loginAttemptFailed.emit(user_id, message, "timeout", pending[3] if pending else "unknown")
+        diagnostic = capture_login_diagnostic(None, message, reason_code='login_timeout')
+        self._emit_login_failure(user_id, message, 'timeout', pending[3] if pending else 'unknown', diagnostic)
 
     def _save_successful_account(
         self,
