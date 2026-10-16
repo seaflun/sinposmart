@@ -18,6 +18,33 @@ DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 45
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30
 
 
+CAPTURE_ERROR_MESSAGES = {
+    'driver_unavailable': '瀏覽器尚未建立或已無法使用，無法擷取截圖。',
+    'frame_context_failed': '無法切回主頁面，未執行截圖。',
+    'redaction_rejected': '欄位或文字遮蔽檢查未通過，未執行截圖。',
+    'redaction_failed': '遮蔽頁面時發生錯誤，未執行截圖。',
+    'screenshot_failed': '瀏覽器擷取截圖時發生錯誤。',
+    'invalid_image': '瀏覽器未回傳有效的 PNG 圖片。',
+    'image_oversize': '圖片尺寸或容量超過保存限制。',
+    'server_image_rejected': '後台圖片安全或格式驗證未通過，未保存截圖。',
+}
+CAPTURE_ERROR_TYPES = frozenset({
+    'Error', 'TypeError', 'ValueError', 'RuntimeError', 'TimeoutError', 'AttributeError',
+    'SecurityError', 'InvalidStateError', 'WebDriverException', 'TimeoutException',
+    'JavascriptException', 'UnexpectedAlertPresentException', 'NoSuchWindowException',
+    'InvalidSessionIdException', 'NoSuchFrameException', 'StaleElementReferenceException',
+    'InvalidArgumentException',
+})
+
+
+def _capture_failed(diagnostic: dict, code: str, error_type: object = '') -> dict:
+    diagnostic.update(
+        capture_error_code=code, capture_error=CAPTURE_ERROR_MESSAGES[code],
+        capture_error_type=error_type if isinstance(error_type, str) and error_type in CAPTURE_ERROR_TYPES else '',
+    )
+    return diagnostic
+
+
 class LoginVerificationError(RuntimeError):
     """Safe login error that may be shown to the operator."""
 
@@ -56,7 +83,8 @@ return {page_text: texts.join('\n').slice(0, 12000), password_fields: passwordFi
 
 LOGIN_DIAGNOSTIC_REDACT_SCRIPT = r"""
 // login-diagnostic-redact: a strict true is required before taking a screenshot.
-if (window.top !== window) return false;
+const rejected = {ok:false, error_code:'redaction_rejected', error_type:''};
+if (window.top !== window) return rejected;
 const secrets = arguments[0].filter(Boolean).sort((a, b) => b.length - a.length);
 function redact(value) {
   let text = String(value || '');
@@ -73,6 +101,7 @@ try {
   const style = document.createElement('style');
   style.textContent = '*::before,*::after { content:none!important; }';
   document.documentElement.appendChild(style);
+  const clearedControls = new Set();
   for (const el of document.querySelectorAll('*')) {
     const generatedContent = ['::before', '::after'].some(pseudo => {
       const content = window.getComputedStyle(el, pseudo).content;
@@ -82,20 +111,41 @@ try {
         el.shadowRoot || el.localName.includes('-') || generatedContent) {
       el.style.setProperty('display', 'none', 'important');
       if ('value' in el) el.value = '';
+      if (el.matches('input,textarea,select')) clearedControls.add(el);
     }
     for (const name of ['title', 'alt', 'placeholder', 'aria-label', 'value']) {
       if (el.hasAttribute(name)) el.setAttribute(name, redact(el.getAttribute(name)));
     }
   }
+  const visibleTextNodes = [];
   const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
   while (walker.nextNode()) {
     const node = walker.currentNode;
-    if (!node.parentElement?.closest('script,style')) node.nodeValue = redact(node.nodeValue);
+    const el = node.parentElement;
+    if (!el || el.closest('script,style')) continue;
+    node.nodeValue = redact(node.nodeValue);
+    if (el.getClientRects().length && window.getComputedStyle(el).visibility !== 'hidden') visibleTextNodes.push(node);
   }
-  const rendered = document.body?.innerText || '';
-  if (redact(rendered) !== rendered) return false;
-  return true;
-} catch (_) { return false; }
+  const emptyFieldLabels = new Set();
+  const isFieldLabel = value => /^(?:(?:帳\s*號|密\s*碼|account|username|password)\s*[:：]\s*)+$/i.test(String(value || '').trim());
+  for (const control of clearedControls) {
+    const row = control.closest('tr,label') || control.parentElement;
+    if (!row || row === document.body || !isFieldLabel(row.innerText)) continue;
+    const controls = Array.from(row.querySelectorAll('input,textarea,select'));
+    if (!controls.length || !controls.every(el => clearedControls.has(el))) continue;
+    for (const node of visibleTextNodes) {
+      if (row.contains(node.parentElement) && isFieldLabel(node.nodeValue)) emptyFieldLabels.add(node);
+    }
+  }
+  // Only proven empty form labels are excluded. Unassociated labels/values still
+  // undergo both adjacent-node and cross-line checks, including unknown tokens.
+  const verificationTexts = visibleTextNodes.filter(node => !emptyFieldLabels.has(node)).map(node => node.nodeValue);
+  for (const separator of ['', '\n']) {
+    const rendered = verificationTexts.join(separator);
+    if (redact(rendered) !== rendered) return rejected;
+  }
+  return {ok:true};
+} catch (error) { return {ok:false, error_code:'redaction_failed', error_type:error.name}; }
 """
 
 
@@ -184,15 +234,16 @@ def capture_login_diagnostic(
         'page_url': '', 'page_title': '', 'page_text': '',
         'captured_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'capture_status': 'unavailable', 'image_redacted': False,
+        'capture_error_code': '', 'capture_error': '', 'capture_error_type': '',
     }
     if driver is None:
-        return diagnostic
+        return _capture_failed(diagnostic, 'driver_unavailable')
     top_level = False
     try:
         driver.switch_to.default_content()
         top_level = True
-    except Exception:
-        pass
+    except Exception as exc:
+        _capture_failed(diagnostic, 'frame_context_failed', type(exc).__name__)
     probe = _login_page_probe(driver)
     diagnostic['page_text'] = _safe_login_text(probe.get('page_text'), secrets, 4000)
     for key, attribute, limit in (('page_url', 'current_url', 320), ('page_title', 'title', 160)):
@@ -203,27 +254,39 @@ def capture_login_diagnostic(
             diagnostic[key] = _safe_login_text(value, secrets, limit)
         except Exception:
             pass
+    if not top_level:
+        return diagnostic
     try:
-        if not top_level:
-            return diagnostic
-        if driver.execute_script(LOGIN_DIAGNOSTIC_REDACT_SCRIPT, list(secrets)) is not True:
-            return diagnostic
+        redaction = driver.execute_script(LOGIN_DIAGNOSTIC_REDACT_SCRIPT, list(secrets))
+    except Exception as exc:
+        return _capture_failed(diagnostic, 'redaction_failed', type(exc).__name__)
+    if redaction is not True:
+        if not (isinstance(redaction, dict) and redaction.get('ok') is True
+                and isinstance(redaction.get('error_code', ''), str) and redaction.get('error_code', '') == ''):
+            code, error_type = 'redaction_rejected', ''
+            if isinstance(redaction, dict):
+                if redaction.get('error_code') == 'redaction_failed':
+                    code = 'redaction_failed'
+                error_type = redaction.get('error_type', '')
+            return _capture_failed(diagnostic, code, error_type)
+    try:
         png = driver.get_screenshot_as_png()
-        if not isinstance(png, bytes):
-            return diagnostic
-        if len(png) > 512 * 1024:
-            diagnostic['capture_status'] = 'oversize'
-            return diagnostic
-        if len(png) < 33 or png[:8] != b'\x89PNG\r\n\x1a\n' or png[12:16] != b'IHDR':
-            return diagnostic
-        width, height = struct.unpack('>II', png[16:24])
-        if not (0 < width <= 4096 and 0 < height <= 4096 and width * height <= 4194304):
-            diagnostic['capture_status'] = 'oversize'
-            return diagnostic
-        diagnostic.update(capture_status='captured', image_redacted=True,
-                          image_png=base64.b64encode(png).decode('ascii'))
-    except Exception:
-        pass
+    except Exception as exc:
+        return _capture_failed(diagnostic, 'screenshot_failed', type(exc).__name__)
+    if not isinstance(png, bytes):
+        return _capture_failed(diagnostic, 'invalid_image')
+    if len(png) > 512 * 1024:
+        diagnostic['capture_status'] = 'oversize'
+        return _capture_failed(diagnostic, 'image_oversize')
+    if len(png) < 33 or png[:8] != b'\x89PNG\r\n\x1a\n' or png[12:16] != b'IHDR':
+        return _capture_failed(diagnostic, 'invalid_image')
+    width, height = struct.unpack('>II', png[16:24])
+    if not (0 < width <= 4096 and 0 < height <= 4096 and width * height <= 4194304):
+        diagnostic['capture_status'] = 'oversize'
+        return _capture_failed(diagnostic, 'image_oversize')
+    diagnostic.update(capture_status='captured', image_redacted=True,
+                      image_png=base64.b64encode(png).decode('ascii'),
+                      capture_error_code='', capture_error='', capture_error_type='')
     return diagnostic
 
 

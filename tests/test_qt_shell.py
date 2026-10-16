@@ -477,6 +477,202 @@ class SessionStateTests(unittest.TestCase):
 
 
 class LoginVerifierTests(unittest.TestCase):
+    @classmethod
+    def _execute_redaction_fixture(cls, *, extra_texts=None, row_extra_texts=None, secrets=None, fail_style=False):
+        from PySide6.QtQml import QJSEngine
+        from PySide6.QtWidgets import QApplication
+        from app_core.login_verifier import LOGIN_DIAGNOSTIC_REDACT_SCRIPT
+
+        cls._redaction_app = QApplication.instance() or QApplication(['redaction-test'])
+        engine = QJSEngine()
+        fixture = r'''
+const all = [], nodes = [], inputs = [];
+function element(tag, parent) {
+  const el = {
+    localName: tag, parentElement: parent, shadowRoot: null, value: '',
+    style: {display:'', setProperty(name, value) { this[name] = value; }},
+    matches(selector) { return selector.split(',').includes(this.localName); },
+    closest(selector) {
+      for (let el = this; el; el = el.parentElement) if (el.matches(selector)) return el;
+      return null;
+    },
+    contains(other) {
+      for (let el = other; el; el = el.parentElement) if (el === this) return true;
+      return false;
+    },
+    getClientRects() {
+      for (let el = this; el; el = el.parentElement) if (el.style.display === 'none') return [];
+      return [1];
+    },
+    hasAttribute() { return false; },
+    querySelectorAll(selector) { return all.filter(el => el !== this && this.contains(el) && el.matches(selector)); },
+    get innerText() {
+      return nodes.filter(node => this.contains(node.parentElement) && node.parentElement.getClientRects().length)
+        .map(node => node.nodeValue).join('\n');
+    }
+  };
+  all.push(el); return el;
+}
+const body = element('body', null);
+function text(value, parent) { nodes.push({nodeValue:value, parentElement:parent}); }
+for (const label of ['帳號：', '密碼：']) {
+  const row = element('tr', body);
+  text(label, element('font', element('td', row)));
+  const input = element('input', element('font', element('td', row)));
+  input.value = 'fixture-password'; inputs.push(input);
+  if (label === '帳號：') for (const value of ROW_EXTRA_TEXTS) text(value, element('span', row));
+}
+text('登入', element('button', body));
+for (const value of EXTRA_TEXTS) text(value, element('span', body));
+const window = {top:null, getComputedStyle(el) {
+  if (FAIL_STYLE) throw new TypeError('private exception message must never be returned');
+  return {content:'none', display:el.style.display, visibility:'visible'};
+}}; window.top = window;
+const document = {
+  body:body, documentElement:{appendChild(){}}, createElement(){return {};},
+  querySelectorAll(selector){return selector === '*' ? all : all.filter(el => el.matches(selector));},
+  createTreeWalker(root){
+    const selected = nodes.filter(node => root.contains(node.parentElement));
+    let index = -1;
+    return {nextNode(){return ++index < selected.length;},get currentNode(){return selected[index];}};
+  }
+};
+const NodeFilter = {SHOW_TEXT:4};
+'''
+        fixture = fixture.replace('ROW_EXTRA_TEXTS', json.dumps(row_extra_texts or [], ensure_ascii=False))
+        fixture = fixture.replace('EXTRA_TEXTS', json.dumps(extra_texts or [], ensure_ascii=False))
+        fixture = fixture.replace('FAIL_STYLE', 'true' if fail_style else 'false')
+        code = '(function(){' + fixture + '\nconst result=(function(){' + LOGIN_DIAGNOSTIC_REDACT_SCRIPT
+        code += '\n})(' + json.dumps(secrets or ['fixture-user', 'fixture-password']) + ');'
+        code += 'return {result:result,rendered:body.innerText,inputs:inputs.map(el=>({value:el.value,display:el.style.display}))};})()'
+        result = engine.evaluate(code)
+        if result.isError():
+            raise AssertionError(result.toString())
+        return result.toVariant()
+
+    def test_actual_redaction_script_accepts_empty_table_row_labels_after_hiding_inputs(self):
+        outcome = self._execute_redaction_fixture()
+        self.assertEqual(outcome['result'], {'ok': True})
+        self.assertIn('帳號：', outcome['rendered'])
+        self.assertIn('密碼：', outcome['rendered'])
+        self.assertTrue(all(item == {'value':'', 'display':'none'} for item in outcome['inputs']))
+
+    def test_actual_redaction_script_preserves_secret_guards_across_nodes_and_lines(self):
+        for values in (['token=', 'unknown-runtime-token'], ['token=first-part', 'unmasked-tail'],
+                       ['tok', 'en=', 'unknown-runtime-token'], ['密碼：', 'unknown-runtime-password'],
+                       ['fixture-', 'password']):
+            with self.subTest(values=values):
+                outcome = self._execute_redaction_fixture(extra_texts=values)
+                self.assertEqual(outcome['result']['ok'], False)
+                self.assertEqual(outcome['result']['error_code'], 'redaction_rejected')
+        outcome = self._execute_redaction_fixture(row_extra_texts=['unknown-runtime-password'])
+        self.assertEqual(outcome['result']['error_code'], 'redaction_rejected')
+        outcome = self._execute_redaction_fixture(extra_texts=[
+            'fixture-user', 'fixture-password', 'https://user:pass@example.test/login?token=private#fragment',
+            'token="private token value"',
+        ])
+        self.assertEqual(outcome['result'], {'ok': True})
+        for secret in ('fixture-user', 'fixture-password', 'user:pass', 'private', 'fragment'):
+            self.assertNotIn(secret, outcome['rendered'])
+
+    def test_actual_redaction_script_reports_safe_javascript_type_and_rejects_mask_collision(self):
+        outcome = self._execute_redaction_fixture(fail_style=True)
+        self.assertEqual(outcome['result'], {'ok':False, 'error_code':'redaction_failed', 'error_type':'TypeError'})
+        self.assertNotIn('private exception', json.dumps(outcome))
+        outcome = self._execute_redaction_fixture(extra_texts=['fixture-secret'], secrets=['已遮蔽', 'fixture-secret'])
+        self.assertEqual(outcome['result']['error_code'], 'redaction_rejected')
+
+    def test_capture_records_first_safe_failure_branch_without_exception_messages(self):
+        from selenium.common.exceptions import JavascriptException, TimeoutException
+        from app_core.login_verifier import capture_login_diagnostic
+
+        driver = self.DiagnosticDriver()
+        cases = [
+            ('driver_unavailable', None, ''),
+            ('frame_context_failed', self.DiagnosticDriver(), 'RuntimeError'),
+            ('redaction_rejected', self.DiagnosticDriver(redacted=False), ''),
+            ('redaction_failed', self.DiagnosticDriver(), 'JavascriptException'),
+            ('screenshot_failed', self.DiagnosticDriver(), 'TimeoutException'),
+            ('invalid_image', self.DiagnosticDriver(png=b'bad image'), ''),
+            ('image_oversize', self.DiagnosticDriver(png=b'x' * (512 * 1024 + 1)), ''),
+        ]
+        cases[1][1].switch_to = SimpleNamespace(default_content=Mock(side_effect=RuntimeError('private-message token=hidden')))
+        original_script = cases[3][1].execute_script
+
+        def failed_script(script, *args):
+            if 'login-diagnostic-redact' in script:
+                raise JavascriptException('private-message password=hidden')
+            return original_script(script, *args)
+
+        cases[3][1].execute_script = failed_script
+        cases[4][1].get_screenshot_as_png = Mock(side_effect=TimeoutException('private-message token=hidden'))
+        for code, driver, error_type in cases:
+            with self.subTest(code=code):
+                diagnostic = capture_login_diagnostic(driver, '原始登入原因', user_id='fixture-user', password='fixture-password')
+                self.assertEqual(diagnostic['reason'], '原始登入原因')
+                self.assertEqual(diagnostic['capture_error_code'], code)
+                self.assertEqual(diagnostic['capture_error_type'], error_type)
+                self.assertTrue(diagnostic['capture_error'])
+                self.assertNotIn('private-message', json.dumps(diagnostic))
+                self.assertNotIn('image_png', diagnostic)
+                if driver is not None and code in ('frame_context_failed', 'redaction_failed', 'redaction_rejected'):
+                    self.assertNotIn('screenshot', driver.events)
+
+    def test_capture_accepts_only_strict_structured_success_and_clears_error_fields(self):
+        from app_core.login_verifier import capture_login_diagnostic
+
+        for response in (True, {'ok':True}, {'ok':True, 'error_code':''}):
+            with self.subTest(response=response):
+                diagnostic = capture_login_diagnostic(self.DiagnosticDriver(redacted=response), '登入失敗')
+                self.assertEqual(diagnostic['capture_status'], 'captured')
+                for key in ('capture_error_code', 'capture_error', 'capture_error_type'):
+                    self.assertEqual(diagnostic[key], '')
+        for response in ('true', 1, [], {'ok':1}, {'ok':'true'}, *(
+            {'ok':True, 'error_code':value} for value in (0, False, [], {}, None)
+        )):
+            with self.subTest(response=response):
+                driver = self.DiagnosticDriver(redacted=response)
+                diagnostic = capture_login_diagnostic(driver, '登入失敗')
+                self.assertEqual(diagnostic['capture_error_code'], 'redaction_rejected')
+                self.assertNotIn('screenshot', driver.events)
+        driver = self.DiagnosticDriver(redacted={'ok':False, 'error_code':'redaction_failed', 'error_type':'TypeError'})
+        diagnostic = capture_login_diagnostic(driver, '登入失敗')
+        self.assertEqual(diagnostic['capture_error_code'], 'redaction_failed')
+        self.assertEqual(diagnostic['capture_error_type'], 'TypeError')
+        driver.redacted['error_type'] = 'private-message'
+        self.assertEqual(capture_login_diagnostic(driver, '登入失敗')['capture_error_type'], '')
+
+    def test_metadata_probe_failure_does_not_block_verified_safe_screenshot(self):
+        from app_core.login_verifier import capture_login_diagnostic
+
+        fixture = self.DiagnosticDriver()
+
+        class MetadataFailureDriver:
+            switch_to = fixture.switch_to
+
+            @property
+            def current_url(self):
+                raise RuntimeError('private metadata URL')
+
+            @property
+            def title(self):
+                raise RuntimeError('private metadata title')
+
+            def execute_script(self, script, *_args):
+                if 'login-diagnostic-probe' in script:
+                    raise RuntimeError('private metadata text')
+                return {'ok':True}
+
+            def get_screenshot_as_png(self):
+                return fixture.png
+
+        diagnostic = capture_login_diagnostic(MetadataFailureDriver(), '原始登入原因')
+        self.assertEqual(diagnostic['capture_status'], 'captured')
+        self.assertEqual(diagnostic['reason'], '原始登入原因')
+        for key in ('capture_error_code', 'capture_error', 'capture_error_type'):
+            self.assertEqual(diagnostic[key], '')
+
+
     class DiagnosticDriver:
         def __init__(self, *, text="密碼已到期，請更換密碼", password_fields=3, redacted=True, png=None):
             import base64
@@ -589,7 +785,9 @@ class LoginVerifierTests(unittest.TestCase):
         from qt_app.workers.login_worker import LoginWorker
 
         diagnostic = {"reason_code": "password_change_required", "stage": "login",
-                      "reason": "密碼已到期，請更換密碼", "capture_status": "unavailable", "image_redacted": False}
+                      "reason": "密碼已到期，請更換密碼", "capture_status": "unavailable", "image_redacted": False,
+                      "capture_error_code": "screenshot_failed", "capture_error": "瀏覽器擷取截圖時發生錯誤。",
+                      "capture_error_type": "NoSuchWindowException"}
         verifier = SimpleNamespace(verify=Mock(side_effect=LoginVerificationError(
             diagnostic["reason"], login_diagnostic=diagnostic, reason_code="password_change_required")))
         worker = LoginWorker(attempt_id=7, verifier=verifier, actor_no="", user_id="user10", password="secret",
@@ -8870,6 +9068,8 @@ class OperationalSyncServiceTests(unittest.TestCase):
         from app_core.operational_sync_service import OperationalSyncService
 
         posted = []
+        diagnostic = {"capture_error_code": "screenshot_failed", "capture_error": "瀏覽器擷取截圖時發生錯誤。",
+                      "capture_error_type": "NoSuchWindowException"}
         with tempfile.TemporaryDirectory() as temp_dir:
             service = OperationalSyncService(
                 Path(temp_dir),
@@ -8881,7 +9081,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 user_id="safe-user",
                 content="工具執行完成",
                 password="must-not-appear",
-                snapshot={"token": "hidden", "result": "ok"},
+                snapshot={"token": "hidden", "result": "ok", "login_diagnostic": diagnostic},
             )
             service.send_event_payload(payload)
             pending = service.pending_path.read_text(encoding="utf-8")
@@ -8890,6 +9090,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertNotIn("must-not-appear", serialized)
         self.assertNotIn("hidden", serialized)
         self.assertEqual(posted[0]["snapshot"]["result"], "ok")
+        self.assertEqual(posted[0]["snapshot"]["login_diagnostic"], diagnostic)
         self.assertEqual(posted[0]["content"], "工具執行完成")
         self.assertEqual(pending, "")
 
@@ -17423,7 +17624,9 @@ if return_code != 0 or loaded:
                 return {"record_type": record_type}
 
         diagnostic = {"reason_code": "password_change_required", "stage": "post_login",
-                      "reason": "密碼須更新", "page_text": "請更換密碼", "capture_status": "unavailable", "image_redacted": False}
+                      "reason": "密碼須更新", "page_text": "請更換密碼", "capture_status": "unavailable", "image_redacted": False,
+                      "capture_error_code": "screenshot_failed", "capture_error": "瀏覽器擷取截圖時發生錯誤。",
+                      "capture_error_type": "NoSuchWindowException"}
         with tempfile.TemporaryDirectory() as directory:
             sync = FakeOperationalSyncService()
             app = AppController(repository=CredentialRepository(Path(directory) / "saved.json", "SinpoSmart", None),
