@@ -94,6 +94,412 @@ def legacy_duty_sheet_module():
     return module
 
 
+class DailyVehicleVerificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        script = package_dir() / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+        spec = importlib.util.spec_from_file_location("_vehicle_verification_smoke", script)
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def test_empty_grid_is_unconfirmed_instead_of_success(self) -> None:
+        driver, wait, _old, _new, actions = self._query_fixture([{"ready": True, "failed": False}])
+        driver.find_elements.side_effect = lambda *_args: []
+        with self.assertRaisesRegex(RuntimeError, "empty_list"):
+            self.module.query_grid_rows(driver, wait, "maintain")
+        self.assertEqual(actions[-1], "cleanup")
+
+    def _query_fixture(self, states):
+        module = self.module
+        old_row, new_row = object(), object()
+        visible = [old_row]
+        observed = iter(states)
+        actions = []
+        driver, wait = mock.Mock(), mock.Mock()
+
+        def execute(_script, action=None, token=None, *_args):
+            actions.append(action)
+            if action == "state":
+                state = next(observed, states[-1])
+                if state.get("ready"):
+                    visible[:] = [new_row]
+                return {"token": token, **state}
+            return True
+
+        driver.execute_script.side_effect = execute
+        driver.find_elements.side_effect = lambda *_args: list(visible)
+        return driver, wait, old_row, new_row, actions
+
+    def test_search_waits_for_current_binding_instead_of_using_old_rows(self) -> None:
+        driver, wait, _old, new, actions = self._query_fixture([
+            {"ready": False, "failed": False}, {"ready": True, "failed": False}])
+        with mock.patch.object(self.module.time, "sleep"):
+            rows = self.module.query_grid_rows(driver, wait, "maintain")
+        self.assertEqual(rows, [new])
+        self.assertEqual(driver.find_elements.call_count, 1)
+        self.assertEqual(actions, ["begin", "click", "state", "state", "cleanup"])
+
+    def test_search_error_and_missing_binding_are_unconfirmed_and_cleanup(self) -> None:
+        for state in ({"ready": False, "failed": True}, {"ready": False, "failed": False}):
+            with self.subTest(state=state):
+                driver, wait, _old, _new, actions = self._query_fixture([state])
+                with mock.patch.object(self.module.time, "monotonic", side_effect=[0, 0, 11]), \
+                        mock.patch.object(self.module.time, "sleep"):
+                    with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+                        self.module.query_grid_rows(driver, wait, "maintain")
+                driver.find_elements.assert_not_called()
+                self.assertEqual(actions[-1], "cleanup")
+
+    def test_query_observer_ignores_old_binding_and_removes_only_its_handlers(self) -> None:
+        javascript = """
+function observable() {
+    return {handlers: {}, bind: function(name, callback) {
+        (this.handlers[name] || (this.handlers[name] = [])).push(callback);
+    }, unbind: function(name, callback) {
+        this.handlers[name] = (this.handlers[name] || []).filter(fn => fn !== callback);
+    }, fire: function(name, event) {
+        (this.handlers[name] || []).slice().forEach(fn => fn(event));
+    }};
+}
+var grid = observable(), source = observable();
+grid.dataSource = source;
+var window = {jQuery: function() {return {data: function() {return grid;}};}};
+function query(action, token, button) { return (function() {
+""" + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
+}).apply(null, [action, token, button]); }
+var externalCalls = 0;
+var external = function() {externalCalls++;};
+grid.bind('dataBound', external);
+query('begin', 'first');
+var oldStart = source.handlers.requestStart[0], oldBound = grid.handlers.dataBound[1];
+grid.fire('dataBound', {});
+var beforeClick = query('state', 'first').ready;
+query('click', 'first', {click: function() {}});
+grid.fire('dataBound', {});
+var oldResponse = query('state', 'first').ready;
+source.fire('requestStart', {type: 'read'});
+grid.fire('dataBound', {});
+var currentResponse = query('state', 'first').ready;
+query('begin', 'second');
+query('cleanup', 'first');
+query('click', 'second', {click: function() {}});
+oldStart({type: 'read'}); oldBound();
+var staleCallback = query('state', 'second').ready;
+source.fire('error', {});
+var failed = query('state', 'second').failed;
+query('cleanup', 'second');
+JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
+    currentResponse: currentResponse, staleCallback: staleCallback, failed: failed,
+    gridHandlers: grid.handlers.dataBound.length,
+    startHandlers: source.handlers.requestStart.length, errorHandlers: source.handlers.error.length,
+    externalRetained: grid.handlers.dataBound[0] === external});
+"""
+        runner = (
+            "import json\nfrom PySide6.QtCore import QCoreApplication\n"
+            "from PySide6.QtQml import QJSEngine\napp=QCoreApplication([])\nengine=QJSEngine()\n"
+            "result=engine.evaluate(" + repr(javascript) + ")\n"
+            "assert not result.isError(), result.toString()\nprint(result.toString())\n"
+        )
+        result = subprocess.run([sys.executable, "-B", "-c", runner], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "beforeClick": False, "oldResponse": False, "currentResponse": True,
+            "staleCallback": False, "failed": True, "gridHandlers": 1,
+            "startHandlers": 0, "errorHandlers": 0, "externalRetained": True})
+
+    def _fixture(self, **options):
+        module = self.module
+        state = {"maintenance_done": False, "equipment_done": False,
+                 "persist": True, "event_class": "unchecked", "missing_today": False,
+                 "total": 1, "filtered": False, "placeholder": False,
+                 "equipment_text": "", "equipment_button": True,
+                 "contradictory_button": False, "no_paging": False,
+                 "row_names": None,
+                 "button_only_evidence": False, "change_after_save": False,
+                 "saved": 0}
+        state.update(options)
+
+        class Element:
+            def __init__(self, role="button", text="", displayed=True):
+                self.role, self.text, self.displayed = role, text, displayed
+
+            def is_displayed(self):
+                return self.displayed
+
+            def is_enabled(self):
+                return True
+
+            def get_attribute(self, name):
+                if name == "textContent":
+                    return self.text
+                if name == "aria-label":
+                    return "2026年10月16日" if state["missing_today"] else "2026年10月17日"
+                if name == "class":
+                    return "checked" if state["maintenance_done"] else state["event_class"]
+                return ""
+
+            def find_elements(self, by, selector):
+                if self.role == "equipment-status" and state["button_only_evidence"]:
+                    return [Element(text="完成清點")]
+                return []
+
+        class Row(Element):
+            def __init__(self, vehicle=None):
+                super().__init__()
+                self.vehicle = vehicle
+
+            def find_elements(self, by, selector):
+                if selector == "td":
+                    if state["placeholder"]:
+                        return [Element(text="查無資料")]
+                    vehicle = self.vehicle or ("CAR-02" if state["change_after_save"] and state["saved"] else "CAR-01")
+                    if driver.mode == "maintain":
+                        cells = [Element() for _ in range(13)]
+                        cells[8] = Element(text=vehicle)
+                        cells[9] = Element(text="115/10/17" if state["maintenance_done"] else "未完成")
+                        return cells
+                    text = state["equipment_text"] or ("115/10/17 已完成" if state["equipment_done"] else "未清點")
+                    return [Element(), Element(), Element(), Element(text=vehicle), Element("equipment-status", text)]
+                if driver.mode == "equip" and state["equipment_button"] and (not state["equipment_done"] or state["contradictory_button"]):
+                    return [Element("check")]
+                return []
+
+        class Driver:
+            mode = "maintain"
+            current_url = "fixture://maintain"
+
+            def get(self, url):
+                self.mode = "equip" if "CarEquipCheck" in url else "maintain"
+                self.current_url = url
+
+            def refresh(self):
+                self.mode = "calendar"
+
+            def find_element(self, by, selector):
+                if selector == "spinner-container":
+                    return Element(displayed=False)
+                if "tbody/tr[" in selector:
+                    return Row()
+                if "SaveProc" in selector:
+                    return Element("save")
+                if "btnCancel" in selector:
+                    return Element("return")
+                if "完成清點" in selector:
+                    return Element("finish")
+                if "保養" in selector:
+                    return Element("maintain")
+                return Element()
+
+            def find_elements(self, by, selector):
+                if selector == "#scheduler .k-event":
+                    return [Element("event")]
+                if "swal-button" in selector:
+                    return []
+                return []
+
+            def execute_script(self, script, *args):
+                if "dataSource" in script:
+                    total = len(state["row_names"]) if state["row_names"] is not None else state["total"]
+                    return {"total": total, "page": None if state["no_paging"] else 1,
+                            "page_size": None if state["no_paging"] else 20,
+                            "filtered": state["filtered"]}
+                element = args[0]
+                if element.role == "maintain":
+                    self.mode = "calendar"
+                elif element.role == "return":
+                    self.mode = "maintain"
+                elif element.role in ("save", "finish"):
+                    state["saved"] += 1
+                    if state["persist"]:
+                        state["maintenance_done" if element.role == "save" else "equipment_done"] = True
+                    if element.role == "finish":
+                        self.current_url = "fixture://CarEquipCheck/View"
+                return None
+
+        class Wait:
+            def until(self, condition):
+                result = condition(driver)
+                if not result:
+                    raise module.TimeoutException("fixture condition was not confirmed")
+                return result
+
+        driver = Driver()
+        return driver, Wait(), state, lambda *_args: (
+            [Row(vehicle) for vehicle in state["row_names"]] if state["row_names"] is not None else [Row()])
+
+    def _run_operation(self, operation, report=None, **options):
+        module = self.module
+        driver, wait, state, query = self._fixture(**options)
+        report = report if report is not None else module.new_vehicle_report("2026-10-17")
+        with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(module, "ensure_requested_date"):
+            if operation == "maintenance":
+                today = datetime(2026, 10, 17)
+                module.process_maintain_checks(driver, wait, module.build_today_strings(today), today, report=report)
+            else:
+                module.process_equip_checks(driver, wait, report=report)
+        return report, state
+
+    def test_calendar_without_today_is_unconfirmed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "today_not_found"):
+            self._run_operation("maintenance", missing_today=True)
+
+    def test_unchecked_is_submitted_and_verified_after_save(self) -> None:
+        report, state = self._run_operation("maintenance")
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_disabled_calendar_is_not_completion_evidence(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+            self._run_operation("maintenance", event_class="disable")
+
+    def test_save_without_persisted_completion_is_unconfirmed(self) -> None:
+        for operation in ("maintenance", "equipment"):
+            with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "save_unconfirmed"):
+                self._run_operation(operation, persist=False)
+
+    def test_placeholder_paging_filter_and_changed_inventory_cannot_complete(self) -> None:
+        for options in ({"placeholder": True}, {"total": 2}, {"filtered": True}, {"change_after_save": True}):
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                self._run_operation("maintenance", **options)
+
+    def test_missing_equipment_button_needs_positive_today_evidence(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+            self._run_operation("equipment", equipment_button=False)
+        report, state = self._run_operation("equipment", equipment_done=True)
+        self.assertEqual(state["saved"], 0)
+        self.assertEqual(report["items"][0]["status"], "already_done")
+
+    def test_equipment_save_is_verified_from_fresh_list(self) -> None:
+        report, state = self._run_operation("equipment")
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["reason_code"], "saved_verified")
+
+    def test_today_completed_text_with_pending_button_is_unconfirmed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+            self._run_operation("equipment", equipment_done=True, contradictory_button=True)
+
+    def test_loaded_grid_without_paging_is_accepted(self) -> None:
+        report, _state = self._run_operation("maintenance", maintenance_done=True, no_paging=True)
+        self.assertEqual(report["items"][0]["status"], "already_done")
+
+    def test_duplicate_vehicle_case_cannot_complete(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+            self._run_operation("maintenance", maintenance_done=True, row_names=["CAR-01", "car-01"])
+
+    def test_vehicle_names_match_protocol_and_casefold_upsert(self) -> None:
+        module = self.module
+        self.assertEqual(module.safe_vehicle_name("トヨタ"), "")
+        self.assertEqual(module.safe_vehicle_name("  新坡  91  "), "新坡 91")
+        report = module.new_vehicle_report("2026-10-17")
+        module.record_vehicle_result(report, "CAR-01", "maintenance", "unconfirmed", "save_unconfirmed")
+        module.record_vehicle_result(report, "car-01", "maintenance", "completed", "saved_verified")
+        self.assertEqual(len(report["items"]), 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_negative_date_status_and_button_text_cannot_be_completion(self) -> None:
+        module = self.module
+        today_strings = module.build_today_strings(datetime(2026, 10, 17))
+        for status in ("未完成", "尚未完成", "待完成", "未清點", "待清點", "未知狀態"):
+            with self.subTest(status=status):
+                self.assertFalse(module.is_task_done("115/10/17 " + status, today_strings))
+                with self.assertRaises(RuntimeError):
+                    self._run_operation("equipment", equipment_button=False,
+                                        equipment_text="115/10/17 " + status)
+        with self.assertRaises(RuntimeError):
+            self._run_operation("equipment", equipment_button=False,
+                                equipment_text="115/10/17 完成清點", button_only_evidence=True)
+
+    def test_positive_report_requires_both_operations_and_safe_unique_rows(self) -> None:
+        module = self.module
+        report, _ = self._run_operation("maintenance", maintenance_done=True)
+        self.assertFalse(module.verify_vehicle_report(report))
+        self._run_operation("equipment", report, equipment_done=True)
+        self.assertTrue(module.verify_vehicle_report(report))
+        self.assertEqual(len(report["items"]), 2)
+        module.record_vehicle_result(report, "CAR-01", "maintenance", "already_done", "verified_today")
+        self.assertEqual(len(report["items"]), 2)
+        for name in ("account-secret", "帳號測試", "CAR-01\nTOKEN", "CAR-01\n", "https://fixture.invalid", "A" * 33):
+            with self.subTest(name=name):
+                self.assertEqual(module.safe_vehicle_name(name), "")
+        report = module.new_vehicle_report("2026-10-17")
+        for index in range(200):
+            module.record_vehicle_result(report, f"CAR-{index}", "maintenance", "completed", "saved_verified")
+        with self.assertRaisesRegex(RuntimeError, "row_limit"):
+            module.record_vehicle_result(report, "OVER-LIMIT", "equipment", "completed", "saved_verified")
+        self.assertEqual(len(report["items"]), 200)
+
+    def _run_main(self, *, keep_browser=False, configuration_error=False, **options):
+        from contextlib import ExitStack, redirect_stdout
+        from io import StringIO
+        module = self.module
+        driver, wait, state, query = self._fixture(**options)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 10, 17, 9)
+
+        configuration = {"username": "fixture-user", "password": "fixture-password",
+                         "headless": False, "keep_browser_open": keep_browser,
+                         "timeout_seconds": 1, "selenium_remote_url": ""}
+        output = StringIO()
+        error = None
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(module.dt, "datetime", FixedDateTime))
+            stack.enter_context(mock.patch.dict(module.os.environ, {"PPE_TARGET_DATE": "2026-10-17"}))
+            stack.enter_context(mock.patch.object(module, "query_grid_rows", side_effect=query))
+            stack.enter_context(mock.patch.object(module, "ensure_requested_date"))
+            stack.enter_context(mock.patch.object(module, "load_config", side_effect=RuntimeError("token=fixture-secret"))
+                                if configuration_error else mock.patch.object(module, "load_config", return_value=configuration))
+            stack.enter_context(mock.patch.object(module.webdriver, "ChromeOptions"))
+            stack.enter_context(mock.patch.object(module, "retry_duty_browser_session_open", return_value=driver))
+            stack.enter_context(mock.patch.object(module, "WebDriverWait", return_value=wait))
+            cleanup = stack.enter_context(mock.patch.object(module, "quit_driver"))
+            sleep = stack.enter_context(mock.patch.object(module.time, "sleep"))
+            stack.enter_context(redirect_stdout(output))
+            try:
+                module.main([])
+            except RuntimeError as exception:
+                error = exception
+        lines = output.getvalue().splitlines()
+        reports = [json.loads(line[len(module.REPORT_PREFIX):]) for line in lines if line.startswith(module.REPORT_PREFIX)]
+        return reports, lines, error, cleanup, sleep
+
+    def test_main_emits_one_verified_report_before_done_and_retains_browser(self) -> None:
+        reports, lines, error, cleanup, sleep = self._run_main(
+            keep_browser=True, maintenance_done=True, equipment_done=True)
+        self.assertIsNone(error)
+        self.assertEqual(len(reports), 1)
+        self.assertTrue(reports[0]["verified"])
+        self.assertEqual(reports[0]["target_date"], "2026-10-17")
+        report_line = next(index for index, line in enumerate(lines) if line.startswith(self.module.REPORT_PREFIX))
+        self.assertLess(report_line, lines.index("[done] automation finished"))
+        sleep.assert_called_once_with(self.module.DEFAULT_BROWSER_RETENTION_SECONDS)
+        cleanup.assert_called_once()
+
+    def test_main_failure_preserves_verified_items_without_done(self) -> None:
+        reports, lines, error, cleanup, _sleep = self._run_main(maintenance_done=True, persist=False)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0]["verified"])
+        self.assertEqual([item["status"] for item in reports[0]["items"]], ["already_done", "unconfirmed"])
+        self.assertNotIn("[done] automation finished", lines)
+        cleanup.assert_called_once()
+
+    def test_configuration_failure_emits_safe_unconfirmed_report(self) -> None:
+        reports, lines, error, cleanup, _sleep = self._run_main(configuration_error=True)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0]["verified"])
+        self.assertEqual(reports[0]["reason_code"], "unexpected_error")
+        self.assertNotIn("fixture-secret", "\n".join(lines) + str(error))
+        self.assertNotIn("[done] automation finished", lines)
+        cleanup.assert_not_called()
+
+
 class PackageSmokeTests(unittest.TestCase):
     def test_retained_browser_is_scheduled_to_close_after_ten_minutes(self) -> None:
         module = duty_rehearsal_module()

@@ -2449,6 +2449,8 @@ class AppController(QObject):
                 "target_date": str(target_date or ""),
                 "execution_mode": "automatic" if automatic else "manual",
             }
+        elif tool_name == "daily_vehicle":
+            run_context = self._daily_vehicle_controller.run_context
         self._tool_run_contexts[tool_name] = run_context
         snapshot.update(run_context)
         if self._automatic_tool_record and self._automatic_tool_record["tool_id"] == tool_name:
@@ -2483,11 +2485,15 @@ class AppController(QObject):
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
+        if tool_name == "daily_vehicle" and not run_context:
+            run_context = self._daily_vehicle_controller.run_context
         self._tool_controller.record_finished(tool_name, "completed", message)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
+        if tool_name == "daily_vehicle":
+            snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
         if run_id:
             snapshot["run_id"] = run_id
         if snapshot_extra:
@@ -2521,6 +2527,8 @@ class AppController(QObject):
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
+        if tool_name == "daily_vehicle" and not run_context:
+            run_context = self._daily_vehicle_controller.run_context
         if tool_name == "duty_sheet" and (run_context.get("workbook_name") or run_context.get("target_date")):
             execution_mode = "自動" if run_context.get("execution_mode") == "automatic" else "手動"
             message = (
@@ -2533,6 +2541,8 @@ class AppController(QObject):
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
+        if tool_name == "daily_vehicle":
+            snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
         if run_id:
             snapshot["run_id"] = run_id
         failure_stage = self._failure_stage_for_tool(tool_name)

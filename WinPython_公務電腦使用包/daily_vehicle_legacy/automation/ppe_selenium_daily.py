@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -11,6 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Iterable
+from uuid import uuid4
 
 try:
     from dotenv import load_dotenv
@@ -50,6 +52,121 @@ TEXT_SEARCH = "\u67e5\u8a62"
 TEXT_EQUIP_CHECK = "\u6e05\u9ede"
 TEXT_REVIEW = "\u6aa2\u8996"
 TEXT_FINISH_EQUIP_CHECK = "\u5b8c\u6210\u6e05\u9ede"
+EQUIPMENT_BUTTON_XPATH = f".//button[text()='{TEXT_EQUIP_CHECK}' or contains(., '{TEXT_EQUIP_CHECK}')]"
+REPORT_PREFIX = "[sinposmart-vehicle-report] "
+MAX_REPORT_ITEMS = 200
+GRID_STATE_SCRIPT = """
+return (() => {
+    const grid = window.jQuery && window.jQuery('#grid').data('kendoGrid');
+    if (!grid || !grid.dataSource) return null;
+    const source = grid.dataSource;
+    const filter = source.filter();
+    return {total: source.total(), page: source.page() ?? null,
+            page_size: source.pageSize() ?? null,
+            filtered: !!filter && (!Array.isArray(filter.filters) || filter.filters.length > 0)};
+})();
+"""
+GRID_QUERY_OBSERVER_SCRIPT = """
+const [action, token, button] = arguments;
+const key = '__sinposmartVehicleGridQuery';
+if (action === 'begin') {
+    if (window[key]) window[key].cleanup();
+    const grid = window.jQuery && window.jQuery('#grid').data('kendoGrid');
+    const source = grid && grid.dataSource;
+    if (!grid || !source || typeof grid.bind !== 'function' ||
+        typeof grid.unbind !== 'function' || typeof source.bind !== 'function' ||
+        typeof source.unbind !== 'function') return false;
+    const state = {token, armed: false, started: false, bound: false, failed: false};
+    state.onStart = event => {
+        if (state.armed && event.type === 'read') {
+            if (state.started) state.failed = true;
+            state.started = true;
+        }
+    };
+    state.onBound = () => { if (state.armed && state.started) state.bound = true; };
+    state.onError = () => { if (state.armed) state.failed = true; };
+    state.cleanup = () => {
+        grid.unbind('dataBound', state.onBound);
+        source.unbind('requestStart', state.onStart);
+        source.unbind('error', state.onError);
+        if (window[key] === state) delete window[key];
+    };
+    grid.bind('dataBound', state.onBound);
+    source.bind('requestStart', state.onStart);
+    source.bind('error', state.onError);
+    window[key] = state;
+    return true;
+}
+const state = window[key];
+if (!state || state.token !== token) return action === 'cleanup';
+if (action === 'click') {
+    if (state.armed || !button || typeof button.click !== 'function') return false;
+    state.armed = true;
+    button.click();
+    return true;
+}
+if (action === 'state') return {token: state.token,
+    ready: state.armed && state.started && state.bound && !state.failed, failed: state.failed};
+if (action === 'cleanup') { state.cleanup(); return true; }
+return false;
+"""
+
+
+class VehicleVerificationError(RuntimeError):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(f"車輛完成結果未確認（{reason_code}）。")
+        self.reason_code = reason_code
+
+
+def new_vehicle_report(target_date: str) -> dict:
+    return {"target_date": target_date, "verified": False,
+            "reason_code": "execution_unconfirmed", "items": []}
+
+
+def safe_vehicle_name(value: str) -> str:
+    raw = str(value or "")
+    text = " ".join(raw.split())
+    if (not text or len(text) > 32 or re.search(r"[\r\n\t]", raw)
+            or re.search(r"secret|token|password|cookie|account|username|帳號|密碼", text, re.I)
+            or re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff -]+", text) is None):
+        return ""
+    return text
+
+
+def record_vehicle_result(report: dict, vehicle: str, operation: str,
+                          status: str, reason_code: str) -> None:
+    safe_name = safe_vehicle_name(vehicle)
+    if vehicle and not safe_name:
+        status, reason_code = "unconfirmed", "state_unconfirmed"
+    item = {"vehicle": safe_name, "operation": operation,
+            "status": status, "reason_code": reason_code}
+    for index, previous in enumerate(report["items"]):
+        if (previous["vehicle"].casefold(), previous["operation"]) == (safe_name.casefold(), operation):
+            report["items"][index] = item
+            return
+    if len(report["items"]) >= MAX_REPORT_ITEMS:
+        report["verified"], report["reason_code"] = False, "row_limit"
+        raise VehicleVerificationError("row_limit")
+    report["items"].append(item)
+
+
+def fail_verification(report: dict, operation: str, reason_code: str,
+                      vehicle: str = "") -> None:
+    report["verified"], report["reason_code"] = False, reason_code
+    record_vehicle_result(report, vehicle, operation, "unconfirmed", reason_code)
+    raise VehicleVerificationError(reason_code)
+
+
+def verify_vehicle_report(report: dict) -> bool:
+    items = report["items"]
+    verified = (report.get("reason_code") != "row_limit" and 0 < len(items) <= MAX_REPORT_ITEMS
+                and {item["operation"] for item in items} == {"maintenance", "equipment"}
+                and all(item["vehicle"] and item["status"] in {"completed", "already_done"}
+                        and item["reason_code"] in {"verified_today", "saved_verified"}
+                        for item in items))
+    report["verified"] = verified
+    report["reason_code"] = "" if verified else report.get("reason_code") or "execution_unconfirmed"
+    return verified
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -99,14 +216,22 @@ def build_today_strings(today: dt.datetime) -> list[str]:
 
 
 def is_task_done(cell_text: str, today_strings: Iterable[str]) -> bool:
-    return any(date_text in cell_text for date_text in today_strings)
+    text = str(cell_text or "").strip()
+    if re.search(r"未完成|尚未|待完成|未清點|待清點|未保養|待保養|not\s+(?:done|completed)", text, re.I):
+        return False
+    matched = False
+    for date_text in today_strings:
+        text, count = re.subn(r"(?<!\d)" + re.escape(date_text) + r"(?!\d)", "", text)
+        matched = matched or bool(count)
+    if not matched:
+        return False
+    text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", "", text)
+    text = re.sub(r"已完成|已清點|清點完成|保養完成|完成清點|完成保養", "", text)
+    return not text.strip(" \t\r\n:：,，;；()（）[]【】.-")
 
 
 def wait_for_spinner(wait: WebDriverWait) -> None:
-    try:
-        wait.until(EC.invisibility_of_element_located((By.ID, "spinner-container")))
-    except TimeoutException:
-        pass
+    wait.until(EC.invisibility_of_element_located((By.ID, "spinner-container")))
 
 
 def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str) -> list:
@@ -114,20 +239,35 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
     search_button = wait.until(
         EC.element_to_be_clickable((By.XPATH, f"//button[contains(normalize-space(.), '{TEXT_SEARCH}')]"))
     )
-    driver.execute_script("arguments[0].click();", search_button)
-    wait_for_spinner(wait)
-
-    deadline = time.time() + 10
-    rows: list = []
-    while time.time() < deadline:
+    token = uuid4().hex
+    try:
+        if driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "begin", token) is not True:
+            raise VehicleVerificationError("state_unconfirmed")
+        if driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "click", token, search_button) is not True:
+            raise VehicleVerificationError("state_unconfirmed")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+            if (not isinstance(state, dict) or state.get("token") != token
+                    or type(state.get("ready")) is not bool or type(state.get("failed")) is not bool
+                    or state["failed"]):
+                raise VehicleVerificationError("state_unconfirmed")
+            if state["ready"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise VehicleVerificationError("state_unconfirmed")
+        wait_for_spinner(wait)
         rows = driver.find_elements(By.XPATH, "//div[@id='grid']//tbody/tr")
-        if rows:
-            print(f"[{context}] rows loaded: {len(rows)}")
-            return rows
-        time.sleep(0.5)
-
-    print(f"[{context}] rows loaded: 0")
-    return rows
+        if not rows:
+            raise VehicleVerificationError("empty_list")
+        print(f"[{context}] rows loaded: {len(rows)}")
+        return rows
+    finally:
+        try:
+            driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "cleanup", token)
+        except Exception:
+            pass
 
 
 def wait_for_remote_selenium(remote_url: str, timeout_seconds: int) -> None:
@@ -189,194 +329,182 @@ def ensure_requested_date() -> None:
         raise RuntimeError("每日點車已跨日，停止送出，請人工確認。")
 
 
-def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str], today: dt.datetime) -> None:
-    needs_weekly = today.weekday() == 6
-    needs_monthly = today.day == 28
-    needs_half_year = (today.month == 6 and today.day == 30) or (today.month == 10 and today.day == 31)
+def verified_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, operation: str,
+                       report: dict, expected: set[str] | None = None) -> dict:
+    context = "maintain" if operation == "maintenance" else "equip"
+    try:
+        rows = query_grid_rows(driver, wait, context)
+        metadata = driver.execute_script(GRID_STATE_SCRIPT)
+    except VehicleVerificationError as error:
+        fail_verification(report, operation, error.reason_code)
+    except Exception:
+        fail_verification(report, operation, "state_unconfirmed")
+    if not rows:
+        fail_verification(report, operation, "empty_list")
+    if len(rows) > MAX_REPORT_ITEMS:
+        fail_verification(report, operation, "row_limit")
+    if (not isinstance(metadata, dict) or type(metadata.get("total")) is not int
+            or metadata.get("filtered") is not False):
+        fail_verification(report, operation, "state_unconfirmed")
+    total, page, page_size = metadata["total"], metadata.get("page"), metadata.get("page_size")
+    if (total != len(rows) or (page is not None and (type(page) is not int or page != 1))
+            or (page_size is not None and (type(page_size) is not int or page_size < len(rows)))):
+        fail_verification(report, operation, "list_changed")
+    result, identities = {}, set()
+    for index, row in enumerate(rows, 1):
+        cells = row.find_elements(By.TAG_NAME, "td")
+        column = 8 if operation == "maintenance" else 3
+        if len(cells) < (13 if operation == "maintenance" else 4):
+            fail_verification(report, operation, "state_unconfirmed")
+        vehicle = safe_vehicle_name(cells[column].get_attribute("textContent"))
+        if not vehicle or vehicle.casefold() in identities:
+            fail_verification(report, operation, "state_unconfirmed")
+        identities.add(vehicle.casefold())
+        result[vehicle] = (index, row)
+    if expected is not None and set(result) != expected:
+        fail_verification(report, operation, "list_changed")
+    return result
 
-    print("[maintain] opening maintain list")
+
+def cell_completion_text(cell) -> str:
+    if cell.find_elements(By.XPATH, ".//button|.//a|.//input|.//select|.//textarea"):
+        return ""
+    return str(cell.get_attribute("textContent") or "").strip()
+
+
+def maintenance_done(row, today_strings: list[str], today: dt.datetime) -> bool:
+    cells = row.find_elements(By.TAG_NAME, "td")
+    required = [9]
+    if today.weekday() == 6:
+        required.append(10)
+    if today.day == 28:
+        required.append(11)
+    if (today.month, today.day) in {(6, 30), (10, 31)}:
+        required.append(12)
+    return len(cells) >= 13 and all(is_task_done(cell_completion_text(cells[index]), today_strings)
+                                   for index in required)
+
+
+def equipment_done(row, today_strings: list[str]) -> bool:
+    texts = [cell_completion_text(cell) for cell in row.find_elements(By.TAG_NAME, "td")]
+    if any(re.search(r"未完成|尚未|待完成|未清點|待清點", text) for text in texts):
+        return False
+    return any(is_task_done(text, today_strings)
+               and re.search(r"已完成|已清點|清點完成|完成清點", text) for text in texts)
+
+
+def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str],
+                            today: dt.datetime, report: dict | None = None) -> None:
+    report = report if report is not None else new_vehicle_report(today.date().isoformat())
     driver.get(MAINTAIN_LIST_URL)
-    rows = query_grid_rows(driver, wait, "maintain")
-
-    for index in range(1, len(rows) + 1):
+    inventory = set(verified_grid_rows(driver, wait, "maintenance", report))
+    for vehicle in sorted(inventory):
         ensure_requested_date()
-        wait_for_spinner(wait)
-        row_xpath = f"//div[@id='grid']//tbody/tr[{index}]"
-        row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
-        cells = row_element.find_elements(By.TAG_NAME, "td")
-
-        car_license = cells[8].get_attribute("textContent").strip() if len(cells) > 8 else f"car-{index}"
-        day_text = cells[9].get_attribute("textContent").strip() if len(cells) > 9 else ""
-        week_text = cells[10].get_attribute("textContent").strip() if len(cells) > 10 else ""
-        month_text = cells[11].get_attribute("textContent").strip() if len(cells) > 11 else ""
-        half_year_text = cells[12].get_attribute("textContent").strip() if len(cells) > 12 else ""
-
-        daily_done = is_task_done(day_text, today_strings)
-        weekly_done = is_task_done(week_text, today_strings) if needs_weekly else True
-        monthly_done = is_task_done(month_text, today_strings) if needs_monthly else True
-        half_year_done = is_task_done(half_year_text, today_strings) if needs_half_year else True
-
-        if daily_done and weekly_done and monthly_done and half_year_done:
-            print(f"[maintain] {car_license}: already done")
+        current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
+        index, row = current[vehicle]
+        if maintenance_done(row, today_strings, today):
+            record_vehicle_result(report, vehicle, "maintenance", "already_done", "verified_today")
             continue
-
-        print(f"[maintain] {car_license}: processing")
-        maintain_button = wait.until(
-            EC.presence_of_element_located((By.XPATH, f"{row_xpath}//button[contains(., '{TEXT_MAINTAIN}')]"))
-        )
-        driver.execute_script("arguments[0].click();", maintain_button)
-
-        while True:
+        button = wait.until(EC.element_to_be_clickable((By.XPATH,
+            f"//div[@id='grid']//tbody/tr[{index}]//button[contains(., '{TEXT_MAINTAIN}')]")))
+        driver.execute_script("arguments[0].click();", button)
+        saved = False
+        previous = None
+        for _ in range(MAX_REPORT_ITEMS):
             wait_for_spinner(wait)
-            wait.until(lambda current_driver: len(current_driver.find_elements(By.CSS_SELECTOR, "#scheduler .k-event")) > 0)
-            date_label = f"{today.year}年{today.month}月{today.day}日"
-            events = driver.find_elements(By.CSS_SELECTOR, "#scheduler .k-event")
-            has_today = False
+            wait.until(lambda current_driver: current_driver.find_elements(By.CSS_SELECTOR, "#scheduler .k-event"))
+            events = [event for event in driver.find_elements(By.CSS_SELECTOR, "#scheduler .k-event")
+                      if f"{today.year}年{today.month}月{today.day}日" in (event.get_attribute("aria-label") or "")]
+            if not events:
+                fail_verification(report, "maintenance", "today_not_found", vehicle)
+            signature = tuple((event.get_attribute("aria-label"), event.get_attribute("class"),
+                               len(event.find_elements(By.CSS_SELECTOR, ".reviewed"))) for event in events)
+            if previous == signature:
+                fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
             target_event = None
-
-            for event_element in events:
-                aria_label = event_element.get_attribute("aria-label") or ""
-                if date_label not in aria_label:
+            for event in events:
+                classes = set((event.get_attribute("class") or "").split())
+                if "checked" in classes or event.find_elements(By.CSS_SELECTOR, ".reviewed"):
                     continue
-
-                has_today = True
-                class_names = event_element.get_attribute("class") or ""
-                reviewed_flags = event_element.find_elements(By.CSS_SELECTOR, ".reviewed")
-                if "checked" in class_names or "disable" in class_names or reviewed_flags:
-                    continue
-
-                target_event = event_element
+                if classes & {"disable", "disabled"}:
+                    fail_verification(report, "maintenance", "state_unconfirmed", vehicle)
+                target_event = event
                 break
-
-            if target_event is not None:
-                ensure_requested_date()
-                driver.execute_script("arguments[0].click();", target_event)
-                result = "SUCCESS"
-            else:
-                result = "ALL_DONE" if has_today else "NOT_FOUND"
-
-            if result == "SUCCESS":
-                wait.until(EC.visibility_of_element_located((By.ID, "maintainList")))
-                submit_button = wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//button[@onclick='SaveProc()']"))
-                )
-                ensure_requested_date()
-                driver.execute_script("arguments[0].click();", submit_button)
-                wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'swal') or contains(@class, 'sweet')]"))
-                )
-                driver.refresh()
-                continue
-
-            if result == "ALL_DONE":
-                print(f"[maintain] {car_license}: all items completed")
-            else:
-                print(f"[maintain] {car_license}: calendar result = {result}")
-            break
-
-        try:
-            return_button = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, f"//a[contains(@class, 'btnCancel') and contains(., '{TEXT_RETURN_TO_LIST}')]")
-                )
-            )
-            driver.execute_script("arguments[0].click();", return_button)
-        except TimeoutException:
-            driver.get(MAINTAIN_LIST_URL)
-            query_grid_rows(driver, wait, "maintain")
+            if target_event is None:
+                break
+            previous = signature
+            ensure_requested_date()
+            driver.execute_script("arguments[0].click();", target_event)
+            wait.until(EC.visibility_of_element_located((By.ID, "maintainList")))
+            submit = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@onclick='SaveProc()']")))
+            ensure_requested_date()
+            driver.execute_script("arguments[0].click();", submit)
+            wait.until(EC.presence_of_element_located((By.XPATH,
+                "//div[contains(@class, 'swal') or contains(@class, 'sweet')]")))
+            saved = True
+            driver.refresh()
+        else:
+            fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
+        driver.get(MAINTAIN_LIST_URL)
+        current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
+        if not maintenance_done(current[vehicle][1], today_strings, today):
+            fail_verification(report, "maintenance", "save_unconfirmed" if saved else "state_unconfirmed", vehicle)
+        record_vehicle_result(report, vehicle, "maintenance", "completed" if saved else "already_done",
+                              "saved_verified" if saved else "verified_today")
+    current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
+    for vehicle, (_index, row) in current.items():
+        if not maintenance_done(row, today_strings, today):
+            fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
 
 
-def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
+                         report: dict | None = None) -> None:
+    target_date = report["target_date"] if report is not None else dt.date.today().isoformat()
+    report = report if report is not None else new_vehicle_report(target_date)
+    today_strings = build_today_strings(dt.datetime.combine(dt.date.fromisoformat(target_date), dt.time()))
     ensure_requested_date()
-    print("[equip] opening equipment check list")
     driver.get(EQUIP_CHECK_LIST_URL)
-
-    while True:
-        rows = query_grid_rows(driver, wait, "equip")
-        target_index = None
-        target_license = None
-
-        for index in range(1, len(rows) + 1):
-            row_xpath = f"//div[@id='grid']//tbody/tr[{index}]"
-            row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
-            cells = row_element.find_elements(By.TAG_NAME, "td")
-            car_license = cells[3].text.strip() if len(cells) > 3 else f"car-{index}"
-            check_buttons = row_element.find_elements(
-                By.XPATH,
-                f".//button[text()='{TEXT_EQUIP_CHECK}' or contains(., '{TEXT_EQUIP_CHECK}')]",
-            )
-
-            if not check_buttons:
-                print(f"[equip] {car_license}: already done")
-                continue
-
-            target_index = index
-            target_license = car_license
-            break
-
-        if target_index is None:
-            print("[equip] no pending equipment checks")
-            break
-
-        wait_for_spinner(wait)
-        row_xpath = f"//div[@id='grid']//tbody/tr[{target_index}]"
-        row_element = wait.until(EC.presence_of_element_located((By.XPATH, row_xpath)))
-        check_buttons = row_element.find_elements(
-            By.XPATH,
-            f".//button[text()='{TEXT_EQUIP_CHECK}' or contains(., '{TEXT_EQUIP_CHECK}')]",
-        )
-
-        if not check_buttons:
-            print(f"[equip] {target_license}: already done")
+    inventory = set(verified_grid_rows(driver, wait, "equipment", report))
+    for vehicle in sorted(inventory):
+        current = verified_grid_rows(driver, wait, "equipment", report, inventory)
+        _index, row = current[vehicle]
+        buttons = row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH)
+        if equipment_done(row, today_strings):
+            if buttons:
+                fail_verification(report, "equipment", "state_unconfirmed", vehicle)
+            record_vehicle_result(report, vehicle, "equipment", "already_done", "verified_today")
             continue
-
-        print(f"[equip] {target_license}: processing")
+        if len(buttons) != 1 or not buttons[0].is_displayed() or not buttons[0].is_enabled():
+            fail_verification(report, "equipment", "state_unconfirmed", vehicle)
         ensure_requested_date()
-        driver.execute_script("arguments[0].click();", check_buttons[0])
+        driver.execute_script("arguments[0].click();", buttons[0])
         wait_for_spinner(wait)
-
-        select_all_checkbox = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//input[@aria-label='Select all rows' and @type='checkbox']"))
-        )
-        driver.execute_script("arguments[0].click();", select_all_checkbox)
-
-        submit_button = wait.until(
-            EC.presence_of_element_located((By.XPATH, f"//button[contains(., '{TEXT_FINISH_EQUIP_CHECK}')]"))
-        )
+        checkbox = wait.until(EC.element_to_be_clickable((By.XPATH,
+            "//input[@aria-label='Select all rows' and @type='checkbox']")))
+        driver.execute_script("arguments[0].click();", checkbox)
+        submit = wait.until(EC.element_to_be_clickable((By.XPATH, f"//button[contains(., '{TEXT_FINISH_EQUIP_CHECK}')]")))
         ensure_requested_date()
-        driver.execute_script("arguments[0].click();", submit_button)
-
-        wait.until(
-            lambda current_driver: (
-                any(
-                    button.is_displayed()
-                    for button in current_driver.find_elements(
-                        By.XPATH,
-                        "//button[contains(@class, 'swal-button') or contains(@class, 'swal2-confirm')]",
-                    )
-                )
-                or "/CarEquipCheck/View" in current_driver.current_url
-                or "/CarEquipCheck/Take" not in current_driver.current_url
-            )
-        )
-
-        for confirm_button in driver.find_elements(
-            By.XPATH,
-            "//button[contains(@class, 'swal-button') or contains(@class, 'swal2-confirm')]",
-        ):
-            if confirm_button.is_displayed():
+        driver.execute_script("arguments[0].click();", submit)
+        wait.until(lambda current_driver: current_driver.find_elements(By.XPATH,
+            "//button[contains(@class, 'swal-button') or contains(@class, 'swal2-confirm')]")
+            or "/CarEquipCheck/Take" not in current_driver.current_url)
+        for confirm in driver.find_elements(By.XPATH,
+                "//button[contains(@class, 'swal-button') or contains(@class, 'swal2-confirm')]"):
+            if confirm.is_displayed():
                 ensure_requested_date()
-                driver.execute_script("arguments[0].click();", confirm_button)
+                driver.execute_script("arguments[0].click();", confirm)
                 break
-
-        wait.until(
-            lambda current_driver: (
-                "/CarEquipCheck/View" in current_driver.current_url
-                or "/CarEquipCheck/Take" not in current_driver.current_url
-            )
-        )
-        print(f"[equip] {target_license}: submitted")
+        wait.until(lambda current_driver: "/CarEquipCheck/Take" not in current_driver.current_url)
         driver.get(EQUIP_CHECK_LIST_URL)
+        current = verified_grid_rows(driver, wait, "equipment", report, inventory)
+        row = current[vehicle][1]
+        if not equipment_done(row, today_strings) or row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH):
+            fail_verification(report, "equipment", "save_unconfirmed", vehicle)
+        record_vehicle_result(report, vehicle, "equipment", "completed", "saved_verified")
+    current = verified_grid_rows(driver, wait, "equipment", report, inventory)
+    for vehicle, (_index, row) in current.items():
+        if not equipment_done(row, today_strings) or row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH):
+            fail_verification(report, "equipment", "save_unconfirmed", vehicle)
 
 
 def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
@@ -394,87 +522,86 @@ def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parse_args(argv)
-    config = load_config()
     driver = None
-
-    options = webdriver.ChromeOptions()
-    if config["headless"]:
-        options.add_argument("--headless=new")
-    options.add_argument("--window-size=1440,1200")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-features=Translate,BackForwardCache")
-    options.add_argument("--dns-prefetch-disable")
-    options.page_load_strategy = "none"
-
-    remote_url = str(config["selenium_remote_url"])
-    print("[sinposmart-stage] browser_start", flush=True)
-    def create_driver() -> webdriver.Chrome:
-        if remote_url:
-            print(f"[driver] using remote selenium: {remote_url}")
-            wait_for_remote_selenium(remote_url, int(config["selenium_remote_ready_timeout_seconds"]))
-            wait_for_login_site(LOGIN_URL, int(config["selenium_remote_ready_timeout_seconds"]))
-            return webdriver.Remote(command_executor=remote_url, options=options)
-        print("[driver] using local chrome")
-        return build_driver(
-            headless=bool(config["headless"]),
-            option_arguments=(
-                "--window-size=1440,1200",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-features=Translate,BackForwardCache",
-                "--dns-prefetch-disable",
-            ),
-            page_load_strategy="none",
-        )
-
-    def initialize_browser(candidate: webdriver.Chrome) -> None:
-        candidate.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
-        candidate.set_script_timeout(max(15, int(config["timeout_seconds"])))
-        login(
-            candidate,
-            WebDriverWait(candidate, int(config["timeout_seconds"])),
-            str(config["username"]),
-            str(config["password"]),
-        )
-
     today = dt.datetime.now()
-    ensure_requested_date()
-    today_strings = build_today_strings(today)
-
+    report = new_vehicle_report(today.date().isoformat())
+    operation = "maintenance"
     try:
+        target_date = os.environ.get("PPE_TARGET_DATE", "").strip()
+        if target_date:
+            if dt.date.fromisoformat(target_date).isoformat() != target_date:
+                raise VehicleVerificationError("report_invalid")
+            report["target_date"] = target_date
+        else:
+            os.environ["PPE_TARGET_DATE"] = report["target_date"]
+        ensure_requested_date()
+        config = load_config()
+        options = webdriver.ChromeOptions()
+        if config["headless"]:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1440,1200")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-features=Translate,BackForwardCache")
+        options.add_argument("--dns-prefetch-disable")
+        options.page_load_strategy = "none"
+        remote_url = str(config["selenium_remote_url"])
+
+        def create_driver() -> webdriver.Chrome:
+            if remote_url:
+                wait_for_remote_selenium(remote_url, int(config["selenium_remote_ready_timeout_seconds"]))
+                wait_for_login_site(LOGIN_URL, int(config["selenium_remote_ready_timeout_seconds"]))
+                return webdriver.Remote(command_executor=remote_url, options=options)
+            return build_driver(
+                headless=bool(config["headless"]),
+                option_arguments=(
+                    "--window-size=1440,1200",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-features=Translate,BackForwardCache",
+                    "--dns-prefetch-disable",
+                ),
+                page_load_strategy="none",
+            )
+
+        def initialize_browser(candidate: webdriver.Chrome) -> None:
+            candidate.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
+            candidate.set_script_timeout(max(15, int(config["timeout_seconds"])))
+            login(candidate, WebDriverWait(candidate, int(config["timeout_seconds"])),
+                  str(config["username"]), str(config["password"]))
+
+        print("[sinposmart-stage] browser_start", flush=True)
         print("[sinposmart-stage] login", flush=True)
         driver = retry_duty_browser_session_open(create_driver, initialize_browser, cleanup=quit_driver)
         wait = WebDriverWait(driver, int(config["timeout_seconds"]))
-        print("=" * 50)
-        print(f"date: {today.strftime('%Y/%m/%d')}")
-        print(f"headless: {config['headless']}")
-        print("=" * 50)
+        today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())
         print("[sinposmart-stage] maintenance_check", flush=True)
-        process_maintain_checks(driver, wait, today_strings, today)
+        process_maintain_checks(driver, wait, build_today_strings(today), today, report=report)
+        operation = "equipment"
         print("[sinposmart-stage] equipment_check", flush=True)
-        process_equip_checks(driver, wait)
-        print("[done] automation finished")
+        process_equip_checks(driver, wait, report=report)
+        ensure_requested_date()
+        if not verify_vehicle_report(report):
+            fail_verification(report, operation, "execution_unconfirmed")
+        print(REPORT_PREFIX + json.dumps(report, ensure_ascii=False), flush=True)
+        print("[done] automation finished", flush=True)
         if config["keep_browser_open"]:
             time.sleep(DEFAULT_BROWSER_RETENTION_SECONDS)
     except Exception as error:
-        if driver is not None:
-            save_artifacts(driver, "error")
-        message = (
-            "PPE 自動化失敗\n"
-            f"時間: {today.strftime('%Y/%m/%d %H:%M:%S')}\n"
-            f"錯誤: {type(error).__name__}: {error}"
-        )
-        print(traceback.format_exc())
-        raise
+        reason = error.reason_code if isinstance(error, VehicleVerificationError) else "unexpected_error"
+        report["verified"], report["reason_code"] = False, reason
+        if not any(item["status"] == "unconfirmed" for item in report["items"]) and len(report["items"]) < MAX_REPORT_ITEMS:
+            record_vehicle_result(report, "", operation, "unconfirmed", reason)
+        print(REPORT_PREFIX + json.dumps(report, ensure_ascii=False), flush=True)
+        raise VehicleVerificationError(reason) from None
     finally:
         if driver is not None:
             try:
                 quit_driver(driver)
-            except Exception as error:
-                print(f"[driver] quit skipped: {error}")
+            except Exception:
+                pass
         runner_pid_path = str(os.environ.get("PPE_RUNNER_PID_FILE", "") or "").strip()
         if runner_pid_path:
             try:

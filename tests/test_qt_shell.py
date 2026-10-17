@@ -135,14 +135,24 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         check, checkbox, submit, confirm = (Mock() for _ in range(4))
+        cells = [Mock() for _ in range(4)]
+        for index, cell in enumerate(cells):
+            cell.get_attribute.return_value = "test-car" if index == 3 else ""
+            cell.find_elements.return_value = []
         row = Mock()
         row.find_elements.side_effect = lambda by, _selector: (
-            [SimpleNamespace(text="test-car")] * 4 if by == module.By.TAG_NAME else [check]
+            cells if by == module.By.TAG_NAME else [check]
         )
+        check.is_displayed.return_value = True
+        check.is_enabled.return_value = True
         driver = Mock()
+        driver.execute_script.side_effect = lambda script, *_args: (
+            {"total": 1, "filtered": False, "page": 1, "page_size": 20}
+            if script == module.GRID_STATE_SCRIPT else None
+        )
         driver.find_elements.return_value = [confirm]
         confirm.is_displayed.return_value = True
-        values = iter([row, row, checkbox, submit, True])
+        values = iter([checkbox, submit, True])
         midnight = False
 
         def until(_condition):
@@ -156,11 +166,12 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             if midnight:
                 raise RuntimeError("每日點車已跨日")
 
-        with patch.object(module, "query_grid_rows", side_effect=[[row], []]), patch.object(
+        with patch.object(module, "query_grid_rows", return_value=[row]), patch.object(
             module, "wait_for_spinner"
         ), patch.object(module, "ensure_requested_date", side_effect=date_guard):
             with self.assertRaisesRegex(RuntimeError, "每日點車已跨日"):
                 module.process_equip_checks(driver, SimpleNamespace(until=until))
+        self.assertTrue(any(call.args[-1] is submit for call in driver.execute_script.call_args_list))
         self.assertFalse(any(call.args[-1] is confirm for call in driver.execute_script.call_args_list))
 
 
@@ -5922,6 +5933,327 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
 
 class DailyVehicleServiceTests(unittest.TestCase):
+    @staticmethod
+    def _verified_report():
+        from datetime import date
+
+        return {"target_date": date.today().isoformat(), "verified": True, "reason_code": "", "items": [
+            {"vehicle": "新坡 91", "operation": "maintenance", "status": "already_done", "reason_code": "verified_today"},
+            {"vehicle": "新坡 91", "operation": "equipment", "status": "completed", "reason_code": "saved_verified"},
+        ]}
+
+    def _execute_output(self, output, *, returncode=0, target_date="", user_id="user10", password="private-pass"):
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = Path(temp_dir)
+            script = package_root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# fixture\n", encoding="utf-8")
+            process = SimpleNamespace(pid=12345, stdout=None, returncode=returncode,
+                                      poll=lambda: returncode, communicate=lambda **_kwargs: (output, None))
+            service = DailyVehicleService(package_root, process_factory=lambda *_args, **_kwargs: process,
+                                          process_checker=lambda _pid: False)
+            try:
+                result = service.execute(DailyVehicleRequest(user_id, password, target_date))
+            except Exception as error:
+                return service, error
+            return service, result
+
+    def test_exit_zero_without_report_and_done_is_unconfirmed(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        service, result = self._execute_output("[sinposmart-stage] equipment_check\n")
+        self.assertIsInstance(result, DailyVehicleExecutionError)
+        self.assertIs(service.completion_report["verified"], False)
+        self.assertEqual(service.completion_report["reason_code"], "report_missing")
+
+    def test_report_requires_done_and_preserves_safe_partial_failure(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        report = self._verified_report()
+        prefix = "[sinposmart-vehicle-report] "
+        service, result = self._execute_output(prefix + json.dumps(report) + "\n")
+        self.assertIsInstance(result, DailyVehicleExecutionError)
+        self.assertEqual(service.completion_report["reason_code"], "execution_unconfirmed")
+        report["verified"] = False
+        report["reason_code"] = "save_unconfirmed"
+        report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
+        service, result = self._execute_output(prefix + json.dumps(report) + "\n", returncode=1)
+        self.assertIsInstance(result, DailyVehicleExecutionError)
+        self.assertEqual(service.completion_report, report)
+        self.assertNotIn("private-pass", str(result))
+
+    def test_valid_report_has_today_date_and_is_defensively_copied(self) -> None:
+        from datetime import date
+
+        report = self._verified_report()
+        service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+        self.assertEqual(result, f"車輛保養清點已完成：{date.today().isoformat()}")
+        self.assertEqual(service.completion_report, report)
+        copy = service.completion_report
+        copy["items"][0]["vehicle"] = "mutated"
+        self.assertEqual(service.completion_report, report)
+
+    def test_invalid_report_never_becomes_success_or_leaks_unsafe_rows(self) -> None:
+        from copy import deepcopy
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        mutations = [
+            lambda report: report.update(verified=1),
+            lambda report: report.update(verified="true"),
+            lambda report: report.update(verified=None),
+            lambda report: report.update(reason_code=False),
+            lambda report: report.update(reason_code=[]),
+            lambda report: report.update(target_date="2020-01-01"),
+            lambda report: report.update(items=[]),
+            lambda report: report.update(items=report["items"][:1]),
+            lambda report: report["items"].append(deepcopy(report["items"][0])),
+            lambda report: report["items"].append(dict(report["items"][0], status="unconfirmed", reason_code="state_unconfirmed")),
+            lambda report: report["items"][0].update(status="unchecked"),
+            lambda report: report["items"][0].update(reason_code="empty_list"),
+            lambda report: report["items"][0].update(operation="other"),
+            lambda report: report["items"][0].update(vehicle=""),
+            lambda report: report["items"][0].update(vehicle="x" * 33),
+        ]
+        for mutation in mutations:
+            report = deepcopy(self._verified_report())
+            mutation(report)
+            with self.subTest(report=report):
+                service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+                self.assertIsInstance(result, DailyVehicleExecutionError)
+                self.assertIs(service.completion_report["verified"], False)
+        for unsafe in ("https://site", "car\nsecret", "TOKEN 123", "帳號123", "private-pass", "user10"):
+            report = self._verified_report()
+            report["items"][0]["vehicle"] = unsafe
+            service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+            self.assertIsInstance(result, DailyVehicleExecutionError)
+            self.assertNotIn(unsafe, json.dumps(service.completion_report, ensure_ascii=False))
+        report = self._verified_report()
+        report["items"] *= 101
+        service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+        self.assertIsInstance(result, DailyVehicleExecutionError)
+        self.assertEqual(service.completion_report["reason_code"], "row_limit")
+        self.assertLessEqual(len(service.completion_report["items"]), 200)
+        for content in ('{"verified":true,"verified":true}', "{}\n[sinposmart-vehicle-report] {}", "{" * 65537):
+            service, result = self._execute_output("[sinposmart-vehicle-report] " + content + "\n[done] automation finished\n")
+            self.assertIsInstance(result, DailyVehicleExecutionError)
+            self.assertEqual(service.completion_report["reason_code"], "report_invalid")
+
+    def test_vehicle_case_and_space_duplicates_are_rejected_before_success(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        for first, duplicate in (("TEST-01", "test-01"), ("新坡 91", " 新坡  91 ")):
+            report = self._verified_report()
+            report["items"][0]["vehicle"] = first
+            report["items"].append(dict(report["items"][0], vehicle=duplicate))
+            service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+            self.assertIsInstance(result, DailyVehicleExecutionError)
+            self.assertIs(service.completion_report["verified"], False)
+            self.assertEqual(service.completion_report["reason_code"], "report_invalid")
+        report = self._verified_report()
+        report["items"][0]["vehicle"] = " 新坡  91 "
+        service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+        self.assertIsInstance(result, str)
+        self.assertEqual(service.completion_report["items"][0]["vehicle"], "新坡 91")
+        for vehicle in (" CAR-01\n", "CAR\t01", "CAR\r01"):
+            report["items"][0]["vehicle"] = vehicle
+            service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+            self.assertIsInstance(result, DailyVehicleExecutionError)
+            self.assertNotIn(vehicle, repr(service.completion_report))
+
+    def test_normalized_vehicle_cannot_reveal_known_credentials(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        for credential, vehicle, field in (("123", " 123 ", "user_id"), ("CAR 01", "CAR  01", "password")):
+            report = self._verified_report()
+            report["items"][0]["vehicle"] = vehicle
+            service, result = self._execute_output(
+                "[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n",
+                **{field: credential},
+            )
+            self.assertIsInstance(result, DailyVehicleExecutionError)
+            self.assertIs(service.completion_report["verified"], False)
+            self.assertNotIn(credential, json.dumps(service.completion_report, ensure_ascii=False))
+
+    def test_child_utf8_environment_roundtrips_chinese_report_without_changing_parent(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleService, DailyVehicleRequest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+            script.parent.mkdir(parents=True)
+            output = "[sinposmart-vehicle-report] " + json.dumps(self._verified_report(), ensure_ascii=False)
+            script.write_text("print(" + repr(output) + ", flush=True)\nprint('[done] automation finished', flush=True)\n", encoding="utf-8")
+            launches = []
+            children = []
+
+            def launch(command, **kwargs):
+                launches.append(kwargs["env"]["PYTHONIOENCODING"])
+                child = subprocess.Popen(command, **kwargs)
+                children.append(child)
+                return child
+
+            service = DailyVehicleService(root, process_factory=launch, process_checker=lambda _pid: False)
+            with patch.dict(os.environ, {"PYTHONIOENCODING": "cp950"}):
+                try:
+                    result = service.execute(DailyVehicleRequest("user10", "private-pass"))
+                finally:
+                    for child in children:
+                        child.wait(timeout=5)
+                        child.stdout.close()
+                self.assertEqual(os.environ["PYTHONIOENCODING"], "cp950")
+            self.assertIsInstance(result, str)
+            self.assertEqual(launches, ["utf-8"])
+            self.assertEqual(service.completion_report["items"][0]["vehicle"], "新坡 91")
+            self.assertIs(service.completion_report["verified"], True)
+
+    def test_manual_and_automatic_dates_resolve_today_and_new_run_clears_report(self) -> None:
+        from datetime import date
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleValidationError
+
+        today = date.today()
+        output = "[sinposmart-vehicle-report] " + json.dumps(self._verified_report()) + "\n[done] automation finished\n"
+        for target in ("", today.isoformat(), today.strftime("%Y/%m/%d"), f"{today.year - 1911:03d}{today:%m%d}"):
+            service, result = self._execute_output(output, target_date=target)
+            self.assertEqual(result, f"車輛保養清點已完成：{today.isoformat()}")
+        with self.assertRaises(DailyVehicleValidationError):
+            service.execute(DailyVehicleRequest("", ""))
+        self.assertIs(service.completion_report["verified"], False)
+        self.assertEqual(service.completion_report["items"], [])
+        service, result = self._execute_output(output, target_date="private-pass")
+        self.assertIsInstance(result, DailyVehicleValidationError)
+        self.assertNotIn("private-pass", str(result))
+
+    def test_worker_controller_copy_report_before_terminal_signals_and_isolate_requests(self) -> None:
+        from copy import deepcopy
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleExecutionError
+        from app_core.session import SessionState
+        from qt_app.workers.daily_vehicle_worker import DailyVehicleWorker
+        from qt_app.controllers.daily_vehicle_controller import DailyVehicleController
+
+        for fail in (False, True):
+            report = self._verified_report()
+            if fail:
+                report.update(verified=False, reason_code="save_unconfirmed")
+                report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
+
+            class FakeService:
+                completion_report = report
+
+                def execute(self, request, **_kwargs):
+                    if fail:
+                        raise DailyVehicleExecutionError("安全錯誤")
+                    return "安全完成"
+
+            service = FakeService()
+            worker = DailyVehicleWorker(2, service, DailyVehicleRequest("user10", "private-pass", report["target_date"]))
+            controller = DailyVehicleController(SessionState(), service)
+            controller._request_id = 2
+            controller._execution_mode = "automatic"
+            controller._workers[2] = (None, worker)
+            worker.succeeded.connect(controller._succeeded)
+            worker.failed.connect(controller._failed)
+            observed = []
+            controller.runSucceeded.connect(lambda _message: observed.append(controller.completion_report))
+            controller.runFailed.connect(lambda _message: observed.append(controller.completion_report))
+            worker.run()
+            expected = dict(deepcopy(report), execution_mode="automatic")
+            self.assertEqual(observed, [expected])
+            report["items"][0]["vehicle"] = "changed"
+            self.assertEqual(controller.completion_report, expected)
+            self.assertNotIn("private-pass", repr(controller.completion_report))
+            controller._succeeded(1, "stale")
+            self.assertEqual(observed, [expected])
+            controller._workers.clear()
+
+    def test_worker_exception_cannot_publish_a_successful_or_credential_report(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleRequest
+        from qt_app.workers.daily_vehicle_worker import DailyVehicleWorker
+
+        class FakeService:
+            completion_report = self._verified_report()
+
+            def execute(self, request, **_kwargs):
+                raise RuntimeError("private-pass https://private/?token=value")
+
+        worker = DailyVehicleWorker(1, FakeService(), DailyVehicleRequest("user10", "private-pass"))
+        observed = []
+        worker.failed.connect(lambda _request, message: observed.append((message, worker.completion_report)))
+        worker.run()
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][1]["verified"], False)
+        self.assertEqual(observed[0][1]["reason_code"], "unexpected_error")
+        self.assertEqual(len(observed[0][1]["items"]), 2)
+        self.assertNotIn("private-pass", repr(observed))
+        self.assertNotIn("token=value", repr(observed))
+
+    def test_rejected_new_run_clears_previous_success_and_keeps_safe_context(self) -> None:
+        from datetime import date
+        from app_core.daily_vehicle_service import DailyVehicleValidationError
+        from app_core.session import SessionState, LoginSession
+        from qt_app.controllers.daily_vehicle_controller import DailyVehicleController
+
+        class RejectedService:
+            def validate(self, _request):
+                raise DailyVehicleValidationError("每日點車已跨日，未執行，請人工確認。")
+
+        state = SessionState()
+        state.complete_login(state.begin_login(), LoginSession("10", "user10", "private-pass", verified=True))
+        controller = DailyVehicleController(state, RejectedService())
+        controller._completion_report = self._verified_report()
+        self.assertFalse(controller.start_automatic("1140101"))
+        self.assertIs(controller.completion_report["verified"], False)
+        self.assertEqual(controller.completion_report["items"], [])
+        self.assertEqual(controller.run_context, {"target_date": date.today().isoformat(), "execution_mode": "automatic"})
+
+    def test_alive_unverified_runner_is_stopped_and_timeout_keeps_partial_report(self) -> None:
+        from io import StringIO
+        from app_core.daily_vehicle_service import DailyVehicleService, DailyVehicleRequest, DailyVehicleExecutionError
+
+        for mode in ("invalid", "partial", "timeout"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                script = root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+                script.parent.mkdir(parents=True)
+                script.write_text("# fixture\n", encoding="utf-8")
+                report = self._verified_report()
+                report.update(verified=False, reason_code="save_unconfirmed")
+                report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
+                output = "[sinposmart-vehicle-report] " + json.dumps(report) + "\n"
+                if mode == "invalid":
+                    output = "[sinposmart-vehicle-report] {}\n"
+                if mode != "timeout":
+                    output += "[done] automation finished\n"
+
+                class AliveProcess:
+                    pid = 12345
+                    returncode = None
+                    stdout = StringIO(output)
+                    killed = 0
+
+                    def poll(self):
+                        return self.returncode
+
+                    def kill(self):
+                        self.killed += 1
+                        self.returncode = -1
+
+                process = AliveProcess()
+                service = DailyVehicleService(root, process_factory=lambda *_args, **_kwargs: process,
+                                              process_checker=lambda _pid: False)
+                clock = iter((0, 0, 0, 2))
+                with patch.object(service, "_timeout_seconds", return_value=1), \
+                        patch("app_core.daily_vehicle_service.time.monotonic", side_effect=lambda: next(clock, 2)):
+                    with self.assertRaises(DailyVehicleExecutionError):
+                        service.execute(DailyVehicleRequest("user10", "private-pass"))
+                self.assertEqual(process.killed, 1)
+                self.assertFalse((script.parents[1] / ".daily_vehicle_runner.pid").exists())
+                self.assertIs(service.completion_report["verified"], False)
+                if mode == "timeout":
+                    self.assertEqual(len(service.completion_report["items"]), 2)
+                    self.assertEqual(service.completion_report["reason_code"], "execution_unconfirmed")
+
     def test_vehicle_runner_retains_after_success_and_closes_after_failure(self) -> None:
         import daily_vehicle_legacy.automation.ppe_selenium_daily as automation
 
@@ -5947,7 +6279,16 @@ class DailyVehicleServiceTests(unittest.TestCase):
                         initialize(candidate)
                         return candidate
 
-                    equip_check = RuntimeError("回查未確認") if fail else None
+                    def record_maintain(*_args, report=None):
+                        report["items"].append({"vehicle": "CAR-01", "operation": "maintenance",
+                                                "status": "already_done", "reason_code": "verified_today"})
+
+                    def record_equipment(*_args, report=None):
+                        if fail:
+                            raise RuntimeError("回查未確認")
+                        report["items"].append({"vehicle": "CAR-01", "operation": "equipment",
+                                                "status": "completed", "reason_code": "saved_verified"})
+
                     with patch.dict(os.environ, {"PPE_RUNNER_PID_FILE": str(pid_marker)}), \
                             patch.object(automation, "parse_args"), \
                             patch.object(automation, "load_config", return_value=config), \
@@ -5957,14 +6298,14 @@ class DailyVehicleServiceTests(unittest.TestCase):
                             patch.object(automation, "retry_duty_browser_session_open", side_effect=open_session), \
                             patch.object(automation, "WebDriverWait", return_value=Mock()), \
                             patch.object(automation, "login"), \
-                            patch.object(automation, "process_maintain_checks"), \
-                            patch.object(automation, "process_equip_checks", side_effect=equip_check), \
+                            patch.object(automation, "process_maintain_checks", side_effect=record_maintain), \
+                            patch.object(automation, "process_equip_checks", side_effect=record_equipment), \
                             patch.object(automation, "save_artifacts"), \
                             patch.object(automation.traceback, "format_exc", return_value=""), \
                             patch.object(automation.time, "sleep") as retention_wait, \
                             patch.object(automation, "quit_driver") as quit_driver:
                         if fail:
-                            with self.assertRaisesRegex(RuntimeError, "回查未確認"):
+                            with self.assertRaises(RuntimeError):
                                 automation.main([])
                         else:
                             automation.main([])
@@ -5986,15 +6327,16 @@ class DailyVehicleServiceTests(unittest.TestCase):
             script.parent.mkdir(parents=True)
             script.write_text("# placeholder\n", encoding="utf-8")
             release_runner = threading.Event()
+            verified_output = "[sinposmart-vehicle-report] " + json.dumps(self._verified_report()) + "\n"
 
             class CompletionStdout:
                 def __init__(self) -> None:
-                    self.read_marker = False
+                    self._lines = iter((verified_output, "[done] automation finished\n"))
 
                 def readline(self):
-                    if not self.read_marker:
-                        self.read_marker = True
-                        return "[done] automation finished\n"
+                    line = next(self._lines, None)
+                    if line is not None:
+                        return line
                     release_runner.wait(2)
                     return ""
 
@@ -6039,7 +6381,7 @@ class DailyVehicleServiceTests(unittest.TestCase):
             worker.start()
             try:
                 self.assertTrue(finished.wait(1), "已驗證完成標記出現後不應等待瀏覽器計時結束")
-                self.assertEqual(result, ["車輛保養清點已完成。"])
+                self.assertEqual(result, [f"車輛保養清點已完成：{self._verified_report()['target_date']}"])
                 self.assertIn("已完成；瀏覽器將保留 10 分鐘後自動關閉。", progress)
                 self.assertEqual((project_dir / ".daily_vehicle_runner.pid").read_text().strip(), "56789")
             finally:
@@ -6061,6 +6403,7 @@ class DailyVehicleServiceTests(unittest.TestCase):
             script.parent.mkdir(parents=True)
             script.write_text("# placeholder\n", encoding="utf-8")
             launches: list[dict] = []
+            verified_output = "[sinposmart-vehicle-report] " + json.dumps(self._verified_report()) + "\n"
 
             class FakeProcess:
                 pid = 12345
@@ -6078,7 +6421,7 @@ class DailyVehicleServiceTests(unittest.TestCase):
                     self.stdout = ReportingStdout(
                         "[sinposmart-stage] login\n"
                         "[sinposmart-stage] maintenance_check\n"
-                        "[done] automation finished\n"
+                        + verified_output + "[done] automation finished\n"
                     )
                     self.returncode = None
 
@@ -6108,11 +6451,12 @@ class DailyVehicleServiceTests(unittest.TestCase):
 
             self.assertEqual(defaults.target_date, "2026/07/29")
             self.assertEqual(confirmation, "將開啟瀏覽器執行車輛保養清點，是否繼續？")
-            self.assertEqual(result, "車輛保養清點已完成。")
+            self.assertEqual(result, f"車輛保養清點已完成：{date.today().isoformat()}")
             self.assertEqual(len(launches), 1)
             self.assertEqual(launches[0]["env"]["PPE_ACCOUNT"], "user10")
             self.assertEqual(launches[0]["env"]["PPE_PASSWORD"], "session-secret")
             self.assertEqual(launches[0]["env"]["KEEP_BROWSER_OPEN"], "true")
+            self.assertEqual(launches[0]["env"]["PPE_TARGET_DATE"], date.today().isoformat())
             self.assertEqual(
                 launches[0]["env"]["PPE_RUNNER_PID_FILE"],
                 str(project_dir / ".daily_vehicle_runner.pid"),
@@ -6127,8 +6471,8 @@ class DailyVehicleServiceTests(unittest.TestCase):
             self.assertIn("正在登入車輛保養系統…", progress)
             self.assertIn("正在執行車輛保養檢查…", progress)
 
-    def test_execute_returns_after_runner_exits_when_retained_browser_keeps_stdout_open(self) -> None:
-        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService
+    def test_execute_rejects_exit_without_evidence_when_retained_browser_keeps_stdout_open(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleRequest, DailyVehicleService, DailyVehicleExecutionError
 
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
@@ -6208,9 +6552,9 @@ class DailyVehicleServiceTests(unittest.TestCase):
                 runner.join(1)
 
         self.assertFalse(runner.is_alive())
-        if failures:
-            raise failures[0]
-        self.assertEqual(result, ["車輛保養清點已完成。"])
+        self.assertEqual(result, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], DailyVehicleExecutionError)
         self.assertIn("正在執行隨車器材清點…", progress)
         self.assertFalse(process.stdout.close_called.is_set())
 
@@ -13623,6 +13967,88 @@ if return_code != 0 or loaded:
 
         self.assertEqual(errors.count(), 1)
         self.assertIn("姓名", errors.at(0)[0])
+
+    def test_daily_vehicle_app_events_preserve_today_mode_and_partial_report(self) -> None:
+        from copy import deepcopy
+        from datetime import date
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.daily_vehicle_service import DailyVehicleService, DailyVehicleExecutionError
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        today = date.today().isoformat()
+        for mode in ("manual", "automatic"):
+            for fail in (False, True):
+                with self.subTest(mode=mode, fail=fail), tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    script = root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+                    script.parent.mkdir(parents=True)
+                    script.write_text("# fixture\n", encoding="utf-8")
+                    requested = []
+
+                    class FakeDailyService(DailyVehicleService):
+                        def execute(self, request, **_kwargs):
+                            requested.append(request.target_date)
+                            self._completion_report = DailyVehicleServiceTests._verified_report()
+                            if fail:
+                                self._completion_report.update(verified=False, reason_code="save_unconfirmed")
+                                self._completion_report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
+                                raise DailyVehicleExecutionError("器材清點結果未確認。")
+                            return f"車輛保養清點已完成：{request.target_date}"
+
+                    class Sync:
+                        def __init__(self):
+                            self.events = []
+
+                        def enqueue_event(self, record_type, **fields):
+                            self.events.append((record_type, deepcopy(fields)))
+                            return {"record_type": record_type}
+
+                        def sync_board_async(self, _schedule_data):
+                            return True
+
+                    service, sync = FakeDailyService(root), Sync()
+                    app = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                                        daily_vehicle_service=service, operational_sync_service=sync,
+                                        tool_controller=ToolController(root))
+                    try:
+                        state = app._session_state
+                        state.complete_login(state.begin_login(), LoginSession("10", "user10", "private-pass", verified=True))
+                        controller = app.dailyVehicleController
+                        controller._completion_report = {"verified": True, "items": [{"vehicle": "stale"}]}
+                        started_reports = []
+                        controller.runStarted.connect(lambda: started_reports.append(controller.completion_report))
+                        if mode == "manual":
+                            controller.loadDefaults()
+                            controller.prepareRun()
+                            self.assertEqual(controller._pending_request.target_date, today)
+                            controller.confirmRun()
+                        else:
+                            current = date.today()
+                            self.assertTrue(controller.start_automatic(f"{current.year - 1911:03d}{current:%m%d}"))
+                        for _ in range(100):
+                            QTest.qWait(10)
+                            if not controller.isRunning and any(
+                                    kind == "tool_action_finished" and fields.get("snapshot", {}).get("tool_name") == "daily_vehicle"
+                                    for kind, fields in sync.events):
+                                break
+                        self.assertFalse(controller.isRunning)
+                        self.assertEqual(requested, [today])
+                        self.assertIs(started_reports[0]["verified"], False)
+                        self.assertEqual(started_reports[0]["items"], [])
+                        events = [fields for _kind, fields in sync.events if fields.get("snapshot", {}).get("tool_name") == "daily_vehicle"]
+                        self.assertEqual([item["status"] for item in events], ["started", "failed" if fail else "completed"])
+                        expected = dict(service.completion_report, execution_mode=mode)
+                        for event in events:
+                            self.assertEqual(event["snapshot"]["target_date"], today)
+                            self.assertEqual(event["snapshot"]["execution_mode"], mode)
+                        self.assertEqual(events[1]["snapshot"]["daily_vehicle_report"], expected)
+                        self.assertIs(events[1]["snapshot"]["daily_vehicle_report"]["verified"], not fail)
+                        self.assertNotIn("private-pass", repr(sync.events))
+                    finally:
+                        app.shutdown()
 
     def test_daily_vehicle_controller_requires_confirmation_and_runs_in_worker(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest

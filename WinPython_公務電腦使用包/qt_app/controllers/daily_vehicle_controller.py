@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import date
+
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
 from app_core.daily_vehicle_service import (
@@ -40,6 +43,8 @@ class DailyVehicleController(QObject):
         self._pending_request: DailyVehicleRequest | None = None
         self._request_id = 0
         self._failure_stage = "unknown"
+        self._execution_mode = "manual"
+        self._completion_report: dict = {}
         self._workers: dict[int, tuple[QThread, DailyVehicleWorker]] = {}
         self._shutdown_admission = False
         self._read_only_acceptance = bool(read_only_acceptance)
@@ -68,6 +73,18 @@ class DailyVehicleController(QObject):
     def isRunning(self) -> bool:
         return bool(self._workers)
 
+    @property
+    def completion_report(self) -> dict:
+        return deepcopy(self._completion_report)
+
+    @property
+    def run_context(self) -> dict:
+        try:
+            target_date = date.fromisoformat(self._target_date.replace("/", "-")).isoformat()
+        except ValueError:
+            target_date = date.today().isoformat()
+        return {"target_date": target_date, "execution_mode": self._execution_mode}
+
     @Slot()
     def loadDefaults(self) -> None:
         if self._reject_read_only_execution():
@@ -89,13 +106,17 @@ class DailyVehicleController(QObject):
         if not str(session.actor_no or "").strip():
             self._set_error("登入身分尚未完成番號確認，請稍候勤務表查詢完成。")
             return
+        self._execution_mode = "manual"
+        self._reset_completion_report()
         try:
-            request = self._service.validate(DailyVehicleRequest(session.user_id, session.password))
+            request = self._service.validate(DailyVehicleRequest(session.user_id, session.password, date.today().isoformat()))
             summary = self._service.confirmation_summary(request)
         except DailyVehicleValidationError as exc:
             self._set_error(str(exc))
             return
         self._pending_request = request
+        self._target_date = request.target_date
+        self._execution_mode = "manual"
         self._confirmation_summary = summary
         self._status_text = "等待使用者確認正式登打。"
         self.stateChanged.emit()
@@ -107,10 +128,18 @@ class DailyVehicleController(QObject):
             return
         if self._shutdown_admission or self._pending_request is None or self._workers:
             return
+        self._reset_completion_report()
+        try:
+            request = self._service.validate(self._pending_request)
+        except DailyVehicleValidationError as exc:
+            self._pending_request = None
+            self._set_error(str(exc))
+            return
         self._request_id += 1
         request_id = self._request_id
         self._failure_stage = "unknown"
-        request = self._pending_request
+        self._target_date = request.target_date
+        self._completion_report["target_date"] = request.target_date
         self._pending_request = None
         self._confirmation_summary = ""
         self._status_text = "正在執行車輛保養清點…"
@@ -141,6 +170,7 @@ class DailyVehicleController(QObject):
                 or session is None or not session.verified or not session.actor_no):
             return False
         self._pending_request = DailyVehicleRequest(session.user_id, session.password, target_date=target_date)
+        self._execution_mode = "automatic"
         self.confirmRun()
         return bool(self._workers)
 
@@ -163,6 +193,7 @@ class DailyVehicleController(QObject):
     def _succeeded(self, request_id: int, message: str) -> None:
         if request_id != self._request_id:
             return
+        self._copy_worker_report(request_id)
         self._status_text = message
         self.stateChanged.emit()
         self.runSucceeded.emit(message)
@@ -173,8 +204,23 @@ class DailyVehicleController(QObject):
             worker_pair = self._workers.get(request_id)
             worker = worker_pair[1] if worker_pair is not None else None
             self._failure_stage = str(getattr(worker, "failure_stage", "unknown") or "unknown")
+            self._copy_worker_report(request_id)
             self.runFailed.emit(message)
             self._set_error(message)
+
+    def _copy_worker_report(self, request_id: int) -> None:
+        worker_pair = self._workers.get(request_id)
+        report = getattr(worker_pair[1], "completion_report", {}) if worker_pair else {}
+        if isinstance(report, dict) and report:
+            self._completion_report = deepcopy(report)
+            self._completion_report["verified"] = report.get("verified") is True
+        self._completion_report["execution_mode"] = self._execution_mode
+
+    def _reset_completion_report(self) -> None:
+        self._target_date = date.today().isoformat()
+        self._completion_report = {"target_date": self._target_date, "verified": False,
+                                   "reason_code": "report_missing", "items": [],
+                                   "execution_mode": self._execution_mode}
 
     @Slot(int)
     def _worker_finished(self, request_id: int) -> None:

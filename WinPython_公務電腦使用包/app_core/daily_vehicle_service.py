@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -11,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 from typing import Callable
@@ -20,6 +22,13 @@ from app_core.duty_task_projection import parse_roc_date
 AUTOMATION_SCRIPT = Path("automation") / "ppe_selenium_daily.py"
 RUNNING_PID_FILE = ".daily_vehicle_runner.pid"
 DEFAULT_TIMEOUT_SECONDS = 15 * 60
+VEHICLE_REPORT_PREFIX = "[sinposmart-vehicle-report] "
+VEHICLE_REPORT_REASONS = frozenset({
+    "verified_today", "saved_verified", "empty_list", "today_not_found", "state_unconfirmed",
+    "save_unconfirmed", "list_changed", "execution_unconfirmed", "report_missing",
+    "report_invalid", "unexpected_error", "row_limit",
+})
+POSITIVE_REPORT_REASONS = frozenset({"verified_today", "saved_verified"})
 
 
 class DailyVehicleValidationError(ValueError):
@@ -58,6 +67,15 @@ class DailyVehicleService:
         self.package_root = Path(package_root)
         self.process_factory = process_factory
         self.process_checker = process_checker or self._is_process_running
+        self._completion_report: dict = {}
+
+    @property
+    def completion_report(self) -> dict:
+        return deepcopy(self._completion_report)
+
+    @staticmethod
+    def _unconfirmed_report(target_date: str, reason_code: str = "report_missing") -> dict:
+        return {"target_date": target_date, "verified": False, "reason_code": reason_code, "items": []}
 
     def load_defaults(self, today: date | None = None) -> DailyVehicleDefaults:
         current = today or date.today()
@@ -69,7 +87,13 @@ class DailyVehicleService:
     def validate(self, request: DailyVehicleRequest) -> DailyVehicleRequest:
         if not str(request.user_id or "").strip() or not request.password:
             raise DailyVehicleValidationError("請先完成勤務系統登入。")
-        if request.target_date and parse_roc_date(request.target_date) != date.today():
+        try:
+            raw_date = str(request.target_date or "").strip()
+            target_date = (date.fromisoformat(raw_date.replace("/", "-")) if len(raw_date) == 10
+                           else parse_roc_date(raw_date)) if raw_date else date.today()
+        except (ValueError, TypeError):
+            raise DailyVehicleValidationError("車輛保養清點日期格式不正確。") from None
+        if target_date != date.today():
             raise DailyVehicleValidationError("每日點車已跨日，未執行，請人工確認。")
         project_dir = self._project_dir()
         if project_dir is None:
@@ -79,7 +103,7 @@ class DailyVehicleService:
             raise DailyVehicleValidationError("車輛保養清點目前正在執行。")
         if running_pid:
             self._clear_running_pid(project_dir, running_pid)
-        return DailyVehicleRequest(request.user_id.strip(), request.password, request.target_date)
+        return DailyVehicleRequest(request.user_id.strip(), request.password, target_date.isoformat())
 
     def confirmation_summary(self, request: DailyVehicleRequest) -> str:
         self.validate(request)
@@ -93,6 +117,7 @@ class DailyVehicleService:
         stage_callback: Callable[[str], None] | None = None,
     ) -> str:
         stage = "preflight"
+        self._completion_report = self._unconfirmed_report(date.today().isoformat())
 
         def report_stage(value: str) -> None:
             nonlocal stage
@@ -115,7 +140,8 @@ class DailyVehicleService:
                 "KEEP_BROWSER_OPEN": "true",
                 "PPE_RUNNER_PID_FILE": str(self._pid_path(project_dir)),
                 "SELENIUM_REMOTE_URL": "",
-                "PPE_TARGET_DATE": parse_roc_date(request.target_date).isoformat() if request.target_date else "",
+                "PYTHONIOENCODING": "utf-8",
+                "PPE_TARGET_DATE": request.target_date,
             }
         )
         if status_callback:
@@ -140,30 +166,127 @@ class DailyVehicleService:
                 report_stage("process_running")
                 output = self._wait_for_process_exit(process, status_callback)
             except subprocess.TimeoutExpired as exc:
-                process.kill()
+                self._completion_report = self._read_completion_report(
+                    str(exc.output or ""), request.target_date, (request.user_id, request.password)
+                )
+                self._completion_report.update(verified=False, reason_code="execution_unconfirmed")
                 raise DailyVehicleExecutionError(
                     "車輛保養清點執行逾時。",
                     failure_stage=stage,
                 ) from exc
             process_exited = process.poll() is not None
-            completion_verified = "[done] automation finished" in output
-            if process.returncode != 0 and not (not process_exited and completion_verified):
+            self._completion_report = self._read_completion_report(
+                output, request.target_date, (request.user_id, request.password)
+            )
+            completion_verified = (self._completion_report["verified"] is True
+                                   and "[done] automation finished" in output.splitlines())
+            if not completion_verified or (process_exited and process.returncode != 0):
+                if self._completion_report["verified"] is True:
+                    self._completion_report.update(verified=False, reason_code="execution_unconfirmed")
                 stage = self._failure_stage_from_output(output, stage)
                 message = self._browser_startup_safe_error(output) or self._safe_error(output)
                 raise DailyVehicleExecutionError(message, failure_stage=stage)
-            retaining_runner = not process_exited and completion_verified
+            retaining_runner = not process_exited
             report_stage("result_evaluation")
-            return f"車輛保養清點已完成：{request.target_date}" if request.target_date else "車輛保養清點已完成。"
+            if status_callback and retaining_runner:
+                status_callback("已完成；瀏覽器將保留 10 分鐘後自動關閉。")
+            return f"車輛保養清點已完成：{request.target_date}"
         except DailyVehicleExecutionError:
             raise
         except OSError as exc:
+            self._completion_report.update(verified=False, reason_code="unexpected_error")
             raise DailyVehicleExecutionError(
                 "無法啟動車輛保養清點程式。",
                 failure_stage=stage,
             ) from exc
         finally:
             if process is not None and not retaining_runner:
-                self._clear_running_pid(project_dir, process.pid)
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except OSError:
+                    pass
+                else:
+                    self._clear_running_pid(project_dir, process.pid)
+
+    @classmethod
+    def _read_completion_report(cls, output: str, target_date: str, credentials: tuple[str, ...]) -> dict:
+        report = cls._unconfirmed_report(target_date)
+        lines = [line[len(VEHICLE_REPORT_PREFIX):] for line in output.splitlines()
+                 if line.startswith(VEHICLE_REPORT_PREFIX)]
+        if not lines:
+            return report
+        report["reason_code"] = "report_invalid"
+        if len(lines) != 1 or len(lines[0]) > 65536:
+            return report
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate report field")
+                result[key] = value
+            return result
+
+        try:
+            value = json.loads(lines[0], object_pairs_hook=unique_object)
+        except (ValueError, TypeError, RecursionError):
+            return report
+        if not isinstance(value, dict) or value.get("target_date") != target_date:
+            return report
+        items = value.get("items")
+        if not isinstance(items, list):
+            return report
+        verified = value.get("verified")
+        reason = value.get("reason_code")
+        valid = type(verified) is bool and isinstance(reason, str)
+        if valid:
+            valid = (reason in POSITIVE_REPORT_REASONS or reason == "") if verified else (
+                reason in VEHICLE_REPORT_REASONS - POSITIVE_REPORT_REASONS
+            )
+        seen = set()
+        for item in items[:200]:
+            if not isinstance(item, dict):
+                valid = False
+                continue
+            vehicle, operation = item.get("vehicle"), item.get("operation")
+            status, item_reason = item.get("status"), item.get("reason_code")
+            if (not isinstance(vehicle, str) or len(vehicle) > 32
+                    or re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff -]*", vehicle) is None
+                    or re.search(r"secret|token|password|cookie|account|username|帳號|密碼", vehicle, re.I)
+                    or operation not in ("maintenance", "equipment")
+                    or status not in ("completed", "already_done", "unconfirmed")
+                    or not isinstance(item_reason, str)
+                    or item_reason not in VEHICLE_REPORT_REASONS
+                    or (status != "unconfirmed" and (not vehicle.strip() or item_reason not in POSITIVE_REPORT_REASONS))
+                    or (status == "unconfirmed" and item_reason in POSITIVE_REPORT_REASONS)):
+                valid = False
+                continue
+            vehicle = " ".join(vehicle.split())
+            if any(secret and (vehicle.casefold() == secret.casefold()
+                               or len(secret) >= 4 and secret.casefold() in vehicle.casefold())
+                   for secret in credentials):
+                valid = False
+                continue
+            key = (vehicle.casefold(), operation)
+            if key in seen:
+                valid = False
+                continue
+            seen.add(key)
+            report["items"].append({"vehicle": vehicle, "operation": operation,
+                                    "status": status, "reason_code": item_reason})
+        if len(items) > 200:
+            report["reason_code"] = "row_limit"
+        elif not valid:
+            pass
+        elif verified is not True:
+            report["reason_code"] = reason
+        elif ({item["operation"] for item in report["items"]} != {"maintenance", "equipment"}
+              or any(item["status"] == "unconfirmed" for item in report["items"])):
+            report["reason_code"] = "report_invalid"
+        else:
+            report.update(verified=True, reason_code=reason)
+        return report
 
     def _project_dir(self) -> Path | None:
         configured = str(os.environ.get("SINPOSMART_DAILY_VEHICLE_PROJECT", "") or "").strip()
@@ -237,7 +360,7 @@ class DailyVehicleService:
         while process.poll() is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired("daily_vehicle", timeout_seconds)
+                raise subprocess.TimeoutExpired("daily_vehicle", timeout_seconds, output="".join(output_lines))
             try:
                 line = output_queue.get(timeout=min(0.2, remaining))
             except queue.Empty:
@@ -247,6 +370,7 @@ class DailyVehicleService:
                 if line.strip() == "[done] automation finished":
                     return "".join(output_lines)
 
+        reader.join(timeout=0.1)
         while True:
             try:
                 line = output_queue.get_nowait()
@@ -276,8 +400,6 @@ class DailyVehicleService:
         }
         if stage is not None and stage.group(1) in messages:
             status_callback(messages[stage.group(1)])
-        elif line.strip() == "[done] automation finished":
-            status_callback("已完成；瀏覽器將保留 10 分鐘後自動關閉。")
 
     @staticmethod
     def _timeout_seconds() -> int:
