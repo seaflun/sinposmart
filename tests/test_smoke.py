@@ -118,6 +118,8 @@ class DailyVehicleVerificationTests(unittest.TestCase):
         driver, wait = mock.Mock(), mock.Mock()
 
         def execute(_script, action=None, token=None, *_args):
+            if _script == module.GRID_PAGE_READY_SCRIPT:
+                return True
             actions.append(action)
             if action == "state":
                 state = next(observed, states[-1])
@@ -160,6 +162,214 @@ class DailyVehicleVerificationTests(unittest.TestCase):
                         self.module.query_grid_rows(driver, wait, "maintain")
                 driver.find_elements.assert_not_called()
                 self.assertEqual(actions[-1], "cleanup")
+
+    def test_navigation_waits_for_current_document_and_query_initialization_before_begin(self) -> None:
+        runner = r'''
+import json
+import sys
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtQml import QJSEngine
+from tests.test_smoke import DailyVehicleVerificationTests
+
+DailyVehicleVerificationTests.setUpClass()
+module = DailyVehicleVerificationTests.module
+app = QCoreApplication([])
+engine = QJSEngine()
+engine.evaluate("""
+var document = {readyState: 'complete'};
+var location = {pathname: '/CarMaintainCheck/Index', href: 'https://fixture.invalid/CarMaintainCheck/Index'};
+var window = {document: document, location: location};
+var expectedPath = location.pathname, queryName = 'QueryData', requireSource = true;
+function source(uid) {return {view: () => [{uid: uid}], bind: () => {}, unbind: () => {}};}
+function makeGrid(uid) {const grid = {dataSource: source(uid), bind: () => {}, unbind: () => {}};
+    grid.tbody = {find: () => [{getAttribute: () => grid.dataSource.view()[0].uid}]};
+    grid.setDataSource = value => {grid.dataSource = value;}; return grid;}
+var grid = makeGrid('old');
+function installQuery() {window.jQuery = function() {return {data: () => grid};};
+    window.jQuery.fn = {jquery: 'fixture'}; window.QueryData = function() {}; window.Query = function() {};}
+function fixtureReady() {return location.pathname === expectedPath &&
+    document.readyState === 'complete' && typeof window.jQuery === 'function' &&
+    typeof window[queryName] === 'function' && (!requireSource || !!grid && !!grid.dataSource);}
+function releaseDocument() {location.pathname = expectedPath;
+    location.href = 'https://fixture.invalid' + expectedPath;
+    document.readyState = 'complete'; installQuery(); grid = makeGrid('current');}
+installQuery();
+var fixtureButton = {click: () => {grid = makeGrid('searched');}};
+""")
+pending = sys.argv[1]
+engine.evaluate({
+    'new_document_scripts_loading': "document.readyState = 'loading'; delete window.jQuery; delete window.QueryData;",
+    'old_document_search_still_visible': "location.pathname = '/CarEquipCheck/Index'; location.href = 'https://fixture.invalid/CarEquipCheck/Index';",
+    'query_function_not_initialized': "delete window.QueryData;",
+    'query_datasource_not_initialized': "grid.dataSource = null;",
+    'equipment_without_initial_grid': "expectedPath = '/CarEquipCheck/Index'; location.pathname = expectedPath; queryName = 'Query'; requireSource = false; grid = null;",
+}[pending])
+
+class Button:
+    def is_displayed(self): return True
+    def is_enabled(self): return True
+
+class Driver:
+    def __init__(self):
+        self.readiness_polls = 0
+        self.actions = []
+        self.early = []
+    @property
+    def current_url(self): return engine.evaluate('location.href').toString()
+    def find_element(self, by, selector):
+        if selector == 'spinner-container':
+            raise NoSuchElementException('fixture spinner has not been created')
+        return Button()
+    def find_elements(self, by, selector): return ['current-row']
+    def execute_script(self, script, *args):
+        observer = script == module.GRID_QUERY_OBSERVER_SCRIPT
+        if observer:
+            self.actions.append(args[0])
+            if args[0] in ('begin', 'click') and not engine.evaluate('fixtureReady()').toBool():
+                self.early.append(args[0])
+        else:
+            self.readiness_polls += 1
+            if self.readiness_polls >= 2:
+                engine.evaluate('releaseDocument()')
+        values = [json.dumps(arg) if not isinstance(arg, Button) else 'fixtureButton' for arg in args]
+        result = engine.evaluate('(function(){' + script + '}).apply(null,[' + ','.join(values) + ']);')
+        if result.isError(): raise AssertionError(result.toString())
+        return result.toVariant()
+
+driver = Driver()
+error = ''
+try:
+    context = 'equip' if pending == 'equipment_without_initial_grid' else 'maintain'
+    rows = module.query_grid_rows(driver, WebDriverWait(driver, 0.2, poll_frequency=0.01), context)
+except Exception as failure:
+    rows, error = [], type(failure).__name__
+print(json.dumps({'rows': rows, 'error': error, 'early': driver.early, 'actions': driver.actions,
+                  'readiness_polls': driver.readiness_polls}))
+'''
+        for pending in ("new_document_scripts_loading", "old_document_search_still_visible",
+                        "query_function_not_initialized", "query_datasource_not_initialized",
+                        "equipment_without_initial_grid"):
+            with self.subTest(pending=pending):
+                result = subprocess.run([sys.executable, "-B", "-c", runner, pending], cwd=PROJECT_ROOT,
+                                        capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                evidence = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(evidence["early"], [], evidence)
+                self.assertEqual(evidence["error"], "", evidence)
+                self.assertEqual(evidence["rows"], ["current-row"], evidence)
+                self.assertGreater(evidence["readiness_polls"], 0)
+                self.assertEqual(evidence["actions"][0:2], ["begin", "click"])
+                self.assertEqual(evidence["actions"][-1], "cleanup")
+
+    def test_query_stages_identify_last_fixed_phase_without_raw_details(self) -> None:
+        module = self.module
+        for operation, context in (("maintenance", "maintain"), ("equipment", "equip")):
+            with self.subTest(operation=operation):
+                driver, wait, _old, _new, _actions = self._query_fixture([{"ready": True, "failed": False}])
+                fixture_driver, _wait, _state, rows = self._fixture()
+                fixture_driver.mode = context
+                original = driver.execute_script.side_effect
+                driver.execute_script.side_effect = lambda script, *args: (
+                    {"total": 1, "page": 1, "page_size": 20, "filtered": False}
+                    if script == module.GRID_STATE_SCRIPT else original(script, *args))
+                driver.find_elements.side_effect = rows
+                with mock.patch("builtins.print") as output:
+                    module.verified_grid_rows(driver, wait, operation, module.new_vehicle_report("2026-10-17"))
+                stages = [call.args[0] for call in output.call_args_list
+                          if call.args and str(call.args[0]).startswith("[sinposmart-stage] ")]
+                self.assertEqual(stages, [f"[sinposmart-stage] {operation}_{step}" for step in
+                                         ("page_ready", "query_start", "query_wait", "query_verify",
+                                          "inventory_verify", "check")])
+                driver, wait, _old, _new, _actions = self._query_fixture([{"ready": False, "failed": True}])
+                with mock.patch("builtins.print") as output, self.assertRaises(module.VehicleVerificationError):
+                    module.query_grid_rows(driver, wait, context)
+                self.assertEqual([call.args[0] for call in output.call_args_list],
+                                 [f"[sinposmart-stage] {operation}_{step}"
+                                  for step in ("page_ready", "query_start", "query_wait")])
+
+    def test_same_path_navigation_waits_for_old_document_to_become_stale_before_query(self) -> None:
+        from selenium.common.exceptions import StaleElementReferenceException
+
+        module = self.module
+        for operation in ("maintenance", "equipment"):
+            with self.subTest(operation=operation):
+                driver, _wait, state, query = self._fixture(maintenance_done=True, equipment_done=True)
+                state["committed"], state["stale_polls"] = False, 0
+                original_find = driver.find_element
+                original_get = driver.get
+
+                class OldDocument:
+                    def is_enabled(self):
+                        state["stale_polls"] += 1
+                        if state["stale_polls"] >= 2:
+                            state["committed"] = True
+                            raise StaleElementReferenceException("fixture new document committed")
+                        return True
+
+                driver.find_element = lambda by, selector: OldDocument() if selector == "html" else original_find(by, selector)
+                driver.get = lambda url: original_get(url)
+                driver.current_url = module.MAINTAIN_LIST_URL if operation == "maintenance" else module.EQUIP_CHECK_LIST_URL
+
+                def current_rows(*args):
+                    self.assertTrue(state["committed"], "query used the old complete document at the same pathname")
+                    return query(*args)
+
+                with mock.patch.object(module, "query_grid_rows", side_effect=current_rows), \
+                        mock.patch.object(module, "ensure_requested_date"):
+                    wait = module.WebDriverWait(driver, 0.2, poll_frequency=0.01)
+                    if operation == "maintenance":
+                        today = datetime(2026, 10, 17)
+                        module.process_maintain_checks(driver, wait, module.build_today_strings(today), today)
+                    else:
+                        module.process_equip_checks(driver, wait, module.new_vehicle_report("2026-10-17"))
+                self.assertGreaterEqual(state["stale_polls"], 2)
+
+    def test_refresh_waits_for_new_calendar_after_server_save_before_readback(self) -> None:
+        from selenium.common.exceptions import StaleElementReferenceException
+
+        module = self.module
+        driver, _wait, state, query = self._fixture(persist=False)
+        original_find, original_get, original_script = driver.find_element, driver.get, driver.execute_script
+        state.update(document=0, refresh_pending=False, refresh_polls=0, server_saved=False)
+
+        class Document:
+            def __init__(self): self.generation = state["document"]
+            def is_enabled(self):
+                if state["refresh_pending"]:
+                    state["refresh_polls"] += 1
+                    if state["refresh_polls"] >= 2:
+                        state["refresh_pending"] = False
+                        state["document"] += 1
+                        state["maintenance_done"] = state["server_saved"]
+                if self.generation != state["document"]:
+                    raise StaleElementReferenceException("fixture new calendar committed")
+                return True
+
+        def navigate(url):
+            state["document"] += 1
+            original_get(url)
+
+        def execute(script, *args):
+            result = original_script(script, *args)
+            if args and getattr(args[0], "role", "") == "save":
+                state["server_saved"] = True
+            return result
+
+        driver.find_element = lambda by, selector: Document() if selector == "html" else original_find(by, selector)
+        driver.get = navigate
+        driver.refresh = lambda: state.update(refresh_pending=True)
+        driver.execute_script = execute
+        with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(module, "ensure_requested_date"):
+            today = datetime(2026, 10, 17)
+            module.process_maintain_checks(driver, module.WebDriverWait(driver, 0.2, poll_frequency=0.01),
+                                          module.build_today_strings(today), today)
+        self.assertTrue(state["server_saved"])
+        self.assertGreaterEqual(state["refresh_polls"], 2)
+        self.assertEqual(state["saved"], 1)
 
     def test_query_observer_ignores_old_binding_and_removes_only_its_handlers(self) -> None:
         javascript = """
@@ -264,6 +474,8 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
             "initial": True, "staleRender": False, "rendered": True, "changedRejected": True})
 
     def _fixture(self, **options):
+        from selenium.common.exceptions import StaleElementReferenceException
+
         module = self.module
         state = {"maintenance_done": False, "equipment_done": False,
                  "persist": True, "event_class": "unchecked", "missing_today": False,
@@ -333,18 +545,30 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
                     return [Element("check")]
                 return []
 
+        class Document:
+            def __init__(self, generation): self.generation = generation
+            def is_enabled(self):
+                if self.generation != driver.document_generation:
+                    raise StaleElementReferenceException("fixture document was replaced")
+                return True
+
         class Driver:
             mode = "maintain"
             current_url = "fixture://maintain"
+            document_generation = 0
 
             def get(self, url):
+                self.document_generation += 1
                 self.mode = "equip" if "CarEquipCheck" in url else "maintain"
                 self.current_url = url
 
             def refresh(self):
+                self.document_generation += 1
                 self.mode = "calendar"
 
             def find_element(self, by, selector):
+                if selector == "html":
+                    return Document(self.document_generation)
                 if selector == "spinner-container":
                     return Element(displayed=False)
                 if "tbody/tr[" in selector:

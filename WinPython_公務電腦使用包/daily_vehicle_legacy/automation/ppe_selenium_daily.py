@@ -66,6 +66,19 @@ return (() => {
             filtered: !!filter && (!Array.isArray(filter.filters) || filter.filters.length > 0)};
 })();
 """
+GRID_PAGE_READY_SCRIPT = """
+const [pathname, queryName, requireGrid] = arguments;
+try {
+    if (window.location.pathname !== pathname || document.readyState !== 'complete' ||
+        typeof window.jQuery !== 'function' || typeof window[queryName] !== 'function') return false;
+    const holder = window.jQuery('#grid');
+    if (!holder || typeof holder.data !== 'function') return false;
+    if (!requireGrid) return true;
+    const grid = holder.data('kendoGrid');
+    return !!grid && typeof grid.setDataSource === 'function' && !!grid.dataSource &&
+        typeof grid.dataSource.view === 'function';
+} catch (_) { return false; }
+"""
 GRID_QUERY_OBSERVER_SCRIPT = """
 const [action, token, button] = arguments;
 const key = '__sinposmartVehicleGridQuery';
@@ -265,17 +278,37 @@ def wait_for_spinner(wait: WebDriverWait) -> None:
     wait.until(EC.invisibility_of_element_located((By.ID, "spinner-container")))
 
 
+def navigate_vehicle_document(driver: webdriver.Chrome, wait: WebDriverWait, context: str,
+                              *, refresh: bool = False) -> None:
+    phase = "maintenance" if context == "maintain" else "equipment"
+    print(f"[sinposmart-stage] {phase}_page_ready", flush=True)
+    previous_document = driver.find_element(By.TAG_NAME, "html")
+    if refresh:
+        driver.refresh()
+    else:
+        driver.get(MAINTAIN_LIST_URL if context == "maintain" else EQUIP_CHECK_LIST_URL)
+    wait.until(EC.staleness_of(previous_document))
+
+
 def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str) -> list:
+    phase = "maintenance" if context == "maintain" else "equipment"
+    print(f"[sinposmart-stage] {phase}_page_ready", flush=True)
+    pathname, query_name = (("/CarMaintainCheck/Index", "QueryData") if context == "maintain"
+                            else ("/CarEquipCheck/Index", "Query"))
+    wait.until(lambda current_driver: current_driver.execute_script(
+        GRID_PAGE_READY_SCRIPT, pathname, query_name, context == "maintain") is True)
     wait_for_spinner(wait)
     search_button = wait.until(
         EC.element_to_be_clickable((By.XPATH, f"//button[contains(normalize-space(.), '{TEXT_SEARCH}')]"))
     )
     token = uuid4().hex
     try:
+        print(f"[sinposmart-stage] {phase}_query_start", flush=True)
         if driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "begin", token) is not True:
             raise VehicleVerificationError("state_unconfirmed")
         if driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "click", token, search_button) is not True:
             raise VehicleVerificationError("state_unconfirmed")
+        print(f"[sinposmart-stage] {phase}_query_wait", flush=True)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
@@ -288,6 +321,7 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
             time.sleep(0.1)
         else:
             raise VehicleVerificationError("state_unconfirmed")
+        print(f"[sinposmart-stage] {phase}_query_verify", flush=True)
         wait_for_spinner(wait)
         state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
         if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
@@ -369,8 +403,10 @@ def ensure_requested_date() -> None:
 def verified_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, operation: str,
                        report: dict, expected: set[str] | None = None) -> dict:
     context = "maintain" if operation == "maintenance" else "equip"
+    phase = "maintenance" if context == "maintain" else "equipment"
     try:
         rows = query_grid_rows(driver, wait, context)
+        print(f"[sinposmart-stage] {phase}_inventory_verify", flush=True)
         metadata = driver.execute_script(GRID_STATE_SCRIPT)
     except VehicleVerificationError as error:
         fail_verification(report, operation, error.reason_code)
@@ -400,6 +436,7 @@ def verified_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, operation:
         result[vehicle] = (index, row)
     if expected is not None and set(result) != expected:
         fail_verification(report, operation, "list_changed")
+    print(f"[sinposmart-stage] {phase}_check", flush=True)
     return result
 
 
@@ -440,7 +477,7 @@ def equipment_done(row, today_strings: list[str]) -> bool:
 def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str],
                             today: dt.datetime, report: dict | None = None) -> None:
     report = report if report is not None else new_vehicle_report(today.date().isoformat())
-    driver.get(MAINTAIN_LIST_URL)
+    navigate_vehicle_document(driver, wait, "maintain")
     inventory = set(verified_grid_rows(driver, wait, "maintenance", report))
     not_required = set()
     for vehicle in sorted(inventory):
@@ -495,10 +532,10 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
             wait.until(EC.presence_of_element_located((By.XPATH,
                 "//div[contains(@class, 'swal') or contains(@class, 'sweet')]")))
             saved = True
-            driver.refresh()
+            navigate_vehicle_document(driver, wait, "maintain", refresh=True)
         else:
             fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
-        driver.get(MAINTAIN_LIST_URL)
+        navigate_vehicle_document(driver, wait, "maintain")
         current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
         if vehicle in not_required:
             record_vehicle_result(report, vehicle, "maintenance", "not_required", "not_required")
@@ -521,7 +558,7 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
     report = report if report is not None else new_vehicle_report(target_date)
     today_strings = build_today_strings(dt.datetime.combine(dt.date.fromisoformat(target_date), dt.time()))
     ensure_requested_date()
-    driver.get(EQUIP_CHECK_LIST_URL)
+    navigate_vehicle_document(driver, wait, "equip")
     inventory = set(verified_grid_rows(driver, wait, "equipment", report))
     for vehicle in sorted(inventory):
         current = verified_grid_rows(driver, wait, "equipment", report, inventory)
@@ -555,7 +592,7 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
                 driver.execute_script("arguments[0].click();", confirm)
                 break
         wait.until(lambda current_driver: "/CarEquipCheck/Take" not in current_driver.current_url)
-        driver.get(EQUIP_CHECK_LIST_URL)
+        navigate_vehicle_document(driver, wait, "equip")
         current = verified_grid_rows(driver, wait, "equipment", report, inventory)
         row = current[vehicle][1]
         if not equipment_done(row, today_strings):

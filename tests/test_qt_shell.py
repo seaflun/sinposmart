@@ -130,6 +130,8 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
     def test_vehicle_final_confirmation_does_not_submit_after_midnight(self) -> None:
         import importlib.util
         from unittest.mock import Mock
+        from selenium.common.exceptions import StaleElementReferenceException
+        from selenium.webdriver.support.ui import WebDriverWait
         script = PACKAGE_ROOT / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
         spec = importlib.util.spec_from_file_location("_daily_vehicle_midnight_test", script)
         module = importlib.util.module_from_spec(spec)
@@ -145,24 +147,45 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             cells if by == module.By.TAG_NAME else [check]
             if by == module.By.CSS_SELECTOR and selector == ".k-grid-check" else []
         )
-        check.is_displayed.return_value = True
-        check.is_enabled.return_value = True
+        for control in (check, checkbox, submit):
+            control.is_displayed.return_value = True
+            control.is_enabled.return_value = True
         driver = Mock()
+        document_generation = 0
+        midnight = False
+
+        class Document:
+            def __init__(self):
+                self.generation = document_generation
+
+            def is_enabled(self):
+                if self.generation != document_generation:
+                    raise StaleElementReferenceException("previous fixture document")
+                return True
+
+        def navigate(*_args):
+            nonlocal document_generation
+            document_generation += 1
+
+        def find_element(by, selector):
+            if by == module.By.TAG_NAME and selector == "html":
+                return Document()
+            return checkbox if "Select all rows" in selector else submit
+
+        def find_confirm(*_args):
+            nonlocal midnight
+            midnight = True
+            return [confirm]
+
+        driver.get.side_effect = navigate
+        driver.refresh.side_effect = navigate
+        driver.find_element.side_effect = find_element
         driver.execute_script.side_effect = lambda script, *_args: (
             {"total": 1, "filtered": False, "page": 1, "page_size": 20}
             if script == module.GRID_STATE_SCRIPT else None
         )
-        driver.find_elements.return_value = [confirm]
+        driver.find_elements.side_effect = find_confirm
         confirm.is_displayed.return_value = True
-        values = iter([checkbox, submit, True])
-        midnight = False
-
-        def until(_condition):
-            nonlocal midnight
-            value = next(values, True)
-            if value is True:
-                midnight = True
-            return value
 
         def date_guard():
             if midnight:
@@ -172,9 +195,12 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             module, "wait_for_spinner"
         ), patch.object(module, "ensure_requested_date", side_effect=date_guard):
             with self.assertRaisesRegex(RuntimeError, "每日點車已跨日"):
-                module.process_equip_checks(driver, SimpleNamespace(until=until))
+                module.process_equip_checks(driver, WebDriverWait(driver, 0.2, poll_frequency=0.01))
         self.assertTrue(any(call.args[-1] is submit for call in driver.execute_script.call_args_list))
         self.assertFalse(any(call.args[-1] is confirm for call in driver.execute_script.call_args_list))
+        clicked = [call.args[-1] for call in driver.execute_script.call_args_list
+                   if call.args[0] == "arguments[0].click();"]
+        self.assertEqual(clicked, [check, checkbox, submit])
 
 
 class AutomaticDutyWorkbookTests(unittest.TestCase):
