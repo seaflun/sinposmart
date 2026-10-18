@@ -1714,6 +1714,12 @@ class AppController(QObject):
                 "paths": schedule_paths,
                 "days": schedule_days,
             }
+            personnel_titles = official_personnel_title_snapshot(
+                str(snapshot.target_roc_date or ""),
+                schedule_data_by_date.get(snapshot.target_roc_date, schedule_data),
+            )
+            if personnel_titles is not None:
+                schedule_snapshot["personnel_titles"] = personnel_titles
             signature = json.dumps(
                 schedule_snapshot,
                 ensure_ascii=False,
@@ -3171,6 +3177,44 @@ def duty_shift_label(schedule_data: Mapping, actor_no: str) -> str:
     if not spans:
         return "今日無值班時段"
     return f"{min(item[0] for item in spans):02d} - {max(item[1] for item in spans):02d}"
+
+
+def official_personnel_title_snapshot(target_roc_date: str, schedule_data: Mapping) -> dict | None:
+    """Publish only a complete, explicitly verified official roster, or its invalidation."""
+    if not re.fullmatch(r"[0-9]{7}", target_roc_date):
+        return None
+    try:
+        target_date = date(int(target_roc_date[:3]) + 1911, int(target_roc_date[3:5]), int(target_roc_date[5:])).isoformat()
+    except ValueError:
+        return None
+    result = {"schema_version": 1, "source": "official_duty_staff", "target_date": target_date,
+              "complete": False, "members": []}
+    today = schedule_data.get("today") if isinstance(schedule_data, Mapping) else None
+    if not isinstance(today, Mapping) or today.get("roc_date") != target_roc_date or today.get("staff_complete") is not True:
+        return result
+    staff = today.get("staff")
+    if not isinstance(staff, Mapping) or not 1 <= len(staff) <= 200:
+        return result
+    actors, names, members = set(), set(), []
+    for raw_actor, info in staff.items():
+        if not isinstance(raw_actor, str) or not re.fullmatch(r"[0-9]{1,4}", raw_actor) or not isinstance(info, Mapping):
+            return result
+        actor = str(int(raw_actor))
+        name = info.get("name")
+        if not isinstance(name, str):
+            return result
+        name = name.strip()
+        name_key = "".join(name.split()).casefold()
+        if (not 1 <= len(name) <= 80 or not all(char.isalpha() or char in " ·・-'’" for char in name)
+                or actor in actors or name_key in names):
+            return result
+        title = info.get("role")
+        title = title.strip() if isinstance(title, str) else ""
+        members.append({"actor_no": actor, "name": name, "title": title if title in {"分隊長", "小隊長", "隊員"} else ""})
+        actors.add(actor)
+        names.add(name_key)
+    result.update(complete=True, members=sorted(members, key=lambda member: int(member["actor_no"])))
+    return result
 
 
 def operational_staff_from_schedule(schedule_data: Mapping) -> dict[str, dict]:

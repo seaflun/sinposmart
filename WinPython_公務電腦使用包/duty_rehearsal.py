@@ -128,6 +128,7 @@ class DutySheet:
     rows: list[DutyRow] = field(default_factory=list)
     summary: dict[str, list[str]] = field(default_factory=dict)
     staff: dict[str, dict[str, str]] = field(default_factory=dict)
+    staff_complete: bool = False
 
 
 @dataclass
@@ -1817,7 +1818,8 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
           return parts.length ? parts.join(' ') : text;
         }
         const tables = Array.from(document.querySelectorAll('table'));
-        const result = {unit: '', rows: [], summary: {}, staff: {}, checkNums: []};
+        const result = {unit: '', rows: [], summary: {}, staff: {}, staff_complete: false, checkNums: []};
+        const staffTables = [];
         const bodyText = document.body.innerText || '';
         const unitMatch = bodyText.match(/勤務單位\\s*[:：]\\s*([^\\n\\r\\t ]+)/);
         if (unitMatch) result.unit = unitMatch[1];
@@ -1826,6 +1828,10 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
           const trs = Array.from(table.querySelectorAll('tr'));
           const matrix = trs.map(tr => Array.from(tr.children).map(cellText));
           const flat = matrix.flat().join('|');
+          if (table.className.includes('report_list1') && matrix.some(row =>
+              ['番號', '職稱', '姓名'].every(label => row.some(cell => cell.replace(/\\s+/g, '') === label)))) {
+            staffTables.push(matrix);
+          }
           const looksLikeDutyTable = table.className.includes('report_list1') &&
             trs.length >= 20 &&
             matrix.some(row => /^8[~～-]9$/.test((row[0] || '').replace(/\\s+/g, ''))) &&
@@ -1890,8 +1896,40 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
             }
           }
         }
+        const capturedDateField = document.getElementById('_txtTaskDate');
+        let complete = staffTables.length === 1 && document.readyState === 'complete' &&
+          (!window.jQuery || window.jQuery.active === 0) &&
+          String(capturedDateField?.value || '').replace(/\\D/g, '') === arguments[0];
+        const verifiedStaff = {};
+        for (const matrix of staffTables) {
+          const labels = ['番號', '職稱', '姓名'];
+          const isHeader = values => labels.every((label, index) => values[index]?.replace(/\\s+/g, '') === label);
+          const header = matrix.find(row => row.some((_, i) => isHeader(row.slice(i, i + 3))));
+          const groups = [];
+          for (let i = 0; header && i + 2 < header.length; i++) {
+            if (isHeader(header.slice(i, i + 3))) { groups.push(i); i += 2; }
+          }
+          const covered = index => groups.some(start => index >= start && index < start + 3);
+          if (!groups.length) complete = false;
+          for (const row of matrix) {
+            if (row.some((cell, index) => cell.trim() && !covered(index))) complete = false;
+            for (const i of groups) {
+              const no = (row[i] || '').trim();
+              const role = (row[i + 1] || '').trim();
+              const name = (row[i + 2] || '').trim();
+              if ((!no && !role && !name) || isHeader([no, role, name])) continue;
+              if (!/^\\d{1,2}$/.test(no) || !name || Object.hasOwn(verifiedStaff, no)) complete = false;
+              verifiedStaff[no] = {role, name};
+            }
+          }
+        }
+        const numbers = Object.keys(verifiedStaff);
+        result.staff_complete = complete && numbers.length > 0 && numbers.length <= 200 &&
+          numbers.length === Object.keys(result.staff).length && numbers.every(no =>
+            result.staff[no]?.name === verifiedStaff[no].name && result.staff[no]?.role === verifiedStaff[no].role);
         return result;
-        """
+        """,
+        target_roc_date,
     )
     if not data.get("rows"):
         page_text = driver.execute_script(
@@ -1918,6 +1956,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         ],
         summary={key: roster_nums(value) for key, value in data.get("summary", {}).items()},
         staff=data.get("staff", {}),
+        staff_complete=data.get("staff_complete") is True,
     )
     off_duty = set()
     for key in OFF_DUTY_SUMMARY_KEYS:

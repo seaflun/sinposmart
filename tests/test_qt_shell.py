@@ -7305,6 +7305,7 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
                         "rows": [{"slot": "8-9", "columns": {"值班": "10"}}],
                         "summary": {},
                         "staff": {"10": {"role": "隊員", "name": "測試員"}},
+                        "staff_complete": True,
                         "checkNums": [],
                     }
                 return True
@@ -7333,6 +7334,65 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         self.assertEqual(driver.wait_checks, 2)
         self.assertEqual(sheet.roc_date, "1150808")
         self.assertEqual(sheet.rows[0].columns["值班"], ["10"])
+        self.assertTrue(sheet.staff_complete)
+
+    def test_official_staff_completeness_requires_full_ready_unique_table_in_actual_parser_script(self) -> None:
+        import ast
+        import shutil
+        import subprocess
+        import duty_rehearsal
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is needed for the isolated DOM contract")
+        tree = ast.parse(Path(duty_rehearsal.__file__).read_text(encoding="utf-8-sig"))
+        function = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "query_duty_sheet")
+        source = next(call.args[0].value for call in ast.walk(function) if isinstance(call, ast.Call) and call.args
+                      and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+                      and "function cellText(cell)" in call.args[0].value)
+        harness = r"""
+        const source = JSON.parse(process.argv[1]);
+        function check(change) {
+          const rows = [['番號', '職稱', '姓名'], ['1', '隊員', '測試甲'], ['2', '', '測試乙']];
+          if (change === 'header') rows[0][1] = '其他';
+          if (change === 'duplicate') rows[2][0] = '1';
+          if (change === 'empty-name') rows[2][2] = '';
+          if (change === 'partial-row') rows[2].pop();
+          if (change === 'blank-actor') rows[2] = ['', '隊員', '測試乙'];
+          if (change === 'bad-actor') rows[2] = ['X2', '隊員', '測試乙'];
+          if (change === 'padding') rows.push(['', '', '']);
+          if (change === 'repeat-header') rows.push(['番號', '職稱', '姓名']);
+          if (change === 'six-columns' || change === 'nine-columns') {
+            rows.splice(0, rows.length,
+              ['番號', '職稱', '姓名', '番號', '職稱', '姓名'],
+              ['1', '隊員', '測試甲', '2', '', '測試乙'],
+              ['3', '小隊長', '測試丙', '', '', '']);
+            if (change === 'nine-columns') {
+              rows[0].push('番號', '職稱', '姓名');
+              rows[1].push('4', '隊員', '測試丁');
+              rows[2].push('', '', '');
+            }
+          }
+          const cell = text => ({innerText:text, querySelectorAll:()=>[]});
+          const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
+          const schedule = table(Array.from({length:24}, (_,i)=>[`${(i+8)%24}~${(i+9)%24}`, '1', '']));
+          const staff = table(rows);
+          const tables = [schedule, staff];
+          if (change === 'two-tables') tables.push(table(rows));
+          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}};
+          global.document = {readyState:change === 'loading' ? 'loading' : 'complete', body:{innerText:''},
+            querySelectorAll:()=>tables, getElementById:()=>({value:change === 'wrong-date' ? '1150807' : '1150808'})};
+          return new Function(source)('1150808').staff_complete;
+        }
+        console.log(JSON.stringify(['ready','loading','ajax','wrong-date','header','duplicate','empty-name','partial-row','two-tables',
+          'padding','repeat-header','six-columns','nine-columns','blank-actor','bad-actor'].map(check)));
+        """
+        completed = subprocess.run([node, "-e", harness, json.dumps(source)], check=True, text=True, capture_output=True, encoding="utf-8")
+        results = json.loads(completed.stdout)
+        self.assertEqual(results[:13], [True, False, False, False, False, False, False, False, False, True, True, True, True])
+        for change, result in zip(("blank-actor", "bad-actor"), results[13:]):
+            with self.subTest(change=change):
+                self.assertIs(result, False)
 
     def test_control_wait_returns_immediately_when_form_is_ready(self) -> None:
         import duty_rehearsal
@@ -16507,6 +16567,93 @@ if return_code != 0 or loaded:
 
         self.assertEqual(send_event.call_count, 1)
         self.assertEqual(send_event.call_args.kwargs["snapshot"]["days"][0]["action_count"], 2)
+
+    def test_schedule_snapshot_publishes_complete_official_staff_titles_without_private_fields(self) -> None:
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.app_controller import AppController
+
+        payload = {"target_date": "1150808", "actions": [], "today": {
+            "roc_date": "1150808", "staff_complete": True, "staff": {
+                "2": {"name": "測試乙", "role": "未識別職稱", "user_id": "private-account"},
+                "1": {"name": "測試甲", "role": "分隊長", "password": "private-secret"},
+            },
+        }}
+        controller = AppController()
+        self.addCleanup(controller.shutdown)
+        snapshot = ScheduleSnapshot(Path("synthetic.json"), payload, "1150808", schedule_data_by_date={"1150808": payload})
+        with patch.object(controller, "_send_operational_event") as send:
+            controller._live_snapshot_captured(snapshot)
+            controller._live_snapshot_captured(snapshot)
+        self.assertEqual(send.call_count, 1)
+        roster = send.call_args.kwargs["snapshot"]["personnel_titles"]
+        self.assertEqual(roster, {"schema_version": 1, "source": "official_duty_staff", "target_date": "2026-08-08",
+                                 "complete": True, "members": [{"actor_no": "1", "name": "測試甲", "title": "分隊長"},
+                                                               {"actor_no": "2", "name": "測試乙", "title": ""}]})
+        self.assertNotIn("private-", json.dumps(roster))
+
+    def test_schedule_snapshot_incomplete_or_unsafe_staff_revokes_previous_titles(self) -> None:
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.app_controller import AppController
+
+        good = {"roc_date": "1150808", "staff_complete": True, "staff": {"1": {"name": "測試甲", "role": "隊員"}}}
+        invalid_days = [
+            {**good, "staff_complete": False}, {key: value for key, value in good.items() if key != "staff_complete"},
+            {**good, "staff_complete": "true"}, {**good, "roc_date": "1150807"}, {**good, "staff": {}},
+            {**good, "staff": {str(i): {"name": "測試甲", "role": "隊員"} for i in range(1, 202)}},
+            {**good, "staff": {"1": {"name": "測試甲"}, "01": {"name": "測試乙"}}},
+            {**good, "staff": {"1": {"name": "測試甲"}, "2": {"name": "測試甲"}}},
+            {**good, "staff": {"1": {"name": "測試甲"}, "2": {"name": "測試 甲"}}},
+            {**good, "staff": {"1": {"name": ""}}}, {**good, "staff": {"1": {"name": "測試<script>"}}},
+            {**good, "staff": {"1": {"name": "user123"}}}, {**good, "staff": {"12345": {"name": "測試甲"}}},
+        ]
+        controller = AppController()
+        self.addCleanup(controller.shutdown)
+        for today in invalid_days:
+            with self.subTest(today=today):
+                snapshots = []
+                for day in (good, today):
+                    payload = {"target_date": "1150808", "today": day, "actions": []}
+                    snapshots.append(ScheduleSnapshot(Path("synthetic.json"), payload, "1150808", schedule_data_by_date={"1150808": payload}))
+                with patch.object(controller, "_send_operational_event") as send:
+                    for snapshot in snapshots:
+                        controller._live_snapshot_captured(snapshot)
+                self.assertEqual(send.call_count, 2)
+                roster = send.call_args.kwargs["snapshot"]["personnel_titles"]
+                self.assertIs(roster["complete"], False)
+                self.assertEqual(roster["members"], [])
+                self.assertEqual(roster["target_date"], "2026-08-08")
+
+    def test_schedule_snapshot_uses_only_target_day_staff_and_title_changes_are_sent(self) -> None:
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        self.addCleanup(controller.shutdown)
+        other = {"target_date": "1150809", "actions": [], "today": {"roc_date": "1150809", "staff_complete": True,
+                 "staff": {"9": {"name": "其他人", "role": "分隊長"}}}}
+        with patch.object(controller, "_send_operational_event") as send:
+            for title in ("隊員", "小隊長"):
+                payload = {"target_date": "1150808", "actions": [], "today": {"roc_date": "1150808", "staff_complete": True,
+                           "staff": {"1": {"name": "測試甲", "role": title}}}}
+                snapshot = ScheduleSnapshot(Path("synthetic.json"), payload, "1150808", schedule_data_by_date={"1150808": payload, "1150809": other})
+                controller._live_snapshot_captured(snapshot)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual([call.kwargs["snapshot"]["personnel_titles"]["members"][0]["title"] for call in send.call_args_list], ["隊員", "小隊長"])
+        self.assertNotIn("其他人", json.dumps(send.call_args.kwargs["snapshot"]["personnel_titles"]))
+
+    def test_schedule_snapshot_invalid_target_date_omits_personnel_titles(self) -> None:
+        from app_core.schedule_repository import ScheduleSnapshot
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController()
+        self.addCleanup(controller.shutdown)
+        for target in ("", "1150230", "2026-08-08"):
+            payload = {"target_date": target, "today": {"staff_complete": True, "staff": {"1": {"name": "測試甲", "role": "隊員"}}}, "actions": []}
+            snapshot = ScheduleSnapshot(Path("synthetic.json"), payload, target, schedule_data_by_date={target: payload})
+            with self.subTest(target=target), patch.object(controller, "_send_operational_event") as send:
+                controller._last_schedule_snapshot_signature = ""
+                controller._live_snapshot_captured(snapshot)
+                self.assertNotIn("personnel_titles", send.call_args.kwargs["snapshot"])
 
     def test_app_controller_enqueues_due_task_and_applies_verified_result(self) -> None:
         from datetime import datetime
