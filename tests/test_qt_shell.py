@@ -135,13 +135,15 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         check, checkbox, submit, confirm = (Mock() for _ in range(4))
-        cells = [Mock() for _ in range(4)]
+        cells = [Mock() for _ in range(10)]
         for index, cell in enumerate(cells):
             cell.get_attribute.return_value = "test-car" if index == 3 else ""
             cell.find_elements.return_value = []
+        cells[9].find_elements.return_value = [check]
         row = Mock()
-        row.find_elements.side_effect = lambda by, _selector: (
+        row.find_elements.side_effect = lambda by, selector: (
             cells if by == module.By.TAG_NAME else [check]
+            if by == module.By.CSS_SELECTOR and selector == ".k-grid-check" else []
         )
         check.is_displayed.return_value = True
         check.is_enabled.return_value = True
@@ -5994,6 +5996,51 @@ class DailyVehicleServiceTests(unittest.TestCase):
         copy = service.completion_report
         copy["items"][0]["vehicle"] = "mutated"
         self.assertEqual(service.completion_report, report)
+
+    def test_maintenance_not_required_is_verified_and_survives_partial_failure(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        report = self._verified_report()
+        report["items"][0].update(status="not_required", reason_code="not_required")
+        prefix = "[sinposmart-vehicle-report] "
+        service, result = self._execute_output(prefix + json.dumps(report) + "\n[done] automation finished\n")
+        self.assertEqual(result, f"車輛保養清點已確認全部作業結果：{report['target_date']}")
+        self.assertEqual(service.completion_report, report)
+        report.update(verified=False, reason_code="save_unconfirmed")
+        report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
+        service, result = self._execute_output(prefix + json.dumps(report) + "\n", returncode=1)
+        self.assertIsInstance(result, DailyVehicleExecutionError)
+        self.assertEqual(service.completion_report, report)
+
+    def test_not_required_requires_exact_maintenance_pair_and_safe_vehicle(self) -> None:
+        from copy import deepcopy
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        mutations = [
+            lambda report: report["items"][0].update(operation="equipment"),
+            lambda report: report["items"][0].update(reason_code="verified_today"),
+            lambda report: report["items"][0].update(reason_code=""),
+            lambda report: report["items"][0].update(status="completed"),
+            lambda report: report["items"][0].update(status="already_done"),
+            lambda report: report["items"][0].update(status="unconfirmed"),
+            lambda report: report["items"][0].update(vehicle=" "),
+            lambda report: report["items"][0].update(vehicle=" user10 "),
+            lambda report: report["items"][0].update(vehicle="CAR\n01"),
+            lambda report: report.update(reason_code="not_required"),
+            lambda report: report.update(verified=False, reason_code="not_required"),
+            lambda report: report.update(items=report["items"][:1]),
+            lambda report: report["items"].append(dict(report["items"][0], status="completed", reason_code="saved_verified")),
+        ]
+        for index, mutation in enumerate(mutations):
+            report = deepcopy(self._verified_report())
+            report["items"][0].update(status="not_required", reason_code="not_required")
+            mutation(report)
+            with self.subTest(case=index):
+                service, result = self._execute_output("[sinposmart-vehicle-report] " + json.dumps(report) + "\n[done] automation finished\n")
+                self.assertIsInstance(result, DailyVehicleExecutionError)
+                self.assertIs(service.completion_report["verified"], False)
+                self.assertEqual(service.completion_report["reason_code"], "report_invalid")
+                self.assertNotIn("user10", repr(service.completion_report))
 
     def test_invalid_report_never_becomes_success_or_leaks_unsafe_rows(self) -> None:
         from copy import deepcopy

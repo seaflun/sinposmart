@@ -69,32 +69,52 @@ return (() => {
 GRID_QUERY_OBSERVER_SCRIPT = """
 const [action, token, button] = arguments;
 const key = '__sinposmartVehicleGridQuery';
+const currentGrid = () => window.jQuery && window.jQuery('#grid').data('kendoGrid') || null;
+const rendered = (grid, source) => {
+    try {
+        if (!grid || !source || typeof source.view !== 'function' || !grid.tbody) return null;
+        const ids = Array.from(source.view()).map(record => record && record.uid);
+        const rows = Array.from(grid.tbody.find('tr[data-uid]'));
+        if (ids.some(uid => typeof uid !== 'string' || !uid) || ids.length !== rows.length ||
+            ids.some((uid, index) => rows[index].getAttribute('data-uid') !== uid)) return null;
+        return ids;
+    } catch (_) { return null; }
+};
 if (action === 'begin') {
     if (window[key]) window[key].cleanup();
-    const grid = window.jQuery && window.jQuery('#grid').data('kendoGrid');
+    if (typeof window.jQuery !== 'function') return false;
+    const grid = currentGrid();
     const source = grid && grid.dataSource;
-    if (!grid || !source || typeof grid.bind !== 'function' ||
-        typeof grid.unbind !== 'function' || typeof source.bind !== 'function' ||
-        typeof source.unbind !== 'function') return false;
-    const state = {token, armed: false, started: false, bound: false, failed: false};
+    const state = {token, armed: false, started: false, bound: false, failed: false,
+                   checkedGrid: null, checkedSource: null, checkedIds: null};
     state.onStart = event => {
-        if (state.armed && event.type === 'read') {
-            if (state.started) state.failed = true;
+        if (state.armed && grid && event.type === 'read' && currentGrid() === grid && grid.dataSource === source) {
+            if (state.checkedGrid) state.failed = true;
             state.started = true;
+            state.bound = false;
         }
     };
-    state.onBound = () => { if (state.armed && state.started) state.bound = true; };
-    state.onError = () => { if (state.armed) state.failed = true; };
+    state.onBound = () => {
+        if (state.armed && state.started && grid && currentGrid() === grid && grid.dataSource === source) state.bound = true;
+    };
+    state.onError = () => {
+        if (state.armed && grid && currentGrid() === grid && grid.dataSource === source) state.failed = true;
+    };
     state.cleanup = () => {
-        grid.unbind('dataBound', state.onBound);
-        source.unbind('requestStart', state.onStart);
-        source.unbind('error', state.onError);
+        if (grid && typeof grid.unbind === 'function') grid.unbind('dataBound', state.onBound);
+        if (source && typeof source.unbind === 'function') {
+            source.unbind('requestStart', state.onStart);
+            source.unbind('error', state.onError);
+        }
         if (window[key] === state) delete window[key];
     };
-    grid.bind('dataBound', state.onBound);
-    source.bind('requestStart', state.onStart);
-    source.bind('error', state.onError);
+    state.oldGrid = grid; state.oldSource = source;
     window[key] = state;
+    if (grid && typeof grid.bind === 'function') grid.bind('dataBound', state.onBound);
+    if (source && typeof source.bind === 'function') {
+        source.bind('requestStart', state.onStart);
+        source.bind('error', state.onError);
+    }
     return true;
 }
 const state = window[key];
@@ -105,8 +125,17 @@ if (action === 'click') {
     button.click();
     return true;
 }
-if (action === 'state') return {token: state.token,
-    ready: state.armed && state.started && state.bound && !state.failed, failed: state.failed};
+if (action === 'state') {
+    const grid = currentGrid(), source = grid && grid.dataSource, ids = rendered(grid, source);
+    if (state.checkedGrid) {
+        if (grid !== state.checkedGrid || source !== state.checkedSource || !ids ||
+            ids.length !== state.checkedIds.length || ids.some((uid, i) => uid !== state.checkedIds[i])) state.failed = true;
+    } else if (state.armed && ids && (grid !== state.oldGrid || source !== state.oldSource ||
+                                   state.started && state.bound)) {
+        state.checkedGrid = grid; state.checkedSource = source; state.checkedIds = ids;
+    }
+    return {token: state.token, ready: !!state.checkedGrid && !state.failed, failed: state.failed};
+}
 if (action === 'cleanup') { state.cleanup(); return true; }
 return false;
 """
@@ -159,10 +188,12 @@ def fail_verification(report: dict, operation: str, reason_code: str,
 
 def verify_vehicle_report(report: dict) -> bool:
     items = report["items"]
-    verified = (report.get("reason_code") != "row_limit" and 0 < len(items) <= MAX_REPORT_ITEMS
+    verified = (report.get("reason_code") not in {"row_limit", "not_required"} and 0 < len(items) <= MAX_REPORT_ITEMS
                 and {item["operation"] for item in items} == {"maintenance", "equipment"}
-                and all(item["vehicle"] and item["status"] in {"completed", "already_done"}
-                        and item["reason_code"] in {"verified_today", "saved_verified"}
+                and all(item["vehicle"] and ((item["status"] in {"completed", "already_done"}
+                        and item["reason_code"] in {"verified_today", "saved_verified"})
+                        or (item["operation"] == "maintenance" and item["status"] == "not_required"
+                            and item["reason_code"] == "not_required"))
                         for item in items))
     report["verified"] = verified
     report["reason_code"] = "" if verified else report.get("reason_code") or "execution_unconfirmed"
@@ -258,7 +289,13 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
         else:
             raise VehicleVerificationError("state_unconfirmed")
         wait_for_spinner(wait)
+        state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
+            raise VehicleVerificationError("state_unconfirmed")
         rows = driver.find_elements(By.XPATH, "//div[@id='grid']//tbody/tr")
+        state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
+            raise VehicleVerificationError("state_unconfirmed")
         if not rows:
             raise VehicleVerificationError("empty_list")
         print(f"[{context}] rows loaded: {len(rows)}")
@@ -386,11 +423,18 @@ def maintenance_done(row, today_strings: list[str], today: dt.datetime) -> bool:
 
 
 def equipment_done(row, today_strings: list[str]) -> bool:
-    texts = [cell_completion_text(cell) for cell in row.find_elements(By.TAG_NAME, "td")]
-    if any(re.search(r"未完成|尚未|待完成|未清點|待清點", text) for text in texts):
+    cells = row.find_elements(By.TAG_NAME, "td")
+    if len(cells) != 10 or not is_task_done(cell_completion_text(cells[4]), today_strings):
         return False
-    return any(is_task_done(text, today_strings)
-               and re.search(r"已完成|已清點|清點完成|完成清點", text) for text in texts)
+    checker = cell_completion_text(cells[6])
+    if checker in {"", "-", "—", "－"} or re.search(r"未完成|尚未|待完成|未清點|待清點", checker):
+        return False
+    if not all(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", cell_completion_text(cells[index]))
+               for index in (7, 8)):
+        return False
+    views = row.find_elements(By.CSS_SELECTOR, ".k-grid-view")
+    return bool(views and any(view.is_displayed() and view.is_enabled() for view in views)
+                and not row.find_elements(By.CSS_SELECTOR, ".k-grid-check"))
 
 
 def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str],
@@ -398,6 +442,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
     report = report if report is not None else new_vehicle_report(today.date().isoformat())
     driver.get(MAINTAIN_LIST_URL)
     inventory = set(verified_grid_rows(driver, wait, "maintenance", report))
+    not_required = set()
     for vehicle in sorted(inventory):
         ensure_requested_date()
         current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
@@ -417,6 +462,14 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
                       if f"{today.year}年{today.month}月{today.day}日" in (event.get_attribute("aria-label") or "")]
             if not events:
                 fail_verification(report, "maintenance", "today_not_found", vehicle)
+            disabled = [bool(set((event.get_attribute("class") or "").split()) & {"disable", "disabled"})
+                        for event in events]
+            if any(disabled):
+                if not all(disabled) or any(set((event.get_attribute("class") or "").split()) & {"checked", "unchecked", "reviewed"}
+                        or event.find_elements(By.CSS_SELECTOR, ".reviewed") for event in events):
+                    fail_verification(report, "maintenance", "state_unconfirmed", vehicle)
+                not_required.add(vehicle)
+                break
             signature = tuple((event.get_attribute("aria-label"), event.get_attribute("class"),
                                len(event.find_elements(By.CSS_SELECTOR, ".reviewed"))) for event in events)
             if previous == signature:
@@ -447,12 +500,17 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
             fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
         driver.get(MAINTAIN_LIST_URL)
         current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
+        if vehicle in not_required:
+            record_vehicle_result(report, vehicle, "maintenance", "not_required", "not_required")
+            continue
         if not maintenance_done(current[vehicle][1], today_strings, today):
             fail_verification(report, "maintenance", "save_unconfirmed" if saved else "state_unconfirmed", vehicle)
         record_vehicle_result(report, vehicle, "maintenance", "completed" if saved else "already_done",
                               "saved_verified" if saved else "verified_today")
     current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
     for vehicle, (_index, row) in current.items():
+        if vehicle in not_required:
+            continue
         if not maintenance_done(row, today_strings, today):
             fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
 
@@ -468,7 +526,9 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
     for vehicle in sorted(inventory):
         current = verified_grid_rows(driver, wait, "equipment", report, inventory)
         _index, row = current[vehicle]
-        buttons = row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH)
+        buttons = row.find_elements(By.CSS_SELECTOR, ".k-grid-check")
+        if buttons and row.find_elements(By.CSS_SELECTOR, ".k-grid-view"):
+            fail_verification(report, "equipment", "state_unconfirmed", vehicle)
         if equipment_done(row, today_strings):
             if buttons:
                 fail_verification(report, "equipment", "state_unconfirmed", vehicle)
@@ -498,12 +558,12 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
         driver.get(EQUIP_CHECK_LIST_URL)
         current = verified_grid_rows(driver, wait, "equipment", report, inventory)
         row = current[vehicle][1]
-        if not equipment_done(row, today_strings) or row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH):
+        if not equipment_done(row, today_strings):
             fail_verification(report, "equipment", "save_unconfirmed", vehicle)
         record_vehicle_result(report, vehicle, "equipment", "completed", "saved_verified")
     current = verified_grid_rows(driver, wait, "equipment", report, inventory)
     for vehicle, (_index, row) in current.items():
-        if not equipment_done(row, today_strings) or row.find_elements(By.XPATH, EQUIPMENT_BUTTON_XPATH):
+        if not equipment_done(row, today_strings):
             fail_verification(report, "equipment", "save_unconfirmed", vehicle)
 
 

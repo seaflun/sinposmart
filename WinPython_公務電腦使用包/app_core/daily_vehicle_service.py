@@ -190,6 +190,8 @@ class DailyVehicleService:
             report_stage("result_evaluation")
             if status_callback and retaining_runner:
                 status_callback("已完成；瀏覽器將保留 10 分鐘後自動關閉。")
+            if any(item["status"] == "not_required" for item in self._completion_report["items"]):
+                return f"車輛保養清點已確認全部作業結果：{request.target_date}"
             return f"車輛保養清點已完成：{request.target_date}"
         except DailyVehicleExecutionError:
             raise
@@ -255,11 +257,15 @@ class DailyVehicleService:
                     or re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff -]*", vehicle) is None
                     or re.search(r"secret|token|password|cookie|account|username|帳號|密碼", vehicle, re.I)
                     or operation not in ("maintenance", "equipment")
-                    or status not in ("completed", "already_done", "unconfirmed")
+                    or status not in ("completed", "already_done", "unconfirmed", "not_required")
                     or not isinstance(item_reason, str)
-                    or item_reason not in VEHICLE_REPORT_REASONS
-                    or (status != "unconfirmed" and (not vehicle.strip() or item_reason not in POSITIVE_REPORT_REASONS))
-                    or (status == "unconfirmed" and item_reason in POSITIVE_REPORT_REASONS)):
+                    or (item_reason not in VEHICLE_REPORT_REASONS and item_reason != "not_required")
+                    or (status in ("completed", "already_done")
+                        and (not vehicle.strip() or item_reason not in POSITIVE_REPORT_REASONS))
+                    or (status == "not_required"
+                        and (operation != "maintenance" or item_reason != "not_required" or not vehicle.strip()))
+                    or (status == "unconfirmed"
+                        and (item_reason in POSITIVE_REPORT_REASONS or item_reason == "not_required"))):
                 valid = False
                 continue
             vehicle = " ".join(vehicle.split())

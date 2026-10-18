@@ -137,7 +137,18 @@ class DailyVehicleVerificationTests(unittest.TestCase):
             rows = self.module.query_grid_rows(driver, wait, "maintain")
         self.assertEqual(rows, [new])
         self.assertEqual(driver.find_elements.call_count, 1)
-        self.assertEqual(actions, ["begin", "click", "state", "state", "cleanup"])
+        self.assertEqual(actions[:2], ["begin", "click"])
+        self.assertGreaterEqual(actions.count("state"), 4)
+        self.assertEqual(actions[-1], "cleanup")
+
+    def test_source_change_while_reading_rows_is_unconfirmed(self) -> None:
+        driver, wait, _old, _new, actions = self._query_fixture([
+            {"ready": True, "failed": False}, {"ready": True, "failed": False},
+            {"ready": False, "failed": True}])
+        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+            self.module.query_grid_rows(driver, wait, "maintain")
+        driver.find_elements.assert_called_once()
+        self.assertEqual(actions[-1], "cleanup")
 
     def test_search_error_and_missing_binding_are_unconfirmed_and_cleanup(self) -> None:
         for state in ({"ready": False, "failed": True}, {"ready": False, "failed": False}):
@@ -163,6 +174,8 @@ function observable() {
 }
 var grid = observable(), source = observable();
 grid.dataSource = source;
+source.view = () => [{uid: 'current-row'}];
+grid.tbody = {find: () => [{getAttribute: () => 'current-row'}]};
 var window = {jQuery: function() {return {data: function() {return grid;}};}};
 function query(action, token, button) { return (function() {
 """ + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
@@ -209,12 +222,55 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
             "staleCallback": False, "failed": True, "gridHandlers": 1,
             "startHandlers": 0, "errorHandlers": 0, "externalRetained": True})
 
+    def test_live_query_replacement_rebuilt_and_initial_grid_require_current_render(self) -> None:
+        javascript = """
+function emitter() {return {handlers: {}, bind: function(n,f) {(this.handlers[n]||(this.handlers[n]=[])).push(f);},
+    unbind: function(n,f) {this.handlers[n]=(this.handlers[n]||[]).filter(x=>x!==f);},
+    fire: function(n,e) {(this.handlers[n]||[]).slice().forEach(f=>f(e));}};}
+function source(ids) {const s=emitter(); s.view=()=>ids.map(uid=>({uid})); return s;}
+function makeGrid(ids) {const g=emitter(); g.dataSource=source(ids); g.dom=ids;
+    g.tbody={find:()=>g.dom.map(uid=>({getAttribute:()=>uid}))}; return g;}
+var current=makeGrid(['old']);
+var window={jQuery:()=>({data:()=>current})};
+function query(a,t,b) {return (function() {
+""" + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
+}).apply(null,[a,t,b]);}
+function ready(t) {const s=query('state',t); return !!s && s.ready===true;}
+query('begin','replacement');
+query('click','replacement',{click:()=>{current.dataSource=source(['replacement']);
+    current.dom=['replacement']; current.fire('dataBound',{});}});
+var replacement=ready('replacement'); query('cleanup','replacement');
+query('begin','rebuilt');
+query('click','rebuilt',{click:()=>{current=null; current=makeGrid(['rebuilt']);}});
+var rebuilt=ready('rebuilt'); query('cleanup','rebuilt');
+current=null; var initial=query('begin','initial');
+query('click','initial',{click:()=>{current=makeGrid(['initial']);}});
+initial=initial && ready('initial'); query('cleanup','initial');
+query('begin','render');
+query('click','render',{click:()=>{current=makeGrid(['new-view']);current.dom=['old-dom'];}});
+var staleRender=ready('render'); current.dom=['new-view']; var rendered=ready('render');
+current=makeGrid(['late-replacement']); var changed=query('state','render');
+query('cleanup','render');
+JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected:!changed.ready});
+"""
+        runner = ("from PySide6.QtCore import QCoreApplication\nfrom PySide6.QtQml import QJSEngine\n"
+                  "app=QCoreApplication([])\nengine=QJSEngine()\nresult=engine.evaluate(" + repr(javascript) + ")\n"
+                  "assert not result.isError(),result.toString()\nprint(result.toString())\n")
+        result = subprocess.run([sys.executable, "-B", "-c", runner], capture_output=True,
+                                text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"replacement": True, "rebuilt": True,
+            "initial": True, "staleRender": False, "rendered": True, "changedRejected": True})
+
     def _fixture(self, **options):
         module = self.module
         state = {"maintenance_done": False, "equipment_done": False,
                  "persist": True, "event_class": "unchecked", "missing_today": False,
+                 "event_classes": None, "reviewed": False,
                  "total": 1, "filtered": False, "placeholder": False,
                  "equipment_text": "", "equipment_button": True,
+                 "checker": None, "start": None, "end": None,
                  "contradictory_button": False, "no_paging": False,
                  "row_names": None,
                  "button_only_evidence": False, "change_after_save": False,
@@ -222,8 +278,9 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
         state.update(options)
 
         class Element:
-            def __init__(self, role="button", text="", displayed=True):
+            def __init__(self, role="button", text="", displayed=True, event_class=None):
                 self.role, self.text, self.displayed = role, text, displayed
+                self.event_class = event_class
 
             def is_displayed(self):
                 return self.displayed
@@ -237,12 +294,14 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
                 if name == "aria-label":
                     return "2026年10月16日" if state["missing_today"] else "2026年10月17日"
                 if name == "class":
-                    return "checked" if state["maintenance_done"] else state["event_class"]
+                    return "checked" if state["maintenance_done"] else self.event_class or state["event_class"]
                 return ""
 
             def find_elements(self, by, selector):
                 if self.role == "equipment-status" and state["button_only_evidence"]:
                     return [Element(text="完成清點")]
+                if self.role == "event" and selector == ".reviewed" and state["reviewed"]:
+                    return [Element()]
                 return []
 
         class Row(Element):
@@ -260,8 +319,16 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
                         cells[8] = Element(text=vehicle)
                         cells[9] = Element(text="115/10/17" if state["maintenance_done"] else "未完成")
                         return cells
-                    text = state["equipment_text"] or ("115/10/17 已完成" if state["equipment_done"] else "未清點")
-                    return [Element(), Element(), Element(), Element(text=vehicle), Element("equipment-status", text)]
+                    text = state["equipment_text"] or "115/10/17"
+                    checker = state["checker"] if state["checker"] is not None else "同仁" if state["equipment_done"] else "-"
+                    start = state["start"] if state["start"] is not None else "08:40" if state["equipment_done"] else "-"
+                    end = state["end"] if state["end"] is not None else "08:40" if state["equipment_done"] else "-"
+                    return [Element(), Element(), Element(), Element(text=vehicle), Element("equipment-status", text),
+                            Element(text="-"), Element(text=checker), Element(text=start), Element(text=end), Element()]
+                if selector == ".k-grid-view":
+                    return [Element("view")] if state["equipment_done"] else []
+                if selector not in (".k-grid-check", self_module.EQUIPMENT_BUTTON_XPATH):
+                    return []
                 if driver.mode == "equip" and state["equipment_button"] and (not state["equipment_done"] or state["contradictory_button"]):
                     return [Element("check")]
                 return []
@@ -294,7 +361,8 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
 
             def find_elements(self, by, selector):
                 if selector == "#scheduler .k-event":
-                    return [Element("event")]
+                    return ([Element("event", event_class=value) for value in state["event_classes"]]
+                            if state["event_classes"] is not None else [Element("event")])
                 if "swal-button" in selector:
                     return []
                 return []
@@ -325,6 +393,7 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
                     raise module.TimeoutException("fixture condition was not confirmed")
                 return result
 
+        self_module = module
         driver = Driver()
         return driver, Wait(), state, lambda *_args: (
             [Row(vehicle) for vehicle in state["row_names"]] if state["row_names"] is not None else [Row()])
@@ -351,9 +420,36 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
         self.assertEqual(state["saved"], 1)
         self.assertEqual(report["items"][0]["status"], "completed")
 
-    def test_disabled_calendar_is_not_completion_evidence(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
-            self._run_operation("maintenance", event_class="disable")
+    def test_all_disabled_today_is_explicitly_not_required(self) -> None:
+        report, state = self._run_operation("maintenance", event_classes=["k-event disable", "k-event disabled"])
+        self.assertEqual(state["saved"], 0)
+        self.assertEqual(report["items"], [{"vehicle": "CAR-01", "operation": "maintenance",
+                                          "status": "not_required", "reason_code": "not_required"}])
+
+    def test_mixed_or_reviewed_disabled_events_never_become_not_required(self) -> None:
+        for classes, reviewed in ((["disable", "checked"], False), (["disable", "unchecked"], False),
+                                  (["disable unchecked"], False), (["disable reviewed"], False), (["disable"], True)):
+            with self.subTest(classes=classes, reviewed=reviewed), self.assertRaises(RuntimeError):
+                self._run_operation("maintenance", event_classes=classes, reviewed=reviewed)
+
+    def test_live_equipment_fields_prove_completion_without_literal_complete(self) -> None:
+        report, state = self._run_operation("equipment", equipment_done=True)
+        self.assertEqual(state["saved"], 0)
+        self.assertEqual(report["items"][0]["status"], "already_done")
+        for changes in ({"checker": "-"}, {"start": "-"}, {"end": "-"}, {"start": "99:40"}):
+            with self.subTest(changes=changes), self.assertRaises(RuntimeError):
+                self._run_operation("equipment", equipment_done=True, **changes)
+
+    def test_not_required_is_maintenance_only_and_can_complete_full_report(self) -> None:
+        module = self.module
+        report, _state = self._run_operation("maintenance", event_class="disable")
+        self._run_operation("equipment", report, equipment_done=True)
+        self.assertTrue(module.verify_vehicle_report(report))
+        report["reason_code"] = "not_required"
+        self.assertFalse(module.verify_vehicle_report(report))
+        report["reason_code"] = ""
+        report["items"][1].update(status="not_required", reason_code="not_required")
+        self.assertFalse(module.verify_vehicle_report(report))
 
     def test_save_without_persisted_completion_is_unconfirmed(self) -> None:
         for operation in ("maintenance", "equipment"):
