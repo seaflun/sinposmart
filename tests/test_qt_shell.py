@@ -8664,6 +8664,331 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertNotIn("raw diagnostic", controller.updateView["subtitle"])
             self.assertEqual(controller.updateView["diagnosticPath"], str(root / "check.log"))
 
+    def test_heartbeat_fields_recover_only_matching_runtime_manifest(self) -> None:
+        from app_core.update_repository import UpdateRepository, VersionInfo
+        from qt_app.controllers.update_controller import UpdateController
+
+        request_id = "22222222-2222-4222-8222-222222222222"
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            root = Path(temp_dir)
+            version = root / "VERSION.txt"
+            version.write_text("2026.10.18.1045", encoding="utf-8")
+            old = UpdateController(UpdateRepository(version), remote_update_enabled=False)
+            manifest = old._remote_update_manifest_path(request_id)
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"request_id": request_id, "package_dir": str(root),
+                                            "status": "completed", "remote_version": "2026.10.18.1350",
+                                            "installed_version": "2026.10.18.1350"}), encoding="utf-8")
+            version.write_text("2026.10.18.1350", encoding="utf-8")
+            current = UpdateController(UpdateRepository(version), remote_update_enabled=False)
+            try:
+                self.assertEqual(old.heartbeat_fields(), {"update_request_id": "", "target_version": "", "phase": "idle"})
+                self.assertEqual(old.currentVersion, "2026.10.18.1045")
+                old._check_succeeded(old._request_id, VersionInfo("2026.10.18.1350", "2026.10.18.1350", False))
+                self.assertEqual(old.currentVersion, "2026.10.18.1350")
+                self.assertEqual(old.heartbeat_fields(), {"update_request_id": "", "target_version": "", "phase": "idle"})
+                self.assertEqual(current.heartbeat_fields(), {"update_request_id": request_id,
+                                                              "target_version": "2026.10.18.1350", "phase": "completed"})
+                record = json.loads(manifest.read_text(encoding="utf-8"))
+                for key, bad_value in (("package_dir", str(root / "other")), ("request_id", "wrong-request"),
+                                       ("installed_version", "2026.10.18.1045"), ("status", "staged")):
+                    with self.subTest(key=key):
+                        manifest.write_text(json.dumps({**record, key: bad_value}), encoding="utf-8")
+                        self.assertEqual(current.heartbeat_fields()["update_request_id"], "")
+            finally:
+                old.shutdown()
+                current.shutdown()
+
+    def test_heartbeat_fields_use_safe_active_request_without_claiming_updates(self) -> None:
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.update_controller import UpdateController
+
+        request_id = "33333333-3333-4333-8333-333333333333"
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            root = Path(temp_dir)
+            version = root / "VERSION.txt"
+            version.write_text("2026.10.18.1045", encoding="utf-8")
+            controller = UpdateController(UpdateRepository(version), remote_update_enabled=False)
+            controller._remote_update_request_id = request_id
+            controller._remote_update_status = "waiting_handoff"
+            manifest = controller._remote_update_manifest_path(request_id)
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"request_id": request_id, "package_dir": str(root), "status": "staged",
+                                            "remote_version": "2026.10.18.1350"}), encoding="utf-8")
+            try:
+                with patch.object(controller, "_poll_remote_update") as poll, patch.object(controller, "_send_remote_status") as send:
+                    self.assertEqual(controller.heartbeat_fields(), {"update_request_id": request_id,
+                                                                     "target_version": "2026.10.18.1350", "phase": "waiting_handoff"})
+                    controller._remote_update_status = "completed"
+                    self.assertEqual(controller.heartbeat_fields()["phase"], "unknown")
+                    controller._remote_update_request_id = "https://user:secret@host/?token=private"
+                    controller._remote_update_status = "private detail"
+                    self.assertEqual(controller.heartbeat_fields(), {"update_request_id": "", "target_version": "", "phase": "unknown"})
+                    poll.assert_not_called()
+                    send.assert_not_called()
+            finally:
+                controller.shutdown()
+
+    def _installer_heartbeat_fixture(self, root, *, enabled=True, manifest=None):
+        from unittest.mock import Mock
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        request_id = "44444444-4444-4444-8444-444444444444"
+        (root / "VERSION.txt").write_text("2026.10.18.1045", encoding="utf-8")
+        staging = root / "SinpoSmart" / "update_staging" / request_id / "manifest.json"
+        staging.parent.mkdir(parents=True)
+        staging.write_text(json.dumps(manifest if manifest is not None else {
+            "request_id": request_id, "package_dir": str(root), "status": "staged", "remote_version": "2026.10.18.1350",
+        }), encoding="utf-8")
+        reporter = Mock()
+        factory = Mock(return_value=reporter)
+        controller = UpdateProgressController(root / "update_package.ps1", root, request_id=request_id,
+                                              heartbeat_enabled=enabled, heartbeat_reporter_factory=factory,
+                                              heartbeat_service=Mock(heartbeat_enabled=True))
+        return controller, reporter, factory, staging
+
+    def test_installer_heartbeat_captures_instance_versions_and_runs_without_progress_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            root = Path(temp_dir)
+            controller, reporter, factory, staging = self._installer_heartbeat_fixture(root)
+            try:
+                self.assertEqual(factory.call_args.kwargs["component"], "installer")
+                self.assertEqual(factory.call_args.kwargs["app_version"], "2026.10.18.1045")
+                self.assertEqual(factory.call_args.kwargs["target_version"], "2026.10.18.1350")
+                self.assertEqual(factory.call_args.kwargs["request_id"], "44444444-4444-4444-8444-444444444444")
+                self.assertEqual(reporter.pulse.call_args.kwargs["phase"], "startup")
+                self.assertTrue(controller._heartbeat_timer.isActive())
+                self.assertFalse(controller._poll_timer.isActive())
+                (root / "VERSION.txt").write_text("2026.10.18.1800", encoding="utf-8")
+                staging.write_text("{}", encoding="utf-8")
+                controller.accept_progress({"phase": "setup", "percent": 85, "elapsed_seconds": 1})
+                self.assertEqual(reporter.pulse.call_args.kwargs["phase"], "environment_check")
+                count = reporter.pulse.call_count
+                controller.accept_progress({"phase": "setup", "percent": 85, "elapsed_seconds": 2})
+                self.assertEqual(reporter.pulse.call_count, count)
+                controller._pulse_heartbeat(force=True)
+                self.assertEqual(reporter.pulse.call_count, count + 1)
+                self.assertEqual(factory.call_count, 1)
+            finally:
+                controller.shutdown()
+            self.assertEqual(reporter.pulse.call_args.kwargs["state"], "stopping")
+            reporter.stop.assert_called_once_with(timeout=1.0)
+
+    def test_installer_heartbeat_disabled_or_invalid_manifest_keeps_failure_observable(self) -> None:
+        for enabled, manifest in ((False, None), (True, {}), (True, "broken JSON record"),
+                                  (True, {"request_id": "wrong-request"}),
+                                  (True, {"request_id": "44444444-4444-4444-8444-444444444444", "package_dir": "other",
+                                          "remote_version": "2026.10.18.1350"})):
+            with self.subTest(enabled=enabled, manifest=manifest), tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+                controller, reporter, factory, _ = self._installer_heartbeat_fixture(Path(temp_dir), enabled=enabled, manifest=manifest)
+                try:
+                    if enabled:
+                        self.assertEqual(factory.call_args.kwargs["target_version"], "")
+                        controller.process_finished(1)
+                        self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+                        self.assertTrue(controller._heartbeat_timer.isActive())
+                    else:
+                        factory.assert_not_called()
+                        reporter.pulse.assert_not_called()
+                        self.assertFalse(controller._heartbeat_timer.isActive())
+                finally:
+                    controller.shutdown()
+
+    def test_installer_failed_view_keeps_heartbeat_and_preserves_terminal_result_on_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+            controller.process_finished(9)
+            self.assertEqual(reporter.pulse.call_args.kwargs["state"], "failed")
+            self.assertEqual(reporter.pulse.call_args.kwargs["phase"], "failed")
+            self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+            self.assertEqual(reporter.pulse.call_args.kwargs["exit_code"], 9)
+            self.assertTrue(controller._heartbeat_timer.isActive())
+            self.assertFalse(controller._poll_timer.isActive())
+            controller._pulse_heartbeat(force=True)
+            controller.shutdown()
+            self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+            self.assertEqual(reporter.pulse.call_args.kwargs["state"], "stopping")
+            reporter.stop.assert_called_once_with(timeout=1.0)
+
+    def test_installer_heartbeat_needs_zero_exit_installed_pid_and_ready_before_completion(self) -> None:
+        for ready in (False, True):
+            with self.subTest(ready=ready), tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+                controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+                try:
+                    controller.accept_progress({"phase": "installed", "percent": 98, "pid": 123})
+                    controller.confirm_window_ready("ready:123")
+                    self.assertNotEqual(reporter.pulse.call_args.kwargs["result_code"], "update_completed")
+                    controller.process_finished(0)
+                    controller.confirm_window_ready("ready:999")
+                    self.assertEqual(reporter.pulse.call_args.kwargs["phase"], "waiting_gui")
+                    if ready:
+                        controller.confirm_window_ready("ready:123")
+                        self.assertEqual(reporter.pulse.call_args.kwargs["phase"], "completed")
+                        self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "update_completed")
+                    else:
+                        controller._waiting_since = time.monotonic() - 61
+                        controller.poll()
+                        self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "gui_ready_timeout")
+                    self.assertTrue(controller._heartbeat_timer.isActive())
+                    self.assertEqual(reporter.pulse.call_args.kwargs["exit_code"], 0)
+                finally:
+                    controller.shutdown()
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+            try:
+                controller.process_finished(0)
+                self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+            finally:
+                controller.shutdown()
+
+    def test_installer_gui_start_failure_uses_safe_result_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+            try:
+                controller.accept_progress({"phase": "restarting", "percent": 95})
+                controller.process_finished(1)
+                self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "gui_start_failed")
+                self.assertEqual(set(reporter.pulse.call_args.kwargs), {
+                    "state", "login_state", "phase", "result_code", "exit_code", "progress_percent",
+                })
+            finally:
+                controller.shutdown()
+
+    def test_installer_invalid_target_keeps_valid_early_failure_heartbeat(self) -> None:
+        for target in ("1.2.3.4", "2026.1.18.1350", "https://host/?token=private", True):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+                root = Path(temp_dir)
+                controller, reporter, factory, _ = self._installer_heartbeat_fixture(root, manifest={
+                    "request_id": "44444444-4444-4444-8444-444444444444", "package_dir": str(root),
+                    "status": "staged", "remote_version": target,
+                })
+                try:
+                    self.assertEqual(factory.call_args.kwargs["target_version"], "")
+                    controller.process_finished(1)
+                    self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+                finally:
+                    controller.shutdown()
+
+    def test_installer_current_version_is_idle_without_install_completion_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+            try:
+                controller.accept_progress({"phase": "current", "percent": 2})
+                controller.process_finished(0)
+                fields = reporter.pulse.call_args.kwargs
+                self.assertEqual((fields["state"], fields["phase"], fields["result_code"]), ("idle", "idle", ""))
+                self.assertEqual(controller.updateView["phase"], "current")
+            finally:
+                controller.shutdown()
+
+    def test_installer_real_reporter_sends_only_technical_frozen_instance_data(self) -> None:
+        import threading
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        class Service:
+            heartbeat_enabled = True
+
+            def __init__(self):
+                self.records = []
+                self.received = threading.Event()
+
+            def send_heartbeat(self, payload):
+                self.records.append(dict(payload))
+                self.received.set()
+                return {"ok": True, "accepted": True}
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            root = Path(temp_dir)
+            request_id = "66666666-6666-4666-8666-666666666666"
+            (root / "VERSION.txt").write_text("2026.10.18.1045", encoding="utf-8")
+            service = Service()
+            controller = UpdateProgressController(root / "update_package.ps1", root, request_id=request_id,
+                                                  heartbeat_enabled=True, heartbeat_service=service)
+            try:
+                self.assertTrue(service.received.wait(1))
+                first = service.records[0]
+                service.received.clear()
+                (root / "VERSION.txt").write_text("2026.10.18.1800", encoding="utf-8")
+                controller.process_finished(1)
+                self.assertTrue(service.received.wait(1))
+            finally:
+                controller.shutdown()
+            self.assertEqual(service.records[-1]["state"], "stopping")
+            self.assertEqual(service.records[-1]["result_code"], "installer_failed")
+            for record in service.records:
+                self.assertEqual(record["app_version"], "2026.10.18.1045")
+                self.assertEqual(record["target_version"], "")
+                self.assertEqual(record["update_request_id"], request_id)
+                self.assertEqual(record["instance_id"], first["instance_id"])
+                self.assertEqual(record["process_started_at"], first["process_started_at"])
+                self.assertEqual(record["login_state"], "unknown")
+                self.assertFalse({"detail", "error", "path", "actor", "account", "password", "token"} & set(record))
+            self.assertEqual([row["sequence"] for row in service.records], sorted({row["sequence"] for row in service.records}))
+
+    def test_installer_unwritable_error_log_still_reports_failed_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
+            try:
+                with patch("qt_app.controllers.update_controller.subprocess.Popen", side_effect=OSError("fixture start failed")), \
+                        patch.object(Path, "write_text", side_effect=PermissionError("fixture log denied")):
+                    controller.start()
+                self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "installer_failed")
+                self.assertEqual(reporter.pulse.call_args.kwargs["exit_code"], 1)
+            finally:
+                controller.shutdown()
+
+    def test_installer_missing_qml_root_reports_failure_and_flushes_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "VERSION.txt").write_text("2026.10.18.1045", encoding="utf-8")
+            code = (
+                "import sys; from unittest.mock import Mock, patch; "
+                "import qt_app.controllers.update_controller as m; "
+                "import app_core.operational_sync_service as sync; "
+                "reporter=Mock(); factory=Mock(return_value=reporter); sync.GuiHeartbeatReporter=factory; "
+                "sync.OperationalSyncService=Mock(return_value=Mock(heartbeat_enabled=True)); "
+                "engine=Mock(); engine.rootObjects.return_value=[]; "
+                "exec('with patch(\"PySide6.QtQml.QQmlApplicationEngine\", return_value=engine):\\n result=m.run_update_window([\"--install\",sys.argv[1],\"--state-dir\",sys.argv[2],\"--request-id\",\"77777777-7777-4777-8777-777777777777\"])'); "
+                "assert result == 1; assert factory.call_count == 1; "
+                "assert reporter.pulse.call_args.kwargs['state'] == 'stopping'; "
+                "assert reporter.pulse.call_args.kwargs['result_code'] == 'installer_failed'; "
+                "reporter.stop.assert_called_once_with(timeout=1.0)"
+            )
+            process = subprocess.run(
+                [sys.executable, "-c", code, str(root / "fixture.ps1"), str(root)],
+                cwd=str(PACKAGE_ROOT), env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+                capture_output=True, text=True, timeout=12,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+
+    def test_installer_preview_and_startup_smoke_never_create_reporter_or_installer(self) -> None:
+        for mode in ("--preview", "--startup-smoke-test"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                code = (
+                    "import sys; from unittest.mock import Mock; "
+                    "from PySide6.QtCore import QTimer; from PySide6.QtWidgets import QApplication; "
+                    "import qt_app.controllers.update_controller as m; "
+                    "import app_core.operational_sync_service as sync; "
+                    "reporter=Mock(); sync.GuiHeartbeatReporter=reporter; "
+                    "original=m.UpdateProgressController; "
+                    "factory=lambda *a,**kw: original(*a,**kw); "
+                    "controllers=[]; "
+                    "exec('def create(*a, **kw):\\n c=factory(*a, **kw)\\n controllers.append(c)\\n if sys.argv[1] == \"--preview\": QTimer.singleShot(100, QApplication.instance().quit)\\n return c'); "
+                    "m.UpdateProgressController=create; "
+                    "result=m.run_update_window([sys.argv[1],'--request-id','55555555-5555-4555-8555-555555555555',"
+                    "'--install',sys.argv[2],'--state-dir',sys.argv[3]]); "
+                    "assert reporter.call_count == 0; assert controllers[0]._process is None; "
+                    "raise SystemExit(result)"
+                )
+                process = subprocess.run(
+                    [sys.executable, "-c", code, mode, str(root / "fixture.ps1"), str(root)],
+                    cwd=str(PACKAGE_ROOT), env={**os.environ, "QT_QPA_PLATFORM": "offscreen",
+                                              "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-only-token"},
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+
     def test_installer_progress_survives_partial_status_and_never_claims_early_success(self) -> None:
         from qt_app.controllers.update_controller import UpdateProgressController
 
@@ -9480,6 +9805,257 @@ class DiagnosticsServiceTests(unittest.TestCase):
 
 
 class OperationalSyncServiceTests(unittest.TestCase):
+    def test_heartbeat_redirect_never_contacts_redirect_destination(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        redirected, origin = [], []
+
+        class Destination(BaseHTTPRequestHandler):
+            def do_GET(self):
+                redirected.append(bool(self.headers.get("X-Credential-Sync-Token")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *_args):
+                pass
+
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_GET(self):
+                origin.append(bool(self.headers.get("X-Credential-Sync-Token")))
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/different-destination")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        servers = (server, destination)
+        threads = [threading.Thread(target=lambda target=target: target.serve_forever(poll_interval=0.01), daemon=True)
+                   for target in servers]
+        for thread in threads:
+            thread.start()
+        try:
+            captured = []
+            reporter = GuiHeartbeatReporter(SimpleNamespace(heartbeat_enabled=True, send_heartbeat=lambda payload: captured.append(payload)),
+                                            component="gui", app_version="2026.10.18.1350")
+            reporter.pulse(state="idle")
+            reporter.stop()
+            with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "SINPOSMART_BACKEND_EVENT_URL": f"http://127.0.0.1:{server.server_port}/api/sinposmart/events",
+                "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-only-token",
+                "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
+            }):
+                service = OperationalSyncService(Path(directory))
+                with self.assertRaisesRegex(RuntimeError, "心跳無法確認連線"):
+                    service.send_heartbeat(captured[0])
+                self.assertFalse(service.pending_path.exists())
+            self.assertEqual(origin, [True])
+            self.assertEqual(redirected, [])
+        finally:
+            for target in servers:
+                target.shutdown()
+                target.server_close()
+            for thread in threads:
+                thread.join(1)
+
+    def test_heartbeat_transport_pins_identity_without_durable_events(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        server_id = "366be866-51b0-49df-8712-a6d4f56f592d"
+        server = {"instance_id": server_id, "version": "2026.10.18.1352", "deployment": "test"}
+        requests = []
+
+        def open_request(request, **_kwargs):
+            requests.append(request)
+            response = ({"ok": True, "server": server} if request.method == "GET" else
+                        {"ok": True, "accepted": True, "server": server,
+                         "received_at": "2026-10-18T09:00:00+00:00"})
+            handle = Mock()
+            handle.__enter__ = Mock(return_value=handle)
+            handle.__exit__ = Mock(return_value=False)
+            handle.read.return_value = json.dumps(response).encode()
+            return handle
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid:8080/api/sinposmart/events?discard=1#discard",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
+        }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
+            service = OperationalSyncService(Path(directory))
+            reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.18.1350")
+            self.assertTrue(reporter.pulse(state="idle", login_state="logged_out", phase="idle"))
+            reporter.stop()
+            self.assertFalse(service.pending_path.exists())
+
+        self.assertEqual([request.method for request in requests], ["GET", "POST"])
+        self.assertEqual(requests[0].full_url, "http://nas.invalid:8080/api/sinposmart/identity")
+        self.assertEqual(requests[1].full_url, "http://nas.invalid:8080/api/sinposmart/heartbeat")
+        payload = json.loads(requests[1].data)
+        self.assertEqual(payload["route"], {"name": "configured", "identity_status": "verified", "instance_id": server_id})
+        self.assertEqual(payload["app_version"], "2026.10.18.1350")
+        self.assertEqual(payload["sequence"], 1)
+        self.assertNotIn("test-only-token", json.dumps(payload))
+
+    def test_heartbeat_reporter_coalesces_ui_pulses_and_stop_is_bounded(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter
+
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        sent = []
+
+        def send(payload):
+            sent.append(dict(payload))
+            entered.set()
+            release.wait(2)
+            if len(sent) == 2:
+                finished.set()
+            return {"ok": True}
+
+        service = SimpleNamespace(heartbeat_enabled=True, send_heartbeat=send)
+        reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.18.1350")
+        self.assertTrue(reporter.pulse(state="starting", phase="startup"))
+        self.assertTrue(entered.wait(1))
+        started = time.monotonic()
+        for _ in range(8):
+            reporter.pulse(state="idle", login_state="logged_out", phase="idle")
+        reporter.pulse(state="stopping", phase="stopping", result_code="closed")
+        reporter.stop(timeout=0.01)
+        self.assertLess(time.monotonic() - started, 0.3)
+        release.set()
+        self.assertTrue(finished.wait(1))
+        self.assertEqual([row["sequence"] for row in sent], [1, 10])
+        self.assertEqual(sent[-1]["result_code"], "closed")
+        self.assertEqual(sent[0]["instance_id"], sent[1]["instance_id"])
+        self.assertFalse(reporter.pulse(state="idle"))
+
+    def test_heartbeat_transport_rejects_identity_changes_and_unsafe_endpoints(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        captured = []
+        fake_service = SimpleNamespace(heartbeat_enabled=True, send_heartbeat=lambda payload: captured.append(payload))
+        reporter = GuiHeartbeatReporter(fake_service, component="gui", app_version="2026.10.18.1350")
+        reporter.pulse(state="idle", phase="idle")
+        reporter.stop()
+        payload = captured[0]
+        original_id = "366be866-51b0-49df-8712-a6d4f56f592d"
+        requests = []
+        change_identity = False
+
+        def open_request(request, **_kwargs):
+            requests.append(request)
+            identity = "68586a61-6ad7-4533-9083-6c2d54ca501f" if change_identity else original_id
+            response = {"ok": True, "server": {"instance_id": identity, "version": "2026.10.18.1352", "deployment": "test"},
+                        "accepted": True, "received_at": "2026-10-18T09:00:00+00:00"}
+            handle = Mock()
+            handle.__enter__ = Mock(return_value=handle)
+            handle.__exit__ = Mock(return_value=False)
+            handle.read.return_value = json.dumps(response).encode()
+            return handle
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
+        }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
+            service = OperationalSyncService(Path(directory))
+            service.send_heartbeat(payload)
+            change_identity = True
+            os.environ["SINPOSMART_BACKEND_EVENT_URL"] = "http://other.invalid/api/sinposmart/events"
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "心跳無法確認連線"):
+                    service.send_heartbeat(payload)
+            status = service.status_path.read_text(encoding="utf-8")
+            self.assertNotIn("nas.invalid", status)
+            self.assertNotIn("test-only-token", status)
+            self.assertEqual(len([row for row in requests if row.method == "GET"]), 1)
+            self.assertTrue(all(row.full_url.startswith("http://nas.invalid/") for row in requests))
+            self.assertTrue(all(json.loads(row.data)["route"]["instance_id"] == original_id
+                                for row in requests if row.method == "POST"))
+            with patch("urllib.request.OpenerDirector.open") as network:
+                for endpoint in ("http://user:secret@nas.invalid/api/sinposmart/events", "http://nas.invalid/wrong", "file:///api/sinposmart/events"):
+                    os.environ["SINPOSMART_BACKEND_EVENT_URL"] = endpoint
+                    unsafe = OperationalSyncService(Path(directory))
+                    self.assertFalse(unsafe.heartbeat_enabled)
+                    with self.assertRaises(RuntimeError):
+                        unsafe.send_heartbeat(payload)
+                network.assert_not_called()
+
+    def test_heartbeat_transport_rejects_extra_private_fields_and_boolean_integers(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        captured = []
+        reporter = GuiHeartbeatReporter(SimpleNamespace(heartbeat_enabled=True, send_heartbeat=lambda payload: captured.append(payload)),
+                                        component="gui", app_version="2026.10.18.1350")
+        reporter.pulse(state="idle")
+        reporter.stop()
+        payload = captured[0]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
+        }), patch("urllib.request.OpenerDirector.open") as network:
+            service = OperationalSyncService(Path(directory))
+            for changes in ({"actor_no": "12"}, {"error": "private"}, {"sequence": True}, {"process_id": False},
+                            {"route": {"instance_id": "spoof"}}, {"phase": ["idle"]}):
+                with self.subTest(changes=changes), self.assertRaises(RuntimeError):
+                    service.send_heartbeat({**payload, **changes})
+            network.assert_not_called()
+
+    def test_heartbeat_reporter_disabled_requires_strict_true_and_no_thread(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter
+
+        for enabled in (False, 1, "true", None):
+            with self.subTest(enabled=enabled), patch("threading.Thread") as thread:
+                service = SimpleNamespace(heartbeat_enabled=enabled, send_heartbeat=Mock())
+                reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.18.1350")
+                self.assertFalse(reporter.pulse(state="idle"))
+                reporter.stop()
+                thread.assert_not_called()
+                service.send_heartbeat.assert_not_called()
+
+    def test_heartbeat_reporter_recovers_without_replaying_failed_pulse(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter
+
+        attempted, recovered = threading.Event(), threading.Event()
+        sent = []
+
+        def send(payload):
+            sent.append(dict(payload))
+            if len(sent) == 1:
+                attempted.set()
+                raise RuntimeError("secret-cookie-must-not-persist")
+            recovered.set()
+            return {"ok": True}
+
+        service = SimpleNamespace(heartbeat_enabled=True, send_heartbeat=send)
+        reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.18.1350")
+        reporter.pulse(state="starting", phase="startup")
+        self.assertTrue(attempted.wait(1))
+        reporter.pulse(state="busy", login_state="logged_in", phase="busy")
+        self.assertTrue(recovered.wait(1))
+        reporter.stop()
+        self.assertEqual([row["sequence"] for row in sent], [1, 2])
+        self.assertEqual(sent[-1]["state"], "busy")
+
+    def test_heartbeat_reporter_rejects_invalid_types_and_installer_request_switch(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter
+
+        sent = []
+        service = SimpleNamespace(heartbeat_enabled=True, send_heartbeat=lambda payload: sent.append(payload))
+        request_id = "b8b89564-245a-4bc8-b695-0534d1ad93d6"
+        reporter = GuiHeartbeatReporter(service, component="installer", app_version="2026.10.18.1350", request_id=request_id)
+        self.assertFalse(reporter.pulse(state="updating", phase="installing", exit_code=True))
+        self.assertFalse(reporter.pulse(state="updating", phase="installing", progress_percent=True))
+        self.assertFalse(reporter.pulse(state="updating", phase="installing", login_state="logged_in"))
+        self.assertFalse(reporter.pulse(state="updating", phase="installing", update_request_id="68586a61-6ad7-4533-9083-6c2d54ca501f"))
+        self.assertFalse(reporter.pulse(state="updating", phase="installing", target_version="2026.10.18.9999"))
+        self.assertTrue(reporter.pulse(state="updating", phase="installing", progress_percent=60))
+        reporter.stop()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["update_request_id"], request_id)
+        self.assertEqual(sent[0]["sequence"], 1)
+
     def test_board_payload_is_stable_and_sync_deduplicates_successful_content(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService, build_duty_board_payload
 
@@ -9753,6 +10329,92 @@ class QtShellTests(unittest.TestCase):
         for _ in range(2):
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             QCoreApplication.processEvents()
+
+    def test_gui_heartbeat_starts_before_login_and_survives_update_handoff(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        reporter = SimpleNamespace(pulse=Mock(return_value=True), stop=Mock())
+        service = SimpleNamespace(heartbeat_enabled=False)
+        with patch("qt_app.controllers.app_controller.GuiHeartbeatReporter", return_value=reporter) as factory:
+            controller = AppController(operational_sync_service=service)
+            try:
+                self.app.processEvents()
+                self.assertEqual(reporter.pulse.call_args.kwargs["state"], "starting")
+                self.assertEqual(reporter.pulse.call_args.kwargs["login_state"], "logged_out")
+                self.assertEqual(controller._heartbeat_timer.interval(), 10_000)
+                factory.assert_called_once_with(service, component="gui", app_version=controller.updateController.currentVersion)
+                controller._pulse_gui_heartbeat()
+                self.assertEqual(reporter.pulse.call_args.kwargs["state"], "idle")
+                controller._session_state.login_running = True
+                controller._pulse_gui_heartbeat()
+                self.assertEqual(reporter.pulse.call_args.kwargs["login_state"], "logging_in")
+                controller._session_state.login_running = False
+                controller._session_state.session = LoginSession("12", "private-user", "private-password", verified=True)
+                controller._pulse_gui_heartbeat()
+                self.assertEqual(reporter.pulse.call_args.kwargs["login_state"], "logged_in")
+                with patch.object(controller, "_stop_block_reason", return_value="private work content"):
+                    controller._pulse_gui_heartbeat()
+                self.assertEqual(reporter.pulse.call_args.kwargs["state"], "busy")
+                controller._session_state.session = None
+                self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+                self.assertTrue(controller._heartbeat_timer.isActive())
+                controller._pulse_gui_heartbeat()
+                self.assertEqual(reporter.pulse.call_args.kwargs["state"], "updating")
+                serialized = str(reporter.pulse.call_args_list)
+                for value in ("private-user", "private-password", "private work content", "actor_no"):
+                    self.assertNotIn(value, serialized)
+            finally:
+                controller.shutdown()
+        self.assertEqual(reporter.pulse.call_args.kwargs["result_code"], "closed")
+        self.assertFalse(controller._heartbeat_timer.isActive())
+        reporter.stop.assert_called_once_with(timeout=1.0)
+
+    def test_gui_heartbeat_network_does_not_block_ui_or_update_guard(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        entered, release = threading.Event(), threading.Event()
+        pulses = []
+
+        def send(payload):
+            pulses.append(dict(payload))
+            entered.set()
+            release.wait(2)
+
+        service = SimpleNamespace(heartbeat_enabled=True, send_heartbeat=send)
+        controller = AppController(operational_sync_service=service)
+        try:
+            self.app.processEvents()
+            self.assertTrue(entered.wait(1))
+            controller._heartbeat_timer.setInterval(10)
+            started = time.monotonic()
+            while time.monotonic() - started < 0.06:
+                self.app.processEvents()
+            self.assertEqual(controller._stop_block_reason(), "")
+            self.assertFalse(controller._operational_sync_workers)
+            self.assertFalse(controller._operational_sync_queue)
+            self.assertEqual(len(pulses), 1)
+            self.assertLess(time.monotonic() - started, 0.3)
+        finally:
+            release.set()
+            controller.shutdown()
+        self.assertEqual(pulses[-1]["result_code"], "closed")
+
+    def test_gui_heartbeat_is_disabled_for_all_isolated_startup_modes(self) -> None:
+        from qt_app.main import create_app_controller, STARTUP_SMOKE_ARG, READ_ONLY_ACCEPTANCE_ARG, AUDIT_FIXTURE_ACCEPTANCE_ARG
+
+        with patch("qt_app.controllers.app_controller.GuiHeartbeatReporter") as reporter:
+            for argument in (STARTUP_SMOKE_ARG, READ_ONLY_ACCEPTANCE_ARG, AUDIT_FIXTURE_ACCEPTANCE_ARG):
+                controller = create_app_controller(["test", argument])
+                try:
+                    self.app.processEvents()
+                    self.assertFalse(controller._heartbeat_timer.isActive())
+                    self.assertIsNone(controller._heartbeat_reporter)
+                finally:
+                    controller.shutdown()
+                    from qt_app.main import cleanup_acceptance_directory
+                    cleanup_acceptance_directory(controller)
+            reporter.assert_not_called()
 
     def test_nas_cancellation_blocks_manual_submission_only_on_original_date(self):
         from app_core.unreturned_return_queue import UnreturnedReturnQueue

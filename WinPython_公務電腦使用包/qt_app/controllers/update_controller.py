@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -178,6 +179,38 @@ def _version_order_key(version: str) -> tuple[int, ...] | None:
     return tuple(int(part) for part in parts)
 
 
+def _heartbeat_request_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        return str(uuid.UUID(value)) if len(value) == 36 else ""
+    except ValueError:
+        return ""
+
+
+def _heartbeat_version(value: Any) -> str:
+    return value if (isinstance(value, str)
+                     and re.fullmatch(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{4}", value) is not None) else ""
+
+
+def _heartbeat_stage_manifest(path: Path, request_id: str, package_root: Path) -> dict[str, Any]:
+    """Read only a bounded, matching local install manifest; never control an update."""
+    try:
+        if path.stat().st_size > 65_536:
+            return {}
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+        if (not isinstance(record, dict) or not request_id
+                or _heartbeat_request_id(record.get("request_id")) != request_id
+                or not isinstance(record.get("package_dir"), str)
+                or not record["package_dir"]
+                or Path(record["package_dir"]).resolve() != package_root.resolve()
+                or not _heartbeat_version(record.get("remote_version"))):
+            return {}
+        return record
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return {}
+
+
 class UpdateController(UpdateWindowState):
     unreturnedCancellationsReceived = Signal(object)
     stateChanged = Signal()
@@ -257,6 +290,7 @@ class UpdateController(UpdateWindowState):
             self._current_version = repository.current_version()
         except UpdateCheckError as exc:
             self._status_text = str(exc)
+        self._heartbeat_runtime_version = self._current_version
         if self._remote_update_enabled:
             self._remote_update_poll_timer.start()
             QTimer.singleShot(0, self._poll_remote_update)
@@ -268,6 +302,43 @@ class UpdateController(UpdateWindowState):
     @Property(str, notify=stateChanged)
     def currentVersion(self) -> str:
         return self._current_version
+
+    def heartbeat_fields(self) -> dict[str, str]:
+        """Expose technical update context, using the frozen running version only."""
+        request_id = _heartbeat_request_id(self._remote_update_request_id)
+        phase = {
+            "pending": "preparing", "preparing": "preparing", "staged": "staged",
+            "waiting_handoff": "waiting_handoff", "applying": "applying", "updating": "applying",
+            "failed": "failed", "timed_out": "failed", "completed": "completed", "up_to_date": "completed",
+            "": "idle",
+        }.get(self._remote_update_status, "unknown")
+        package_root = self._repository.version_path.parent
+        if request_id:
+            manifest = _heartbeat_stage_manifest(self._remote_update_manifest_path(request_id), request_id, package_root)
+            target = _heartbeat_version(manifest.get("remote_version"))
+            if phase == "completed" and not (
+                manifest.get("status") in {"completed", "up_to_date"}
+                and manifest.get("installed_version") == self._heartbeat_runtime_version
+            ):
+                phase = "unknown"
+            return {"update_request_id": request_id, "target_version": target, "phase": phase}
+        if self._remote_update_request_id:
+            return {"update_request_id": "", "target_version": "", "phase": "unknown"}
+        # The new GUI can start just before the installer writes its final manifest.
+        # Recover telemetry only; existing claim/status reconciliation stays untouched.
+        root = self._remote_update_manifest_path("heartbeat").parent.parent
+        try:
+            candidates = sorted(root.glob("*/manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True)[:100]
+        except OSError:
+            candidates = []
+        for path in candidates:
+            candidate_id = _heartbeat_request_id(path.parent.name)
+            manifest = _heartbeat_stage_manifest(path, candidate_id, package_root)
+            if (manifest.get("status") in {"completed", "up_to_date"}
+                    and manifest.get("installed_version") == self._heartbeat_runtime_version
+                    and _heartbeat_version(self._heartbeat_runtime_version)):
+                return {"update_request_id": candidate_id, "target_version": manifest["remote_version"], "phase": "completed"}
+        return {"update_request_id": "", "target_version": "", "phase": phase}
 
     @Property("QVariantMap", notify=stateChanged)
     def updateHistory(self) -> dict[str, Any]:
@@ -1139,7 +1210,11 @@ class UpdateProgressController(UpdateWindowState):
 
     installerFinished = Signal()
 
-    def __init__(self, script_path: Path, state_dir: Path, parent: QObject | None = None, *, request_id: str = "") -> None:
+    def __init__(
+        self, script_path: Path, state_dir: Path, parent: QObject | None = None, *, request_id: str = "",
+        heartbeat_enabled: bool = False, heartbeat_reporter_factory: Callable[..., Any] | None = None,
+        heartbeat_service: Any | None = None,
+    ) -> None:
         super().__init__(parent)
         from PySide6.QtNetwork import QLocalSocket
 
@@ -1151,6 +1226,14 @@ class UpdateProgressController(UpdateWindowState):
         self._exit_code = None
         self._expected_pid = 0
         self._waiting_since = None
+        self._heartbeat_reporter: Any | None = None
+        self._heartbeat_snapshot: dict[str, Any] | None = None
+        self._heartbeat_started = False
+        self._heartbeat_closing = False
+        self._heartbeat_result_code = ""
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(10_000)
+        self._heartbeat_timer.timeout.connect(lambda: self._pulse_heartbeat(force=True))
         self._socket = QLocalSocket(self)
         self._socket.connected.connect(lambda: self._socket.write(
             b"update_status_handoff\n" if self._request_id else b"update_status\n"
@@ -1169,11 +1252,96 @@ class UpdateProgressController(UpdateWindowState):
             footer="更新期間無法取消或暫停，請勿關閉電腦。",
             diagnosticPath=str(state_dir / "installer.log"),
         )
+        if heartbeat_enabled is True:
+            self._start_heartbeat(heartbeat_service, heartbeat_reporter_factory)
+
+    def _start_heartbeat(self, service: Any, reporter_factory: Callable[..., Any] | None) -> None:
+        request_id = _heartbeat_request_id(self._request_id)
+        if not request_id:
+            return
+        try:
+            from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+            package_root = self._script_path.parent
+            version = _heartbeat_version(UpdateRepository(package_root / "VERSION.txt").current_version())
+            manifest = _heartbeat_stage_manifest(
+                Path(os.environ.get("LOCALAPPDATA", "").strip() or tempfile.gettempdir())
+                / "SinpoSmart" / "update_staging" / request_id / "manifest.json", request_id, package_root,
+            )
+            if not version:
+                return
+            service = service if service is not None else OperationalSyncService(package_root)
+            if service.heartbeat_enabled is not True:
+                return
+            self._heartbeat_reporter = (reporter_factory or GuiHeartbeatReporter)(
+                service, component="installer", app_version=version,
+                request_id=request_id, target_version=manifest.get("remote_version", ""),
+            )
+        except Exception:
+            return  # Telemetry must never block or change installation behavior.
+        self._heartbeat_timer.start()
+        self._pulse_heartbeat(force=True)
+
+    def _show_view(self, **values: Any) -> None:
+        super()._show_view(**values)
+        if hasattr(self, "_heartbeat_reporter"):
+            self._pulse_heartbeat()
+
+    def _pulse_heartbeat(self, *, force: bool = False) -> None:
+        if self._heartbeat_reporter is None:
+            return
+        phase = {
+            "checking": "preflight", "downloading": "preparing", "verifying": "preflight",
+            "backup": "preparing", "extracting": "preparing", "closing": "waiting_parent",
+            "waiting_idle": "waiting_busy", "installing": "installing", "setup": "environment_check",
+            "environment": "environment_check", "restarting": "restarting", "installed": "waiting_gui",
+            "current": "preflight", "completed": "completed", "failed": "failed",
+        }.get(self._view["phase"], "unknown")
+        state = "updating"
+        if not self._heartbeat_started:
+            state, phase = "starting", "startup"
+        if self._view["phase"] == "failed":
+            state, phase = "failed", "failed"
+        elif self._view["phase"] == "current" and self._exit_code == 0:
+            state, phase = "idle", "idle"
+        elif self._heartbeat_result_code == "update_completed":
+            state, phase = "idle", "completed"
+        if self._heartbeat_closing:
+            state, phase = "stopping", "stopping"
+        progress = self._view["progress"]
+        fields = {
+            "state": state, "login_state": "unknown", "phase": phase,
+            "result_code": self._heartbeat_result_code or ("closed" if self._heartbeat_closing else ""),
+            "exit_code": self._exit_code,
+            "progress_percent": progress if type(progress) is int and 0 <= progress <= 100 else None,
+        }
+        if not force and fields == self._heartbeat_snapshot:
+            return
+        try:
+            self._heartbeat_reporter.pulse(**fields)
+        except Exception:
+            return
+        self._heartbeat_snapshot = fields
+
+    def shutdown(self) -> None:
+        self._heartbeat_timer.stop()
+        reporter = self._heartbeat_reporter
+        if reporter is None:
+            return
+        self._heartbeat_closing = True
+        self._pulse_heartbeat(force=True)
+        try:
+            reporter.stop(timeout=1.0)
+        except Exception:
+            pass
+        self._heartbeat_reporter = None
 
     @Slot()
     def start(self) -> None:
         if self._process is not None or self._exit_code is not None:
             return
+        self._heartbeat_started = True
+        self._pulse_heartbeat(force=True)
         command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                    "-File", str(self._script_path), "-AssumeYes", "-RestartAfterUpdate",
                    "-ProgressPath", str(self._status_path)]
@@ -1188,7 +1356,10 @@ class UpdateProgressController(UpdateWindowState):
                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                 )
         except OSError as exc:
-            (self._state_dir / "installer.log").write_text(str(exc), encoding="utf-8")
+            try:
+                (self._state_dir / "installer.log").write_text(str(exc), encoding="utf-8")
+            except OSError:
+                pass
             self.process_finished(1)
             return
         self._poll_timer.start()
@@ -1207,6 +1378,7 @@ class UpdateProgressController(UpdateWindowState):
             if type(pid) is not int or pid <= 0:
                 return
             self._expected_pid = pid
+        self._heartbeat_started = True
         detail = UPDATE_PHASE_TEXT[phase]
         elapsed = record.get("elapsed_seconds")
         if phase in ("setup", "environment") and type(elapsed) is int and elapsed > 0:
@@ -1229,7 +1401,8 @@ class UpdateProgressController(UpdateWindowState):
                     self.process_finished(code)
         if self._waiting_since is not None:
             if time.monotonic() - self._waiting_since >= 60:
-                self._fail("更新檔案已安裝，但尚未確認登入畫面。", "請手動開啟 SinpoSmart，並查看更新紀錄。")
+                self._fail("更新檔案已安裝，但尚未確認登入畫面。", "請手動開啟 SinpoSmart，並查看更新紀錄。",
+                           result_code="gui_ready_timeout")
             elif self._socket.state() == self._socket.LocalSocketState.UnconnectedState:
                 self._reply.clear()
                 self._socket.connectToServer(UPDATE_INSTANCE_SERVER)
@@ -1237,9 +1410,11 @@ class UpdateProgressController(UpdateWindowState):
 
     def process_finished(self, exit_code: int) -> None:
         self._exit_code = exit_code
+        self._heartbeat_started = True
         self.installerFinished.emit()
         if exit_code != 0:
-            self._fail("這次更新未完成。", "請查看更新紀錄；若主程式未開啟，請手動重新開啟。")
+            self._fail("這次更新未完成。", "請查看更新紀錄；若主程式未開啟，請手動重新開啟。",
+                       result_code="gui_start_failed" if self._view["phase"] == "restarting" else "installer_failed")
         elif self._view["phase"] == "current":
             self._poll_timer.stop()
             self._show_view(title="目前已是最新版", subtitle="不需要安裝更新。", busy=False,
@@ -1249,6 +1424,7 @@ class UpdateProgressController(UpdateWindowState):
             self._poll_timer.start()
         else:
             self._fail("未收到完整的更新結果。", "請查看更新紀錄，確認目前安裝狀態。")
+        self._pulse_heartbeat()
 
     def _read_ready_response(self) -> None:
         self._reply.extend(bytes(self._socket.readAll()))
@@ -1261,13 +1437,16 @@ class UpdateProgressController(UpdateWindowState):
             return
         self._waiting_since = None
         self._poll_timer.stop()
+        self._heartbeat_result_code = "update_completed"
         self._show_view(phase="completed", title="更新完成",
                         subtitle="值班台已重新開啟。" if self._request_id else "登入畫面已開啟。",
                         detail="可以開始使用 SinpoSmart。", progress=100, busy=False,
                         footer="此視窗將自動關閉。")
         QTimer.singleShot(900, self.dismissUpdateWindow)
 
-    def _fail(self, subtitle: str, detail: str) -> None:
+    def _fail(self, subtitle: str, detail: str, *, result_code: str = "installer_failed") -> None:
+        self._heartbeat_result_code = result_code
+        self._heartbeat_started = True
         self._waiting_since = None
         self._poll_timer.stop()
         self._socket.abort()
@@ -1290,8 +1469,10 @@ def run_update_window(arguments: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--startup-smoke-test", action="store_true")
     parser.add_argument("--request-id", default="")
     options = parser.parse_args(arguments)
+    preview_mode = options.preview or options.startup_smoke_test
     package_root = Path(__file__).resolve().parents[2]
     app = QApplication([sys.argv[0]])
     app.setApplicationName("SinpoSmart 更新")
@@ -1307,10 +1488,12 @@ def run_update_window(arguments: list[str] | None = None) -> int:
             app.setFont(QFont(family))
             break
     QQuickStyle.setStyle("Basic")
-    if options.install or options.preview:
+    if options.install or preview_mode:
         directory = options.state_dir or create_update_run_directory()
         controller = UpdateProgressController(options.install or package_root / "update_package.ps1", directory,
-                                              request_id=options.request_id)
+                                              request_id=options.request_id,
+                                              heartbeat_enabled=bool(options.install and not preview_mode))
+        app.aboutToQuit.connect(controller.shutdown)
     else:
         controller = UpdateController(UpdateRepository(package_root / "VERSION.txt"), remote_update_enabled=False)
         controller._show_view(visible=True)
@@ -1320,6 +1503,9 @@ def run_update_window(arguments: list[str] | None = None) -> int:
     qml = Path(__file__).resolve().parents[1] / "qml" / "dialogs" / "UpdateProgressWindow.qml"
     engine.load(QUrl.fromLocalFile(str(qml)))
     if not engine.rootObjects():
+        if isinstance(controller, UpdateProgressController):
+            controller._fail("無法開啟更新視窗。", "請查看更新紀錄。")
+            controller.shutdown()
         return 1
     window: QQuickWindow = engine.rootObjects()[0]
     screen = app.screenAt(QCursor.pos()) or app.primaryScreen()
@@ -1327,8 +1513,10 @@ def run_update_window(arguments: list[str] | None = None) -> int:
     window.setPosition(available.center().x() - window.width() // 2,
                        available.center().y() - window.height() // 2)
     controller.viewChanged.connect(lambda: app.quit() if not controller.updateView["visible"] else None)
-    if options.preview:
+    if preview_mode:
         controller.accept_progress({"phase": "installing", "percent": 68})
+        if options.startup_smoke_test:
+            QTimer.singleShot(250, app.quit)
     elif options.install:
         import hashlib
         lock_key = hashlib.sha256(str(options.install.resolve()).casefold().encode("utf-8")).hexdigest()[:20]

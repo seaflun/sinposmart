@@ -39,7 +39,12 @@ from app_core.duty_task_projection import (
     target_short_label,
 )
 from app_core.login_verifier import LoginVerifier
-from app_core.operational_sync_service import OperationalSyncService
+from app_core.operational_sync_service import (
+    GUI_HEARTBEAT_INTERVAL_MS,
+    HEARTBEAT_PHASES,
+    GuiHeartbeatReporter,
+    OperationalSyncService,
+)
 from app_core.civilpower_service import CivilpowerService
 from qt_app.controllers.civilpower_controller import CivilpowerController
 from app_core.rescue_video_service import RescueVideoService
@@ -387,6 +392,59 @@ class AppController(QObject):
         self._duty_execution_controller.stateChanged.connect(self._finish_pending_logout)
         self._tray_controller.setStopGuard(self._stop_block_reason)
         self._update_controller.setStopGuard(self._stop_block_reason)
+        self._heartbeat_stopped = False
+        self._heartbeat_reporter = None
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(GUI_HEARTBEAT_INTERVAL_MS)
+        self._heartbeat_timer.timeout.connect(self._pulse_gui_heartbeat)
+        if not self._read_only_acceptance:
+            self._heartbeat_reporter = GuiHeartbeatReporter(
+                self._operational_sync_service,
+                component="gui",
+                app_version=self._update_controller.currentVersion,
+            )
+            self._heartbeat_timer.start()
+            QTimer.singleShot(0, lambda: self._pulse_gui_heartbeat(starting=True))
+
+    def _pulse_gui_heartbeat(self, *, starting: bool = False, stopping: bool = False) -> None:
+        if self._heartbeat_stopped or self._heartbeat_reporter is None:
+            return
+        fields = {}
+        describe_update = getattr(self._update_controller, "heartbeat_fields", None)
+        if callable(describe_update):
+            try:
+                value = describe_update()
+                if isinstance(value, dict):
+                    fields = value
+            except Exception:
+                pass
+        login_state = ("logging_in" if self._session_controller.isBusy else
+                       "logged_in" if self._session_controller.isLoggedIn else "logged_out")
+        phase = fields.get("phase", "unknown")
+        if not isinstance(phase, str) or phase not in HEARTBEAT_PHASES:
+            phase = "unknown"
+        if stopping:
+            state, phase = "stopping", "stopping"
+        elif starting:
+            state, phase = "starting", "startup"
+        elif self._update_shutdown_started or phase in {
+            "preparing", "staged", "waiting_handoff", "waiting_parent", "preflight", "waiting_busy", "applying",
+        }:
+            state = "updating"
+            if phase == "unknown":
+                phase = "waiting_parent"
+        else:
+            state = "busy" if self._stop_block_reason() else "idle"
+            if phase in {"unknown", "idle", "startup"}:
+                phase = state
+        self._heartbeat_reporter.pulse(
+            state=state,
+            login_state=login_state,
+            phase=phase,
+            update_request_id=fields.get("update_request_id", ""),
+            target_version=fields.get("target_version", ""),
+            result_code="closed" if stopping else "",
+        )
 
     @Property(QObject, constant=True)
     def sessionController(self) -> SessionController:
@@ -3045,6 +3103,12 @@ class AppController(QObject):
 
     @Slot()
     def shutdown(self) -> None:
+        if not self._heartbeat_stopped:
+            self._heartbeat_timer.stop()
+            self._pulse_gui_heartbeat(stopping=True)
+            self._heartbeat_stopped = True
+            if self._heartbeat_reporter is not None:
+                self._heartbeat_reporter.stop(timeout=1.0)
         self._shutdown_background_manual_chains()
         self._close_worker_admissions()
         for request_id, (thread, _worker) in tuple(self._automatic_prepare_workers.items()):

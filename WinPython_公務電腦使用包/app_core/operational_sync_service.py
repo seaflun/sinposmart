@@ -10,12 +10,13 @@ import re
 import socket
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app_core.duty_task_projection import action_summary
 
@@ -24,6 +25,149 @@ JsonPoster = Callable[[dict[str, Any]], dict[str, Any]]
 SENSITIVE_KEY_PARTS = ("password", "passwd", "token", "secret", "cookie", "authorization")
 DEFAULT_SINPOSMART_BACKEND_EVENT_URL = "http://10.30.65.30:8080/api/sinposmart/events"
 SYNC_STATUS_FILENAME = "sinposmart_operational_sync_status.json"
+GUI_HEARTBEAT_INTERVAL_MS = 10_000
+HEARTBEAT_STATES = frozenset({"starting", "idle", "busy", "updating", "failed", "stopping"})
+HEARTBEAT_LOGIN_STATES = frozenset({"unknown", "logged_out", "logging_in", "logged_in"})
+HEARTBEAT_PHASES = frozenset({
+    "startup", "idle", "busy", "preparing", "staged", "waiting_handoff", "waiting_parent",
+    "preflight", "waiting_busy", "applying", "installing", "environment_check", "restarting",
+    "waiting_gui", "completed", "failed", "stopping", "unknown",
+})
+HEARTBEAT_RESULTS = frozenset({"", "installer_failed", "gui_start_failed", "gui_ready_timeout", "update_completed", "closed"})
+
+
+class _HeartbeatRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None  # Never forward the existing credential-sync token to another endpoint.
+
+
+def _heartbeat_uuid(value: Any, *, empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if empty and value == "":
+        return True
+    try:
+        return str(UUID(value)) == value.lower()
+    except (ValueError, AttributeError):
+        return False
+
+
+def _valid_heartbeat_payload(payload: Mapping[str, Any]) -> bool:
+    fields = {"schema_version", "workstation", "component", "instance_id", "process_started_at",
+              "process_id", "sequence", "app_version", "state", "login_state", "phase",
+              "update_request_id", "target_version", "result_code", "exit_code", "progress_percent"}
+    if set(payload) != fields:
+        return False
+    if (type(payload["schema_version"]) is not int or payload["schema_version"] != 1
+            or not isinstance(payload["workstation"], str)
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", payload["workstation"]) is None
+            or payload["component"] not in {"gui", "installer"}
+            or not _heartbeat_uuid(payload["instance_id"])
+            or not isinstance(payload["process_started_at"], str)):
+        return False
+    try:
+        started = datetime.fromisoformat(payload["process_started_at"])
+        if started.utcoffset() is None:
+            return False
+    except ValueError:
+        return False
+    if any(type(payload[key]) is not int or payload[key] <= 0 for key in ("process_id", "sequence")):
+        return False
+    if not isinstance(payload["app_version"], str) or re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d{4}", payload["app_version"]) is None:
+        return False
+    if (not isinstance(payload["target_version"], str)
+            or (payload["target_version"] and re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d{4}", payload["target_version"]) is None)
+            or not _heartbeat_uuid(payload["update_request_id"], empty=True)
+            or payload["state"] not in HEARTBEAT_STATES
+            or payload["login_state"] not in HEARTBEAT_LOGIN_STATES
+            or payload["phase"] not in HEARTBEAT_PHASES
+            or payload["result_code"] not in HEARTBEAT_RESULTS):
+        return False
+    if payload["component"] == "installer" and (not payload["update_request_id"] or payload["login_state"] != "unknown"):
+        return False
+    for key, minimum, maximum in (("exit_code", -1, 65535), ("progress_percent", 0, 100)):
+        value = payload[key]
+        if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+            return False
+    return len(json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")) <= 4096
+
+
+class GuiHeartbeatReporter:
+    """Coalesce producer pulses; network work never creates proof of UI liveness."""
+
+    def __init__(self, service: OperationalSyncService, *, component: str, app_version: str,
+                 request_id: str = "", target_version: str = "", instance_id: str | None = None,
+                 process_started_at: str | None = None, process_id: int | None = None) -> None:
+        self._service = service
+        self._base = {
+            "schema_version": 1,
+            "workstation": re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:64] or "sinposmart-duty-gui",
+            "component": component,
+            "instance_id": instance_id if instance_id is not None else str(uuid4()),
+            "process_started_at": process_started_at if process_started_at is not None else datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+            "process_id": process_id if process_id is not None else os.getpid(),
+            "app_version": app_version,
+            "update_request_id": request_id,
+            "target_version": target_version,
+        }
+        self._condition = threading.Condition()
+        self._pending: dict[str, Any] | None = None
+        self._sequence = 0
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    def pulse(self, *, state: str, login_state: str = "unknown", phase: str = "unknown",
+              update_request_id: str | None = None, target_version: str | None = None,
+              result_code: str = "", exit_code: int | None = None,
+              progress_percent: int | None = None) -> bool:
+        if getattr(self._service, "heartbeat_enabled", False) is not True:
+            return False
+        with self._condition:
+            if self._closed:
+                return False
+            request_id = self._base["update_request_id"] if update_request_id is None else update_request_id
+            if self._base["component"] == "installer" and request_id != self._base["update_request_id"]:
+                return False
+            if self._base["component"] == "installer" and target_version not in (None, self._base["target_version"]):
+                return False
+            payload = {**self._base, "sequence": self._sequence + 1, "state": state,
+                       "login_state": login_state, "phase": phase, "update_request_id": request_id,
+                       "target_version": self._base["target_version"] if target_version is None else target_version,
+                       "result_code": result_code, "exit_code": exit_code, "progress_percent": progress_percent}
+            try:
+                valid = _valid_heartbeat_payload(payload)
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                return False
+            self._sequence += 1
+            self._pending = payload
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._send_pending, name="SinpoSmart-heartbeat", daemon=True)
+                self._thread.start()
+            self._condition.notify()
+            return True
+
+    def _send_pending(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._pending is None:
+                    return
+                payload, self._pending = self._pending, None
+            try:
+                self._service.send_heartbeat(payload)
+            except Exception:
+                pass  # No replay: only a subsequent real producer pulse may recover liveness.
+
+    def stop(self, *, timeout: float = 1.0) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(max(0.0, min(float(timeout), 1.0)))
 
 
 def sanitize_payload(value: Any) -> Any:
@@ -112,6 +256,83 @@ class OperationalSyncService:
         self._status_lock = threading.Lock()
         self._last_board_hash = ""
         self._board_inflight_hashes: set[str] = set()
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_server_id = ""
+        self._heartbeat_endpoint = self._heartbeat_base_url()
+        self._heartbeat_token = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
+        self._heartbeat_opener = urllib.request.build_opener(_HeartbeatRedirectHandler())
+
+    def _heartbeat_base_url(self) -> str:
+        try:
+            endpoint = urllib.parse.urlsplit(self.event_url)
+            if (endpoint.scheme not in {"http", "https"} or not endpoint.hostname
+                    or endpoint.username is not None or endpoint.password is not None
+                    or endpoint.path != "/api/sinposmart/events"):
+                return ""
+            endpoint.port  # Reject malformed ports before starting any network request.
+            return urllib.parse.urlunsplit((endpoint.scheme, endpoint.netloc, "/api/sinposmart", "", ""))
+        except ValueError:
+            return ""
+
+    @property
+    def heartbeat_enabled(self) -> bool:
+        return bool(self._heartbeat_endpoint and self._heartbeat_token)
+
+    def _heartbeat_request(self, suffix: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        headers = {"Accept": "application/json", "X-Credential-Sync-Token": self._heartbeat_token}
+        body = None
+        if payload is not None:
+            body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+            if len(body) > 4096:
+                raise ValueError("心跳格式不符。")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self._heartbeat_endpoint + suffix, data=body, headers=headers,
+                                         method="GET" if body is None else "POST")
+        try:
+            with self._heartbeat_opener.open(request, timeout=3) as response:
+                raw = response.read(8193)
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise RuntimeError("心跳連線未獲確認。") from None
+        if len(raw) > 8192:
+            raise ValueError("心跳回應格式不符。")
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            raise ValueError("心跳回應格式不符。")
+        server = value.get("server")
+        if (not isinstance(server, dict) or not _heartbeat_uuid(server.get("instance_id"))
+                or not isinstance(server.get("version"), str) or len(server["version"]) > 64
+                or not isinstance(server.get("deployment"), str) or len(server["deployment"]) > 64):
+            raise ValueError("心跳伺服器身分無法確認。")
+        if payload is not None:
+            received_at = value.get("received_at")
+            if (not isinstance(received_at, str) or len(received_at) > 64
+                    or datetime.fromisoformat(received_at).utcoffset() is None):
+                raise ValueError("心跳確認時間不符。")
+        return value
+
+    def send_heartbeat(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Send only the current technical pulse; never touch the event outbox."""
+        try:
+            if not self.heartbeat_enabled or not _valid_heartbeat_payload(payload):
+                raise ValueError("心跳格式或設定不符。")
+            with self._heartbeat_lock:
+                if not self._heartbeat_server_id:
+                    identity = self._heartbeat_request("/identity")
+                    self._heartbeat_server_id = identity["server"]["instance_id"]
+                outgoing = {**payload, "route": {"name": "configured", "identity_status": "verified",
+                                                "instance_id": self._heartbeat_server_id}}
+                response = self._heartbeat_request("/heartbeat", outgoing)
+                if (response["server"]["instance_id"] != self._heartbeat_server_id
+                        or type(response.get("accepted")) is not bool
+                        or not isinstance(response.get("received_at"), str)):
+                    raise ValueError("心跳伺服器身分或確認不符。")
+            self._record_sync_status("heartbeat", "ok" if response["accepted"] else "failed",
+                                     "值班台心跳已同步。" if response["accepted"] else "值班台心跳未被採用。")
+            return response
+        except Exception:
+            self._record_sync_status("heartbeat", "failed", "值班台心跳無法確認連線。")
+            raise RuntimeError("值班台心跳無法確認連線。") from None
 
     @property
     def event_enabled(self) -> bool:
