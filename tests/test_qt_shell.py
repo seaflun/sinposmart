@@ -1001,7 +1001,7 @@ const NodeFilter = {SHOW_TEXT:4};
                         actor_no_from_user_id=lambda _: "10", actor_no_from_name=lambda _: "10",
                         staff={"10": {"name": "測試員"}},
                     )
-                identity_lookup.assert_not_called()
+                identity_lookup.assert_called_once()
                 self.assertEqual(caught.exception.reason_code, "authentication_unverified")
                 diagnostic = caught.exception.login_diagnostic
                 self.assertEqual(diagnostic["stage"], "post_login")
@@ -1089,6 +1089,98 @@ const document = {
             BASE_URL + "/ActionControlServlet?id=00&APname=" + DUTY_TABLE_AP
             + "&pushButton=load&nextAPname=" + DUTY_TABLE_AP + "&_txtFirstEntry=TRUE"
         ])
+
+    def test_authentication_probe_disconnect_retries_with_fresh_login_identity(self) -> None:
+        from selenium.common.exceptions import WebDriverException
+        from app_core.login_verifier import LoginVerifier
+
+        for first_identity in (("4", "前次姓名"), RuntimeError("identity unavailable")):
+            with self.subTest(first_identity=type(first_identity).__name__):
+                first = self.DiagnosticDriver(text="", password_fields=0,
+                                              authenticated=WebDriverException("disconnected"))
+                second = self.DiagnosticDriver(text="", password_fields=0)
+                driver_factory = Mock(side_effect=[first, second])
+                login = Mock()
+                cleanup = Mock()
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=driver_factory,
+                    configure_driver=lambda _driver: None, login_function=login,
+                    driver_cleanup=cleanup, session_open_diagnostics=False,
+                )
+                with patch("app_core.login_verifier.identify_logged_in_actor",
+                           side_effect=[first_identity, ("24", "值班人員")]) as identity:
+                    result = verifier.verify(
+                        typed_actor_no="", user_id="account24", password="fixture-password",
+                        actor_no_from_user_id=lambda _value: "4", actor_no_from_name=lambda _name: "24", staff={},
+                    )
+                self.assertEqual((result.actor_no, result.actor_name), ("24", "值班人員"))
+                self.assertEqual(driver_factory.call_count, 2)
+                self.assertEqual(login.call_count, 2)
+                self.assertEqual([entry.args[0] for entry in identity.call_args_list], [first, second])
+                self.assertEqual([entry.args[0] for entry in cleanup.call_args_list], [first, second])
+
+    def test_identity_lookup_warning_cannot_bypass_authentication_failure(self) -> None:
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        driver = self.DiagnosticDriver(text="已登出", password_fields=0, authenticated=False)
+        verifier = LoginVerifier(
+            options_factory=object, driver_factory=lambda _options: driver,
+            configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+            driver_cleanup=lambda _driver: None, allow_post_login_lookup_warning=True,
+        )
+        with (
+            patch("app_core.login_verifier.identify_logged_in_actor", side_effect=RuntimeError("identity unavailable")),
+            patch("selenium.webdriver.support.ui.WebDriverWait", side_effect=self.authentication_wait_once),
+            self.assertRaises(LoginVerificationError) as caught,
+        ):
+            verifier.verify(
+                typed_actor_no="24", user_id="account24", password="fixture-password",
+                actor_no_from_user_id=lambda _value: "24", actor_no_from_name=lambda _name: "24", staff={},
+            )
+        self.assertEqual(caught.exception.reason_code, "authentication_unverified")
+
+    def test_protected_page_probe_preserves_the_original_logged_in_person(self) -> None:
+        from app_core.login_verifier import LoginVerifier
+        from app_core.schedule_capture_service import actor_identity_from_name
+
+        class LandingPageDriver(self.Driver):
+            def __init__(self):
+                super().__init__()
+                self.page = "login_landing"
+
+            def get(self, url):
+                self.current_url = url
+                self.page = "duty_table"
+
+            def execute_script(self, script):
+                if "duty-authenticated-page" in script:
+                    return True
+                if "login-diagnostic-probe" in script:
+                    return {"page_text": "", "password_fields": 0}
+                if self.page == "login_landing":
+                    return "值班人員，您好"
+                return "勤務分配表\n4 小隊長 其他人員\n24 隊員 值班人員"
+
+        for mode in ({}, {"defer_actor_resolution": True}, {"allow_post_login_lookup_warning": True}):
+            with self.subTest(mode=mode):
+                driver = LandingPageDriver()
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+                    driver_cleanup=lambda _driver: None, **mode,
+                )
+                result = verifier.verify(
+                    typed_actor_no="", user_id="account24", password="fixture-password",
+                    actor_no_from_user_id=lambda _value: "4",  # A previous bad mapping must not override the live name.
+                    actor_no_from_name=lambda name: "24" if name == "值班人員" else "",
+                    staff={},
+                )
+                self.assertEqual(result.actor_name, "值班人員")
+                self.assertEqual(result.actor_no, "" if mode.get("defer_actor_resolution") else "24")
+                self.assertEqual(actor_identity_from_name(
+                    {"4": {"name": "其他人員"}, "24": {"name": "值班人員"}}, result.actor_name,
+                ), ("24", "值班人員"))
+                self.assertEqual(driver.page, "duty_table")
 
     def test_identity_javascript_keeps_newlines_escaped(self) -> None:
         from app_core.login_verifier import page_identity_hint_text, page_identity_text
@@ -13126,6 +13218,49 @@ class QtShellTests(unittest.TestCase):
             self.assertEqual(controller._synced_actor_no, "10")
             self.assertEqual(controller.dutyController._actor_no, "10")
             self.assertEqual(captures, [("test-user", "test-password", "", "測試員")])
+        finally:
+            controller.shutdown()
+
+    def test_verified_login_name_recovers_a_previously_saved_wrong_actor_number(self) -> None:
+        from app_core.login_verifier import LoginResult
+        from qt_app.controllers.app_controller import AppController
+
+        account = {"user_id": "account24", "actor_no": "4", "name": "其他人員",
+                   "display_name": "4番 其他人員", "password": "fixture-password", "id_number": ""}
+        repository = SimpleNamespace(
+            load=lambda: SimpleNamespace(accounts=[account], last_selected="account24",
+                                         can_persist=True, needs_rewrite=False, invalid_file=False),
+            save=Mock(return_value=True), enable_persistence=Mock(),
+            account_identity=lambda item: item["user_id"],
+        )
+        controller = AppController(repository=repository, read_only_acceptance=True)
+        controller.dutyController.load_current_schedule = lambda: None
+        controller.dutyController.refresh_live_schedule = lambda *_a, **_k: True
+        controller.dutyController.refresh_live_comparisons = lambda *_a, **_k: False
+        session = controller.sessionController
+        session._read_only_acceptance = False
+        session._start_credential_sync = Mock()
+        try:
+            attempt = session._state.begin_login()
+            session._pending_credentials[attempt] = ("account24", "fixture-password", True, "manual")
+            session._login_succeeded(attempt, LoginResult("", "account24", actor_name="值班人員"))
+            self.assertEqual(session.displayName, "值班人員")
+            repository.save.assert_not_called()
+            with patch("qt_app.controllers.app_controller.business_roc_date", return_value="1151019"):
+                controller._live_schedule_captured({
+                    "target_date": "1151019", "today": {"staff": {
+                        "4": {"name": "其他人員", "role": "小隊長"},
+                        "24": {"name": "值班人員", "role": "隊員"},
+                    }}, "actions": [],
+                })
+            self.assertEqual(session.actorNo, "24")
+            self.assertEqual(session.displayName, "24番 值班人員")
+            self.assertIn("隊員 值班人員", session.loginStatus)
+            self.assertEqual(controller.dutyController._actor_no, "24")
+            self.assertEqual(session.saved_actor_no("account24"), "24")
+            repository.save.assert_called_once()
+            self.assertEqual(repository.save.call_args.args[0][0]["actor_no"], "24")
+            self.assertEqual(session._start_credential_sync.call_args.kwargs["extra_account"]["actor_no"], "24")
         finally:
             controller.shutdown()
 

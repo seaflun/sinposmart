@@ -595,6 +595,8 @@ class LoginVerifier:
     ) -> LoginResult:
         driver = None
         failure_diagnostic = None
+        detected_actor_no, actor_name = "", ""
+        identity_error = None
         try:
             from duty_rehearsal import retry_duty_browser_session_open
 
@@ -604,7 +606,8 @@ class LoginVerifier:
                 return self.driver_factory(self.options_factory())
 
             def initialize_browser(candidate: Any) -> None:
-                nonlocal failure_diagnostic
+                nonlocal failure_diagnostic, detected_actor_no, actor_name, identity_error
+                detected_actor_no, actor_name, identity_error = "", "", None
                 failure_stage = 'login'
                 configuring = True
                 try:
@@ -620,6 +623,12 @@ class LoginVerifier:
                             '密碼須更新：請至勤務網站手動完成密碼變更後，再重新登入。',
                             reason_code='password_change_required',
                         )
+                    try:
+                        detected_actor_no, actor_name = identify_logged_in_actor(candidate, actor_no_from_name, staff)
+                    except Exception as exc:
+                        identity_error = exc
+                    # The protected-page probe navigates away from the login greeting.
+                    # Preserve its identity first, but authorize no result before the probe passes.
                     verify_duty_authentication(candidate)
                 except Exception as exc:
                     failure_diagnostic = capture_login_diagnostic(
@@ -635,11 +644,9 @@ class LoginVerifier:
                 cleanup=self.driver_cleanup,
                 write_diagnostics=self.session_open_diagnostics,
             )
-            try:
-                detected_actor_no, actor_name = identify_logged_in_actor(driver, actor_no_from_name, staff)
-            except Exception:
+            if identity_error is not None:
                 if not self.allow_post_login_lookup_warning:
-                    raise
+                    raise identity_error
                 return LoginResult(
                     actor_no="",
                     user_id=user_id,
