@@ -75,6 +75,10 @@ try {
     const holder = window.jQuery('#grid');
     if (!holder || typeof holder.data !== 'function') return false;
     if (!requireGrid) return true;
+    // Maintenance schedules its initial QueryData up to 500 ms after document.ready.
+    const initialQueryUrl = window.location.origin + '/CarMaintainCheck/QueryProc';
+    if (!window.performance.getEntriesByType('resource').some(entry =>
+        entry.name.split(/[?#]/, 1)[0] === initialQueryUrl && entry.responseEnd > 0)) return false;
     const grid = holder.data('kendoGrid');
     return !!grid && typeof grid.setDataSource === 'function' && !!grid.dataSource &&
         typeof grid.dataSource.view === 'function';
@@ -144,11 +148,11 @@ if (action === 'state') {
     if (state.checkedGrid) {
         if (grid !== state.checkedGrid || source !== state.checkedSource || !ids ||
             ids.length !== state.checkedIds.length || ids.some((uid, i) => uid !== state.checkedIds[i])) state.failed = true;
-    } else if (state.armed && ids && (grid !== state.oldGrid || source !== state.oldSource ||
+    } else if (state.armed && window.jQuery.active === 0 && ids && (grid !== state.oldGrid || source !== state.oldSource ||
                                    state.started && state.bound)) {
         state.checkedGrid = grid; state.checkedSource = source; state.checkedIds = ids;
     }
-    return {token: state.token, ready: !!state.checkedGrid && !state.failed, failed: state.failed};
+    return {token: state.token, ready: !!state.checkedGrid && !state.failed && window.jQuery.active === 0, failed: state.failed};
 }
 if (action === 'cleanup') { state.cleanup(); return true; }
 return false;

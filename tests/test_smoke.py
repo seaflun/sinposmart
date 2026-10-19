@@ -181,8 +181,11 @@ app = QCoreApplication([])
 engine = QJSEngine()
 engine.evaluate("""
 var document = {readyState: 'complete'};
-var location = {pathname: '/CarMaintainCheck/Index', href: 'https://fixture.invalid/CarMaintainCheck/Index'};
+var location = {origin: 'https://fixture.invalid', pathname: '/CarMaintainCheck/Index', href: 'https://fixture.invalid/CarMaintainCheck/Index'};
 var window = {document: document, location: location};
+var resourceEntries = [{name: location.origin + '/CarMaintainCheck/QueryProc', responseEnd: 1}];
+var performance = {getEntriesByType: kind => kind === 'resource' ? resourceEntries : []};
+window.performance = performance;
 var expectedPath = location.pathname, queryName = 'QueryData', requireSource = true;
 function source(uid) {return {view: () => [{uid: uid}], bind: () => {}, unbind: () => {}};}
 function makeGrid(uid) {const grid = {dataSource: source(uid), bind: () => {}, unbind: () => {}};
@@ -209,7 +212,7 @@ engine.evaluate({
     'query_function_not_initialized': "delete window.QueryData;",
     'query_datasource_not_initialized': "grid.dataSource = null;",
     'initial_query_still_running': "window.jQuery.active = 1;",
-    'equipment_without_initial_grid': "expectedPath = '/CarEquipCheck/Index'; location.pathname = expectedPath; queryName = 'Query'; requireSource = false; grid = null;",
+    'equipment_without_initial_grid': "expectedPath = '/CarEquipCheck/Index'; location.pathname = expectedPath; queryName = 'Query'; requireSource = false; grid = null; resourceEntries = [];",
 }[pending])
 
 class Button:
@@ -270,10 +273,63 @@ print(json.dumps({'rows': rows, 'error': error, 'early': driver.early, 'actions'
                 self.assertEqual(evidence["actions"][0:2], ["begin", "click"])
                 self.assertEqual(evidence["actions"][-1], "cleanup")
 
+    def test_maintenance_page_requires_completed_matching_initial_query_resource(self) -> None:
+        javascript = """
+var document = {readyState: 'complete'};
+var window = {location: {origin: 'https://fixture.invalid', pathname: '/CarMaintainCheck/Index'}};
+var resourceEntries = [];
+var performance = {getEntriesByType: kind => kind === 'resource' ? resourceEntries : []};
+window.performance = performance;
+var grid = {setDataSource: () => {}, dataSource: {view: () => []}};
+window.jQuery = () => ({data: () => grid}); window.jQuery.active = 0;
+window.QueryData = () => {}; window.Query = () => {};
+function ready(requireGrid) {return (function() {
+""" + self.module.GRID_PAGE_READY_SCRIPT + """
+}).apply(null, [window.location.pathname, requireGrid ? 'QueryData' : 'Query', requireGrid]);}
+var cases = {};
+cases.queuedBeforeFirstRequest = ready(true);
+resourceEntries = [{name: window.location.origin + '/CarMaintainCheck/QueryProc', responseEnd: 0}];
+cases.incomplete = ready(true);
+resourceEntries[0].responseEnd = -1; cases.negativeEnd = ready(true);
+resourceEntries = [{name: 'https://other.invalid/CarMaintainCheck/QueryProc', responseEnd: 1}];
+cases.wrongOrigin = ready(true);
+resourceEntries = [{name: window.location.origin + '/CarMaintainCheck/QueryProcExtra', responseEnd: 1}];
+cases.endpointSuffix = ready(true);
+resourceEntries = [{name: window.location.origin + '/CarEquipCheck/QueryProc', responseEnd: 1}];
+cases.wrongEndpoint = ready(true);
+resourceEntries = [{name: window.location.origin + '/CarMaintainCheck/QueryProc?initial=1#response', responseEnd: 1}];
+cases.matchingCompleted = ready(true);
+window.jQuery.active = 1; cases.completedWhileAnotherRequestPending = ready(true);
+window.jQuery.active = 0;
+performance.getEntriesByType = () => {throw new Error('fixture unavailable timing');};
+cases.unavailableTiming = ready(true);
+performance.getEntriesByType = kind => kind === 'resource' ? resourceEntries : [];
+resourceEntries = []; grid = null; window.location.pathname = '/CarEquipCheck/Index';
+cases.equipmentWithoutInitialResource = ready(false);
+JSON.stringify(cases);
+"""
+        runner = ("from PySide6.QtCore import QCoreApplication\nfrom PySide6.QtQml import QJSEngine\n"
+                  "app=QCoreApplication([])\nengine=QJSEngine()\nresult=engine.evaluate(" + repr(javascript) + ")\n"
+                  "assert not result.isError(),result.toString()\nprint(result.toString())\n")
+        result = subprocess.run([sys.executable, "-B", "-c", runner], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads(result.stdout)
+        for case, expected in {
+            "queuedBeforeFirstRequest": False, "incomplete": False, "negativeEnd": False,
+            "wrongOrigin": False, "endpointSuffix": False, "wrongEndpoint": False,
+            "matchingCompleted": True, "completedWhileAnotherRequestPending": False,
+            "unavailableTiming": False, "equipmentWithoutInitialResource": True,
+        }.items():
+            with self.subTest(case=case):
+                self.assertEqual(evidence[case], expected, evidence)
+
     def test_cold_page_waits_for_initial_ajax_before_manual_query(self) -> None:
         # Each response completes between WebDriver commands, never inside one JS callback.
         runner = r'''
 import json
+import sys
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.support.ui import WebDriverWait
 from PySide6.QtCore import QCoreApplication
@@ -286,20 +342,31 @@ app = QCoreApplication([])
 engine = QJSEngine()
 engine.evaluate("""
 var document = {readyState: 'complete'};
-var window = {location: {pathname: '/CarMaintainCheck/Index'}};
+var window = {location: {origin: 'https://fixture.invalid', pathname: '/CarMaintainCheck/Index'}};
+var resourceEntries = [];
+var performance = {getEntriesByType: kind => kind === 'resource' ? resourceEntries : []};
+window.performance = performance;
 function source(uid) {return {view: () => [{uid}], bind: () => {}, unbind: () => {}};}
 var grid = {dataSource: source('initial-placeholder'), dom: 'initial-placeholder',
             bind: () => {}, unbind: () => {}, setDataSource: value => {grid.dataSource = value;}};
 grid.tbody = {find: () => [{getAttribute: () => grid.dom}]};
 window.jQuery = () => ({data: () => grid});
-window.jQuery.active = 1;
-var initialPending = true, manualPending = false, clickedWhileInitial = false;
+window.jQuery.active = 0;
+var clock = 0, initialStarted = false;
+var initialPending = true, manualPending = false, clickedWhileInitial = false, clickedAt = null;
 function response(uid) {grid.setDataSource(source(uid)); grid.dom = uid; window.jQuery.active--;}
-function initialResponse() {initialPending = false; response('auto-A');}
+function initialResponse() {initialPending = false; response('auto-A');
+    resourceEntries.push({name: window.location.origin + '/CarMaintainCheck/QueryProc?initial=1', responseEnd: clock});}
+function advanceInitial() {clock += 250;
+    if (!initialStarted && clock >= 500) {initialStarted = true; window.jQuery.active++;}
+    if (initialPending && initialStarted && clock >= 750) initialResponse();}
 function manualResponse() {manualPending = false; response('manual-B');}
-window.QueryData = () => {clickedWhileInitial = initialPending; manualPending = true; window.jQuery.active++;};
+window.QueryData = () => {clickedWhileInitial = initialPending; clickedAt = clock;
+    manualPending = true; window.jQuery.active++;};
 var fixtureButton = {click: () => window.QueryData()};
 """)
+if sys.argv[1] == 'running':
+    engine.evaluate('initialStarted = true; window.jQuery.active = 1;')
 
 class Button:
     def is_displayed(self): return True
@@ -308,6 +375,7 @@ class Button:
 class Driver:
     def __init__(self):
         self.readiness_polls = 0
+        self.readiness = []
         self.observations = []
         self.actions = []
     def find_element(self, by, selector):
@@ -318,19 +386,21 @@ class Driver:
     def execute_script(self, script, *args):
         if script == module.GRID_PAGE_READY_SCRIPT:
             self.readiness_polls += 1
-            if self.readiness_polls >= 2 and engine.evaluate('initialPending').toBool():
-                engine.evaluate('initialResponse()')
+            engine.evaluate('advanceInitial()')
         elif script == module.GRID_QUERY_OBSERVER_SCRIPT:
             self.actions.append(args[0])
             if args[0] == 'state':
                 if engine.evaluate('initialPending').toBool():
-                    engine.evaluate('initialResponse()')
+                    engine.evaluate('advanceInitial()')
                 elif engine.evaluate('manualPending').toBool():
                     engine.evaluate('manualResponse()')
         values = [json.dumps(arg) if not isinstance(arg, Button) else 'fixtureButton' for arg in args]
         result = engine.evaluate('(function(){' + script + '}).apply(null,[' + ','.join(values) + ']);')
         if result.isError(): raise AssertionError(result.toString())
         value = result.toVariant()
+        if script == module.GRID_PAGE_READY_SCRIPT:
+            self.readiness.append({'ready': value, 'clock': engine.evaluate('clock').toInt(),
+                                   'active': engine.evaluate('window.jQuery.active').toInt()})
         if script == module.GRID_QUERY_OBSERVER_SCRIPT and args[0] == 'state':
             self.observations.append(value)
         return value
@@ -343,20 +413,26 @@ except Exception as failure:
     rows, error = [], type(failure).__name__
 print(json.dumps({'rows': rows, 'error': error, 'readiness_polls': driver.readiness_polls,
                   'clicked_while_initial': engine.evaluate('clickedWhileInitial').toBool(),
+                  'clicked_at': engine.evaluate('clickedAt').toVariant(), 'readiness': driver.readiness,
                   'observations': driver.observations, 'actions': driver.actions}))
 '''
-        result = subprocess.run([sys.executable, "-B", "-c", runner], cwd=PROJECT_ROOT,
-                                capture_output=True, text=True, encoding="utf-8", timeout=15,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        evidence = json.loads(result.stdout.splitlines()[-1])
-        self.assertEqual(evidence["error"], "", evidence)
-        self.assertEqual(evidence["rows"], ["manual-B"], evidence)
-        self.assertFalse(evidence["clicked_while_initial"], evidence)
-        self.assertGreaterEqual(evidence["readiness_polls"], 2, evidence)
-        self.assertTrue(all(value["ready"] is True and value["failed"] is False
-                            for value in evidence["observations"]), evidence)
-        self.assertEqual(evidence["actions"][-1], "cleanup")
+        for initial in ("running", "queued_500ms"):
+            with self.subTest(initial=initial):
+                result = subprocess.run([sys.executable, "-B", "-c", runner, initial], cwd=PROJECT_ROOT,
+                                        capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                evidence = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(evidence["error"], "", evidence)
+                self.assertEqual(evidence["rows"], ["manual-B"], evidence)
+                self.assertFalse(evidence["clicked_while_initial"], evidence)
+                self.assertGreaterEqual(evidence["clicked_at"], 750, evidence)
+                self.assertGreaterEqual(evidence["readiness_polls"], 3, evidence)
+                if initial == "queued_500ms":
+                    self.assertEqual(evidence["readiness"][0], {"ready": False, "clock": 250, "active": 0}, evidence)
+                self.assertTrue(all(value["ready"] is True and value["failed"] is False
+                                    for value in evidence["observations"]), evidence)
+                self.assertEqual(evidence["actions"][-1], "cleanup")
 
     def test_query_verify_diagnostics_distinguish_fixed_failure_boundaries(self) -> None:
         from selenium.common.exceptions import JavascriptException, TimeoutException, WebDriverException
@@ -526,6 +602,7 @@ grid.dataSource = source;
 source.view = () => [{uid: 'current-row'}];
 grid.tbody = {find: () => [{getAttribute: () => 'current-row'}]};
 var window = {jQuery: function() {return {data: function() {return grid;}};}};
+window.jQuery.active = 0;
 function query(action, token, button) { return (function() {
 """ + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
 }).apply(null, [action, token, button]); }
@@ -571,6 +648,64 @@ JSON.stringify({beforeClick: beforeClick, oldResponse: oldResponse,
             "staleCallback": False, "failed": True, "gridHandlers": 1,
             "startHandlers": 0, "errorHandlers": 0, "externalRetained": True})
 
+    def test_query_observer_waits_for_all_pending_responses_and_keeps_latched_changes_failed(self) -> None:
+        javascript = """
+function emitter() {return {handlers: {}, bind: function(n,f) {(this.handlers[n]||(this.handlers[n]=[])).push(f);},
+    unbind: function(n,f) {this.handlers[n]=(this.handlers[n]||[]).filter(x=>x!==f);},
+    fire: function(n,e) {(this.handlers[n]||[]).slice().forEach(f=>f(e));}};}
+function source(ids) {const s=emitter(); s.ids=ids; s.view=()=>s.ids.map(uid=>({uid})); return s;}
+function makeGrid(ids) {const g=emitter(); g.dataSource=source(ids); g.dom=ids;
+    g.tbody={find:()=>g.dom.map(uid=>({getAttribute:()=>uid}))}; return g;}
+var current=makeGrid(['old']);
+var window={jQuery:()=>({data:()=>current})}; window.jQuery.active=0;
+function query(a,t,b) {return (function() {
+""" + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
+}).apply(null,[a,t,b]);}
+function snapshot(t) {const s=query('state',t); return {ready:s.ready,failed:s.failed};}
+query('begin','overlap');
+query('click','overlap',{click:()=>{window.jQuery.active=2;}});
+current.dataSource=source(['auto-A']); current.dom=['auto-A']; window.jQuery.active=1;
+var firstPending=snapshot('overlap');
+current.dataSource=source(['manual-B']); current.dom=['manual-B']; window.jQuery.active=0;
+var lastCompleted=snapshot('overlap'), stableRead=snapshot('overlap');
+window.jQuery.active=1; var newPending=snapshot('overlap');
+const latchedSource=current.dataSource;
+current.dataSource=source(['late-C']); current.dom=['late-C'];
+var sourceChanged=snapshot('overlap');
+current.dataSource=latchedSource; current.dom=['manual-B']; window.jQuery.active=0;
+var sourceRestored=snapshot('overlap'); query('cleanup','overlap');
+query('begin','uids');
+query('click','uids',{click:()=>{current=makeGrid(['uid-A']);}});
+var uidLatched=snapshot('uids');
+current.dataSource.ids=['uid-B']; current.dom=['uid-B'];
+var uidChanged=snapshot('uids');
+current.dataSource.ids=['uid-A']; current.dom=['uid-A'];
+var uidRestored=snapshot('uids'); query('cleanup','uids');
+JSON.stringify({firstPending,lastCompleted,stableRead,newPending,sourceChanged,sourceRestored,
+    uidLatched,uidChanged,uidRestored});
+"""
+        runner = ("from PySide6.QtCore import QCoreApplication\nfrom PySide6.QtQml import QJSEngine\n"
+                  "app=QCoreApplication([])\nengine=QJSEngine()\nresult=engine.evaluate(" + repr(javascript) + ")\n"
+                  "assert not result.isError(),result.toString()\nprint(result.toString())\n")
+        result = subprocess.run([sys.executable, "-B", "-c", runner], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads(result.stdout)
+        for state, expected in {
+            "firstPending": {"ready": False, "failed": False},
+            "lastCompleted": {"ready": True, "failed": False},
+            "stableRead": {"ready": True, "failed": False},
+            "newPending": {"ready": False, "failed": False},
+            "sourceChanged": {"ready": False, "failed": True},
+            "sourceRestored": {"ready": False, "failed": True},
+            "uidLatched": {"ready": True, "failed": False},
+            "uidChanged": {"ready": False, "failed": True},
+            "uidRestored": {"ready": False, "failed": True},
+        }.items():
+            with self.subTest(state=state):
+                self.assertEqual(evidence[state], expected, evidence)
+
     def test_live_query_replacement_rebuilt_and_initial_grid_require_current_render(self) -> None:
         javascript = """
 function emitter() {return {handlers: {}, bind: function(n,f) {(this.handlers[n]||(this.handlers[n]=[])).push(f);},
@@ -581,6 +716,7 @@ function makeGrid(ids) {const g=emitter(); g.dataSource=source(ids); g.dom=ids;
     g.tbody={find:()=>g.dom.map(uid=>({getAttribute:()=>uid}))}; return g;}
 var current=makeGrid(['old']);
 var window={jQuery:()=>({data:()=>current})};
+window.jQuery.active = 0;
 function query(a,t,b) {return (function() {
 """ + self.module.GRID_QUERY_OBSERVER_SCRIPT + """
 }).apply(null,[a,t,b]);}
