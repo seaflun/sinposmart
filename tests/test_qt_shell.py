@@ -9290,6 +9290,81 @@ class UpdateControllerTests(unittest.TestCase):
             finally:
                 controller.shutdown()
 
+    def test_installer_reports_specific_close_failure_without_the_gui(self) -> None:
+        from qt_app.controllers.update_controller import UpdateProgressController
+        from qt_app.workers.update_check_worker import RemoteUpdateWorker
+
+        request_id = "44444444-4444-4444-8444-444444444444"
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+            root = Path(temp_dir)
+            (root / "VERSION.txt").write_text("2026.10.19.2240", encoding="utf-8")
+            manifest = root / "SinpoSmart" / "update_staging" / request_id / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({
+                "request_id": request_id, "package_dir": str(root), "status": "failed",
+                "remote_version": "2026.10.20.0200",
+                "detail": "private raw text must not be sent",
+                "close_failure": {"code": "gui_exit_timeout", "expected_pid": 1234,
+                                  "observed_count": 0, "waited_ms": 60001,
+                                  "exception_type": "", "detail": "private nested text must not be sent"},
+            }), encoding="utf-8")
+            controller = UpdateProgressController(root / "update_package.ps1", root,
+                                                  request_id=request_id, heartbeat_enabled=True,
+                                                  heartbeat_service=SimpleNamespace(heartbeat_enabled=False))
+            try:
+                with patch("qt_app.controllers.update_controller._remote_update_endpoint", return_value="https://example.invalid/api/sinposmart/remote-update"), \
+                     patch("qt_app.controllers.update_controller._remote_update_token", return_value="fixture-only-token"), \
+                     patch("qt_app.controllers.update_controller._remote_update_worker_id", return_value="fixture-pc"), \
+                     patch.object(RemoteUpdateWorker, "_request", autospec=True, return_value={"ok": True}) as send:
+                    controller.process_finished(1)
+                    from PySide6.QtTest import QTest
+                    deadline = time.monotonic() + 2
+                    while send.call_count == 0 and time.monotonic() < deadline:
+                        QTest.qWait(20)
+                    self.assertEqual(send.call_count, 1)
+                    worker = send.call_args.args[0]
+                    report = worker.status_request
+                    self.assertEqual(report["request_id"], request_id)
+                    self.assertEqual(report["status"], "failed")
+                    self.assertEqual(report["exit_code"], 1)
+                    self.assertIn("gui_exit_timeout", report["detail"])
+                    self.assertIn("1234", report["detail"])
+                    self.assertIn("60001", report["detail"])
+                    self.assertNotIn("private", report["detail"])
+                    self.assertIn("等待舊 GUI 自然退出逾時", controller.updateView["detail"])
+                    self.assertNotIn("PID=", controller.updateView["detail"])
+                    controller.process_finished(1)
+                    self.assertEqual(send.call_count, 1)
+            finally:
+                controller.shutdown()
+
+    def test_installer_rejects_mismatched_or_unsafe_close_diagnostics(self) -> None:
+        from qt_app.controllers.update_controller import UpdateProgressController
+
+        request_id = "44444444-4444-4444-8444-444444444444"
+        for mutation in ("wrong_request", "wrong_package", "unknown_code", "bad_pid", "raw_exception", "nonfailure"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
+                root = Path(temp_dir)
+                record = {"request_id": request_id, "package_dir": str(root), "status": "failed",
+                          "remote_version": "2026.10.20.0200",
+                          "close_failure": {"code": "gui_query_failed", "expected_pid": 123,
+                                            "observed_count": -1, "waited_ms": 10,
+                                            "exception_type": "System.InvalidOperationException"}}
+                if mutation == "wrong_request": record["request_id"] = "55555555-5555-4555-8555-555555555555"
+                if mutation == "wrong_package": record["package_dir"] = str(root / "other")
+                if mutation == "unknown_code": record["close_failure"]["code"] = "secret=private"
+                if mutation == "bad_pid": record["close_failure"]["expected_pid"] = True
+                if mutation == "raw_exception": record["close_failure"]["exception_type"] = "password=private"
+                if mutation == "nonfailure": record["status"] = "completed"
+                manifest = root / "SinpoSmart" / "update_staging" / request_id / "manifest.json"
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps(record), encoding="utf-8")
+                controller = UpdateProgressController(root / "update_package.ps1", root, request_id=request_id)
+                try:
+                    self.assertEqual(controller._close_failure_detail(), "")
+                finally:
+                    controller.shutdown()
+
     def test_installer_gui_start_failure_uses_safe_result_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"LOCALAPPDATA": temp_dir}):
             controller, reporter, _, _ = self._installer_heartbeat_fixture(Path(temp_dir))
@@ -14876,12 +14951,11 @@ if return_code != 0 or loaded:
     def test_duty_controller_has_no_generic_pause_or_resume_controls(self) -> None:
         from datetime import datetime
 
+        from app_core.schedule_repository import business_roc_date
         from qt_app.controllers.duty_controller import DutyController
 
         current = datetime.now()
-        target_roc_date = (
-            f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
-        )
+        target_roc_date = business_roc_date(current)
         controller = DutyController()
         controller.set_actor_no("10")
         controller.replace_schedule_data(
@@ -14892,6 +14966,7 @@ if return_code != 0 or loaded:
                     {
                         "kind": "work_log",
                         "time": current.strftime("%H:%M"),
+                        "date_offset": int(current.hour < 8),
                         "actor": "10",
                         "target": "10",
                         "source": "在隊訓練",
@@ -22654,12 +22729,11 @@ if return_code != 0 or loaded:
 
         from PySide6.QtTest import QSignalSpy
 
+        from app_core.schedule_repository import business_roc_date
         from qt_app.controllers.duty_controller import DutyController
 
         current = datetime.now()
-        target_roc_date = (
-            f"{current.year - 1911:03d}{current.month:02d}{current.day:02d}"
-        )
+        target_roc_date = business_roc_date(current)
         controller = DutyController()
         controller.set_actor_no("10")
         controller.replace_schedule_data(
@@ -22669,6 +22743,7 @@ if return_code != 0 or loaded:
                     {
                         "kind": "work_log",
                         "time": current.strftime("%H:%M"),
+                        "date_offset": int(current.hour < 8),
                         "actor": "10",
                         "source": "在隊訓練",
                     }

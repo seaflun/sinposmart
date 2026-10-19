@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, Qt, Signal, Slot
 
 from app_core.operational_sync_service import DEFAULT_SINPOSMART_BACKEND_EVENT_URL
 from app_core.update_repository import UpdateCheckError, UpdateRepository, VersionInfo
@@ -1224,6 +1224,10 @@ class UpdateProgressController(UpdateWindowState):
         self._status_path = state_dir / "progress.json"
         self._process = None
         self._exit_code = None
+        self._failure_reporting_enabled = heartbeat_enabled is True
+        self._failure_report_sent = False
+        self._failure_report_thread: QThread | None = None
+        self._failure_report_worker: RemoteUpdateWorker | None = None
         self._expected_pid = 0
         self._waiting_since = None
         self._heartbeat_reporter: Any | None = None
@@ -1323,7 +1327,83 @@ class UpdateProgressController(UpdateWindowState):
             return
         self._heartbeat_snapshot = fields
 
+    def _close_failure_detail(self) -> str:
+        request_id = _heartbeat_request_id(self._request_id)
+        root = self._script_path.parent
+        manifest = _heartbeat_stage_manifest(
+            Path(os.environ.get("LOCALAPPDATA", "").strip() or tempfile.gettempdir())
+            / "SinpoSmart" / "update_staging" / request_id / "manifest.json", request_id, root,
+        )
+        failure = manifest.get("close_failure")
+        if manifest.get("status") != "failed" or not isinstance(failure, dict):
+            return ""
+        reasons = {
+            "handshake_not_ready": "GUI 尚未回覆可更新",
+            "gui_identity_invalid": "原 GUI 身分或數量不符合更新條件",
+            "gui_query_failed": "無法查詢 GUI 程序",
+            "gui_process_changed": "等待退出時出現其他或無法確認身分的 GUI",
+            "gui_exit_timeout": "等待舊 GUI 自然退出逾時",
+            "gui_exit_check_failed": "無法確認舊 GUI 是否已退出",
+            "gui_busy_timeout": "勤務工作仍未結束，等待可更新回覆逾時",
+        }
+        code = failure.get("code")
+        if not isinstance(code, str) or code not in reasons:
+            return ""
+        limits = {"expected_pid": (0, 2**32 - 1), "observed_count": (-1, 65536),
+                  "waited_ms": (0, 3_600_000)}
+        if any(type(failure.get(key)) is not int or not low <= failure[key] <= high
+               for key, (low, high) in limits.items()):
+            return ""
+        exception_type = failure.get("exception_type", "")
+        if (not isinstance(exception_type, str) or len(exception_type) > 160
+                or (exception_type and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", exception_type) is None)):
+            return ""
+        detail = (f"遠端更新失敗：{reasons[code]} [{code}]；原 PID={failure['expected_pid']}；"
+                  f"GUI 數={failure['observed_count']}；等待={failure['waited_ms']} 毫秒")
+        return detail + (f"；例外類別={exception_type}" if exception_type else "")
+
+    def _report_close_failure(self, detail: str) -> None:
+        if not self._failure_reporting_enabled or self._failure_report_sent or not detail:
+            return
+        endpoint, token = _remote_update_endpoint(), _remote_update_token()
+        if not endpoint or not token or not _heartbeat_request_id(self._request_id):
+            return
+        worker_id = _remote_update_worker_id()
+        worker = RemoteUpdateWorker(
+            1, endpoint, token, worker_id,
+            UpdateRepository(self._script_path.with_name("VERSION.txt")).current_version(),
+            status_request={"request_id": self._request_id, "status": "failed", "detail": detail[:500],
+                            "worker_id": worker_id, "exit_code": self._exit_code},
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.failed.connect(self._close_failure_report_failed)
+        thread.finished.connect(self._finish_close_failure_report)
+        self._failure_report_thread, self._failure_report_worker = thread, worker
+        self._failure_report_sent = True
+        thread.start()
+
+    @Slot(int, str)
+    def _close_failure_report_failed(self, _request_id: int, _message: str) -> None:
+        self._show_view(footer="具體原因已保留於更新紀錄；後台暫時無法接收回報。")
+
+    @Slot()
+    def _finish_close_failure_report(self) -> None:
+        thread = self._failure_report_thread
+        if thread is not None:
+            thread.deleteLater()
+        self._failure_report_thread = None
+        self._failure_report_worker = None
+
     def shutdown(self) -> None:
+        thread = self._failure_report_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            self._finish_close_failure_report()
         self._heartbeat_timer.stop()
         reporter = self._heartbeat_reporter
         if reporter is None:
@@ -1413,8 +1493,12 @@ class UpdateProgressController(UpdateWindowState):
         self._heartbeat_started = True
         self.installerFinished.emit()
         if exit_code != 0:
-            self._fail("這次更新未完成。", "請查看更新紀錄；若主程式未開啟，請手動重新開啟。",
+            detail = self._close_failure_detail()
+            # Keep the fixed-size window concise; retain full diagnostics in the report and log.
+            visible_reason = detail.removeprefix("遠端更新失敗：").split(" [", 1)[0]
+            self._fail("這次更新未完成。", visible_reason or "請查看更新紀錄；若主程式未開啟，請手動重新開啟。",
                        result_code="gui_start_failed" if self._view["phase"] == "restarting" else "installer_failed")
+            self._report_close_failure(detail)
         elif self._view["phase"] == "current":
             self._poll_timer.stop()
             self._show_view(title="目前已是最新版", subtitle="不需要安裝更新。", busy=False,

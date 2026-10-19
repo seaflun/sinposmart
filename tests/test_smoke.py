@@ -5845,7 +5845,7 @@ if (-not (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missing
     throw "A handshaken process that exited naturally was rejected."
 }}
 $liveInitial = [pscustomobject]@{{ ProcessId = $PID; CommandLine = 'pythonw.exe duty_gui.pyw' }}
-if (Stop-RunningDutyGui -Processes @($liveInitial) -ExpectedProcessId $PID -Ready) {{
+if (Stop-RunningDutyGui -Processes @($liveInitial) -ExpectedProcessId $PID -Ready -ExitTimeoutSeconds 0) {{
     throw "An unclassified but still-live handshaken PID was accepted."
 }}
 function Get-RunningDutyGuiProcesses {{
@@ -5859,6 +5859,90 @@ if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $missingPid -R
 
         result = run_powershell_contract(contract)
 
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_update_package_waits_for_temporarily_unclassified_gui_to_exit(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        helpers = script[script.index("function Get-DutyGuiEntrypointToken"):script.index("function Send-UpdateLogoutEvent")]
+        stop = script[script.index("function Stop-RunningDutyGui"):script.index("function Invoke-HiddenProcess")]
+        contract = f"""
+$ErrorActionPreference = "Stop"
+$packageDir = 'C:/SinpoSmart Contract'
+{helpers}
+{stop}
+function Get-RunningDutyGuiProcesses {{ return @() }}
+function Stop-Process {{ throw "The updater must not force-stop the GUI." }}
+$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Milliseconds 500' -WindowStyle Hidden -PassThru
+try {{
+    $initial = [pscustomobject]@{{ ProcessId = $child.Id; CommandLine = 'pythonw.exe duty_gui.pyw' }}
+    if (-not (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $child.Id -Ready)) {{
+        throw "A GUI still exiting after ready must be awaited, not rejected immediately."
+    }}
+    if (-not $child.HasExited) {{ throw "Update was accepted before process exit." }}
+}} finally {{ $child.WaitForExit(); $child.Dispose() }}
+"ok"
+"""
+        result = run_powershell_contract(contract)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_update_package_close_failures_record_bounded_safe_reasons(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        helpers = script[script.index("function Get-DutyGuiEntrypointToken"):script.index("function Send-UpdateLogoutEvent")]
+        stop = script[script.index("function Stop-RunningDutyGui"):script.index("function Invoke-HiddenProcess")]
+        contract = f"""
+$ErrorActionPreference = "Stop"
+$packageDir = 'C:/SinpoSmart Contract'
+{helpers}
+{stop}
+function Stop-Process {{ throw "The updater must not force-stop a process." }}
+$initial = [pscustomobject]@{{ ProcessId = $PID; CommandLine = 'pythonw.exe duty_gui.pyw' }}
+function Get-RunningDutyGuiProcesses {{ return @() }}
+if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $PID -Ready -ExitTimeoutSeconds 0) {{ throw "Live PID accepted." }}
+if ($script:guiCloseFailure.code -ne 'gui_exit_timeout') {{ throw "Missing specific timeout diagnostic." }}
+if ($script:guiCloseFailure.expected_pid -ne $PID) {{ throw "Missing original PID." }}
+if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $PID -ExitTimeoutSeconds 0) {{ throw "Missing handshake accepted." }}
+if ($script:guiCloseFailure.code -ne 'handshake_not_ready') {{ throw "Missing handshake diagnostic." }}
+function Get-RunningDutyGuiProcesses {{ return @([pscustomobject]@{{ ProcessId = 42; CommandLine = 'pythonw.exe duty_gui.pyw' }}) }}
+if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $PID -Ready -ExitTimeoutSeconds 0) {{ throw "Replacement GUI accepted." }}
+if ($script:guiCloseFailure.code -ne 'gui_process_changed') {{ throw "Missing replacement diagnostic." }}
+function Get-RunningDutyGuiProcesses {{ throw 'private-token=must-not-appear' }}
+if (Stop-RunningDutyGui -Processes @($initial) -ExpectedProcessId $PID -Ready -ExitTimeoutSeconds 0) {{ throw "Failed query accepted." }}
+if ($script:guiCloseFailure.code -ne 'gui_query_failed') {{ throw "Missing query diagnostic." }}
+if (($script:guiCloseFailure | ConvertTo-Json) -match 'private-token|must-not-appear') {{ throw "Raw exception leaked." }}
+if (-not $script:guiCloseFailure.exception_type) {{ throw "Missing safe exception type." }}
+"ok"
+"""
+        result = run_powershell_contract(contract)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_update_close_diagnostic_survives_failed_stage_manifest(self) -> None:
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        setter = script[script.index("function Set-GuiCloseFailure"):script.index("function Invoke-HiddenProcess")]
+        writer = script[script.index("function Write-RemoteStageManifest"):script.index("function Add-PendingUpdateNotice")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = str(Path(temp_dir)).replace("'", "''")
+            contract = f"""
+$ErrorActionPreference = "Stop"
+$stagingDir = '{directory}'
+$stagingManifestPath = Join-Path $stagingDir 'manifest.json'
+$RequestId = '44444444-4444-4444-8444-444444444444'
+$packageDir = 'C:/SinpoSmart Contract'
+{setter}
+{writer}
+Set-GuiCloseFailure -Code 'gui_exit_timeout' -Reason 'Timed out waiting for GUI' -ExpectedProcessId 1234 -ObservedCount 0 -WaitedMs 60001
+Write-RemoteStageManifest -Status 'failed' -RemoteVersion '2026.10.20.0200' -RemoteSha256 ('a' * 64) -InstalledVersion '2026.10.19.2240' -Detail $script:guiCloseFailure.detail
+$record = Get-Content -LiteralPath $stagingManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($record.close_failure.code -ne 'gui_exit_timeout' -or $record.close_failure.expected_pid -ne 1234 -or $record.close_failure.waited_ms -ne 60001) {{ throw 'Lost failure details in manifest.' }}
+if ($record.detail -notmatch 'gui_exit_timeout') {{ throw 'Legacy GUI report lost the specific cause.' }}
+Write-RemoteStageManifest -Status 'completed' -RemoteVersion '2026.10.20.0200' -RemoteSha256 ('a' * 64) -InstalledVersion '2026.10.20.0200'
+$record = Get-Content -LiteralPath $stagingManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($record.close_failure) {{ throw 'Stale failure contaminated a successful update.' }}
+"ok"
+"""
+            result = run_powershell_contract(contract)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("ok", result.stdout)
 

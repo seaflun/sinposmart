@@ -220,7 +220,7 @@ function Test-IsPossiblePackageDutyGuiProcess {
 }
 
 function Get-RunningDutyGuiProcesses {
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Get-CimInstance Win32_Process -ErrorAction Stop |
         Where-Object { Test-IsPossiblePackageDutyGuiProcess -Process $_ }
 }
 
@@ -312,75 +312,90 @@ function Stop-RunningDutyGui {
     param(
         [object[]]$Processes = @(),
         [int]$ExpectedProcessId = 0,
-        [switch]$Ready
+        [switch]$Ready,
+        [ValidateRange(0, 300)][int]$ExitTimeoutSeconds = 60
     )
 
+    $script:guiCloseFailure = $null
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     if (-not $Ready) {
-        Write-Warning "Refused to stop SinpoSmart without a ready update handshake."
+        Set-GuiCloseFailure -Code "handshake_not_ready" -Reason "尚未取得 GUI 可更新回覆" -ExpectedProcessId $ExpectedProcessId
         return $false
     }
-
     $processes = @($Processes)
-    if ($processes.Count -ne 1 -or $ExpectedProcessId -le 0) {
-        Write-Warning "Refused to stop SinpoSmart because exactly one handshaken Qt process is required."
+    if ($processes.Count -ne 1 -or $ExpectedProcessId -le 0 -or
+        -not (Test-IsQtDutyGuiProcess -Process $processes[0]) -or
+        [int]$processes[0].ProcessId -ne $ExpectedProcessId) {
+        Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "原 GUI 身分或數量不符合更新條件" -ExpectedProcessId $ExpectedProcessId -ObservedCount $processes.Count
         return $false
     }
 
-    $process = $processes[0]
-    if (
-        -not (Test-IsQtDutyGuiProcess -Process $process) -or
-        [int]$process.ProcessId -ne $ExpectedProcessId
-    ) {
-        Write-Warning "Refused to stop SinpoSmart because the supplied process is not the handshaken Qt duty_gui.pyw process."
-        return $false
-    }
-
-    $currentProcesses = @(Get-RunningDutyGuiProcesses)
-    if ($currentProcesses.Count -eq 0) {
-        try {
-            $remainingProcess = [System.Diagnostics.Process]::GetProcessById($ExpectedProcessId)
-            $remainingProcess.Dispose()
-            Write-Warning "Refused to update because handshaken process $ExpectedProcessId still exists but could not be classified safely."
-            return $false
-        } catch [System.ArgumentException] {
-            Write-Host "The handshaken SinpoSmart process $ExpectedProcessId exited cleanly."
-            return $true
-        } catch {
-            Write-Warning "Could not confirm whether handshaken process $ExpectedProcessId exited: $_"
-            return $false
-        }
-    }
-    if (
-        $currentProcesses.Count -ne 1 -or
-        -not (Test-IsQtDutyGuiProcess -Process $currentProcesses[0]) -or
-        [int]$currentProcesses[0].ProcessId -ne $ExpectedProcessId
-    ) {
-        Write-Warning "Refused to stop SinpoSmart because the running GUI process set changed after the update handshake."
-        return $false
-    }
-
-    Write-Host "Closing running SinpoSmart app so the updated files can load..."
-    $allClosed = $true
+    $original = $null
+    $observedCount = -1
     try {
-        Wait-Process -Id $ExpectedProcessId -Timeout 10 -ErrorAction SilentlyContinue
-        if (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $ExpectedProcessId -Force -ErrorAction Stop
+        try {
+            # Retain the process handle while waiting; never stop a replacement PID.
+            $original = [System.Diagnostics.Process]::GetProcessById($ExpectedProcessId)
+            if (-not $original.HasExited) { [void]$original.Handle }
+        } catch [System.ArgumentException] {
+            # It may have exited between its ready response and this check.
+        } catch [System.InvalidOperationException] {
+            if (-not $original -or -not $original.HasExited) { throw }
         }
-        if (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue) {
-            $allClosed = $false
-            Write-Warning "Process $ExpectedProcessId is still running."
-        } else {
-            Write-Host "Closed process $ExpectedProcessId."
+        while ($true) {
+            try {
+                $current = @(Get-RunningDutyGuiProcesses)
+            } catch {
+                Set-GuiCloseFailure -Code "gui_query_failed" -Reason "無法查詢 GUI 程序" -ExpectedProcessId $ExpectedProcessId -WaitedMs $clock.ElapsedMilliseconds -ExceptionType $_.Exception.GetType().FullName
+                return $false
+            }
+            $observedCount = $current.Count
+            if ($current.Count -gt 1 -or ($current.Count -eq 1 -and
+                ([int]$current[0].ProcessId -ne $ExpectedProcessId -or
+                 -not (Test-IsQtDutyGuiProcess -Process $current[0])))) {
+                Set-GuiCloseFailure -Code "gui_process_changed" -Reason "等待退出時出現其他或無法確認身分的 GUI" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -WaitedMs $clock.ElapsedMilliseconds
+                return $false
+            }
+            $exited = $null -eq $original -or $original.HasExited
+            if ($exited -and $current.Count -eq 0) {
+                Write-Host "The handshaken SinpoSmart process $ExpectedProcessId exited cleanly."
+                return $true
+            }
+            if ($clock.Elapsed.TotalSeconds -ge $ExitTimeoutSeconds) {
+                Set-GuiCloseFailure -Code "gui_exit_timeout" -Reason "等待舊 GUI 自然退出逾時，未套用更新檔案" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -WaitedMs $clock.ElapsedMilliseconds
+                return $false
+            }
+            # CIM may temporarily lose the command line during shutdown. Wait for
+            # the same process to finish instead of interpreting that gap as failure.
+            if ($original -and -not $exited) {
+                [void]$original.WaitForExit(250)
+            } else {
+                Start-Sleep -Milliseconds 250
+            }
         }
     } catch {
-        $allClosed = $false
-        Write-Warning "Could not close process ${ExpectedProcessId}: $_"
-    }
-    if (-not $allClosed) {
+        Set-GuiCloseFailure -Code "gui_exit_check_failed" -Reason "無法確認舊 GUI 是否已退出" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -WaitedMs $clock.ElapsedMilliseconds -ExceptionType $_.Exception.GetType().FullName
         return $false
+    } finally {
+        if ($original) { $original.Dispose() }
     }
-    Start-Sleep -Milliseconds 800
-    return $true
+}
+
+function Set-GuiCloseFailure {
+    param(
+        [string]$Code, [string]$Reason, [int]$ExpectedProcessId = 0,
+        [int]$ObservedCount = -1, [long]$WaitedMs = 0, [string]$ExceptionType = ""
+    )
+
+    # Fixed reasons and numeric process metadata only; never serialize command
+    # lines, paths, credentials or raw exception messages into backend reports.
+    $detail = "關閉舊值班台失敗：$Reason [$Code]；原 PID=$ExpectedProcessId；GUI 數=$ObservedCount；等待=$WaitedMs 毫秒"
+    if ($ExceptionType) { $detail += "；例外類別=$ExceptionType" }
+    $script:guiCloseFailure = [ordered]@{
+        code = $Code; expected_pid = $ExpectedProcessId; observed_count = $ObservedCount
+        waited_ms = $WaitedMs; exception_type = $ExceptionType; detail = $detail
+    }
+    Write-Warning $detail
 }
 
 function Invoke-HiddenProcess {
@@ -722,6 +737,9 @@ function Write-RemoteStageManifest {
         detail = $Detail
         updated_at = (Get-Date).ToString("o")
     }
+    if ($Status -eq "failed" -and $script:guiCloseFailure) {
+        $manifest.close_failure = $script:guiCloseFailure
+    }
     $tempManifestPath = Join-Path $stagingDir ".manifest.$([guid]::NewGuid().ToString('N')).tmp"
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempManifestPath -Encoding UTF8
     Move-Item -LiteralPath $tempManifestPath -Destination $stagingManifestPath -Force
@@ -1005,26 +1023,40 @@ try {
     New-PackageBackup -SourceDir $packageDir -BackupZip $backupZip -StageDir $backupStageRoot
 
     Write-UpdateProgress -Phase "closing" -Percent 58
-    $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
+    try {
+        $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
+    } catch {
+        Set-GuiCloseFailure -Code "gui_query_failed" -Reason "無法查詢 GUI 程序" -ExceptionType $_.Exception.GetType().FullName
+        throw $script:guiCloseFailure.detail
+    }
     $wasRunning = $runningDutyGuiProcesses.Count -gt 0
     if ($wasRunning) {
         if ($runningDutyGuiProcesses.Count -ne 1) {
-            throw "Update postponed because exactly one SinpoSmart GUI process must be running. No process was stopped."
+            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "有多個 GUI，無法確認更新對象" -ObservedCount $runningDutyGuiProcesses.Count
+            throw $script:guiCloseFailure.detail
         }
         $runningQtProcess = $runningDutyGuiProcesses[0]
         if (-not (Test-IsQtDutyGuiProcess -Process $runningQtProcess)) {
-            throw "Update postponed because the running SinpoSmart GUI is not the Qt duty_gui.pyw app. No process was stopped."
+            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "執行中的 GUI 不是可確認的 Qt 值班台" -ExpectedProcessId ([int]$runningQtProcess.ProcessId) -ObservedCount 1
+            throw $script:guiCloseFailure.detail
         }
         $handshakenProcessId = [int]$runningQtProcess.ProcessId
-        $prepareResult = Wait-UpdateLogoutEvent -ExpectedProcessId $handshakenProcessId
+        try {
+            $prepareResult = Wait-UpdateLogoutEvent -ExpectedProcessId $handshakenProcessId
+        } catch {
+            Set-GuiCloseFailure -Code "gui_query_failed" -Reason "等待可更新回覆時程序查詢失敗" -ExpectedProcessId $handshakenProcessId -ExceptionType $_.Exception.GetType().FullName
+            throw $script:guiCloseFailure.detail
+        }
         if ($prepareResult -eq "busy_timeout") {
-            throw "更新等待超過 5 分鐘，工作仍未結束；已停止本次更新，原程式保持開啟。"
+            Set-GuiCloseFailure -Code "gui_busy_timeout" -Reason "更新等待超過 5 分鐘，工作仍未結束；已停止本次更新，原程式保持開啟。" -ExpectedProcessId $handshakenProcessId -ObservedCount 1 -WaitedMs 300000
+            throw $script:guiCloseFailure.detail
         }
         if ($prepareResult -ne "ready") {
-            throw "Update postponed because the running SinpoSmart app did not report ready ($prepareResult). The app remains open."
+            Set-GuiCloseFailure -Code "handshake_not_ready" -Reason "GUI 未回覆可更新（$prepareResult），保留原程式" -ExpectedProcessId $handshakenProcessId
+            throw $script:guiCloseFailure.detail
         }
         if (-not (Stop-RunningDutyGui -Processes $runningDutyGuiProcesses -Ready -ExpectedProcessId $handshakenProcessId)) {
-            throw "Update postponed because the running SinpoSmart app could not be closed safely."
+            throw $script:guiCloseFailure.detail
         }
         $guiStoppedForUpdate = $true
     }
