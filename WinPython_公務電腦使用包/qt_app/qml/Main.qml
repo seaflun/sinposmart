@@ -13,6 +13,7 @@ ApplicationWindow {
     id: window
     visible: true
     flags: Qt.Window | Qt.FramelessWindowHint
+           | (window.backend.loginFailureMessage.length > 0 ? Qt.WindowStaysOnTopHint : 0)
     width: 550
     height: 320 + Design.appTitleBarHeight
     minimumWidth: 550
@@ -38,7 +39,7 @@ ApplicationWindow {
     font.pixelSize: Design.bodySize
 
     onClosing: function(close) {
-        if (window.backend.trayController.interceptClose())
+        if (window.backend.loginFailureMessage.length > 0 || window.backend.trayController.interceptClose())
             close.accepted = false
     }
 
@@ -322,6 +323,15 @@ ApplicationWindow {
     Connections {
         target: window.backend
 
+        function onLoginFailureChanged() {
+            if (window.backend.loginFailureMessage.length === 0)
+                return
+            window.showNormal()
+            window.raise()
+            window.requestActivate()
+            loginFailureDialog.open()
+        }
+
         function onDiagnosticsStatusRequested(message) {
             actionConfirmations.openDiagnosticsStatus(message)
         }
@@ -346,6 +356,41 @@ ApplicationWindow {
         anchors.centerIn: parent
         width: Math.min(window.width - 48, 620)
         height: Math.min(window.height - 96, 560)
+    }
+
+    AppleDialog {
+        id: loginFailureDialog
+        objectName: "loginFailureDialog"
+        anchors.centerIn: parent
+        width: Math.min(window.width - 40, 520)
+        height: Math.min(window.height - 32, 310)
+        z: 10000
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        title: "勤務網站登入失敗"
+        standardButtons: Dialog.Yes
+        acceptText: "確認"
+        onAccepted: {
+            window.hide()
+            window.backend.confirmLoginFailureExit()
+        }
+
+        ScrollView {
+            anchors.fill: parent
+            clip: true
+            contentWidth: availableWidth
+
+            Label {
+                objectName: "loginFailureMessageText"
+                width: parent.width
+                text: window.backend.loginFailureMessage
+                      + "\n\n後續登打已停止。若已更換密碼，重新開啟值班台後請輸入新密碼。\n\n按「確認」關閉值班台。"
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: Design.text
+                font.pixelSize: Design.bodySize
+            }
+        }
     }
 
     UpdateHistoryDialog {

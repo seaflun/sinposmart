@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.19.1932` | 2026-10-19 19:32（台北時間） | 阻擋失效帳密誤登入；登打登入失敗時置頂提醒，確認後安全關閉，保留正常交接及回報。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.19.1932) |
 | `2026.10.18.1045` | 2026-10-18 10:45（台北時間） | 等待清單導頁與刷新完成後再驗證，補齊固定失敗階段，保留逐車完成與不用保養守門。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.18.1045) |
 | `2026.10.18.0910` | 2026-10-18 09:10（台北時間） | 修復實站查詢資料來源替換、網站不用保養與器材完成判定，保留逐車結果。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.18.0910) |
 | `2026.10.17.1253` | 2026-10-17 12:53（台北時間） | 修正車輛保養清點誤報完成，統一手動／自動日期並保留逐車核對結果與未確認原因。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.17.1253) |

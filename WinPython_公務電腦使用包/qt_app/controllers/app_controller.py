@@ -92,6 +92,7 @@ class AppController(QObject):
     nativeTitleBarRequested = Signal(QObject)
     dutyActionFailed = Signal(str, str)
     dutyActionRecovered = Signal(str)
+    loginFailureChanged = Signal()
 
     def __init__(
         self,
@@ -237,6 +238,11 @@ class AppController(QObject):
         self._provisional_actor_no = ""
         self._actor_identity_pending = False
         self._logout_pending = False
+        self._login_failure_message = ""
+        self._login_failure_exit_requested = False
+        self._login_failure_exit_timer = QTimer(self)
+        self._login_failure_exit_timer.setInterval(250)
+        self._login_failure_exit_timer.timeout.connect(self._finish_login_failure_exit)
         self._pending_logout_message = ""
         self._pending_logout_method = "unknown"
         self._pending_auto_login_actor_no = ""
@@ -446,6 +452,10 @@ class AppController(QObject):
             result_code="closed" if stopping else "",
         )
 
+    @Property(str, notify=loginFailureChanged)
+    def loginFailureMessage(self) -> str:
+        return self._login_failure_message
+
     @Property(QObject, constant=True)
     def sessionController(self) -> SessionController:
         return self._session_controller
@@ -653,6 +663,8 @@ class AppController(QObject):
     def _stop_block_reason(self) -> str:
         """Describe the first activity that makes quit or update unsafe."""
 
+        if self._login_failure_message and not self._login_failure_exit_requested:
+            return "等待確認勤務網站登入失敗提醒"
         if self._update_shutdown_prepared or self._worker_admissions_closed:
             return "程式正在關閉"
         if self._automatic_prepare_workers:
@@ -3016,8 +3028,9 @@ class AppController(QObject):
     @Slot(str)
     def _force_logout(self, message: str) -> None:
         session = self._session_state.session
-        if session is None or not session.verified:
+        if session is None or not session.verified or self._login_failure_message:
             return
+        self._login_failure_message = str(message or "勤務網站登入失敗，請確認帳號密碼。")
         self._send_operational_event(
             "login_expired",
             status="failed",
@@ -3025,7 +3038,30 @@ class AppController(QObject):
             error=message,
         )
         self._tray_controller.notify("SinpoSmart", message)
+        self._pending_auto_login_actor_no = ""
+        self._session_controller.prepare_shutdown_admission()
+        self._background_manual_timer.stop()
+        self._duty_execution_controller.close_entry_session(force=True)
         self._begin_session_logout(message)
+        self.loginFailureChanged.emit()
+
+    @Slot()
+    def confirmLoginFailureExit(self) -> None:
+        if not self._login_failure_message or self._login_failure_exit_requested:
+            return
+        self._login_failure_exit_requested = True
+        self._login_failure_exit_timer.start()
+        self._finish_login_failure_exit()
+
+    def _finish_login_failure_exit(self) -> None:
+        if self._worker_admissions_closed:
+            self._login_failure_exit_timer.stop()
+            return
+        if self._login_failure_exit_requested and not self._background_manual_workers:
+            self._shutdown_background_manual_chains()
+        if self._login_failure_exit_requested and not self._stop_block_reason():
+            self._login_failure_exit_timer.stop()
+            self._tray_controller.requestQuit()
 
     @Slot()
     def _refresh_after_settings_save(self) -> None:
@@ -3103,6 +3139,7 @@ class AppController(QObject):
 
     @Slot()
     def shutdown(self) -> None:
+        self._login_failure_exit_timer.stop()
         if not self._heartbeat_stopped:
             self._heartbeat_timer.stop()
             self._pulse_gui_heartbeat(stopping=True)

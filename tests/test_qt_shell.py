@@ -713,7 +713,7 @@ const NodeFilter = {SHOW_TEXT:4};
 
 
     class DiagnosticDriver:
-        def __init__(self, *, text="密碼已到期，請更換密碼", password_fields=3, redacted=True, png=None):
+        def __init__(self, *, text="密碼已到期，請更換密碼", password_fields=3, redacted=True, png=None, authenticated=True):
             import base64
 
             self.current_url = "https://user:pass@dutymgt.tyfd.gov.tw/change?token=private#secret"
@@ -722,6 +722,8 @@ const NodeFilter = {SHOW_TEXT:4};
             self.password_fields = password_fields
             self.redacted = redacted
             self.events = []
+            self.authenticated = authenticated
+            self.visited_urls = []
             self.switch_to = LoginVerifierTests.SwitchTo()
             self.png = png if png is not None else base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -730,7 +732,15 @@ const NodeFilter = {SHOW_TEXT:4};
         def find_elements(self, *_args):
             return []
 
+        def get(self, url):
+            self.current_url = url
+            self.visited_urls.append(url)
+
         def execute_script(self, script, *args):
+            if "duty-authenticated-page" in script:
+                if isinstance(self.authenticated, Exception):
+                    raise self.authenticated
+                return self.authenticated
             if "login-diagnostic-probe" in script:
                 return {"page_text": self.text + " user10 secret", "password_fields": self.password_fields}
             if "login-diagnostic-redact" in script:
@@ -947,8 +957,138 @@ const NodeFilter = {SHOW_TEXT:4};
         def find_elements(self, *_args) -> list[object]:
             return []
 
-        def execute_script(self, _script: str) -> str:
+        def get(self, url: str) -> None:
+            self.current_url = url
+
+        def execute_script(self, _script: str):
+            if "duty-authenticated-page" in _script:
+                return True
             return "勤務系統\n測試員，您好"
+
+    @staticmethod
+    def authentication_wait_once(driver, *_args, **_kwargs):
+        from selenium.common.exceptions import TimeoutException
+
+        def until(condition):
+            result = condition(driver)
+            if not result:
+                raise TimeoutException("protected page unavailable")
+            return result
+
+        return SimpleNamespace(until=until)
+
+    def test_login_requires_server_authentication_even_with_saved_identity(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        for mode in ({}, {"defer_actor_resolution": True}, {"allow_post_login_lookup_warning": True}):
+            with self.subTest(mode=mode):
+                driver = self.DiagnosticDriver(
+                    text="您已經被登出系統，請重新登入", password_fields=0, authenticated=False,
+                )
+                identity_lookup = Mock(return_value=("10", "測試員"))
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+                    driver_cleanup=lambda _driver: driver.events.append("cleanup"), **mode,
+                )
+                with (
+                    patch("selenium.webdriver.support.ui.WebDriverWait", side_effect=self.authentication_wait_once),
+                    patch("app_core.login_verifier.identify_logged_in_actor", identity_lookup),
+                    self.assertRaises(LoginVerificationError) as caught,
+                ):
+                    verifier.verify(
+                        typed_actor_no="10", user_id="user10", password="secret",
+                        actor_no_from_user_id=lambda _: "10", actor_no_from_name=lambda _: "10",
+                        staff={"10": {"name": "測試員"}},
+                    )
+                identity_lookup.assert_not_called()
+                self.assertEqual(caught.exception.reason_code, "authentication_unverified")
+                diagnostic = caught.exception.login_diagnostic
+                self.assertEqual(diagnostic["stage"], "post_login")
+                self.assertEqual(diagnostic["capture_status"], "captured")
+                self.assertEqual(driver.events, ["redact", "screenshot", "cleanup"])
+                self.assertNotIn("secret", json.dumps(diagnostic, ensure_ascii=False))
+
+    def test_missing_or_invalid_authentication_probe_cannot_become_login_success(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        for probe in (None, "true", {"ready": True}, RuntimeError("page unavailable")):
+            with self.subTest(probe=type(probe).__name__):
+                driver = self.DiagnosticDriver(text="", password_fields=0, authenticated=probe)
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+                    defer_actor_resolution=True, allow_post_login_lookup_warning=True,
+                    driver_cleanup=lambda _driver: None,
+                )
+                with (
+                    patch("selenium.webdriver.support.ui.WebDriverWait", side_effect=self.authentication_wait_once),
+                    self.assertRaises(LoginVerificationError),
+                ):
+                    verifier.verify(
+                        typed_actor_no="", user_id="user10", password="secret",
+                        actor_no_from_user_id=lambda _: "10", actor_no_from_name=lambda _: "10", staff={},
+                    )
+
+    def test_authentication_script_requires_protected_controls_without_password_form(self):
+        from PySide6.QtQml import QJSEngine
+        from PySide6.QtWidgets import QApplication
+
+        from app_core.login_verifier import AUTHENTICATED_DUTY_PAGE_SCRIPT
+
+        self._authentication_app = QApplication.instance() or QApplication(["authentication-test"])
+        cases = (
+            (["_txtTaskDate", "_btnQuery"], False, True),
+            (["_txtTaskDate", "_btnSearch"], False, True),
+            (["_txtTaskDate"], False, False),
+            (["_btnQuery"], False, False),
+            ([], False, False),
+            (["_txtUsername", "_txtPassword"], True, False),
+            (["_txtTaskDate", "_btnQuery"], True, False),
+        )
+        for ids, password_form, expected in cases:
+            with self.subTest(ids=ids, password_form=password_form):
+                engine = QJSEngine()
+                fixture = "const ids = " + json.dumps(ids) + "; const passwordForm = " + json.dumps(password_form) + ";"
+                fixture += r'''
+const control = {get value() { throw new Error('credentials must not be read'); }};
+const document = {
+  getElementById(id) { return ids.includes(id) ? control : null; },
+  querySelector(selector) {
+    if (selector !== 'input[type="password"]') throw new Error('unexpected selector');
+    return passwordForm ? control : null;
+  }
+};
+'''
+                result = engine.evaluate(fixture + "(function(){" + AUTHENTICATED_DUTY_PAGE_SCRIPT + "})()")
+                self.assertFalse(result.isError(), result.toString())
+                self.assertTrue(result.isBool())
+                self.assertEqual(result.toBool(), expected)
+
+    def test_authenticated_page_allows_login_without_cached_name_or_schedule_query(self):
+        from app_core.login_verifier import LoginVerifier
+        from duty_rehearsal import BASE_URL, DUTY_TABLE_AP
+
+        driver = self.DiagnosticDriver(text="勤務管理", password_fields=0)
+        schedule_query = Mock()
+        verifier = LoginVerifier(
+            options_factory=object, driver_factory=lambda _options: driver,
+            configure_driver=lambda _driver: None, login_function=lambda *_args: None,
+            actor_no_query=schedule_query, defer_actor_resolution=True, driver_cleanup=lambda _driver: None,
+        )
+        with patch("app_core.login_verifier.identify_logged_in_actor", return_value=("", "")):
+            result = verifier.verify(
+                typed_actor_no="", user_id="user10", password="secret",
+                actor_no_from_user_id=lambda _: "", actor_no_from_name=lambda _: "", staff={},
+            )
+        self.assertEqual(result.user_id, "user10")
+        self.assertEqual(result.actor_no, "")
+        self.assertEqual(result.actor_name, "")
+        schedule_query.assert_not_called()
+        self.assertEqual(driver.visited_urls, [
+            BASE_URL + "/ActionControlServlet?id=00&APname=" + DUTY_TABLE_AP
+            + "&pushButton=load&nextAPname=" + DUTY_TABLE_AP + "&_txtFirstEntry=TRUE"
+        ])
 
     def test_identity_javascript_keeps_newlines_escaped(self) -> None:
         from app_core.login_verifier import page_identity_hint_text, page_identity_text
@@ -1250,7 +1390,9 @@ const NodeFilter = {SHOW_TEXT:4};
         from app_core.login_verifier import LoginVerifier
 
         class IdentityFailureDriver(self.Driver):
-            def execute_script(self, _script: str) -> str:
+            def execute_script(self, _script: str):
+                if "duty-authenticated-page" in _script:
+                    return True
                 raise RuntimeError("登入後頁面結構無法辨識")
 
         verifier = LoginVerifier(
@@ -23368,6 +23510,181 @@ if return_code != 0 or loaded:
         self.assertEqual(actual_actions[1]["fields"]["系統寫入時間"], "10:00")
         self.assertEqual(actual_actions[2]["fields"]["工作時間"], "10:00")
 
+    def test_login_failure_requires_acknowledgement_without_changing_normal_logout(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                controller = AppController(read_only_acceptance=True)
+                controller.dutyController.load_current_schedule = lambda: None
+                controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+                controller.trayController.notify = Mock()
+                attempt = controller._session_state.begin_login()
+                controller._session_state.complete_login(attempt, LoginSession("10", "user10", "secret", verified=True))
+                controller.sessionController.sessionChanged.emit()
+                try:
+                    self.assertEqual(controller.loginFailureMessage, "")
+                    if expired:
+                        controller._pending_auto_login_actor_no = "11"
+                        controller._force_logout("帳號密碼錯誤，無法執行 18:00 交接。")
+                        controller._force_logout("重複的登入失效")
+                        self.assertIn("18:00", controller.loginFailureMessage)
+                        self.assertIn("確認", controller._stop_block_reason())
+                        self.assertFalse(controller.dutyController._auto_execution_enabled)
+                        self.assertEqual(controller._pending_auto_login_actor_no, "")
+                        controller.sessionController.login("user10", "secret", False)
+                        self.assertFalse(controller.sessionController.hasRunningLoginWorkers)
+                        controller.trayController.notify.assert_called_once()
+                    else:
+                        controller.requestLogout()
+                        self.assertEqual(controller.loginFailureMessage, "")
+                        self.assertFalse(controller.sessionController._shutdown_admission)
+                    self.assertFalse(controller.sessionController.isLoggedIn)
+                    self.assertFalse(controller.trayController.quitRequested)
+                finally:
+                    controller.shutdown()
+
+    def test_login_failure_confirmation_waits_for_active_work_and_reports(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        controller.dutyController.load_current_schedule = lambda: None
+        controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+        controller.trayController.notify = Mock()
+        quit_app = Mock()
+        controller.trayController._app = SimpleNamespace(quit=quit_app)
+        attempt = controller._session_state.begin_login()
+        controller._session_state.complete_login(attempt, LoginSession("10", "user10", "secret", verified=True))
+        controller.sessionController.sessionChanged.emit()
+        try:
+            controller.confirmLoginFailureExit()
+            quit_app.assert_not_called()
+            controller.dutyExecutionController._work_active_request_id = 99
+            controller._force_logout("帳號密碼錯誤")
+            self.assertFalse(controller._background_manual_timer.isActive())
+            controller.confirmLoginFailureExit()
+            quit_app.assert_not_called()
+            self.assertTrue(controller._logout_pending)
+            controller.dutyExecutionController._work_active_request_id = None
+            controller._finish_pending_logout()
+            controller._operational_sync_queue.append((1, "event", "logout", {}, {}))
+            controller._finish_login_failure_exit()
+            quit_app.assert_not_called()
+            controller._operational_sync_queue.clear()
+            controller._background_manual_chains["waiting"] = SimpleNamespace()
+            QTest.qWait(300)
+            quit_app.assert_called_once()
+            self.assertFalse(controller._background_manual_chains)
+            self.assertFalse(controller._login_failure_exit_timer.isActive())
+            controller.confirmLoginFailureExit()
+            quit_app.assert_called_once()
+        finally:
+            controller.dutyExecutionController._work_active_request_id = None
+            controller.shutdown()
+
+    def test_only_current_handoff_login_failure_opens_exit_notice(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for error_code, stale in (("login_failed", False), ("validation_error", False), ("login_failed", True)):
+            with self.subTest(error_code=error_code, stale=stale):
+                controller = AppController(read_only_acceptance=True)
+                controller.dutyController.load_current_schedule = lambda: None
+                controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+                controller.trayController.notify = Mock()
+                controller._start_operational_sync = Mock()
+                attempt = controller._session_state.begin_login()
+                controller._session_state.complete_login(attempt, LoginSession("10", "user10", "secret", verified=True))
+                controller.sessionController.sessionChanged.emit()
+                controller._read_only_acceptance = False
+                action = {"kind": "entry_log", "time": "18:00", "actor": "10", "target": "10",
+                          "source": "handoff", "duplicate_key": "exit-notice", "fields": {"status": "incoming"}}
+                data = {"target_date": "1151019", "actions": [action]}
+                controller.dutyController.replace_schedule_data(data)
+                key = action_completion_key(action)
+                request = DutySubmissionRequest(
+                    "user10", "secret", 0,
+                    {**data, "actions": [{**action, "kind": "handoff_preflight"}],
+                     "_handoff_preflight_group_id": "exit-notice", "_handoff_preflight_component_key": key},
+                    session_generation=controller._session_state.generation + int(stale),
+                    schedule_generation=controller.dutyController.schedule_generation,
+                    action_key=key, session_actor_no="10",
+                )
+                controller.dutyController._handoff_preflight_groups["exit-notice"] = {
+                    "indices": (0,), "action_keys": (key,), "actions": [dict(action)],
+                    "pending_keys": {key}, "paused": False, "queue_id": "", "bridge": {},
+                }
+                try:
+                    controller._submission_failed(request, "帳號密碼錯誤" if error_code == "login_failed" else "資料缺漏", error_code, "")
+                    should_stop = error_code == "login_failed" and not stale
+                    self.assertEqual(bool(controller.loginFailureMessage), should_stop)
+                    self.assertEqual(controller.sessionController.isLoggedIn, not should_stop)
+                    if should_stop:
+                        self.assertIn("交接預檢登入失敗", controller.loginFailureMessage)
+                        self.assertIn("尚未執行正式交接", controller.loginFailureMessage)
+                finally:
+                    controller.shutdown()
+
+    def test_qml_login_failure_is_topmost_modal_and_only_confirmation_requests_exit(self) -> None:
+        from PySide6.QtCore import QMetaObject, QObject, Qt
+        from PySide6.QtQml import QQmlExpression
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        controller = AppController(read_only_acceptance=True)
+        controller.dutyController.load_current_schedule = lambda: None
+        controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+        controller.trayController.notify = Mock()
+        engine = create_engine(controller)
+        root = engine.rootObjects()[0]
+        quit_app = Mock()
+        controller.trayController._app = SimpleNamespace(quit=quit_app)
+        try:
+            dialog = root.findChild(QObject, "loginFailureDialog")
+            self.assertIsNotNone(dialog)
+            self.assertFalse(dialog.property("visible"))
+            self.assertFalse(root.flags() & Qt.WindowStaysOnTopHint)
+            attempt = controller._session_state.begin_login()
+            controller._session_state.complete_login(attempt, LoginSession("10", "user10", "secret", verified=True))
+            controller.sessionController.sessionChanged.emit()
+            root.showMinimized()
+            root.hide()
+            controller._force_logout("交接預檢登入失敗，尚未執行正式交接：帳號密碼錯誤。")
+            QTest.qWait(30)
+            self.assertTrue(root.isVisible())
+            self.assertFalse(root.windowState() & Qt.WindowMinimized)
+            self.assertTrue(root.flags() & Qt.WindowStaysOnTopHint)
+            self.assertTrue(dialog.property("visible"))
+            self.assertTrue(dialog.property("modal"))
+            policy = QQmlExpression(engine.rootContext(), dialog, "Number(closePolicy)")
+            self.assertEqual(policy.evaluate()[0], 0)
+            detail = root.findChild(QObject, "loginFailureMessageText")
+            self.assertIn("帳號密碼錯誤", detail.property("text"))
+            QTest.keyClick(root, Qt.Key_Escape)
+            root.close()
+            self.assertTrue(dialog.property("visible"))
+            self.assertTrue(root.isVisible())
+            quit_app.assert_not_called()
+            confirm = dialog.findChild(QObject, "appleDialogYesButton")
+            self.assertEqual(confirm.property("text"), "確認")
+            QMetaObject.invokeMethod(confirm, "clicked", Qt.DirectConnection)
+            quit_app.assert_called_once()
+            self.assertTrue(controller.trayController.quitRequested)
+            self.assertFalse(root.isVisible())
+        finally:
+            controller.shutdown()
+            root.hide()
+            engine.deleteLater()
+            self.app.processEvents()
+
     def test_handoff_preflight_login_failure_states_formal_handoff_not_started(self) -> None:
         from PySide6.QtTest import QSignalSpy
 
@@ -25663,6 +25980,60 @@ if return_code != 0 or loaded:
                     break
                 QTest.qWait(10)
             self.assertFalse(controller._login_workers)
+
+    def test_session_controller_blocks_unverified_saved_and_typed_passwords(self) -> None:
+        from PySide6.QtTest import QSignalSpy, QTest
+
+        from app_core.login_verifier import LoginVerifier
+        from qt_app.controllers.session_controller import SessionController
+
+        for method, password in (("manual", ""), ("automatic", ""), ("manual", "wrong-password")):
+            with self.subTest(method=method, saved=not password):
+                account = {"actor_no": "10", "user_id": "user10", "password": "stale-password",
+                           "display_name": "10番 測試員", "name": "測試員", "id_number": ""}
+                repository = SimpleNamespace(
+                    load=lambda: SimpleNamespace(accounts=[account], last_selected="user10",
+                                                 can_persist=True, needs_rewrite=False, invalid_file=False),
+                    save=Mock(return_value=True), account_identity=lambda item: item["user_id"],
+                )
+                driver = LoginVerifierTests.DiagnosticDriver(
+                    text="您已經被登出系統，請重新登入", password_fields=0, authenticated=False,
+                )
+                login = Mock()
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _options: driver,
+                    configure_driver=lambda _driver: None, login_function=login,
+                    defer_actor_resolution=True, driver_cleanup=lambda _driver: None,
+                )
+                controller = SessionController(repository=repository, verifier=verifier, login_timeout_ms=5000)
+                failures = QSignalSpy(controller.loginAttemptFailed)
+                observed_states, diagnostics = [], []
+                controller.sessionChanged.connect(lambda: observed_states.append(controller.isLoggedIn))
+                controller.loginAttemptFailed.connect(lambda *_args: diagnostics.append(controller.take_login_diagnostic()))
+                try:
+                    with (
+                        patch("selenium.webdriver.support.ui.WebDriverWait", side_effect=LoginVerifierTests.authentication_wait_once),
+                        patch("app_core.login_verifier.identify_logged_in_actor", return_value=("", "")),
+                        patch.object(controller, "_start_credential_sync") as sync,
+                    ):
+                        controller.login("user10", password, True, login_method=method)
+                        for _ in range(100):
+                            if not controller.hasRunningLoginWorkers:
+                                break
+                            QTest.qWait(10)
+                        self.assertFalse(controller.hasRunningLoginWorkers)
+                        self.assertFalse(controller.isLoggedIn)
+                        self.assertNotIn(True, observed_states)
+                        self.assertIsNone(controller._state.session)
+                        self.assertEqual(controller.displayName, "")
+                        self.assertEqual(controller.loginStatusTone, "error")
+                        self.assertEqual(failures.count(), 1)
+                        self.assertEqual(diagnostics[0]["reason_code"], "authentication_unverified")
+                        login.assert_called_once_with(driver, "user10", password or "stale-password")
+                        repository.save.assert_not_called()
+                        sync.assert_not_called()
+                finally:
+                    controller.shutdown()
 
     def test_session_controller_exposes_error_and_system_logout_status_tones(self) -> None:
         from app_core.credential_repository import CredentialRepository

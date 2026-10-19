@@ -375,6 +375,34 @@ def run_duty_login(driver: Any, user_id: str, password: str) -> None:
     login(driver, user_id, password)
 
 
+AUTHENTICATED_DUTY_PAGE_SCRIPT = """
+// duty-authenticated-page: read protected controls only; never submit or read credentials.
+return Boolean(
+    document.getElementById('_txtTaskDate') &&
+    (document.getElementById('_btnQuery') || document.getElementById('_btnSearch')) &&
+    !document.querySelector('input[type="password"]')
+);
+"""
+
+
+def verify_duty_authentication(driver: Any) -> None:
+    """Require a server-protected page before trusting saved identity or lookup warnings."""
+    from selenium.common.exceptions import TimeoutException
+    from selenium.webdriver.support.ui import WebDriverWait
+    from duty_rehearsal import DUTY_TABLE_AP, open_ap
+
+    open_ap(driver, DUTY_TABLE_AP)
+    try:
+        WebDriverWait(driver, 15, poll_frequency=0.25).until(
+            lambda current: current.execute_script(AUTHENTICATED_DUTY_PAGE_SCRIPT) is True
+        )
+    except TimeoutException:
+        raise LoginVerificationError(
+            '登入未通過勤務網站驗證，請確認帳號密碼後重新登入。',
+            reason_code='authentication_unverified',
+        ) from None
+
+
 def query_current_duty_actor_no(driver: Any, actor_name: str) -> str:
     from app_core.schedule_repository import business_roc_date
     from duty_rehearsal import query_duty_sheet
@@ -592,6 +620,7 @@ class LoginVerifier:
                             '密碼須更新：請至勤務網站手動完成密碼變更後，再重新登入。',
                             reason_code='password_change_required',
                         )
+                    verify_duty_authentication(candidate)
                 except Exception as exc:
                     failure_diagnostic = capture_login_diagnostic(
                         candidate, str(exc).splitlines()[0] if str(exc) else '登入失敗。',
