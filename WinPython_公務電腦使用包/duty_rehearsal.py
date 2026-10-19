@@ -1828,9 +1828,11 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
           const trs = Array.from(table.querySelectorAll('tr'));
           const matrix = trs.map(tr => Array.from(tr.children).map(cellText));
           const flat = matrix.flat().join('|');
-          if (table.className.includes('report_list1') && matrix.some(row =>
-              ['番號', '職稱', '姓名'].every(label => row.some(cell => cell.replace(/\\s+/g, '') === label)))) {
-            staffTables.push(matrix);
+          const officialCaption = matrix[0]?.length === 1 &&
+            /^當日勤務輪流順序與值勤人員對照表[(]替代役人數:[0-9]+人[)]$/.test(matrix[0][0].replace(/\\s+/g, ''));
+          if (table.className.includes('report_list1') && (officialCaption || matrix.some(row =>
+              ['番號', '職稱', '姓名'].every(label => row.some(cell => cell.replace(/\\s+/g, '') === label))))) {
+            staffTables.push({matrix, trs, captioned:officialCaption});
           }
           const looksLikeDutyTable = table.className.includes('report_list1') &&
             trs.length >= 20 &&
@@ -1901,23 +1903,43 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
           (!window.jQuery || window.jQuery.active === 0) &&
           String(capturedDateField?.value || '').replace(/\\D/g, '') === arguments[0];
         const verifiedStaff = {};
-        for (const matrix of staffTables) {
+        for (const {matrix, trs, captioned} of staffTables) {
           const labels = ['番號', '職稱', '姓名'];
           const isHeader = values => labels.every((label, index) => values[index]?.replace(/\\s+/g, '') === label);
           const header = matrix.find(row => row.some((_, i) => isHeader(row.slice(i, i + 3))));
           const groups = [];
-          for (let i = 0; header && i + 2 < header.length; i++) {
-            if (isHeader(header.slice(i, i + 3))) { groups.push(i); i += 2; }
+          if (captioned) {
+            // Only the observed five-row official layout proves completeness; other row counts remain unknown.
+            if (matrix.length !== 5 || trs[0].children[0].colSpan !== 32 || trs[0].children[0].rowSpan !== 1) complete = false;
+            for (let i = 1; i < 32; i += 4) groups.push(i);
+            for (const row of trs.slice(1)) {
+              if (row.children.length !== 32 || Array.from(row.children).some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1)) complete = false;
+            }
+          } else {
+            for (let i = 0; header && i + 2 < header.length; i++) {
+              if (isHeader(header.slice(i, i + 3))) { groups.push(i); i += 2; }
+            }
           }
           const covered = index => groups.some(start => index >= start && index < start + 3);
+          const actors = new Set();
+          const names = new Set();
+          const validName = value => /^[\\p{L} ·・'’-]+$/u.test(value) && /\\p{L}/u.test(value);
           if (!groups.length) complete = false;
-          for (const row of matrix) {
+          for (const row of captioned ? matrix.slice(1) : matrix) {
             if (row.some((cell, index) => cell.trim() && !covered(index))) complete = false;
             for (const i of groups) {
               const no = (row[i] || '').trim();
               const role = (row[i + 1] || '').trim();
               const name = (row[i + 2] || '').trim();
-              if ((!no && !role && !name) || isHeader([no, role, name])) continue;
+              if ((!no && !role && !name) || (!captioned && isHeader([no, role, name]))) continue;
+              if (captioned) {
+                if (!no && role === '實習生' && validName(name)) continue;
+                const actor = String(Number(no));
+                const key = name.replace(/\\s+/g, '').toLocaleLowerCase();
+                if (!['分隊長', '小隊長', '隊員'].includes(role) || !validName(name) || actors.has(actor) || names.has(key)) complete = false;
+                actors.add(actor);
+                names.add(key);
+              }
               if (!/^\\d{1,2}$/.test(no) || !name || Object.hasOwn(verifiedStaff, no)) complete = false;
               verifiedStaff[no] = {role, name};
             }

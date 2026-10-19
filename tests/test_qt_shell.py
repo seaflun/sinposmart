@@ -7738,6 +7738,111 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertIs(result, False)
 
+    def _parse_captioned_official_staff_cases(self) -> dict:
+        import ast
+        import shutil
+        import duty_rehearsal
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is needed for the isolated DOM contract")
+        tree = ast.parse(Path(duty_rehearsal.__file__).read_text(encoding="utf-8-sig"))
+        function = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "query_duty_sheet")
+        source = next(call.args[0].value for call in ast.walk(function) if isinstance(call, ast.Call) and call.args
+                      and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+                      and "function cellText(cell)" in call.args[0].value)
+        # Anonymized 2026-10-19 official DOM: caption colspan=32, four rows of eight spacer/number/role/name groups.
+        actors = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 21, 23, 24, 25, 26, 27, 28]
+        names = ["人員甲"] + [f"人員{chr(0x7533 + index)}" for index in range(24)]
+        groups = [["", str(actor), "分隊長" if actor == 1 else "小隊長" if actor <= 5 else "隊員", name]
+                  for actor, name in zip(actors, names)]
+        groups.extend([["", "", "實習生", "人員畋"], ["", "", "實習生", "人員界"]])
+        groups.extend([["", "", "", ""] for _ in range(32 - len(groups))])
+        rows = [[{"text": "當日勤務輪流順序與值勤人員對照表(替代役人數:0人)", "colSpan": 32, "rowSpan": 1}]]
+        rows.extend([[{"text": text, "colSpan": 1, "rowSpan": 1} for group in groups[start:start + 8] for text in group]
+                     for start in range(0, 32, 8)])
+        harness = r"""
+        const source = JSON.parse(process.argv[1]), original = JSON.parse(process.argv[2]);
+        function check(change) {
+          const rows = JSON.parse(JSON.stringify(original));
+          if (change === 'bad-caption') rows[0][0].text = '其他人員對照表';
+          if (change === 'missing-caption') rows.shift();
+          if (change === 'caption-span') rows[0][0].colSpan = 31;
+          if (change === 'cell-span') rows[1][2].colSpan = 2;
+          if (change === 'row-span') rows[1][2].rowSpan = 2;
+          if (change === 'missing-first-row') rows.splice(1, 1);
+          if (change === 'missing-middle-row') rows.splice(2, 1);
+          if (change === 'missing-last-row') rows.pop();
+          if (change === 'extra-row') rows.push(Array.from({length:32},()=>({text:'', colSpan:1, rowSpan:1})));
+          if (change === 'partial-row') rows[2].pop();
+          if (change === 'extra-column') rows[2].push({text:'未知欄', colSpan:1, rowSpan:1});
+          if (change === 'separator') rows[1][4].text = '未知欄';
+          if (change === 'blank-actor') rows[1][5].text = '';
+          if (change === 'bad-actor') rows[1][5].text = 'X2';
+          if (change === 'duplicate') rows[1][5].text = '1';
+          if (change === 'canonical-duplicate') rows[1][5].text = '01';
+          if (change === 'duplicate-name') rows[1][7].text = rows[1][3].text;
+          if (change === 'header-in-captioned') [rows[1][5].text, rows[1][6].text, rows[1][7].text] = ['番號','職稱','姓名'];
+          if (change === 'unknown-role') rows[1][6].text = '其他人員';
+          if (change === 'empty-name') rows[1][7].text = '';
+          if (change === 'unsafe-name') rows[1][7].text = '人員<script>';
+          if (change === 'unknown-unnumbered') rows[4][6].text = '其他人員';
+          if (change === 'numbered-trainee') rows[4][5].text = '29';
+          if (change === 'unnamed-trainee') rows[4][7].text = '';
+          const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan, querySelectorAll:()=>[]});
+          const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
+          const schedule = table(Array.from({length:24}, (_,i)=>[
+            {text:`${(i+8)%24}~${(i+9)%24}`}, {text:'1'}, {text:''}]));
+          const staff = table(rows), tables = [schedule, staff];
+          if (change === 'class') staff.className = 'other';
+          if (change === 'two-tables') tables.push(table(rows));
+          if (change === 'headered-and-captioned') tables.push(table([
+            ['番號','職稱','姓名'].map(text=>({text})), ['1','分隊長','人員甲'].map(text=>({text}))]));
+          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}};
+          global.document = {readyState:change === 'loading' ? 'loading' : 'complete', body:{innerText:''},
+            querySelectorAll:()=>tables, getElementById:()=>({value:change === 'wrong-date' ? '1151018' : '1151019'})};
+          return new Function(source)('1151019');
+        }
+        const cases = ['ready','bad-caption','missing-caption','caption-span','cell-span','row-span',
+          'missing-first-row','missing-middle-row','missing-last-row','extra-row','partial-row',
+          'extra-column','separator','blank-actor','bad-actor','duplicate','canonical-duplicate','duplicate-name',
+          'header-in-captioned','unknown-role','empty-name',
+          'unsafe-name','unknown-unnumbered','numbered-trainee','unnamed-trainee','class','two-tables',
+          'headered-and-captioned','ajax','loading','wrong-date'];
+        console.log(JSON.stringify(Object.fromEntries(cases.map(change=>[change,check(change)]))));
+        """
+        completed = subprocess.run([node, "-e", harness, json.dumps(source), json.dumps(rows)], check=True,
+                                   text=True, capture_output=True, encoding="utf-8")
+        return json.loads(completed.stdout)
+
+    def test_official_captioned_staff_preserves_formal_roster_and_publishes_title_snapshot(self) -> None:
+        from collections import Counter
+        from qt_app.controllers.app_controller import official_personnel_title_snapshot
+
+        parsed = self._parse_captioned_official_staff_cases()["ready"]
+        self.assertTrue(parsed["staff_complete"])
+        self.assertEqual(len(parsed["staff"]), 25)
+        self.assertNotIn("", parsed["staff"])
+        snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
+        self.assertIs(snapshot["complete"], True)
+        self.assertEqual(snapshot["target_date"], "2026-10-19")
+        self.assertEqual(len(snapshot["members"]), 25)
+        self.assertEqual(Counter(member["title"] for member in snapshot["members"]), {"分隊長": 1, "小隊長": 4, "隊員": 20})
+        self.assertFalse(any(member["name"] in {"人員畋", "人員界"} for member in snapshot["members"]))
+        self.assertEqual(snapshot["members"][0], {"actor_no": "1", "name": "人員甲", "title": "分隊長"})
+
+    def test_official_captioned_staff_rejects_ambiguous_broken_unready_or_unknown_layout(self) -> None:
+        from qt_app.controllers.app_controller import official_personnel_title_snapshot
+
+        for change, parsed in self._parse_captioned_official_staff_cases().items():
+            if change == "ready":
+                continue
+            with self.subTest(change=change):
+                self.assertIs(parsed["staff_complete"], False)
+                snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
+                self.assertIs(snapshot["complete"], False)
+                self.assertEqual(snapshot["members"], [])
+
     def test_control_wait_returns_immediately_when_form_is_ready(self) -> None:
         import duty_rehearsal
 
