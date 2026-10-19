@@ -123,6 +123,8 @@ class DailyVehicleVerificationTests(unittest.TestCase):
             actions.append(action)
             if action == "state":
                 state = next(observed, states[-1])
+                if isinstance(state, Exception):
+                    raise state
                 if state.get("ready"):
                     visible[:] = [new_row]
                 return {"token": token, **state}
@@ -188,9 +190,11 @@ function makeGrid(uid) {const grid = {dataSource: source(uid), bind: () => {}, u
     grid.setDataSource = value => {grid.dataSource = value;}; return grid;}
 var grid = makeGrid('old');
 function installQuery() {window.jQuery = function() {return {data: () => grid};};
-    window.jQuery.fn = {jquery: 'fixture'}; window.QueryData = function() {}; window.Query = function() {};}
+    window.jQuery.fn = {jquery: 'fixture'}; window.jQuery.active = 0;
+    window.QueryData = function() {}; window.Query = function() {};}
 function fixtureReady() {return location.pathname === expectedPath &&
     document.readyState === 'complete' && typeof window.jQuery === 'function' &&
+    window.jQuery.active === 0 &&
     typeof window[queryName] === 'function' && (!requireSource || !!grid && !!grid.dataSource);}
 function releaseDocument() {location.pathname = expectedPath;
     location.href = 'https://fixture.invalid' + expectedPath;
@@ -204,6 +208,7 @@ engine.evaluate({
     'old_document_search_still_visible': "location.pathname = '/CarEquipCheck/Index'; location.href = 'https://fixture.invalid/CarEquipCheck/Index';",
     'query_function_not_initialized': "delete window.QueryData;",
     'query_datasource_not_initialized': "grid.dataSource = null;",
+    'initial_query_still_running': "window.jQuery.active = 1;",
     'equipment_without_initial_grid': "expectedPath = '/CarEquipCheck/Index'; location.pathname = expectedPath; queryName = 'Query'; requireSource = false; grid = null;",
 }[pending])
 
@@ -250,6 +255,7 @@ print(json.dumps({'rows': rows, 'error': error, 'early': driver.early, 'actions'
 '''
         for pending in ("new_document_scripts_loading", "old_document_search_still_visible",
                         "query_function_not_initialized", "query_datasource_not_initialized",
+                        "initial_query_still_running",
                         "equipment_without_initial_grid"):
             with self.subTest(pending=pending):
                 result = subprocess.run([sys.executable, "-B", "-c", runner, pending], cwd=PROJECT_ROOT,
@@ -263,6 +269,139 @@ print(json.dumps({'rows': rows, 'error': error, 'early': driver.early, 'actions'
                 self.assertGreater(evidence["readiness_polls"], 0)
                 self.assertEqual(evidence["actions"][0:2], ["begin", "click"])
                 self.assertEqual(evidence["actions"][-1], "cleanup")
+
+    def test_cold_page_waits_for_initial_ajax_before_manual_query(self) -> None:
+        # Each response completes between WebDriver commands, never inside one JS callback.
+        runner = r'''
+import json
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtQml import QJSEngine
+from tests.test_smoke import DailyVehicleVerificationTests
+
+DailyVehicleVerificationTests.setUpClass()
+module = DailyVehicleVerificationTests.module
+app = QCoreApplication([])
+engine = QJSEngine()
+engine.evaluate("""
+var document = {readyState: 'complete'};
+var window = {location: {pathname: '/CarMaintainCheck/Index'}};
+function source(uid) {return {view: () => [{uid}], bind: () => {}, unbind: () => {}};}
+var grid = {dataSource: source('initial-placeholder'), dom: 'initial-placeholder',
+            bind: () => {}, unbind: () => {}, setDataSource: value => {grid.dataSource = value;}};
+grid.tbody = {find: () => [{getAttribute: () => grid.dom}]};
+window.jQuery = () => ({data: () => grid});
+window.jQuery.active = 1;
+var initialPending = true, manualPending = false, clickedWhileInitial = false;
+function response(uid) {grid.setDataSource(source(uid)); grid.dom = uid; window.jQuery.active--;}
+function initialResponse() {initialPending = false; response('auto-A');}
+function manualResponse() {manualPending = false; response('manual-B');}
+window.QueryData = () => {clickedWhileInitial = initialPending; manualPending = true; window.jQuery.active++;};
+var fixtureButton = {click: () => window.QueryData()};
+""")
+
+class Button:
+    def is_displayed(self): return True
+    def is_enabled(self): return True
+
+class Driver:
+    def __init__(self):
+        self.readiness_polls = 0
+        self.observations = []
+        self.actions = []
+    def find_element(self, by, selector):
+        if selector == 'spinner-container':
+            raise NoSuchElementException('fixture no visible loading overlay')
+        return Button()
+    def find_elements(self, by, selector): return [engine.evaluate('grid.dom').toString()]
+    def execute_script(self, script, *args):
+        if script == module.GRID_PAGE_READY_SCRIPT:
+            self.readiness_polls += 1
+            if self.readiness_polls >= 2 and engine.evaluate('initialPending').toBool():
+                engine.evaluate('initialResponse()')
+        elif script == module.GRID_QUERY_OBSERVER_SCRIPT:
+            self.actions.append(args[0])
+            if args[0] == 'state':
+                if engine.evaluate('initialPending').toBool():
+                    engine.evaluate('initialResponse()')
+                elif engine.evaluate('manualPending').toBool():
+                    engine.evaluate('manualResponse()')
+        values = [json.dumps(arg) if not isinstance(arg, Button) else 'fixtureButton' for arg in args]
+        result = engine.evaluate('(function(){' + script + '}).apply(null,[' + ','.join(values) + ']);')
+        if result.isError(): raise AssertionError(result.toString())
+        value = result.toVariant()
+        if script == module.GRID_QUERY_OBSERVER_SCRIPT and args[0] == 'state':
+            self.observations.append(value)
+        return value
+
+driver = Driver()
+error = ''
+try:
+    rows = module.query_grid_rows(driver, WebDriverWait(driver, 0.2, poll_frequency=0.01), 'maintain')
+except Exception as failure:
+    rows, error = [], type(failure).__name__
+print(json.dumps({'rows': rows, 'error': error, 'readiness_polls': driver.readiness_polls,
+                  'clicked_while_initial': engine.evaluate('clickedWhileInitial').toBool(),
+                  'observations': driver.observations, 'actions': driver.actions}))
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", runner], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(evidence["error"], "", evidence)
+        self.assertEqual(evidence["rows"], ["manual-B"], evidence)
+        self.assertFalse(evidence["clicked_while_initial"], evidence)
+        self.assertGreaterEqual(evidence["readiness_polls"], 2, evidence)
+        self.assertTrue(all(value["ready"] is True and value["failed"] is False
+                            for value in evidence["observations"]), evidence)
+        self.assertEqual(evidence["actions"][-1], "cleanup")
+
+    def test_query_verify_diagnostics_distinguish_fixed_failure_boundaries(self) -> None:
+        from selenium.common.exceptions import JavascriptException, TimeoutException, WebDriverException
+        from urllib3.exceptions import MaxRetryError
+
+        module = self.module
+        ready = {"ready": True, "failed": False}
+        changed = {"ready": False, "failed": True}
+        failures = (
+            ("query_spinner_timeout", [ready], TimeoutException("token=fixture-secret"), None, 0),
+            ("query_spinner_driver_error", [ready], WebDriverException("token=fixture-secret"), None, 0),
+            ("query_spinner_driver_error", [ready],
+             MaxRetryError(None, "https://fixture.invalid/?token=fixture-secret"), None, 0),
+            ("query_source_changed_before_read", [ready, changed], None, None, 0),
+            ("query_source_changed_after_read", [ready, ready, changed], None, None, 1),
+            ("query_state_read_failed_before_rows", [ready, JavascriptException("token=fixture-secret")], None, None, 0),
+            ("query_state_read_failed_after_rows", [ready, ready, JavascriptException("token=fixture-secret")], None, None, 1),
+            ("query_state_read_failed_before_rows", [ready, MaxRetryError(None, "https://fixture.invalid/?token=fixture-secret")], None, None, 0),
+            ("query_state_read_failed_after_rows", [ready, ready, MaxRetryError(None, "https://fixture.invalid/?token=fixture-secret")], None, None, 1),
+            ("query_rows_read_failed", [ready, ready], None,
+             WebDriverException("cookie=private-cookie https://fixture.invalid/?token=fixture-secret"), 1),
+            ("query_rows_read_failed", [ready, ready], None,
+             MaxRetryError(None, "https://fixture.invalid/?token=fixture-secret"), 1),
+        )
+        for context, operation in (("maintain", "maintenance"), ("equip", "equipment")):
+            for code, states, spinner_error, read_error, read_count in failures:
+                with self.subTest(operation=operation, code=code):
+                    driver, wait, _old, _new, actions = self._query_fixture(states)
+                    if read_error is not None:
+                        driver.find_elements.side_effect = read_error
+                    spinner = mock.patch.object(module, "wait_for_spinner", side_effect=[None, spinner_error]) if spinner_error else mock.patch.object(module, "wait_for_spinner")
+                    report = module.new_vehicle_report("2026-10-19")
+                    with spinner, mock.patch("builtins.print") as output:
+                        with self.assertRaises(module.VehicleVerificationError) as failure:
+                            module.verified_grid_rows(driver, wait, operation, report)
+                    lines = [str(call.args[0]) for call in output.call_args_list if call.args]
+                    diagnostics = [line for line in lines if line.startswith("[sinposmart-vehicle-diagnostic] ")]
+                    self.assertEqual(len(diagnostics), 1, lines)
+                    self.assertIn(code, diagnostics[0])
+                    self.assertEqual(report["reason_code"], "state_unconfirmed")
+                    self.assertEqual(driver.find_elements.call_count, read_count)
+                    self.assertIn(f"[sinposmart-stage] {operation}_query_verify", lines)
+                    for private in ("fixture-secret", "private-cookie", "https://fixture.invalid"):
+                        self.assertNotIn(private, "\n".join(lines) + str(failure.exception))
+                    self.assertEqual(actions[-1], "cleanup")
 
     def test_query_stages_identify_last_fixed_phase_without_raw_details(self) -> None:
         module = self.module

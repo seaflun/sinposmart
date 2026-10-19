@@ -306,6 +306,19 @@ class DailyVehicleService:
 
     @staticmethod
     def _safe_error(output: str) -> str:
+        diagnostics = {
+            "query_spinner_timeout": "保養清點查詢的載入遮罩未結束，已停止後續操作。",
+            "query_spinner_driver_error": "保養清點查詢無法確認載入遮罩狀態，已停止後續操作。",
+            "query_source_changed_before_read": "保養清點查詢在讀取前的清單驗證未通過，已停止後續操作。",
+            "query_source_changed_after_read": "保養清點查詢在讀取後的清單驗證未通過，已停止後續操作。",
+            "query_rows_read_failed": "保養清點查詢無法讀取網頁資料列，已停止後續操作。",
+            "query_state_read_failed_before_rows": "保養清點查詢在讀取前無法核對清單狀態，已停止後續操作。",
+            "query_state_read_failed_after_rows": "保養清點查詢在讀取後無法核對清單狀態，已停止後續操作。",
+        }
+        prefix = "[sinposmart-vehicle-diagnostic] "
+        for line in reversed(str(output or "").splitlines()):
+            if line.startswith(prefix) and line[len(prefix):] in diagnostics:
+                return diagnostics[line[len(prefix):]]
         text = str(output or "")[-3000:]
         lowered = text.lower()
         if "每日點車已跨日" in text:

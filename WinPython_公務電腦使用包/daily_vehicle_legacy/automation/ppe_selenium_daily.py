@@ -70,7 +70,8 @@ GRID_PAGE_READY_SCRIPT = """
 const [pathname, queryName, requireGrid] = arguments;
 try {
     if (window.location.pathname !== pathname || document.readyState !== 'complete' ||
-        typeof window.jQuery !== 'function' || typeof window[queryName] !== 'function') return false;
+        typeof window.jQuery !== 'function' || typeof window[queryName] !== 'function' ||
+        window.jQuery.active !== 0) return false;
     const holder = window.jQuery('#grid');
     if (!holder || typeof holder.data !== 'function') return false;
     if (!requireGrid) return true;
@@ -322,13 +323,34 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
         else:
             raise VehicleVerificationError("state_unconfirmed")
         print(f"[sinposmart-stage] {phase}_query_verify", flush=True)
-        wait_for_spinner(wait)
-        state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        try:
+            wait_for_spinner(wait)
+        except TimeoutException:
+            print("[sinposmart-vehicle-diagnostic] query_spinner_timeout", flush=True)
+            raise VehicleVerificationError("state_unconfirmed") from None
+        except Exception:
+            print("[sinposmart-vehicle-diagnostic] query_spinner_driver_error", flush=True)
+            raise VehicleVerificationError("state_unconfirmed") from None
+        try:
+            state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        except Exception:
+            print("[sinposmart-vehicle-diagnostic] query_state_read_failed_before_rows", flush=True)
+            raise VehicleVerificationError("state_unconfirmed") from None
         if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
+            print("[sinposmart-vehicle-diagnostic] query_source_changed_before_read", flush=True)
             raise VehicleVerificationError("state_unconfirmed")
-        rows = driver.find_elements(By.XPATH, "//div[@id='grid']//tbody/tr")
-        state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        try:
+            rows = driver.find_elements(By.XPATH, "//div[@id='grid']//tbody/tr")
+        except Exception:
+            print("[sinposmart-vehicle-diagnostic] query_rows_read_failed", flush=True)
+            raise VehicleVerificationError("state_unconfirmed") from None
+        try:
+            state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
+        except Exception:
+            print("[sinposmart-vehicle-diagnostic] query_state_read_failed_after_rows", flush=True)
+            raise VehicleVerificationError("state_unconfirmed") from None
         if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
+            print("[sinposmart-vehicle-diagnostic] query_source_changed_after_read", flush=True)
             raise VehicleVerificationError("state_unconfirmed")
         if not rows:
             raise VehicleVerificationError("empty_list")

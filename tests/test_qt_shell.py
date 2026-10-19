@@ -6012,6 +6012,116 @@ class DailyVehicleServiceTests(unittest.TestCase):
         self.assertEqual(service.completion_report, report)
         self.assertNotIn("private-pass", str(result))
 
+    def test_runner_query_diagnostic_lines_have_distinct_safe_errors(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        cases = (
+            ("query_spinner_timeout", "保養清點查詢的載入遮罩未結束，已停止後續操作。"),
+            ("query_spinner_driver_error", "保養清點查詢無法確認載入遮罩狀態，已停止後續操作。"),
+            ("query_source_changed_before_read", "保養清點查詢在讀取前的清單驗證未通過，已停止後續操作。"),
+            ("query_source_changed_after_read", "保養清點查詢在讀取後的清單驗證未通過，已停止後續操作。"),
+            ("query_rows_read_failed", "保養清點查詢無法讀取網頁資料列，已停止後續操作。"),
+            ("query_state_read_failed_before_rows", "保養清點查詢在讀取前無法核對清單狀態，已停止後續操作。"),
+            ("query_state_read_failed_after_rows", "保養清點查詢在讀取後無法核對清單狀態，已停止後續操作。"),
+        )
+        private_trace = "RuntimeError: user10 private-pass cookie=private-cookie https://u:p@host/?token=private-token"
+        for code, expected in cases:
+            for newline in ("\n", "\r\n"):
+                with self.subTest(code=code, newline=repr(newline)):
+                    output = ("[sinposmart-stage] maintenance_inventory" + newline
+                              + "[sinposmart-vehicle-diagnostic] " + code + newline + private_trace + newline)
+                    service, error = self._execute_output(output, returncode=1)
+                    self.assertIsInstance(error, DailyVehicleExecutionError)
+                    self.assertEqual(str(error), expected)
+                    self.assertIs(service.completion_report["verified"], False)
+                    for private in ("user10", "private-pass", "private-cookie", "https://", "private-token", "RuntimeError"):
+                        self.assertNotIn(private, str(error))
+
+    def test_runner_query_diagnostic_before_large_report_is_not_lost_to_error_tail(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        report = self._verified_report()
+        report.update(verified=False, reason_code="state_unconfirmed")
+        report["items"].extend({"vehicle": f"CAR-{index:03d}", "operation": "maintenance", "status": "unconfirmed",
+                                "reason_code": "state_unconfirmed"} for index in range(80))
+        report_line = "[sinposmart-vehicle-report] " + json.dumps(report) + "\n"
+        self.assertGreater(len(report_line), 3000)
+        for code, expected in (
+            ("query_spinner_timeout", "保養清點查詢的載入遮罩未結束，已停止後續操作。"),
+            ("query_spinner_driver_error", "保養清點查詢無法確認載入遮罩狀態，已停止後續操作。"),
+            ("query_source_changed_before_read", "保養清點查詢在讀取前的清單驗證未通過，已停止後續操作。"),
+            ("query_source_changed_after_read", "保養清點查詢在讀取後的清單驗證未通過，已停止後續操作。"),
+            ("query_rows_read_failed", "保養清點查詢無法讀取網頁資料列，已停止後續操作。"),
+            ("query_state_read_failed_before_rows", "保養清點查詢在讀取前無法核對清單狀態，已停止後續操作。"),
+            ("query_state_read_failed_after_rows", "保養清點查詢在讀取後無法核對清單狀態，已停止後續操作。"),
+        ):
+            with self.subTest(code=code):
+                service, error = self._execute_output("[sinposmart-vehicle-diagnostic] " + code + "\n" + report_line, returncode=1)
+                self.assertIsInstance(error, DailyVehicleExecutionError)
+                self.assertEqual(str(error), expected)
+                self.assertEqual(service.completion_report, report)
+
+    def test_runner_query_diagnostic_uses_last_complete_known_line(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        for code, expected in (
+            ("query_rows_read_failed", "保養清點查詢無法讀取網頁資料列，已停止後續操作。"),
+            ("query_spinner_driver_error", "保養清點查詢無法確認載入遮罩狀態，已停止後續操作。"),
+            ("query_state_read_failed_before_rows", "保養清點查詢在讀取前無法核對清單狀態，已停止後續操作。"),
+            ("query_state_read_failed_after_rows", "保養清點查詢在讀取後無法核對清單狀態，已停止後續操作。"),
+        ):
+            with self.subTest(code=code):
+                output = (
+                    "[sinposmart-vehicle-diagnostic] query_spinner_timeout\n"
+                    "[sinposmart-vehicle-diagnostic] query_source_changed_before_read\n"
+                    "[sinposmart-vehicle-diagnostic] " + code + "\n"
+                    "[sinposmart-vehicle-diagnostic] unknown_private_code\n"
+                    "RuntimeError: [sinposmart-vehicle-diagnostic] query_source_changed_after_read\n"
+                )
+                _, error = self._execute_output(output, returncode=1)
+                self.assertIsInstance(error, DailyVehicleExecutionError)
+                self.assertEqual(str(error), expected)
+
+    def test_runner_query_diagnostic_ignores_unknown_and_embedded_marker_fragments(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        generic = "車輛保養清點執行失敗，請檢查網站狀態。"
+        timeout = "網頁等待逾時：網站可能變慢或頁面結構已變更。"
+        for output, expected in (
+            ("[sinposmart-vehicle-diagnostic] unknown_private_code\n", generic),
+            ("[sinposmart-vehicle-diagnostic] query_rows_read_faile\n", generic),
+            ("[sinposmart-vehicle-diagnostic] query_rows_read_failed private-pass\n", generic),
+            ("ordinary text [sinposmart-vehicle-diagnostic] query_source_changed_before_read\n", generic),
+            ("RuntimeError('[sinposmart-vehicle-diagnostic] query_source_changed_after_read')\n", generic),
+            ('{"error": "[sinposmart-vehicle-diagnostic] query_rows_read_failed"}\n', generic),
+            ("RuntimeError: [sinposmart-vehicle-diagnostic] query_spinner_timeout\n", timeout),
+            ("ordinary text [sinposmart-vehicle-diagnostic] query_spinner_driver_error\n", generic),
+            ("[sinposmart-vehicle-diagnostic] query_state_read_failed_after_rows private-pass\n", generic),
+            ("RuntimeError('[sinposmart-vehicle-diagnostic] query_state_read_failed_before_rows')\n", generic),
+            ("[sinposmart-vehicle-diagnostic] unknown_private_code\nTimeoutError: private-pass\n", timeout),
+        ):
+            with self.subTest(output=output):
+                _, error = self._execute_output(output, returncode=1)
+                self.assertIsInstance(error, DailyVehicleExecutionError)
+                self.assertEqual(str(error), expected)
+                self.assertNotIn("private-pass", str(error))
+                self.assertNotIn("unknown_private_code", str(error))
+
+    def test_runner_query_diagnostic_keeps_existing_generic_safe_classifications(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError
+
+        for output, expected in (
+            ("登入失敗 user10 private-pass\n", "登入失敗：帳號或密碼可能已變更，請登出後重新登入系統。"),
+            ("TimeoutError: private-pass\n", "網頁等待逾時：網站可能變慢或頁面結構已變更。"),
+            ("NoSuchElementException private-pass\n", "找不到網頁元素：網站可能已改版。"),
+            ("每日點車已跨日 private-pass\n", "每日點車已跨日，已停止送出，請人工確認。"),
+        ):
+            with self.subTest(output=output):
+                _, error = self._execute_output(output, returncode=1)
+                self.assertIsInstance(error, DailyVehicleExecutionError)
+                self.assertEqual(str(error), expected)
+                self.assertNotIn("private-pass", str(error))
+
     def test_valid_report_has_today_date_and_is_defensively_copied(self) -> None:
         from datetime import date
 
