@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from typing import Any
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
@@ -111,6 +112,18 @@ class SessionController(QObject):
     @Property(QObject, constant=True)
     def savedAccountsModel(self) -> SavedAccountListModel:
         return self._saved_accounts_model
+
+    @Slot(result="QVariantMap")
+    def passwordKeyboardState(self) -> dict[str, bool]:
+        """Read only keyboard modifiers; never inspect or transform password text."""
+
+        try:
+            get_key_state = ctypes.windll.user32.GetKeyState
+            caps_lock = bool(get_key_state(0x14) & 1)  # VK_CAPITAL toggle bit
+            shift = bool(get_key_state(0x10) & 0x8000)  # VK_SHIFT pressed bit
+        except (AttributeError, OSError):
+            return {"available": False}
+        return {"available": True, "capsLock": caps_lock, "shift": shift, "uppercase": caps_lock != shift}
 
     @Slot(str, str, bool)
     def login(self, user_id: str, password: str, remember: bool = False, *, login_method: str = "manual") -> None:

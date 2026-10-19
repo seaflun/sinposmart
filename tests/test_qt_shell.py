@@ -11879,6 +11879,74 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn("toolRow.toolId", source)
         self.assertIn('QQuickStyle.setStyle("Basic")', (PACKAGE_ROOT / "qt_app" / "main.py").read_text(encoding="utf-8"))
 
+    def test_password_keyboard_state_handles_caps_lock_shift_and_unavailable_reader(self) -> None:
+        from qt_app.controllers.session_controller import SessionController
+
+        repository = SimpleNamespace(load=lambda: SimpleNamespace(
+            accounts=[], last_selected="", can_persist=True, needs_rewrite=False, invalid_file=False))
+        controller = SessionController(repository=repository, read_only_acceptance=True)
+        try:
+            for caps, shift, uppercase in ((0, 0, False), (1, 0, True),
+                                           (0, 0x8000, True), (1, 0x8000, False)):
+                with self.subTest(caps=caps, shift=shift):
+                    reader = Mock(side_effect=lambda key: {0x14: caps, 0x10: shift}[key])
+                    with patch("ctypes.windll", SimpleNamespace(user32=SimpleNamespace(GetKeyState=reader)), create=True):
+                        self.assertEqual(controller.passwordKeyboardState(), {
+                            "available": True, "capsLock": bool(caps), "shift": bool(shift), "uppercase": uppercase,
+                        })
+            with patch("ctypes.windll", SimpleNamespace(), create=True):
+                self.assertEqual(controller.passwordKeyboardState(), {"available": False})
+            with patch("ctypes.windll", SimpleNamespace(
+                user32=SimpleNamespace(GetKeyState=Mock(side_effect=OSError("unavailable")))), create=True):
+                self.assertEqual(controller.passwordKeyboardState(), {"available": False})
+        finally:
+            controller.shutdown()
+
+    def test_password_case_hint_refreshes_without_changing_masked_input(self) -> None:
+        from PySide6.QtCore import QObject, Qt
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AppController(
+                repository=CredentialRepository(Path(temp_dir) / "saved_login.json", "SinpoSmart", None),
+                read_only_acceptance=True,
+            )
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+            try:
+                field = root.findChild(QObject, "loginPasswordField")
+                hint = root.findChild(QObject, "passwordCaseHint")
+                self.assertIsNotNone(hint)
+                original_size = (root.width(), root.height())
+                field.setProperty("text", "aB9!")
+                root.requestActivate()
+                field.forceActiveFocus()
+                for state, expected in (({0x14: 0, 0x10: 0}, "英文小寫"),
+                                        ({0x14: 1, 0x10: 0}, "英文大寫"),
+                                        ({0x14: 1, 0x10: 0x8000}, "英文小寫"),
+                                        ({0x14: 0, 0x10: 0x8000}, "英文大寫")):
+                    with self.subTest(state=state):
+                        with patch("ctypes.windll", SimpleNamespace(
+                            user32=SimpleNamespace(GetKeyState=state.__getitem__)), create=True):
+                            QTest.qWait(220)
+                        self.assertEqual(hint.property("text"), expected)
+                        self.assertEqual(field.property("text"), "aB9!")
+                        self.assertNotIn("aB9!", field.property("displayText"))
+                        self.assertGreaterEqual(field.property("rightPadding"), hint.width())
+                with patch("ctypes.windll", SimpleNamespace(), create=True):
+                    QTest.qWait(220)
+                    self.assertEqual(hint.property("text"), "無法偵測")
+                QTest.keyClick(root, Qt.Key_Backspace)
+                self.assertEqual(field.property("text"), "aB9")
+                self.assertEqual((root.width(), root.height()), original_size)
+            finally:
+                root.close()
+                controller.shutdown()
+                engine.deleteLater()
+
     def test_qml_login_control_sizes_match_finalized_legacy_gui(self) -> None:
         source = (
             PACKAGE_ROOT / "qt_app" / "qml" / "pages" / "SessionHeader.qml"

@@ -10,11 +10,22 @@ ColumnLayout {
     property var hostWindow: null
     property alias userIdText: userIdField.text
     property alias passwordText: passwordField.text
+    property var passwordKeyboardState: ({available: false})
     signal accountManagerRequested
     signal workLogSettingsRequested
     signal logoutRequested
     Layout.fillWidth: true
     spacing: 10
+
+    Timer {
+        interval: 150
+        repeat: true
+        triggeredOnStart: true
+        running: sessionHeader.visible && passwordField.enabled
+                 && !sessionHeader.backend.sessionController.isLoggedIn
+                 && (!sessionHeader.hostWindow || sessionHeader.hostWindow.active)
+        onTriggered: sessionHeader.passwordKeyboardState = sessionHeader.backend.sessionController.passwordKeyboardState()
+    }
 
     Rectangle {
         Layout.fillWidth: true
@@ -206,7 +217,28 @@ ColumnLayout {
                     enabled: !sessionHeader.backend.sessionController.isBusy
                     echoMode: TextInput.Password
                     passwordCharacter: "*"
+                    rightPadding: passwordCaseHint.width + 8
                     onAccepted: loginButton.clicked()
+
+                    Label {
+                        id: passwordCaseHint
+                        objectName: "passwordCaseHint"
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        leftPadding: 8
+                        rightPadding: 8
+                        text: !sessionHeader.passwordKeyboardState.available ? "無法偵測"
+                              : sessionHeader.passwordKeyboardState.uppercase ? "英文大寫" : "英文小寫"
+                        color: sessionHeader.passwordKeyboardState.capsLock ? Design.warningStrong : Design.muted
+                        font.pixelSize: Design.captionSize
+                        font.bold: true
+                        Accessible.name: text
+                        ToolTip.visible: passwordCaseHover.hovered
+                        ToolTip.text: !sessionHeader.passwordKeyboardState.available ? "無法取得鍵盤大小寫狀態"
+                                      : "Caps Lock：" + (sessionHeader.passwordKeyboardState.capsLock ? "開啟" : "關閉")
+                                        + "；Shift：" + (sessionHeader.passwordKeyboardState.shift ? "按住" : "未按住")
+                        HoverHandler { id: passwordCaseHover }
+                    }
                 }
 
                 AppleCheckBox {
