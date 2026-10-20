@@ -87,30 +87,54 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
     driver = None
     checkpoint = {}
     record_verified = False
+    current_stage = "browser_start"
+
+    def report_progress(message):
+        nonlocal current_stage
+        for stage, label in CIVILPOWER_STAGE_LABELS.items():
+            if message == label:
+                current_stage = stage
+                break
+        progress(message)
+
     try:
         options = Options()
         options.add_argument("--window-size=1280,900")
         driver = create_login_webdriver(options, profile_root=Path(package_root) / "runtime_outputs" / "civilpower_profiles",
                                         prune_profiles=False, write_diagnostics=False)
         configure_login_webdriver_timeouts(driver)
-        login_attendance(driver, request, recognizer, progress)
+        current_stage = "login"
+        login_attendance(driver, request, recognizer, report_progress)
 
         def before_save():
             _write_json(ledger, {"state": "pending_verification", "user_id": request.user_id,
                                  "updated_at": datetime.now().isoformat(timespec="seconds")})
 
         created = _ensure_io_record(driver, plan, plan.status, checkpoint, cancel_check=None,
-                                    require_lookup_confirmation=True, progress=progress, before_save=before_save)
+                                    require_lookup_confirmation=True, progress=report_progress, before_save=before_save)
         record_verified = True
         _write_json(ledger, {"state": "verified", "user_id": request.user_id,
                             "updated_at": datetime.now().isoformat(timespec="seconds")})
         return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：" + ("已儲存並回查確認。" if created else "網站已有相同紀錄，未重複新增。")
-    except CivilpowerError:
+    except CivilpowerError as exc:
+        if exc.failure_stage == "unknown":
+            raise CivilpowerError(str(exc), failure_stage=current_stage) from None
         raise
-    except Exception:
+    except Exception as exc:
         if checkpoint.get("out_save_state") == "pending_verification" or checkpoint.get("in_save_state") == "pending_verification":
-            raise CivilpowerError("已進入儲存階段，但結果尚未確認；請使用原值班帳號重試回查，勿另建不同時間的紀錄。") from None
-        raise CivilpowerError("民力登打未完成；請確認網站及人員資料。查詢不明時不會新增紀錄。") from None
+            raise CivilpowerError("已進入儲存階段，但結果尚未確認；請使用原值班帳號重試回查，勿另建不同時間的紀錄。",
+                                  failure_stage=current_stage) from None
+        if record_verified:
+            raise CivilpowerError("網站紀錄已回查確認，但本機查核紀錄無法寫入；請確認磁碟狀態，勿另建不同時間的紀錄。",
+                                  failure_stage="io_save_verify") from None
+        stage_label = {"browser_start": "啟動瀏覽器", "login": "登入民力系統"}.get(
+            current_stage, CIVILPOWER_STAGE_LABELS.get(current_stage, "登打").rstrip("…"))
+        reason = ("等待逾時" if isinstance(exc, TimeoutException) else
+                  "頁面節點已被替換" if isinstance(exc, StaleElementReferenceException) else
+                  "查詢未完成" if isinstance(exc, _IncompleteQueryError) else
+                  "查詢結果不唯一" if isinstance(exc, _AmbiguousSelectionError) else "操作未完成")
+        raise CivilpowerError(f"民力系統「{stage_label}」{reason}；查詢不明時不會新增紀錄，請使用相同人員與時間重試。",
+                              failure_stage=current_stage) from None
     finally:
         if driver is not None:
             if record_verified:
@@ -382,11 +406,14 @@ def _select_io_person(driver, wait: WebDriverWait, plan: AttendancePlan) -> None
 
 def _wait_for_io_person_dialog_row(driver, wait: WebDriverWait, tokens: list[str]):
     def find_row(current):
-        dialogs = [
-            dialog
-            for dialog in current.find_elements(By.CSS_SELECTOR, "#jqxSltWindow")
-            if dialog.is_displayed()
-        ]
+        try:
+            dialogs = [
+                dialog
+                for dialog in current.find_elements(By.CSS_SELECTOR, "#jqxSltWindow")
+                if dialog.is_displayed()
+            ]
+        except StaleElementReferenceException:
+            return False
         if not dialogs:
             return False
         dialog = dialogs[-1]
@@ -857,16 +884,16 @@ def _wait_visible(wait: WebDriverWait, selector: str):
 def _control_value(driver, selector: str) -> str:
     try:
         element = driver.find_element(By.CSS_SELECTOR, selector)
-    except NoSuchElementException:
+        value = element.get_attribute("value")
+        if value:
+            return _clean_text(value)
+        if selector.startswith("#txt_"):
+            nested = element.find_elements(By.CSS_SELECTOR, "input")
+            if nested:
+                return _clean_text(nested[0].get_attribute("value"))
+        return _clean_text(element.text)
+    except (NoSuchElementException, StaleElementReferenceException):
         return ""
-    value = element.get_attribute("value")
-    if value:
-        return _clean_text(value)
-    if selector.startswith("#txt_"):
-        nested = element.find_elements(By.CSS_SELECTOR, "input")
-        if nested:
-            return _clean_text(nested[0].get_attribute("value"))
-    return _clean_text(element.text)
 
 
 def _element_displayed(driver, selector: str) -> bool:

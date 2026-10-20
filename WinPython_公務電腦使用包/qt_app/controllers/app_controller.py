@@ -2665,6 +2665,7 @@ class AppController(QObject):
     def _failure_stage_for_tool(self, tool_name: str) -> str:
         controllers = {
             "duty_sheet": self._duty_sheet_controller,
+            "civilpower": self._civilpower_controller,
             "rest_time": self._rest_monthly_controller,
             "monthly_base": self._rest_monthly_controller,
             "daily_vehicle": self._daily_vehicle_controller,

@@ -92,6 +92,98 @@ class AttendanceTests(unittest.TestCase):
         self.assertEqual(login.call_count, 3)
         self.assertNotIn("secret", str(result.exception))
 
+    def test_person_lookup_waits_for_replaced_dialog(self):
+        from selenium.common.exceptions import StaleElementReferenceException
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        driver, old_dialog, dialog, row = Mock(), Mock(), Mock(), Mock()
+        driver.find_elements.side_effect = [[old_dialog], [dialog]]
+        old_dialog.is_displayed.side_effect = StaleElementReferenceException("replaced")
+        dialog.is_displayed.return_value = True
+        with patch.object(automation, "_find_paginated_table_rows", return_value=[row]):
+            result = automation._wait_for_io_person_dialog_row(
+                driver, WebDriverWait(driver, 0.1, poll_frequency=0.001), ["測試義消"])
+        self.assertEqual(result, (dialog, row))
+        self.assertEqual(driver.find_elements.call_count, 2)
+
+    def test_person_lookup_never_restarts_partial_page_scan(self):
+        from selenium.common.exceptions import StaleElementReferenceException
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        driver, dialog = Mock(), Mock()
+        driver.find_elements.return_value = [dialog]
+        with patch.object(automation, "_find_paginated_table_rows",
+                          side_effect=StaleElementReferenceException("page replaced")) as query:
+            with self.assertRaises(StaleElementReferenceException):
+                automation._wait_for_io_person_dialog_row(
+                    driver, WebDriverWait(driver, 0.1, poll_frequency=0.001), ["測試義消"])
+        query.assert_called_once()
+
+    def test_unit_readback_waits_for_replaced_field(self):
+        from selenium.common.exceptions import StaleElementReferenceException
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        driver, element = Mock(), Mock()
+        driver.find_element.return_value = element
+        driver.execute_script.return_value = True
+        element.get_attribute.side_effect = [StaleElementReferenceException("replaced"), "新坡分隊"]
+        with patch.object(automation, "_wait_for_jqx_combobox_option"):
+            automation._select_jqx_combobox(
+                driver, WebDriverWait(driver, 0.1, poll_frequency=0.001), "#txt_AddServeUnit", "新坡分隊")
+        self.assertEqual(element.get_attribute.call_count, 2)
+
+    def test_persistently_replaced_person_dialog_never_saves(self):
+        from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        driver, dialog, before_save = Mock(), Mock(), Mock()
+        driver.find_elements.return_value = [dialog]
+        dialog.is_displayed.side_effect = StaleElementReferenceException("replaced")
+        plan = CivilpowerService(PACKAGE).validate(self.request())
+        with ExitStack() as stack:
+            for name in ("_wait_visible", "_select_jqx_combobox", "_wait_for_io_form_dependencies"):
+                stack.enter_context(patch.object(automation, name))
+            click = stack.enter_context(patch.object(automation, "_click"))
+            stack.enter_context(patch.object(automation, "_find_io_record", return_value=False))
+            stack.enter_context(patch.object(automation, "WebDriverWait", side_effect=lambda d, _t:
+                                            WebDriverWait(d, 0.01, poll_frequency=0.001)))
+            with self.assertRaises(TimeoutException):
+                automation._ensure_io_record(driver, plan, plan.status, {}, cancel_check=None,
+                                             require_lookup_confirmation=True, before_save=before_save)
+        before_save.assert_not_called()
+        self.assertNotIn("#btn_IOWorkLogAdd", [call.args[1] for call in click.call_args_list])
+
+    def test_failure_preserves_stage_without_raw_browser_details(self):
+        from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+        from app_core import civilpower_automation as automation
+
+        for exception_type in (TimeoutException, StaleElementReferenceException, RuntimeError):
+            with self.subTest(exception_type=exception_type), TemporaryDirectory() as root, ExitStack() as stack:
+                driver = Mock()
+                stack.enter_context(patch("app_core.login_verifier.create_login_webdriver", return_value=driver))
+                stack.enter_context(patch("app_core.login_verifier.configure_login_webdriver_timeouts"))
+                stack.enter_context(patch.dict(sys.modules, {"ddddocr": Mock()}))
+                stack.enter_context(patch.object(automation, "login_attendance"))
+                def fail(_driver, _plan, _status, _checkpoint, **kwargs):
+                    kwargs["progress"](automation.CIVILPOWER_STAGE_LABELS["io_person"])
+                    raise exception_type("password=secret token=private")
+                stack.enter_context(patch.object(automation, "_ensure_io_record", side_effect=fail))
+                request = self.request()
+                plan = CivilpowerService(PACKAGE).validate(request)
+                with self.assertRaises(CivilpowerError) as result:
+                    automation.run_attendance(Path(root), request, plan, Mock())
+                self.assertEqual(result.exception.failure_stage, "io_person")
+                self.assertIn("選擇義消", str(result.exception))
+                self.assertNotIn("secret", str(result.exception))
+                self.assertNotIn("private", str(result.exception))
+                self.assertNotIn(request.password, str(result.exception))
+                self.assertFalse((Path(root) / "runtime_outputs" / "civilpower").exists())
+                driver.quit.assert_called_once()
+
     def test_existing_record_never_saves(self):
         from app_core import civilpower_automation as automation
         plan = CivilpowerService(PACKAGE).validate(self.request())

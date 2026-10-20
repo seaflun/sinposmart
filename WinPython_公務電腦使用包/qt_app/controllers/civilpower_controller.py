@@ -15,6 +15,7 @@ class _CivilpowerJob(QThread):
         super().__init__(parent)
         self.service = service
         self.request = request
+        self.failure_stage = "unknown"
 
     def run(self):
         try:
@@ -22,6 +23,7 @@ class _CivilpowerJob(QThread):
                       else self.service.execute(self.request, self.progress.emit))
             self.result.emit(result)
         except CivilpowerError as exc:
+            self.failure_stage = exc.failure_stage
             self.failed.emit(str(exc))
         except Exception:
             self.failed.emit("民力作業未完成，請確認連線與網站狀態。")
@@ -54,6 +56,7 @@ class CivilpowerController(QObject):
         self._summary = ""
         self._date = ""
         self._time = ""
+        self._failure_stage = "unknown"
         self.run_actor = {}
 
     @Property(bool, notify=stateChanged)
@@ -71,6 +74,10 @@ class CivilpowerController(QObject):
     @Property(str, notify=stateChanged)
     def statusText(self):
         return self._status
+
+    @Property(str, notify=stateChanged)
+    def failureStage(self):
+        return self._failure_stage
 
     @Property(str, notify=stateChanged)
     def rosterStatus(self):
@@ -147,6 +154,7 @@ class CivilpowerController(QObject):
         request, self._pending = self._pending, None
         self._summary = ""
         self._status = "準備登入民力系統…"
+        self._failure_stage = "unknown"
         self.run_actor = {"actor_no": request.actor_no, "user_id": request.user_id,
                           "display_name": request.actor_name}
         self.runStarted.emit()
@@ -195,6 +203,7 @@ class CivilpowerController(QObject):
 
     @Slot(str)
     def _run_failed(self, message):
+        self._failure_stage = getattr(self._job, "failure_stage", "unknown")
         self.runFailed.emit(message)
         self._error(message)
 

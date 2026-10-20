@@ -18,6 +18,10 @@ HOME_UNIT = "大園救護分隊"
 class CivilpowerError(RuntimeError):
     """User-facing error without credentials or raw browser diagnostics."""
 
+    def __init__(self, message: str, *, failure_stage: str = "unknown"):
+        super().__init__(message)
+        self.failure_stage = failure_stage
+
 
 @dataclass(frozen=True)
 class AttendanceRequest:

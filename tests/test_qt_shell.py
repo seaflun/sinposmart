@@ -20144,6 +20144,85 @@ if return_code != 0 or loaded:
         self.assertEqual(failure["snapshot"]["failure_stage"], "browser_start")
         self.assertEqual(failure["snapshot"]["failure_detail"], "browser_startup")
 
+    def test_civilpower_job_preserves_failure_stage_in_event_and_resets_next_run(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.civilpower_service import CivilpowerError, CivilpowerService
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+
+        class FakeOperationalSyncService:
+            def __init__(self) -> None:
+                self.events = []
+
+            def enqueue_event(self, record_type, **fields):
+                self.events.append((record_type, fields))
+                return {"record_type": record_type}
+
+            def sync_board_async(self, _schedule_data):
+                return True
+
+        def fail_at_person_selection(*_args):
+            raise CivilpowerError("safe", failure_stage="io_person")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            operational_sync = FakeOperationalSyncService()
+            runner = Mock(side_effect=fail_at_person_selection)
+            controller = AppController(
+                repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                operational_sync_service=operational_sync,
+                tool_controller=ToolController(root),
+                civilpower_service=CivilpowerService(root, runner=runner),
+            )
+            try:
+                controller._session_state.session = LoginSession(
+                    "1", "duty1", "not-a-real-password", verified=True, actor_name="測試值班員",
+                )
+                attendance = controller.civilpowerController
+                attendance._members = [{
+                    "member_id": "m1", "name": "測試義消", "title": "隊員", "unit": "大園救護分隊",
+                }]
+                started_stages = []
+                attendance.runStarted.connect(
+                    lambda: started_stages.append(getattr(attendance, "failureStage", "missing"))
+                )
+                attendance.prepareRun("2026-10-20", "17:12", "m1", "退勤")
+                attendance.confirmRun()
+                for _ in range(100):
+                    QTest.qWait(10)
+                    if not attendance.isRunning and any(
+                        record_type == "tool_action_finished" and fields["status"] == "failed"
+                        for record_type, fields in operational_sync.events
+                    ):
+                        break
+                self.assertFalse(attendance.isRunning)
+                failure = next(
+                    fields for record_type, fields in operational_sync.events
+                    if record_type == "tool_action_finished" and fields["status"] == "failed"
+                )
+                self.assertEqual(failure["snapshot"]["failure_stage"], "io_person")
+                self.assertEqual(failure["error"], "safe")
+                self.assertEqual(attendance.failureStage, "io_person")
+
+                runner.side_effect = None
+                runner.return_value = "已儲存並回查確認。"
+                attendance.prepareRun("2026-10-20", "17:12", "m1", "退勤")
+                attendance.confirmRun()
+                self.assertEqual(attendance.failureStage, "unknown")
+                self.assertEqual(started_stages, ["unknown", "unknown"])
+                for _ in range(100):
+                    QTest.qWait(10)
+                    if not attendance.isRunning:
+                        break
+                self.assertFalse(attendance.isRunning)
+                self.assertEqual(runner.call_count, 2)
+                self.assertNotIn("not-a-real-password", json.dumps(operational_sync.events, ensure_ascii=False))
+            finally:
+                controller.shutdown()
+
     def test_all_tool_failures_include_error_and_stage_for_nas_backend(self) -> None:
         """Every QML tool failure keeps a displayable NAS event contract."""
         from app_core.credential_repository import CredentialRepository
