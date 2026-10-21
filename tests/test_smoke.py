@@ -5093,6 +5093,84 @@ try {
                         current_at=datetime(2026, 10, 13, 22, 0),
                     ))
 
+    def test_same_minute_case_return_accepts_appended_incident_notes(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        prefix = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        for outgoing, incoming in (
+            (prefix, prefix + "-電桿起火"),
+            (prefix + "-電桿起火", prefix),
+            (prefix + "-電桿起火", prefix + "（電線冒煙）"),
+            (prefix, prefix + "，電桿起火"),
+            (prefix + " 梯次：2", prefix + "－電桿起火 梯次：2"),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", outgoing],
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", incoming],
+            ]
+            for raw_rows in (records, list(reversed(records)), records + records):
+                with self.subTest(outgoing=outgoing, incoming=incoming, rows=raw_rows):
+                    self.assertIsNone(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151021"), "1151021",
+                        {"27": {"name": "林宏為"}}, {"target": "27"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ))
+
+    def test_same_minute_incident_notes_preserve_address_and_identity_boundaries(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        prefix = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        for stamp, name, reason in (
+            ("115/10/21 12:41", "林宏為", prefix.replace("89號", "890號") + "-電桿起火"),
+            ("115/10/21 12:41", "林宏為", prefix.replace("89號", "89-1號") + "-電桿起火"),
+            ("115/10/21 12:41", "林宏為", prefix + "之1-電桿起火"),
+            ("115/10/21 12:41", "林宏為", prefix + "-1"),
+            ("115/10/21 12:41", "林宏為", prefix + "-一樓"),
+            ("115/10/21 12:41", "林宏為", prefix + "-A棟"),
+            ("115/10/21 12:41", "林宏為", prefix + "-地下一層"),
+            ("115/10/21 12:41", "林宏為", prefix + "（A座）"),
+            ("115/10/21 12:41", "林宏為", prefix + "-Ａ座"),
+            ("115/10/21 12:41", "林宏為", prefix.replace("一心路", "二心路") + "-電桿起火"),
+            ("115/10/21 12:41", "林宏為", prefix.replace("火災-其他", "緊急救護-急病") + "-電桿起火"),
+            ("115/10/21 12:41", "另一人", prefix + "-電桿起火"),
+            ("115/10/20 12:41", "林宏為", prefix + "-電桿起火"),
+            ("115/10/21 12:40", "林宏為", prefix + "-電桿起火"),
+            ("115/10/21 12:41", "林宏為", prefix + "-電桿起火 梯次：2"),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", prefix],
+                [stamp, "新坡分隊", name, "隊員", "入", reason],
+            ]
+            for raw_rows in (records, list(reversed(records))):
+                with self.subTest(stamp=stamp, name=name, reason=reason):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151021", start_date="1151020"), "1151021",
+                        {"27": {"name": "林宏為"}}, {"target": "27"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ), "2026-10-21T12:41")
+
+    def test_same_minute_incident_note_pairing_rejects_multiple_candidates(self) -> None:
+        from itertools import permutations
+
+        module = package_module("compare_rehearsal_records")
+        prefix = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        for direction, time, extra_reason in (
+            ("出", "12:41", prefix + "-其他電桿"),
+            ("入", "12:41", prefix + "-其他電桿"),
+            ("出", "12:40", prefix),
+            ("入", "12:40", prefix),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", prefix],
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", prefix + "-電桿起火"],
+                ["115/10/21 " + time, "新坡分隊", "林宏為", "隊員", direction, extra_reason],
+            ]
+            for raw_rows in permutations(records):
+                with self.subTest(direction=direction, time=time):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(list(raw_rows), "1151021"), "1151021",
+                        {"27": {"name": "林宏為"}}, {"target": "27"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ), "2026-10-21T12:41")
+
     def test_same_minute_return_requires_matching_person_case_and_wave(self) -> None:
         module = package_module("compare_rehearsal_records")
         reason = "案件類別：緊急救護-創傷 案發地點：測試路段 梯次：2"

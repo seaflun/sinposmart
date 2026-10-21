@@ -424,6 +424,18 @@ def find_incomplete_training_work_matches(
     return matches
 
 
+def _case_location_without_incident_note(value: str) -> str:
+    """Keep the full house number while ignoring an appended incident note."""
+
+    match = re.fullmatch(r"(.+\d+(?:-\d+)?號(?:之\d+)?)[-－—–（(，,](.+)", value)
+    if match is None:
+        return value
+    location, note = match.groups()
+    if re.search(r"\d|[號樓棟室層座]", note) or re.match(r"(?:之|附)?[一二三四五六七八九十百千甲乙丙丁]", note):
+        return value
+    return location
+
+
 def find_open_external_assignment(
     rows: list[str],
     target_date: str,
@@ -506,6 +518,21 @@ def find_open_external_assignment(
                     f"出入時間異常（梯次 {case_key[-1]}）："
                     f"入 {returned:%m/%d %H:%M}／出 {departure:%m/%d %H:%M}，已視為返隊。"
                 )
+    case_families: dict[tuple[str, ...], tuple[set, set]] = {}
+    for case_key, (departures, returns) in case_events.items():
+        day, category, location, wave = case_key
+        family = (day, category, _case_location_without_incident_note(location), wave)
+        family_departures, family_returns = case_families.setdefault(family, (set(), set()))
+        # Retain original keys: two same-minute descriptions are still two candidates.
+        family_departures.update((at, case_key) for at in departures)
+        family_returns.update((at, case_key) for at in returns)
+    for departures, returns in case_families.values():
+        if len(departures) != 1 or len(returns) != 1:
+            continue
+        departure, case_key = next(iter(departures))
+        returned, _ = next(iter(returns))
+        if returned == departure:
+            closed_departures.add((departure, case_key))
     active_at: datetime | None = None
     # At equal minute precision, unmatched departures must remain open.
     for row_at, is_active, case_key in sorted(events, key=lambda item: (item[0], item[1])):

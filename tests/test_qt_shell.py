@@ -4840,6 +4840,57 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     self.assertEqual(result.status, "handoff_preflight_ready")
                     self.assertEqual(fills, [])
 
+    def test_handoff_preflight_accepts_same_address_description_change_but_not_other_case(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        reason = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        for trigger in ("due", "recovery"):
+            for reverse_rows in (False, True):
+                for case, departure_reason, return_reason, expected_status in (
+                    ("incident_description", reason, reason + "-電桿起火", "handoff_preflight_ready"),
+                    ("different_house", reason, reason.replace("89號", "90號") + "-電桿起火", "paused_external"),
+                    ("different_dispatch", reason + " 梯次：1", reason + "-電桿起火 梯次：2", "paused_external"),
+                ):
+                    with self.subTest(trigger=trigger, reverse_rows=reverse_rows, case=case), \
+                            tempfile.TemporaryDirectory() as directory:
+                        records = [
+                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", departure_reason],
+                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", return_reason],
+                        ]
+                        if reverse_rows:
+                            records.reverse()
+                        fill = Mock()
+                        automation = SimpleNamespace(
+                            ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                            build_driver=lambda **_kwargs: object(), login=lambda *_args: None,
+                            query_visible_table=lambda *_args, **_kwargs: records,
+                            fill_entry_log_form_for_test=fill, fill_work_log_form_for_test=fill,
+                            quit_driver=lambda _driver: None,
+                        )
+                        service = DutySubmissionService(
+                            Path(directory), module_loader=lambda: automation,
+                            now_factory=lambda: datetime(2026, 10, 21, 14, 0),
+                        )
+                        data = {
+                            "target_date": "1151021",
+                            "today": {"staff": {"25": {"name": "值班員"}, "27": {"name": "林宏為"}}},
+                            "actions": [{
+                                "kind": "handoff_preflight", "time": "14:00", "actor": "25",
+                                "target": "27", "source": "值班交接",
+                                "fields": {"出或入": "值班", "領用事由及地點": "值班"},
+                            }],
+                        }
+                        if trigger == "recovery":
+                            data["_unreturned_return_query_start_at"] = "2026-10-21T12:41:00"
+                        result = service.execute(DutySubmissionRequest(
+                            "fixture-user25", "fixture-password", 0, data, trigger_type=trigger,
+                        ))
+                        fill.assert_not_called()
+                        self.assertEqual(result.status, expected_status)
+                        if expected_status == "paused_external":
+                            self.assertEqual(result.comparison["unreturned_entry_at"], "2026-10-21T12:41")
+
     def test_handoff_preflight_checks_incoming_staff_without_writing_a_form(self) -> None:
         from datetime import datetime
 
