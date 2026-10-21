@@ -5134,6 +5134,8 @@ try {
             ("115/10/20 12:41", "林宏為", prefix + "-電桿起火"),
             ("115/10/21 12:40", "林宏為", prefix + "-電桿起火"),
             ("115/10/21 12:41", "林宏為", prefix + "-電桿起火 梯次：2"),
+            ("115/10/21 12:41", "林宏為", prefix + "-第二梯"),
+            ("115/10/21 12:41", "林宏為", prefix + "-電桿起火 梯次：二"),
         ):
             records = [
                 ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", prefix],
@@ -5143,6 +5145,25 @@ try {
                 with self.subTest(stamp=stamp, name=name, reason=reason):
                     self.assertEqual(module.find_open_external_assignment(
                         module.flatten_rows(raw_rows, "1151021", start_date="1151020"), "1151021",
+                        {"27": {"name": "林宏為"}}, {"target": "27"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ), "2026-10-21T12:41")
+
+    def test_same_minute_incident_notes_preserve_handwritten_wave_markers(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        prefix = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        for outgoing, incoming in (
+            (prefix + "-第一梯", prefix + "-第二梯"),
+            (prefix + "-電桿起火 梯次：一", prefix + "-電桿起火 梯次：二"),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", outgoing],
+                ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", incoming],
+            ]
+            for raw_rows in (records, list(reversed(records))):
+                with self.subTest(outgoing=outgoing, incoming=incoming):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151021"), "1151021",
                         {"27": {"name": "林宏為"}}, {"target": "27"},
                         current_at=datetime(2026, 10, 21, 14, 0),
                     ), "2026-10-21T12:41")

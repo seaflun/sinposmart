@@ -431,7 +431,7 @@ def _case_location_without_incident_note(value: str) -> str:
     if match is None:
         return value
     location, note = match.groups()
-    if re.search(r"\d|[號樓棟室層座]", note) or re.match(r"(?:之|附)?[一二三四五六七八九十百千甲乙丙丁]", note):
+    if re.search(r"\d|[號樓棟室層座]|梯次|第.*梯", note) or re.match(r"(?:之|附)?[一二三四五六七八九十百千甲乙丙丁]", note):
         return value
     return location
 
