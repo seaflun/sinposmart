@@ -18,6 +18,7 @@ from app_core.duty_task_projection import (
     DutyTaskProjectionState,
     action_completion_key,
     action_return_pair_key,
+    action_staff,
     action_summary,
     action_datetime,
     build_schedule_comparisons,
@@ -466,10 +467,14 @@ class DutyController(QObject):
             self._is_early_manual_departure_wait_eligible(index, now=current)
             for index in ready
         )
-        summaries = "\n".join(
-            f"• {action_summary(self._actions[index])}（{self._manual_time_summary(self._actions[index], current)}）"
-            for index in ready[:8]
-        )
+        summary_lines = []
+        for index in ready[:8]:
+            action = self._actions[index]
+            label = action_summary(action)
+            if action.get("staff_roc_date"):
+                label = f"{target_short_label(action, action_staff(self._schedule_data, action))} ｜ {label}"
+            summary_lines.append(f"• {label}（{self._manual_time_summary(action, current)}）")
+        summaries = "\n".join(summary_lines)
         if len(ready) > 8:
             summaries += f"\n…另 {len(ready) - 8} 筆"
         action_keys = tuple(action_completion_key(self._actions[index]) for index in ready)
@@ -683,6 +688,11 @@ class DutyController(QObject):
             return False
         action = self._actions[index]
         current = now or datetime.now()
+        if action.get("staff_roc_date") and is_external_or_rest_return(action) and (
+            self._target_date_text != action["staff_roc_date"]
+            or action_datetime(action, self._target_date_text, fallback_date=current.date()) > current
+        ):
+            return False
         if self._manual_submission_uses_scheduled_time(action, current):
             return True
         if is_auto_duty_action(action):
@@ -703,6 +713,10 @@ class DutyController(QObject):
         if not 0 <= index < len(self._actions):
             return False
         action = self._actions[index]
+        if action.get("staff_roc_date") and not action_staff(self._schedule_data, action).get(
+            str(action.get("target", "")), {},
+        ).get("name"):
+            return False
         if action_completion_key(action) in self._manual_waiting_action_keys:
             return False
         comparison = self._comparisons.get(index, {})
@@ -1026,6 +1040,11 @@ class DutyController(QObject):
 
         if not self.request_matches_current_session(request):
             return ""
+        if (
+            str(request.schedule_data.get("target_date", "") or "").strip() != self._target_date_text
+            and self._resolve_request_action_index(request) is None
+        ):
+            return ""
         action_key = str(request.action_key or "").strip()
         if not action_key:
             actions = request.schedule_data.get("actions", [])
@@ -1064,8 +1083,6 @@ class DutyController(QObject):
             if not self.request_matches_current_session(request):
                 return None
         request_target_date = str(request.schedule_data.get("target_date", "") or "").strip()
-        if request_target_date != str(self._target_date_text or "").strip():
-            return None
         action_key = str(request.action_key or "").strip()
         if not action_key:
             actions = request.schedule_data.get("actions", [])
@@ -1075,6 +1092,38 @@ class DutyController(QObject):
             if not isinstance(action, Mapping):
                 return None
             action_key = action_completion_key(action)
+        if request_target_date != str(self._target_date_text or "").strip():
+            if not request.background or not self.request_matches_current_session(request):
+                return None
+            actions = request.schedule_data.get("actions", [])
+            action_index = self._unique_action_indices_by_key().get(action_key)
+            if not isinstance(actions, list) or not 0 <= request.action_index < len(actions) or action_index is None:
+                return None
+            requested_action = actions[request.action_index]
+            current_action = self._actions[action_index]
+            if (
+                not isinstance(requested_action, Mapping)
+                or action_completion_key(requested_action) != action_key
+                or requested_action.get("staff_roc_date") != request_target_date
+                or current_action.get("staff_roc_date") != request_target_date
+                or requested_action.get("source") not in ("外勤簽出", "外勤簽入")
+                or requested_action.get("source") != current_action.get("source")
+            ):
+                return None
+            try:
+                request_date = str(requested_action.get("submit_target_date") or request_target_date)
+                actual_at = action_datetime(requested_action, request_date)
+                original_at = action_datetime(current_action, self._target_date_text)
+                scheduled_at = requested_action.get("scheduled_at")
+                if scheduled_at and requested_action.get("source") == "外勤簽出":
+                    planned_at = datetime.fromisoformat(str(scheduled_at))
+                    if planned_at != original_at or not planned_at <= actual_at <= planned_at + AUTO_DUE_CATCH_UP_WINDOW:
+                        return None
+                elif actual_at != original_at:
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return action_index
         if request.schedule_generation == self._schedule_generation:
             action_index = request.action_index
             if (
@@ -2557,6 +2606,7 @@ class DutyController(QObject):
             manual_waiting_indices=frozenset(self._manual_waiting_indices()),
             background_return_phases=self._background_return_phases(),
             completed_return_pair_keys=frozenset(self._completed_return_pair_keys),
+            schedule_data=self._schedule_data,
         )
 
     def _refresh_projection(self) -> None:
@@ -2570,6 +2620,7 @@ class DutyController(QObject):
             actor_no=self._actor_no if self._audit_only_actor else "",
             kind_filter=self._audit_kind_filter,
             status_filter="全部",
+            schedule_data=self._schedule_data,
         )
         counts = {"todo": 0, "review": 0, "ready": 0, "done": 0}
         for row in summary_rows:
@@ -2591,6 +2642,7 @@ class DutyController(QObject):
             actor_no=self._actor_no if self._audit_only_actor else "",
             kind_filter=self._audit_kind_filter,
             status_filter=self._audit_status_filter,
+            schedule_data=self._schedule_data,
         )
         self._audit_model.replace_tasks(audit_rows)
         self._refresh_due_tasks(emit_signal=False)

@@ -48,6 +48,7 @@ class DutyTaskProjectionState:
     manual_waiting_indices: frozenset[int] = frozenset()
     background_return_phases: Mapping[int, str] = field(default_factory=dict)
     completed_return_pair_keys: frozenset[str] = frozenset()
+    schedule_data: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,27 @@ def is_fire_day_closing_action(action: Mapping[str, Any], target_roc_date: str, 
 
 def action_return_pair_key(action: Mapping[str, Any]) -> str:
     return str(action.get("return_pair_key", "") or "").strip()
+
+
+def action_staff(data: Mapping[str, Any], action: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Keep an explicitly dated action tied to its original personnel roster."""
+
+    staff_date = str(action.get("staff_roc_date", "") or "").strip()
+    sheets = [data.get(name, {}) for name in ("yesterday", "today", "tomorrow")]
+    if staff_date:
+        matching = [sheet for sheet in sheets if isinstance(sheet, Mapping)
+                    and str(sheet.get("roc_date", "") or "") == staff_date]
+        if len(matching) != 1 or matching[0].get("staff_complete") is not True:
+            return {}
+        sources = matching
+    else:
+        sources = sheets[:2]
+    staff = {}
+    for sheet in sources:
+        values = sheet.get("staff", {}) if isinstance(sheet, Mapping) else {}
+        if isinstance(values, Mapping):
+            staff.update({str(number): dict(info) for number, info in values.items() if isinstance(info, Mapping)})
+    return staff
 
 
 def is_external_or_rest_entry(action: Mapping[str, Any]) -> bool:
@@ -737,7 +759,8 @@ def project_duty_tasks(
             is_previous_item=is_previous_item,
             now=now,
         )
-        system_text, kind_text, detail_text, people_text = duty_task_columns(action, state.staff)
+        row_staff = action_staff(state.schedule_data, action) if action.get("staff_roc_date") else state.staff
+        system_text, kind_text, detail_text, people_text = duty_task_columns(action, row_staff)
         action_at = action_datetime(action, state.target_roc_date)
         if action.get("source") == "值班交接":
             fields = action.get("fields", {})
@@ -880,6 +903,7 @@ def project_audit_tasks(
     actor_no: str = "",
     kind_filter: str = "全部",
     status_filter: str = "全部",
+    schedule_data: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Project all review rows with optional actor, kind and status filters."""
 
@@ -888,7 +912,9 @@ def project_audit_tasks(
         action_actor = str(action.get("actor", "") or "")
         if actor_no and action_actor != actor_no:
             continue
-        system_text, kind_text, detail_text, people_text = duty_task_columns(action, staff)
+        row_staff = action_staff(schedule_data or {}, action) if action.get("staff_roc_date") else staff
+        actor_staff = staff if action.get("staff_roc_date") and is_external_or_rest_departure(action) else row_staff
+        system_text, kind_text, detail_text, people_text = duty_task_columns(action, row_staff)
         audit_kind_text = (
             "案件工作"
             if action.get("source") == "案件工作審核"
@@ -938,8 +964,8 @@ def project_audit_tasks(
                     "statusText": comparison_text,
                     "statusTone": tone,
                     "selected": False,
-                    "actorText": person_short_label(action_actor, staff),
-                    "targetText": target_short_label(action, staff),
+                    "actorText": person_short_label(action_actor, actor_staff),
+                    "targetText": target_short_label(action, row_staff),
                 "comparisonText": comparison_text,
                 "group": group,
                 "fullDetailText": audit_detail_text(action, comparison),
@@ -1047,14 +1073,10 @@ def compare_submission_action(
 ) -> dict[str, Any]:
     """Match only the action being submitted, with a short write-time tolerance."""
 
-    today = data.get("today", {})
-    yesterday = data.get("yesterday", {})
-    today_staff = today.get("staff", {}) if isinstance(today, Mapping) else {}
-    yesterday_staff = yesterday.get("staff", {}) if isinstance(yesterday, Mapping) else {}
-    staff = {**yesterday_staff, **today_staff}
+    staff = action_staff(data, action)
     current_action = dict(action)
 
-    if is_external_or_rest_entry(current_action) and not verify_saved:
+    if is_external_or_rest_entry(current_action) and not verify_saved and not current_action.get("staff_roc_date"):
         return {"compare": "略過防重複比對", "group": "todo", "matched": []}
 
     if current_action.get("kind") == "entry_log":
@@ -1116,11 +1138,6 @@ def build_schedule_comparisons(
     """Match planned actions to the already-captured visible duty-system rows."""
 
     target_date = str(data.get("target_date", "") or "")
-    today = data.get("today", {})
-    yesterday = data.get("yesterday", {})
-    today_staff = today.get("staff", {}) if isinstance(today, Mapping) else {}
-    yesterday_staff = yesterday.get("staff", {}) if isinstance(yesterday, Mapping) else {}
-    staff = {**yesterday_staff, **today_staff}
     comparison_cache: dict[str, dict[str, list[str]]] = {}
     for action_date in comparison_dates(actions, target_date):
         comparison_data = comparison_data_by_date.get(action_date, {})
@@ -1136,6 +1153,7 @@ def build_schedule_comparisons(
     for action in actions:
         if action.get("kind") != "entry_log" or not str(action.get("source", "")).startswith("外勤"):
             continue
+        staff = action_staff(data, action)
         fields = action.get("fields", {})
         action_date = action_target_roc_date(action, target_date)
         key = f"{action_date}:{fields.get('系統寫入時間', action.get('time', ''))}:{fields.get('出或入', '')}"
@@ -1144,13 +1162,14 @@ def build_schedule_comparisons(
         )
 
     for index, action in enumerate(actions):
+        staff = action_staff(data, action)
         fields = action.get("fields", {})
         action_date = action_target_roc_date(action, target_date)
         entry_rows = comparison_cache.get(action_date, {}).get("entry_rows", [])
         work_rows = comparison_cache.get(action_date, {}).get("work_rows", [])
         if action.get("kind") == "entry_log":
             if is_external_or_rest_entry(action):
-                if is_drowning_patrol_action(action):
+                if is_drowning_patrol_action(action) or action.get("staff_roc_date"):
                     exact = find_entry_matches(
                         entry_rows,
                         action_date,

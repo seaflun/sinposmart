@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -145,6 +146,82 @@ class ScheduleRepository:
 
     def load_current(self, now: datetime | None = None) -> ScheduleSnapshot:
         return self.load_for_date(business_roc_date(now))
+
+    def current_duty_identity(self, now: datetime | None = None) -> dict | None:
+        """Identify one current person from a complete, date-matched saved duty sheet."""
+
+        current = now or datetime.now()
+        target = business_roc_date(current)
+        base = datetime(int(target[:3]) + 1911, int(target[3:5]), int(target[5:]))
+        path = self.schedule_path(target)
+        try:
+            if path.is_file():
+                day = self._load_path(path, expected_target_date=target).data.get("today")
+            else:
+                previous = base - timedelta(days=1)
+                previous_target = f"{previous.year - 1911:03d}{previous.month:02d}{previous.day:02d}"
+                previous_path = self.schedule_path(previous_target)
+                if not previous_path.is_file():
+                    return None
+                day = self._load_path(previous_path, expected_target_date=previous_target).data.get("tomorrow")
+        except (OSError, ScheduleLoadError):
+            return None
+        if (not isinstance(day, dict) or day.get("roc_date") != target
+                or day.get("staff_complete") is not True):
+            return None
+        staff, rows = day.get("staff"), day.get("rows")
+        if not isinstance(staff, dict) or not isinstance(rows, list):
+            return None
+        periods = []
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            match = re.fullmatch(r"\s*(\d{1,2})\s*[~～-]\s*(\d{1,2})\s*", str(row.get("slot", "")))
+            columns = row.get("columns")
+            people = columns.get("值班") if isinstance(columns, dict) else None
+            if match is None or not isinstance(people, list):
+                return None
+            start_hour, end_hour = map(int, match.groups())
+            if not (0 <= start_hour <= 24 and 0 <= end_hour <= 24):
+                return None
+            start_hour += 24 if start_hour < 8 else 0
+            end_hour += 24 if end_hour < 8 else 0
+            if end_hour <= start_hour:
+                end_hour += 24
+            if not 8 <= start_hour < end_hour <= 32:
+                return None
+            numbers = [str(number).strip() for number in people]
+            if any(not number for number in numbers):
+                return None
+            periods.append((base + timedelta(hours=start_hour), base + timedelta(hours=end_hour), numbers))
+        active = [period for period in periods if period[0] <= current < period[1]]
+        if len(active) != 1 or len(active[0][2]) != 1:
+            return None
+        start, end, people = active[0]
+        actor_no = people[0]
+        info = staff.get(actor_no)
+        name = str(info.get("name", "") or "").strip() if isinstance(info, dict) else ""
+        normalized_name = "".join(name.split())
+        if not normalized_name or sum(
+            isinstance(person, dict)
+            and "".join(str(person.get("name", "") or "").split()) == normalized_name
+            for person in staff.values()
+        ) != 1:
+            return None
+        # Hourly rows belonging to the same person form one continuous duty span.
+        changed = True
+        while changed:
+            changed = False
+            for row_start, row_end, row_people in periods:
+                if row_people != people:
+                    continue
+                if row_end == start:
+                    start, changed = row_start, True
+                elif row_start == end:
+                    end, changed = row_end, True
+        return {"actor_no": actor_no, "actor_name": name, "target_roc_date": target,
+                "shift_start": start.isoformat(timespec="seconds"),
+                "shift_end": end.isoformat(timespec="seconds")}
 
     def _load_comparison_data(self, target_roc_date: str) -> dict[str, Any]:
         path = self.comparison_path(target_roc_date)

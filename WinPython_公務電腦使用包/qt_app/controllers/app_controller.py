@@ -33,9 +33,11 @@ from app_core.duty_task_projection import (
     action_datetime,
     action_completion_key,
     action_return_pair_key,
+    action_staff,
     action_summary,
     compact_action_snapshot,
     is_external_or_rest_return,
+    parse_roc_date,
     target_short_label,
 )
 from app_core.login_verifier import LoginVerifier
@@ -246,6 +248,8 @@ class AppController(QObject):
         self._pending_logout_message = ""
         self._pending_logout_method = "unknown"
         self._pending_auto_login_actor_no = ""
+        self._pending_update_auto_login = False
+        self._update_login_notice_retries = 40
         self._pending_update_logout = False
         self._auto_login_marker_path = self._auto_login_marker_file(package_root)
         self._restore_auto_login_marker()
@@ -611,6 +615,10 @@ class AppController(QObject):
                         return "failed"
                 except Exception:
                     return "failed"
+            try:
+                self._persist_auto_login_marker(self._pending_auto_login_actor_no)
+            except OSError:
+                return "failed"
             self._pending_live_refresh_generation = None
             self._update_shutdown_started = True
         if not self._close_worker_admissions():
@@ -952,6 +960,9 @@ class AppController(QObject):
             key = action_completion_key(snapshot_actions[index])
             target_date = str(snapshot.get("target_date", "") or "")
             actions[(target_date, key)] = chain.phase
+            staff_date = str(snapshot_actions[index].get("staff_roc_date", "") or "").strip()
+            if staff_date:
+                actions[(staff_date, key)] = chain.phase
         self._duty_controller.set_background_return_actions(actions)
 
     def _check_background_manual_chains(self, current: datetime | None = None) -> None:
@@ -1023,7 +1034,27 @@ class AppController(QObject):
             fields = source_action.get("fields", {})
             snapshot_action["fields"] = dict(fields) if isinstance(fields, Mapping) else {}
             snapshot_actions.append(snapshot_action)
+        schedule_data = dict(base_request.schedule_data)
+        staff_date = str(snapshot_actions[action_index].get("staff_roc_date", "") or "").strip()
+        if staff_date:
+            tomorrow = schedule_data.get("tomorrow")
+            try:
+                next_date = parse_roc_date(str(schedule_data.get("target_date", ""))) + timedelta(days=1)
+                expected_date = f"{next_date.year - 1911:03d}{next_date.month:02d}{next_date.day:02d}"
+                if (staff_date != expected_date or not isinstance(tomorrow, Mapping)
+                        or tomorrow.get("roc_date") != staff_date or not action_staff(schedule_data, snapshot_actions[action_index])):
+                    return None
+                for snapshot_action in snapshot_actions:
+                    snapshot_action["date_offset"] = int(snapshot_action.get("date_offset", 0) or 0) - 1
+            except (TypeError, ValueError):
+                return None
+            schedule_data.update(target_date=staff_date, yesterday=schedule_data.get("today"),
+                                 today=tomorrow, tomorrow=None)
         if phase == "departure":
+            if staff_date:
+                snapshot_actions[action_index]["scheduled_at"] = action_datetime(
+                    actions[action_index], str(base_request.schedule_data.get("target_date", ""))
+                ).isoformat(timespec="seconds")
             stamped_action = DutyController._stamped_submission_action(
                 snapshot_actions[action_index],
                 submit_at,
@@ -1031,13 +1062,17 @@ class AppController(QObject):
             if stamped_action is None:
                 return None
             snapshot_actions[action_index] = stamped_action
-        schedule_data = dict(base_request.schedule_data)
         schedule_data["actions"] = snapshot_actions
         action = snapshot_actions[action_index]
         if phase == "return":
             actor_no = str(action.get("actor", "") or "").strip()
             if not actor_no:
                 return None
+            if staff_date:
+                actor_name = str(action_staff(schedule_data, action).get(actor_no, {}).get("name", "") or "")
+                if (session.actor_no != actor_no or not actor_name.strip()
+                        or "".join(session.actor_name.split()) != "".join(actor_name.split())):
+                    return None
             if actor_no != str(base_request.session_actor_no or "").strip():
                 session = self._session_state.session
                 if (
@@ -1430,41 +1465,105 @@ class AppController(QObject):
     def _restore_auto_login_marker(self) -> None:
         try:
             payload = json.loads(self._auto_login_marker_path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            return
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = {}
         if not isinstance(payload, dict):
+            payload = {}
+        version = self._update_controller.currentVersion
+        if payload.get("state") == "consumed" and payload.get("version") == version:
+            self._update_login_notice_retries = 0
             return
-        actor_no = str(payload.get("actor_no") or "").strip()
-        if actor_no:
-            self._pending_auto_login_actor_no = actor_no
+        if (payload.get("schema_version") == 2 and payload.get("state") == "pending"
+                and payload.get("before_version") == version):
+            self._update_login_notice_retries = 0
+            return
+        if (payload.get("state") != "consumed"
+                and (payload.get("reason") == "update" or payload.get("actor_no"))
+                and self._recent_update_login_intent(payload.get("created_at"))
+                and payload.get("before_version") != version):
+            self._pending_update_auto_login = True
+            return
+        # Older installed GUIs can exit through the updater without writing an intent.
+        # The installer's version-matched notice proves this is an update restart.
+        try:
+            notice = json.loads(self._auto_login_marker_path.with_name(
+                "pending_update_notice.json").read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if (isinstance(notice, dict) and isinstance(notice.get("pending_versions"), list)
+                and version in notice["pending_versions"]
+                and self._recent_update_login_intent(notice.get("updated_at"))):
+            self._pending_update_auto_login = True
 
-    def _persist_auto_login_marker(self, actor_no: str) -> None:
-        actor_no = str(actor_no or "").strip()
-        if not actor_no:
-            return
+    @staticmethod
+    def _recent_update_login_intent(timestamp: object) -> bool:
+        try:
+            created = datetime.fromisoformat(str(timestamp or ""))
+            if created.tzinfo is not None:
+                created = created.astimezone().replace(tzinfo=None)
+            elapsed = datetime.now() - created
+            return timedelta(0) <= elapsed <= timedelta(hours=24)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _write_auto_login_marker(self, payload: dict) -> None:
         self._auto_login_marker_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self._auto_login_marker_path.with_suffix(".tmp")
-        payload = {
-            "actor_no": actor_no,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
         temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         temp_path.replace(self._auto_login_marker_path)
 
-    def _clear_auto_login_marker(self) -> None:
+    def _persist_auto_login_marker(self, actor_no: str) -> None:
+        self._write_auto_login_marker({
+            "schema_version": 2,
+            "reason": "update",
+            "state": "pending",
+            "actor_no": str(actor_no or "").strip(),
+            "before_version": self._update_controller.currentVersion,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    def _clear_auto_login_marker(self) -> bool:
+        self._pending_update_auto_login = False
+        self._update_login_notice_retries = 0
         try:
-            self._auto_login_marker_path.unlink()
-        except FileNotFoundError:
-            pass
+            self._write_auto_login_marker({"state": "consumed", "version": self._update_controller.currentVersion,
+                                          "created_at": datetime.now().isoformat(timespec="seconds")})
         except OSError:
-            return
+            return False
+        return True
 
     @Slot()
     def resumePendingAutoLogin(self) -> None:
-        if self._read_only_acceptance or not self._pending_auto_login_actor_no:
+        if self._read_only_acceptance or self._worker_admissions_closed:
             return
-        self._clear_auto_login_marker()
-        self._schedule_auto_login_successor()
+        if not self._pending_update_auto_login:
+            if self._update_login_notice_retries <= 0:
+                return
+            self._update_login_notice_retries -= 1
+            self._restore_auto_login_marker()
+            if not self._pending_update_auto_login:
+                if self._update_login_notice_retries > 0:
+                    QTimer.singleShot(250, self.resumePendingAutoLogin)
+                return
+        if self._session_controller.isBusy:
+            QTimer.singleShot(500, self.resumePendingAutoLogin)
+            return
+        self._pending_auto_login_actor_no = ""
+        if not self._clear_auto_login_marker():
+            self._session_controller.setOperationalStatus("無法保存更新後登入狀態，請手動確認值班人員並登入。", "warning")
+            return
+        if self._session_controller.isLoggedIn:
+            return
+        identity = self._duty_controller._repository.current_duty_identity(datetime.now())
+        if identity is None:
+            self._session_controller.setOperationalStatus("目前班表或值班人員無法唯一確認，請手動登入。", "warning")
+            return
+        credentials = self._session_controller.saved_credentials_for_person(identity["actor_no"], identity["actor_name"])
+        if credentials is None:
+            self._session_controller.setOperationalStatus("已確認目前值班人員，但找不到唯一完整的已儲存帳密，請手動登入。", "warning")
+            return
+        user_id, password = credentials
+        self._session_controller.login(user_id, password, False, login_method="automatic")
 
     def _sync_session_actor(self) -> None:
         previous_actor_no = self._synced_actor_no
@@ -2018,6 +2117,9 @@ class AppController(QObject):
 
     @staticmethod
     def _submission_staff(request: DutySubmissionRequest) -> dict[str, dict]:
+        actions = request.schedule_data.get("actions", [])
+        if 0 <= request.action_index < len(actions) and actions[request.action_index].get("staff_roc_date"):
+            return action_staff(request.schedule_data, actions[request.action_index])
         return operational_staff_from_schedule(request.schedule_data)
 
     def _submission_event_fields(
@@ -2028,6 +2130,10 @@ class AppController(QObject):
         actor_no = str(request.session_actor_no or "").strip()
         staff = self._submission_staff(request)
         actor_name = str(staff.get(actor_no, {}).get("name", "") or "").strip()
+        if action.get("staff_roc_date"):
+            session = self._session_state.session
+            actor_name = (session.actor_name if session and session.verified
+                          and session.user_id == request.user_id and session.actor_no == actor_no else "")
         return {
             "actor_no": actor_no,
             "user_id": str(request.user_id or "").strip(),
@@ -2711,7 +2817,8 @@ class AppController(QObject):
         if action and "target" not in fields:
             fields["target"] = operational_person_label(
                 str(action.get("target") or ""),
-                self._operational_staff,
+                action_staff(self._duty_controller._schedule_data, action)
+                if action.get("staff_roc_date") else self._operational_staff,
             )
         event_fields = {
             "actor_no": session.actor_no if session else self._synced_actor_no,

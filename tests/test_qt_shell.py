@@ -7275,7 +7275,161 @@ class RescueVideoServiceTests(unittest.TestCase):
         self.assertEqual(model.data(model.index(0, 0), model.SourceTextRole), "video001.TS")
 
 
+class SessionControllerTests(unittest.TestCase):
+    def controller_for_accounts(self, accounts):
+        from qt_app.controllers.session_controller import SessionController
+
+        repository = Mock()
+        repository.load.return_value = SimpleNamespace(
+            accounts=accounts, last_selected="", can_persist=True,
+            needs_rewrite=False, invalid_file=False,
+        )
+        controller = SessionController(repository=repository, read_only_acceptance=True)
+        self.addCleanup(controller.shutdown)
+        return controller
+
+    def test_person_credentials_follow_exact_name_after_duty_number_changes(self):
+        controller = self.controller_for_accounts([
+            {"actor_no": "9", "name": "前日人員", "user_id": "old", "password": "old-pass"},
+            {"actor_no": "15", "name": "今 日 人員", "user_id": "current", "password": "current-pass"},
+        ])
+        self.assertEqual(controller.saved_credentials_for_person("9", "今日人員"),
+                         ("current", "current-pass"))
+        self.assertIsNone(controller.saved_credentials_for_person("9", "未存人員"))
+        self.assertIsNone(controller.saved_credentials_for_person("9", ""))
+
+    def test_person_credentials_accept_only_exact_legacy_display_name(self):
+        for display in ("15番 今日人員", "15番 隊員 今日人員", "隊員 今日人員"):
+            with self.subTest(display=display):
+                controller = self.controller_for_accounts([
+                    {"actor_no": "15", "display_name": display, "user_id": "current", "password": "fake"},
+                ])
+                self.assertEqual(controller.saved_credentials_for_person("9", "今日人員"), ("current", "fake"))
+        for account in (
+            {"actor_no": "9", "display_name": "9番 今日人員甲", "user_id": "wrong", "password": "fake"},
+            {"actor_no": "9", "name": "別人", "display_name": "9番 今日人員", "user_id": "wrong", "password": "fake"},
+            {"actor_no": "9", "user_id": "wrong", "password": "fake"},
+        ):
+            with self.subTest(account=account):
+                self.assertIsNone(self.controller_for_accounts([account]).saved_credentials_for_person("9", "今日人員"))
+
+    def test_person_credentials_reject_duplicate_or_incomplete_accounts(self):
+        account = {"actor_no": "9", "name": "今日人員", "user_id": "current", "password": "fake"}
+        for accounts in (
+            [account, {**account, "actor_no": "15", "user_id": "another"}],
+            [{**account, "password": ""}], [{**account, "user_id": ""}], [],
+        ):
+            with self.subTest(accounts=accounts):
+                self.assertIsNone(self.controller_for_accounts(accounts).saved_credentials_for_person("9", "今日人員"))
+
+
 class ScheduleRepositoryTests(unittest.TestCase):
+    @staticmethod
+    def write_duty_cache(repository, target, *, today=None, tomorrow=None):
+        path = repository.schedule_path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"target_date": target, "actions": [],
+                                    "today": today, "tomorrow": tomorrow}), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def duty_day(target, *, name="前日人員", slots=("22-24", "0-8")):
+        return {"roc_date": target, "staff_complete": True,
+                "staff": {"9": {"name": name}},
+                "rows": [{"slot": slot, "columns": {"值班": ["9"]}} for slot in slots]}
+
+    def test_current_duty_identity_keeps_fire_day_across_midnight_and_month_year(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository, business_roc_date
+
+        for now in (datetime(2026, 10, 20, 23, 59), datetime(2026, 10, 21, 0),
+                    datetime(2026, 10, 21, 7, 59), datetime(2026, 11, 1, 0), datetime(2027, 1, 1, 0)):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as directory:
+                repository = ScheduleRepository(Path(directory))
+                target = business_roc_date(now)
+                self.write_duty_cache(repository, target, today=self.duty_day(target))
+                identity = repository.current_duty_identity(now)
+                self.assertEqual(identity["actor_no"], "9")
+                self.assertEqual(identity["actor_name"], "前日人員")
+                self.assertEqual(identity["target_roc_date"], target)
+                base = date(int(target[:3]) + 1911, int(target[3:5]), int(target[5:]))
+                from datetime import timedelta
+                self.assertEqual(identity["shift_start"], f"{base.isoformat()}T22:00:00")
+                self.assertEqual(identity["shift_end"], f"{(base + timedelta(days=1)).isoformat()}T08:00:00")
+
+    def test_current_duty_identity_changes_person_at_eight_with_same_number(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScheduleRepository(Path(directory))
+            self.write_duty_cache(repository, "1151020", today=self.duty_day("1151020"))
+            self.write_duty_cache(repository, "1151021", today=self.duty_day("1151021", name="今日人員", slots=("8-10",)))
+            before = repository.current_duty_identity(datetime(2026, 10, 21, 7, 59))
+            after = repository.current_duty_identity(datetime(2026, 10, 21, 8))
+            self.assertEqual((before["actor_no"], before["actor_name"]), ("9", "前日人員"))
+            self.assertEqual((after["actor_no"], after["actor_name"]), ("9", "今日人員"))
+            self.assertIsNone(repository.current_duty_identity(datetime(2026, 10, 21, 10)))
+
+    def test_current_duty_identity_uses_exact_tomorrow_cache_when_new_day_file_missing(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+
+        for now, previous, target in ((datetime(2026, 10, 21, 8), "1151020", "1151021"),
+                                      (datetime(2026, 11, 1, 8), "1151031", "1151101"),
+                                      (datetime(2027, 1, 1, 8), "1151231", "1160101")):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as directory:
+                repository = ScheduleRepository(Path(directory))
+                day = self.duty_day(target, name="今日人員", slots=("8-10",))
+                self.write_duty_cache(repository, previous, today=self.duty_day(previous), tomorrow=day)
+                self.assertEqual(repository.current_duty_identity(now)["actor_name"], "今日人員")
+                self.write_duty_cache(repository, target, today={**day, "staff": {"9": {"name": "更新人員"}}})
+                self.assertEqual(repository.current_duty_identity(now)["actor_name"], "更新人員")
+
+    def test_current_duty_identity_rejects_incomplete_ambiguous_and_invalid_day(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+
+        day = self.duty_day("1151021", name="今日人員", slots=("8-10",))
+        bad_days = (
+            None, {**day, "roc_date": "1151020"}, {**day, "staff_complete": False},
+            {**day, "staff": {}}, {**day, "staff": {"9": {"name": ""}}},
+            {**day, "staff": {"9": {"name": "今日人員"}, "10": {"name": "今日人員"}}},
+            {**day, "rows": day["rows"] * 2},
+            {**day, "rows": [{"slot": "8-10", "columns": {"值班": ["9", "10"]}}]},
+            {**day, "rows": [{"slot": "8-10", "columns": {"值班": ["9", "9"]}}]},
+            {**day, "rows": [{"slot": "wrong", "columns": {"值班": ["9"]}}]},
+            {**day, "rows": [{"slot": "25-26", "columns": {"值班": ["9"]}}]},
+        )
+        for bad_day in bad_days:
+            with self.subTest(day=bad_day), tempfile.TemporaryDirectory() as directory:
+                repository = ScheduleRepository(Path(directory))
+                self.write_duty_cache(repository, "1151021", today=bad_day)
+                self.assertIsNone(repository.current_duty_identity(datetime(2026, 10, 21, 9)))
+
+    def test_current_duty_identity_never_masks_bad_current_file_or_guesses_older_data(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+
+        now = datetime(2026, 10, 21, 9)
+        day = self.duty_day("1151021", name="今日人員", slots=("8-10",))
+        for case in ("missing", "corrupt", "wrong_target", "wrong_tomorrow", "rehearsal_only"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repository = ScheduleRepository(Path(directory))
+                if case != "missing":
+                    tomorrow = {**day, "roc_date": "1151022"} if case == "wrong_tomorrow" else day
+                    self.write_duty_cache(repository, "1151020", tomorrow=tomorrow)
+                if case == "corrupt":
+                    repository.schedule_path("1151021").write_text("{", encoding="utf-8")
+                elif case == "wrong_target":
+                    repository.schedule_path("1151021").write_text(json.dumps({"target_date": "1151020", "today": day}), encoding="utf-8")
+                elif case == "rehearsal_only":
+                    repository.schedule_path("1151020").write_text("{}", encoding="utf-8")
+                    path = repository.rehearsal_path("1151021")
+                    path.parent.mkdir(parents=True)
+                    path.write_text(json.dumps({"target_date": "1151021", "today": day}), encoding="utf-8")
+                self.assertIsNone(repository.current_duty_identity(now))
+
     def test_available_dates_preserve_legacy_schedule_and_rehearsal_choices(self) -> None:
         from app_core.schedule_repository import ScheduleRepository
 
@@ -26958,6 +27112,279 @@ if return_code != 0 or loaded:
             self.assertFalse(controller.isBusy)
             self.assertFalse(controller._pending_credentials)
             self.assertFalse(controller._credential_sync_workers)
+
+
+    def test_next_morning_background_chain_rebases_date_and_preserves_people_and_pair(self) -> None:
+        from datetime import datetime
+        from app_core.credential_repository import CredentialRepository
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.duty_task_projection import action_datetime
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOCALAPPDATA": directory}):
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "accounts.json", "test", None),
+                                       read_only_acceptance=True)
+            try:
+                actions = [
+                    {"kind": "entry_log", "source": "外勤簽出", "time": "08:00", "date_offset": 1,
+                     "actor": "8", "target": "18", "staff_roc_date": "1151022",
+                     "duplicate_key": "next:out", "return_pair_key": "next:pair",
+                     "fields": {"出或入": "出", "領用事由及地點": "外勤支援"}},
+                    {"kind": "entry_log", "source": "外勤簽入", "time": "10:00", "date_offset": 1,
+                     "actor": "5", "target": "18", "staff_roc_date": "1151022",
+                     "duplicate_key": "next:in", "return_pair_key": "next:pair",
+                     "fields": {"出或入": "入", "領用事由及地點": "返隊"}},
+                ]
+                data = {"target_date": "1151021", "today": {"roc_date": "1151021", "staff": {
+                    "8": {"name": "夜班人員"}, "18": {"name": "舊番號人員"}}},
+                    "tomorrow": {"roc_date": "1151022", "staff_complete": True,
+                                 "staff": {"5": {"name": "早班人員"}, "18": {"name": "翌日外勤人員"}}},
+                    "actions": actions}
+                original = DutySubmissionRequest("night-user", "fixture-password", 0, data,
+                                                 session_actor_no="8", background=True)
+                chain = _BackgroundManualChain(original, 1)
+                controller._session_state.session = LoginSession("8", "night-user", "fixture-password",
+                                                                  actor_name="夜班人員", verified=True)
+                request = controller._background_submission_request(chain, "departure", datetime(2026, 10, 22, 8))
+                self.assertIsNotNone(request)
+                self.assertEqual(request.schedule_data["target_date"], "1151022")
+                self.assertEqual(request.schedule_data["today"]["roc_date"], "1151022")
+                self.assertEqual(request.schedule_data["yesterday"]["roc_date"], "1151021")
+                for index in (0, 1):
+                    rebased = request.schedule_data["actions"][index]
+                    self.assertEqual(action_datetime(rebased, "1151022"), action_datetime(actions[index], "1151021"))
+                    self.assertEqual(rebased["return_pair_key"], "next:pair")
+                    self.assertEqual(rebased["duplicate_key"], actions[index]["duplicate_key"])
+                fields = controller._submission_event_fields(request, request.schedule_data["actions"][0])
+                self.assertIn("翌日外勤人員", fields["target"])
+                self.assertIn("夜班人員", fields["display_name"])
+                chain.phase = "return_waiting"
+                controller._background_manual_chains["next"] = chain
+                controller._sync_background_return_status()
+                for day in ("1151021", "1151022"):
+                    self.assertIn((day, "next:in"), controller.dutyController._background_return_actions)
+                self.assertIsNone(controller._background_submission_request(chain, "return", datetime(2026, 10, 22, 10)))
+                controller._session_state.session = LoginSession("5", "morning-user", "fixture-password",
+                                                                  actor_name="早班人員", verified=True)
+                returned = controller._background_submission_request(chain, "return", datetime(2026, 10, 22, 10))
+                self.assertEqual(returned.schedule_data["target_date"], "1151022")
+                self.assertEqual(returned.trigger_type, "due")
+                self.assertEqual(returned.session_actor_no, "5")
+                actions[1]["actor"] = "8"
+                data["tomorrow"]["staff"]["8"] = {"name": "翌日早班人員"}
+                controller._session_state.session = LoginSession("8", "night-user", "fixture-password",
+                                                                  actor_name="夜班人員", verified=True)
+                self.assertIsNone(controller._background_submission_request(chain, "return", datetime(2026, 10, 22, 10)))
+                controller._session_state.session = LoginSession("8", "next-user", "fixture-password",
+                                                                  actor_name="翌日早班人員", verified=True)
+                self.assertEqual(controller._background_submission_request(
+                    chain, "return", datetime(2026, 10, 22, 10)).user_id, "next-user")
+                self.assertEqual(data["actions"][0]["date_offset"], 1)
+                data["tomorrow"]["roc_date"] = "1151023"
+                self.assertIsNone(controller._background_submission_request(chain, "departure", datetime(2026, 10, 22, 8)))
+            finally:
+                controller.shutdown()
+
+    def test_update_shutdown_preserves_restart_login_intent_before_closing(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOCALAPPDATA": directory}):
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "accounts.json", "test", None),
+                                       read_only_acceptance=True)
+            marker = root / "SinpoSmart" / "pending_auto_login.json"
+            try:
+                controller._read_only_acceptance = False
+                def close_admissions():
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                    self.assertEqual(payload["reason"], "update")
+                    self.assertEqual(payload["state"], "pending")
+                    self.assertNotIn("password", payload)
+                    return True
+                with patch.object(controller, "_stop_block_reason", return_value="busy"):
+                    self.assertEqual(controller.prepareUpdateShutdown(), "busy")
+                self.assertFalse(marker.exists())
+                with patch.object(controller, "_stop_block_reason", return_value=""), \
+                        patch.object(controller, "_close_worker_admissions", side_effect=close_admissions):
+                    self.assertEqual(controller.prepareUpdateShutdown(), "ready")
+            finally:
+                controller._read_only_acceptance = True
+                controller.shutdown()
+
+    def test_update_restart_rechecks_person_after_midnight_and_fire_day_change(self) -> None:
+        from datetime import datetime
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.app_controller import AppController
+
+        for now, actor_no, name in ((datetime(2026, 10, 21, 0, 15), "8", "夜班人員"),
+                                    (datetime(2026, 10, 21, 8, 0), "8", "早班人員"),
+                                    (datetime(2026, 10, 21, 10, 5), "16", "下一班人員")):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, {"LOCALAPPDATA": directory}), \
+                    patch("qt_app.controllers.app_controller.datetime", wraps=datetime) as clock:
+                clock.now.return_value = now
+                root = Path(directory)
+                marker = root / "SinpoSmart" / "pending_auto_login.json"
+                marker.parent.mkdir()
+                marker.write_text(json.dumps({"actor_no": "99", "created_at": "2026-10-20T23:58:00",
+                                              "reason": "update", "state": "pending",
+                                              "before_version": "2026.10.20.1834"}), encoding="utf-8")
+                version = root / "VERSION.txt"
+                version.write_text("2026.10.21.1000", encoding="utf-8")
+                repository = ScheduleRepository(root / "runtime_outputs")
+                identity = {"actor_no": actor_no, "actor_name": name}
+                with patch.object(repository, "current_duty_identity", return_value=identity) as identify:
+                    controller = AppController(repository=CredentialRepository(root / "accounts.json", "test", None),
+                        schedule_repository=repository, update_repository=UpdateRepository(version),
+                        read_only_acceptance=True)
+                    try:
+                        controller._read_only_acceptance = False
+                        with patch.object(controller.sessionController, "saved_credentials_for_person",
+                                          return_value=("correct-user", "fixture-password")) as credentials, \
+                                patch.object(controller.sessionController, "login") as login:
+                            controller.resumePendingAutoLogin()
+                            controller.resumePendingAutoLogin()
+                        identify.assert_called_once_with(now)
+                        credentials.assert_called_once_with(actor_no, name)
+                        login.assert_called_once_with("correct-user", "fixture-password", False, login_method="automatic")
+                        self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["state"], "consumed")
+                        self.assertNotIn("fixture-password", marker.read_text(encoding="utf-8"))
+                    finally:
+                        controller._read_only_acceptance = True
+                        controller.shutdown()
+
+    def test_fresh_installer_notice_resumes_once_when_old_gui_wrote_no_marker(self) -> None:
+        from datetime import datetime
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOCALAPPDATA": directory}), \
+                patch("qt_app.controllers.app_controller.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 21, 8, 1)
+            root = Path(directory)
+            state = root / "SinpoSmart"
+            state.mkdir()
+            version = root / "VERSION.txt"
+            version.write_text("2026.10.21.1000", encoding="utf-8")
+            (state / "pending_update_notice.json").write_text(json.dumps({
+                "pending_versions": ["2026.10.21.1000"], "updated_at": "2026-10-21T08:00:00+08:00"}), encoding="utf-8")
+            repository = ScheduleRepository(root / "runtime_outputs")
+            with patch.object(repository, "current_duty_identity", return_value={"actor_no": "8", "actor_name": "早班"}):
+                for attempt in range(2):
+                    controller = AppController(repository=CredentialRepository(root / "accounts.json", "test", None),
+                        schedule_repository=repository, update_repository=UpdateRepository(version),
+                        read_only_acceptance=True)
+                    try:
+                        controller._read_only_acceptance = False
+                        with patch.object(controller.sessionController, "saved_credentials_for_person",
+                                          return_value=("user8", "fixture-password")), \
+                                patch.object(controller.sessionController, "login") as login:
+                            controller.resumePendingAutoLogin()
+                        self.assertEqual(login.call_count, 1 if attempt == 0 else 0)
+                    finally:
+                        controller._read_only_acceptance = True
+                        controller.shutdown()
+
+    def test_update_notice_written_after_startup_is_retried_but_same_version_intent_is_rejected(self) -> None:
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.app_controller import AppController
+
+        for case in ("fresh_notice", "delayed_notice", "same_version_intent"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, {"LOCALAPPDATA": directory}), \
+                    patch("qt_app.controllers.app_controller.datetime", wraps=datetime) as clock:
+                clock.now.return_value = datetime(2026, 10, 21, 8, 1)
+                root = Path(directory)
+                state = root / "SinpoSmart"
+                state.mkdir()
+                version = root / "VERSION.txt"
+                version.write_text("2026.10.21.1000", encoding="utf-8")
+                notice_path = state / "pending_update_notice.json"
+                notice = {"schema_version": 1, "last_seen_version": "2026.10.20.1834",
+                          "pending_versions": ["2026.10.21.1000"], "pending_releases": [],
+                          "updated_at": "2026-10-21T08:00:59.1234567+08:00"}
+                if case != "delayed_notice":
+                    notice_path.write_text(json.dumps(notice), encoding="utf-8")
+                if case == "same_version_intent":
+                    (state / "pending_auto_login.json").write_text(json.dumps({
+                        "schema_version": 2, "state": "pending", "reason": "update",
+                        "before_version": "2026.10.21.1000", "created_at": "2026-10-21T08:00:00"}), encoding="utf-8")
+                repository = ScheduleRepository(root / "runtime_outputs")
+                schedule_path = repository.schedule_path("1151021")
+                schedule_path.parent.mkdir(parents=True)
+                schedule_path.write_text(json.dumps({"target_date": "1151021", "actions": [],
+                    "today": {"roc_date": "1151021", "staff_complete": True,
+                              "staff": {"8": {"name": "早班"}},
+                              "rows": [{"slot": "8-10", "columns": {"值班": ["8"]}}]}}), encoding="utf-8")
+                credentials = Mock()
+                credentials.account_identity.side_effect = lambda account: account["user_id"]
+                credentials.load.return_value = SimpleNamespace(accounts=[
+                    {"actor_no": "8", "name": "前一日人員", "user_id": "wrong-user", "password": "old-fixture"},
+                    {"actor_no": "15", "name": "早班", "user_id": "user8", "password": "fixture-password"},
+                ], last_selected="", can_persist=True, needs_rewrite=False, invalid_file=False)
+                controller = AppController(repository=credentials,
+                    schedule_repository=repository, update_repository=UpdateRepository(version),
+                    read_only_acceptance=True)
+                try:
+                    controller._read_only_acceptance = False
+                    with patch.object(controller.sessionController, "login") as login, \
+                            patch("qt_app.controllers.app_controller.QTimer.singleShot") as retry:
+                        if case == "delayed_notice":
+                            controller.resumePendingAutoLogin()
+                            login.assert_not_called()
+                            notice_path.write_text(json.dumps(notice), encoding="utf-8")
+                        for _ in range(50):
+                            controller.resumePendingAutoLogin()
+                    if case == "same_version_intent":
+                        login.assert_not_called()
+                        retry.assert_not_called()
+                    else:
+                        login.assert_called_once_with("user8", "fixture-password", False, login_method="automatic")
+                    self.assertLessEqual(retry.call_count, 40)
+                finally:
+                    controller._read_only_acceptance = True
+                    controller.shutdown()
+
+    def test_update_restart_never_guesses_from_missing_roster_or_old_marker(self) -> None:
+        from datetime import datetime
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.update_repository import UpdateRepository
+        from qt_app.controllers.app_controller import AppController
+
+        for created_at in ("2026-10-21T07:59:00", "2026-10-18T08:00:00", "not-a-date"):
+            with self.subTest(created_at=created_at), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, {"LOCALAPPDATA": directory}), \
+                    patch("qt_app.controllers.app_controller.datetime", wraps=datetime) as clock:
+                clock.now.return_value = datetime(2026, 10, 21, 8, 1)
+                root = Path(directory)
+                marker = root / "SinpoSmart" / "pending_auto_login.json"
+                marker.parent.mkdir()
+                marker.write_text(json.dumps({"actor_no": "99", "created_at": created_at}), encoding="utf-8")
+                version = root / "VERSION.txt"
+                version.write_text("2026.10.21.1000", encoding="utf-8")
+                repository = ScheduleRepository(root / "runtime_outputs")
+                with patch.object(repository, "current_duty_identity", return_value=None):
+                    controller = AppController(repository=CredentialRepository(root / "accounts.json", "test", None),
+                        schedule_repository=repository, update_repository=UpdateRepository(version),
+                        read_only_acceptance=True)
+                    try:
+                        controller._read_only_acceptance = False
+                        with patch.object(controller.sessionController, "login") as login:
+                            controller.resumePendingAutoLogin()
+                        login.assert_not_called()
+                    finally:
+                        controller._read_only_acceptance = True
+                        controller.shutdown()
 
 
 class SavedLoginPersistenceTests(unittest.TestCase):

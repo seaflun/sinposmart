@@ -151,6 +151,7 @@ class PlannedAction:
     duplicate_key: str
     date_offset: int = 0
     return_pair_key: str = ""
+    staff_roc_date: str = ""
 
 
 # Date, roster, and radio helpers
@@ -3288,14 +3289,27 @@ def planned_actions(
         next_morning_sources = {"今日在勤且昨日未在勤", "昨日在勤且今日未在勤", "值班交接"}
         existing_entry_keys = {key for action in actions if (key := physical_entry_key(target, action)) is not None}
         existing_work_keys = {action.duplicate_key for action in actions if action.kind == "work_log" and action.duplicate_key}
-        for action in planned_actions(tomorrow, today, [], next_target, today_cases, None):
-            if action.source not in next_morning_sources:
+        next_actions = planned_actions(tomorrow, today, [], next_target, today_cases, None)
+        external_departures = [
+            action for action in next_actions
+            if action.source == "外勤簽出" and action.time == "08:00" and action.date_offset == 0
+        ]
+        external_pair_keys = {action.return_pair_key for action in external_departures if action.return_pair_key}
+        for action in next_actions:
+            external_preview = action in external_departures or (
+                action.source == "外勤簽入" and action.return_pair_key in external_pair_keys
+            )
+            if external_preview:
+                action.date_offset += 1
+                action.staff_roc_date = tomorrow.roc_date
+            else:
+                if action.source not in next_morning_sources:
+                    continue
+                if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
+                    continue
+                action.date_offset = 1
+            if not external_preview and action.kind == "entry_log" and action.target in today_rest_checkouts and action.fields.get("出或入") in ("出", "值退"):
                 continue
-            if action.time not in ("06:00", "07:00", "07:55", "08:00", "08:05"):
-                continue
-            if action.kind == "entry_log" and action.target in today_rest_checkouts and action.fields.get("出或入") in ("出", "值退"):
-                continue
-            action.date_offset = 1
             if action.kind == "entry_log":
                 entry_key = physical_entry_key(target, action)
                 if entry_key is not None and entry_key in existing_entry_keys:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import re
 from typing import Any
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
@@ -440,6 +441,26 @@ class SessionController(QObject):
             and str(account.get("user_id", "") or "").strip()
             and str(account.get("password", "") or "")
         ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def saved_credentials_for_person(self, actor_no: str, actor_name: str) -> tuple[str, str] | None:
+        """Match a person independently of duty numbers that change at 08:00."""
+
+        expected_name = "".join(str(actor_name or "").split())
+        if not str(actor_no or "").strip() or not expected_name:
+            return None
+        candidates = []
+        for account in self._accounts:
+            name = str(account.get("name", "") or "").strip()
+            if not name:
+                name = re.sub(r"^\s*\d{1,2}\s*番\s*", "", str(account.get("display_name", "") or "")).strip()
+                name = re.sub(r"^(?:分隊長|副分隊長|小隊長|隊員)\s+", "", name)
+            if "".join(name.split()) != expected_name:
+                continue
+            user_id = str(account.get("user_id", "") or "").strip()
+            password = str(account.get("password", "") or "")
+            if user_id and password:
+                candidates.append((user_id, password))
         return candidates[0] if len(candidates) == 1 else None
 
     def _actor_no_from_name(self, name: str) -> str:

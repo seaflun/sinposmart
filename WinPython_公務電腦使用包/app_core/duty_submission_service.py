@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 
 from app_core.duty_task_projection import (
     action_completion_key,
+    action_staff,
     action_target_roc_date,
     is_fire_day_closing_action,
     build_schedule_comparisons,
@@ -135,6 +136,10 @@ class DutySubmissionService:
             "handoff_preflight",
         ):
             raise DutySubmissionValidationError("這筆任務不支援勤務系統登打。")
+        if action.get("staff_roc_date") and not action_staff(data, action).get(
+            str(action.get("target", "")), {},
+        ).get("name"):
+            raise DutySubmissionValidationError("下一消防日人員名冊不完整，請重新更新勤務資料後再安排登打。")
         if request.trigger_type not in ("due", "manual", "recovery"):
             raise DutySubmissionValidationError("登打觸發類型不正確。")
         try:
@@ -239,7 +244,7 @@ class DutySubmissionService:
                 query_range=query_range,
                 query_started_callback=query_started_callback,
             )
-            staff = self._staff(comparison_source)
+            staff = action_staff(comparison_source, action)
             time_order_warnings: list[str] = []
             pause_details = self._open_assignment_pause_details(
                 action,

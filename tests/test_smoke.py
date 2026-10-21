@@ -5595,6 +5595,357 @@ try {
             ],
         )
 
+    def test_next_fire_day_external_preview_keeps_pair_dates_and_unique_keys(self) -> None:
+        from dataclasses import asdict
+        from datetime import timedelta
+
+        module = duty_rehearsal_module()
+        from app_core.duty_task_projection import action_datetime
+
+        for target in (datetime(2026, 10, 21).date(), datetime(2026, 10, 31).date(), datetime(2026, 12, 31).date()):
+            for end_slot in ("08-10", "08-24"):
+                with self.subTest(target=target, end_slot=end_slot):
+                    following = target + timedelta(days=1)
+                    today = module.DutySheet(
+                        roc_date=module.roc_date(target),
+                        rows=[module.DutyRow("08-10", {"值班": ["3"], "外勤支援": ["21"]}),
+                              module.DutyRow("10-12", {"值班": ["3"]}),
+                              module.DutyRow("22-24", {"值班": ["8"]})],
+                        summary={"在勤": ["3", "8", "21"]},
+                    )
+                    tomorrow = module.DutySheet(
+                        roc_date=module.roc_date(following),
+                        rows=[module.DutyRow(end_slot, {"值班": ["11"], "外勤支援": ["21"]})]
+                             + ([module.DutyRow("10-12", {"值班": ["12"]}),
+                                 module.DutyRow("12-14", {"值班": ["12"], "外勤支援": ["22"]})]
+                                if end_slot == "08-10" else []),
+                        summary={"在勤": ["11", "12", "21", "22"]},
+                    )
+                    with mock.patch.object(module, "load_work_log_defaults", return_value=dict(module.DEFAULT_WORK_LOG_DEFAULTS)):
+                        standalone = module.planned_actions(tomorrow, today, [], following)
+                        actions = module.planned_actions(today, None, [], target, [], tomorrow)
+                    expected = [action for action in standalone if action.source.startswith("外勤") and action.target == "21"]
+                    previews = [action for action in actions if action.source.startswith("外勤") and action.target == "21"
+                                and action.date_offset >= 1]
+                    self.assertEqual(len(previews), 2)
+                    self.assertEqual(previews[0].actor, "8")
+                    self.assertEqual({action.staff_roc_date for action in previews}, {tomorrow.roc_date})
+                    self.assertEqual(len({action.return_pair_key for action in previews}), 1)
+                    self.assertTrue(previews[0].return_pair_key)
+                    self.assertEqual([action.duplicate_key for action in previews], [action.duplicate_key for action in expected])
+                    self.assertEqual(
+                        [action_datetime(asdict(action), today.roc_date) for action in previews],
+                        [action_datetime(asdict(action), tomorrow.roc_date) for action in expected],
+                    )
+                    self.assertEqual(len([action for action in actions if action.source == "外勤簽出" and action.target == "21"]), 2)
+                    self.assertFalse(any(action.source == "外勤簽出" and action.target == "22" for action in actions))
+
+    def test_next_fire_day_external_wait_uses_next_roster_without_submitting_early(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        duty_rehearsal_module()
+        from PySide6.QtTest import QSignalSpy
+        from PySide6.QtWidgets import QApplication
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        app = QApplication.instance() or QApplication(["next-fire-day-preview"])
+        for early in (datetime(2026, 10, 21, 22), datetime(2026, 10, 22, 1)):
+            current = early
+
+            class Clock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return current.replace(tzinfo=tz)
+
+            with self.subTest(early=early), tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+                "qt_app.controllers.duty_controller.datetime", Clock,
+            ):
+                controller = DutyController(
+                    repository=ScheduleRepository(Path(temp_dir)),
+                    unreturned_return_queue=UnreturnedReturnQueue(Path(temp_dir)),
+                )
+                try:
+                    controller.set_session_context(1, "night-user")
+                    controller.set_actor_no("8")
+                    departure = {
+                        "kind": "entry_log", "time": "08:00", "date_offset": 1,
+                        "actor": "8", "target": "21", "source": "外勤簽出",
+                        "duplicate_key": "entry:2026-10-22:8:out:21:外勤支援",
+                        "return_pair_key": "return-pair:next-day", "staff_roc_date": "1151022",
+                        "fields": {"出或入": "出", "領用事由及地點": "外勤支援"},
+                    }
+                    returning = {**departure, "time": "10:00", "actor": "11", "source": "外勤簽入",
+                                 "duplicate_key": "entry:2026-10-22:10:in:21:返隊:外勤支援",
+                                 "fields": {"出或入": "入", "領用事由及地點": "返隊"}}
+                    controller.replace_schedule_data({
+                        "target_date": "1151021", "today": {"roc_date": "1151021", "staff": {"21": {"name": "今日人員"}}},
+                        "tomorrow": {"roc_date": "1151022", "staff_complete": True, "staff": {"21": {"name": "明日人員"}}},
+                        "actions": [departure, returning],
+                    })
+                    row = next(row for row in controller._task_model._tasks if row["taskIndex"] == 0)
+                    self.assertIn("明日人員", row["peopleText"])
+                    self.assertNotIn("今日人員", row["peopleText"])
+                    submitted = QSignalSpy(controller.manualSubmissionRequested)
+                    controller.toggleTaskSelection(0)
+                    self.assertTrue(controller.canManualSubmitSelected)
+                    controller.prepareManualSubmission()
+                    self.assertIn("明日人員", controller.manualConfirmationSummary)
+                    controller.confirmManualSubmission()
+                    self.assertEqual(submitted.count(), 0)
+                    self.assertEqual(controller.manual_submission_requests("night-user", "fake", [0], submit_at=early), [])
+                    waiting = controller.background_manual_waiting_requests("night-user", "fake", [0])
+                    self.assertEqual(len(waiting), 1)
+                    self.assertEqual(len(waiting[0].schedule_data["actions"]), 2)
+                    current = datetime(2026, 10, 22, 7, 59)
+                    controller._refresh_due_tasks()
+                    self.assertEqual(submitted.count(), 0)
+                    current = datetime(2026, 10, 22, 8)
+                    controller._refresh_due_tasks()
+                    controller._refresh_due_tasks()
+                    self.assertEqual(submitted.count(), 1)
+                    requests = controller.manual_submission_requests("night-user", "fake", [0], submit_at=current)
+                    self.assertEqual(len(requests), 1)
+                    submitted_action = requests[0].schedule_data["actions"][0]
+                    self.assertEqual(submitted_action["submit_target_date"], "1151022")
+                    self.assertEqual(submitted_action["fields"]["系統寫入時間"], "08:00")
+                finally:
+                    controller.shutdown()
+        self.assertIsNotNone(app)
+
+    def test_next_fire_day_external_submission_uses_original_roster_and_verifies_once(self) -> None:
+        from types import SimpleNamespace
+
+        duty_rehearsal_module()
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fills = []
+
+            def fill(_driver, action, staff, action_date, *, save):
+                fills.append((staff["21"]["name"], action_date, save))
+                return {}
+
+            automation = SimpleNamespace(
+                WORK_LOG_AP="work", ENTRY_LOG_AP="entry", build_driver=lambda **_kwargs: object(),
+                login=lambda *_args: None, quit_driver=lambda _driver: None,
+                fill_entry_log_form_for_test=fill,
+                query_visible_table=lambda *_args, **_kwargs: (
+                    [["115/10/22", "08:00", "-", fills[0][0], "出", "外勤支援"]] if fills else []
+                ),
+            )
+            action = {"kind": "entry_log", "time": "08:00", "date_offset": 1,
+                      "actor": "8", "target": "21", "source": "外勤簽出", "staff_roc_date": "1151022",
+                      "duplicate_key": "entry:2026-10-22:8:out:21:外勤支援",
+                      "fields": {"出或入": "出", "領用事由及地點": "外勤支援", "系統寫入時間": "08:00"}}
+            data = {"target_date": "1151021", "actions": [action],
+                    "today": {"roc_date": "1151021", "staff": {"21": {"name": "今日人員"}}},
+                    "tomorrow": {"roc_date": "1151022", "staff_complete": True, "staff": {"21": {"name": "明日人員"}}}}
+            service = DutySubmissionService(
+                Path(temp_dir), module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 10, 22, 8), sleeper=lambda _seconds: None,
+            )
+            request = DutySubmissionRequest("night-user", "fake", 0, data, trigger_type="manual")
+            result = service.execute(request)
+            self.assertEqual(result.status, "submitted")
+            self.assertEqual(fills, [("明日人員", "1151022", True)])
+            self.assertIn("明日人員", " ".join(result.comparison["matched"]))
+            repeated = service.execute(request)
+            self.assertEqual(repeated.status, "skipped_duplicate")
+            self.assertEqual(len(fills), 1)
+
+    def test_next_fire_day_external_missing_roster_stops_before_browser(self) -> None:
+        duty_rehearsal_module()
+        from app_core.duty_submission_service import (
+            DutySubmissionRequest, DutySubmissionService, DutySubmissionValidationError,
+        )
+
+        action = {"kind": "entry_log", "time": "08:00", "date_offset": 1,
+                  "actor": "8", "target": "21", "source": "外勤簽出", "staff_roc_date": "1151022",
+                  "fields": {"出或入": "出", "領用事由及地點": "外勤支援"}}
+        for tomorrow in (None, {"roc_date": "1151022", "staff": {}},
+                         {"roc_date": "1151022", "staff": {"21": {"name": "部分名冊人員"}}},
+                         {"roc_date": "1151022", "staff_complete": False, "staff": {"21": {"name": "部分名冊人員"}}},
+                         {"roc_date": "1151023", "staff": {"21": {"name": "錯日人員"}}}):
+            with self.subTest(tomorrow=tomorrow), tempfile.TemporaryDirectory() as temp_dir:
+                loader = mock.Mock()
+                service = DutySubmissionService(Path(temp_dir), module_loader=loader)
+                data = {"target_date": "1151021", "actions": [action], "tomorrow": tomorrow,
+                        "today": {"roc_date": "1151021", "staff": {"21": {"name": "今日同番號人員"}}}}
+                with self.assertRaisesRegex(DutySubmissionValidationError, "名冊"):
+                    service.execute(DutySubmissionRequest("night-user", "fake", 0, data, trigger_type="manual"))
+                loader.assert_not_called()
+
+    def test_next_fire_day_rebased_background_result_matches_only_its_preview(self) -> None:
+        from dataclasses import replace
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        duty_rehearsal_module()
+        from PySide6.QtWidgets import QApplication
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        app = QApplication.instance() or QApplication(["next-fire-day-result"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(
+                repository=ScheduleRepository(Path(temp_dir)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(temp_dir)),
+            )
+            try:
+                controller.set_session_context(1, "night-user")
+                controller.set_actor_no("8")
+                action = {"kind": "entry_log", "time": "08:00", "date_offset": 1,
+                          "actor": "8", "target": "21", "source": "外勤簽出", "staff_roc_date": "1151022",
+                          "duplicate_key": "entry:2026-10-22:8:out:21:外勤支援",
+                          "fields": {"出或入": "出", "領用事由及地點": "外勤支援"}}
+                controller.replace_schedule_data({"target_date": "1151021", "actions": [action]})
+                request = DutySubmissionRequest(
+                    "night-user", "fake", 0, {"target_date": "1151022", "actions": [{**action, "date_offset": 0}]},
+                    trigger_type="manual", session_generation=1, session_actor_no="8", background=True,
+                    schedule_generation=controller.schedule_generation, action_key=action["duplicate_key"],
+                )
+                invalid_requests = [
+                    replace(request, background=False),
+                    replace(request, session_generation=2),
+                    replace(request, session_actor_no="9"),
+                    replace(request, user_id="another-user"),
+                    replace(request, schedule_data={"target_date": "1151023", "actions": [{**action, "date_offset": 0}]}),
+                    replace(request, schedule_data={"target_date": "1151022", "actions": [{**action, "date_offset": 1}]}),
+                    replace(request, schedule_data={"target_date": "1151022", "actions": [{**action, "date_offset": 0, "staff_roc_date": ""}]}),
+                ]
+                for invalid in invalid_requests:
+                    with self.subTest(request=invalid):
+                        self.assertFalse(controller.handle_submission_request_result(invalid, "submitted", "完成", "result.json"))
+                        self.assertEqual(controller.ui_action_key_for_request(invalid), "")
+                self.assertEqual(controller.ui_action_key_for_request(request), action["duplicate_key"])
+                self.assertTrue(controller.handle_submission_request_result(request, "submitted", "完成", "result.json"))
+                self.assertEqual(controller._executed_indices, {0})
+                controller.replace_schedule_data({"target_date": "1151022", "actions": [{**action, "date_offset": 0, "staff_roc_date": ""}]})
+                self.assertEqual(controller._executed_indices, {0})
+                self.assertEqual(controller._comparisons[0]["group"], "done")
+            finally:
+                controller.shutdown()
+        self.assertIsNotNone(app)
+
+    def test_next_fire_day_preview_result_allows_only_bounded_scheduled_catchup(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        duty_rehearsal_module()
+        from PySide6.QtWidgets import QApplication
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        app = QApplication.instance() or QApplication(["next-fire-day-catchup"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = DutyController(
+                repository=ScheduleRepository(Path(temp_dir)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(temp_dir)),
+            )
+            try:
+                controller.set_session_context(1, "night-user")
+                controller.set_actor_no("8")
+                action = {"kind": "entry_log", "time": "08:00", "date_offset": 1,
+                          "actor": "8", "target": "21", "source": "外勤簽出", "staff_roc_date": "1151022",
+                          "duplicate_key": "entry:2026-10-22:8:out:21:外勤支援",
+                          "fields": {"出或入": "出", "領用事由及地點": "外勤支援"}}
+                controller.replace_schedule_data({"target_date": "1151021", "actions": [action]})
+                for actual_time, scheduled_at, expected in (
+                    ("08:01", "2026-10-22T08:00:00", True),
+                    ("10:00", "2026-10-22T08:00:00", True),
+                    ("07:59", "2026-10-22T08:00:00", False),
+                    ("10:01", "2026-10-22T08:00:00", False),
+                    ("08:01", "2026-10-22T09:00:00", False),
+                    ("08:01", "invalid", False),
+                    ("08:01", "", False),
+                ):
+                    with self.subTest(actual_time=actual_time, scheduled_at=scheduled_at):
+                        submitted_action = {**action, "time": actual_time, "date_offset": 0,
+                                            "scheduled_at": scheduled_at, "submit_target_date": "1151022",
+                                            "fields": {**action["fields"], "系統寫入時間": actual_time}}
+                        request = DutySubmissionRequest(
+                            "night-user", "fake", 0, {"target_date": "1151022", "actions": [submitted_action]},
+                            trigger_type="manual", session_generation=1, session_actor_no="8", background=True,
+                            schedule_generation=controller.schedule_generation, action_key=action["duplicate_key"],
+                        )
+                        self.assertEqual(controller.handle_submission_request_result(request, "submitted", "完成", "result.json"), expected)
+                        self.assertEqual(controller.ui_action_key_for_request(request), action["duplicate_key"] if expected else "")
+            finally:
+                controller.shutdown()
+        self.assertIsNotNone(app)
+
+    def test_next_fire_day_preview_return_cannot_submit_before_due_for_reused_actor_number(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        duty_rehearsal_module()
+        from PySide6.QtTest import QSignalSpy
+        from PySide6.QtWidgets import QApplication
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        app = QApplication.instance() or QApplication(["next-fire-day-early-return"])
+        current = datetime(2026, 10, 21, 22)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return current.replace(tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "qt_app.controllers.duty_controller.datetime", Clock,
+        ):
+            controller = DutyController(
+                repository=ScheduleRepository(Path(temp_dir)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(temp_dir)),
+            )
+            try:
+                controller.set_session_context(1, "night-user")
+                controller.set_actor_no("8")
+                departure = {"kind": "entry_log", "time": "08:00", "date_offset": 1,
+                             "actor": "8", "target": "21", "source": "外勤簽出", "staff_roc_date": "1151022",
+                             "duplicate_key": "next-day:departure", "return_pair_key": "next-day:pair",
+                             "fields": {"出或入": "出", "領用事由及地點": "外勤支援"}}
+                returning = {**departure, "time": "10:00", "source": "外勤簽入",
+                             "duplicate_key": "next-day:return", "fields": {"出或入": "入", "領用事由及地點": "返隊"}}
+                controller.replace_schedule_data({
+                    "target_date": "1151021", "actions": [departure, returning],
+                    "today": {"roc_date": "1151021", "staff": {"8": {"name": "夜班人員"}}},
+                    "tomorrow": {"roc_date": "1151022", "staff_complete": True,
+                                 "staff": {"8": {"name": "明日同番號人員"}, "21": {"name": "外勤人員"}}},
+                })
+                self.assertEqual({row["taskIndex"] for row in controller._task_model._tasks}, {0, 1})
+                self.assertFalse(controller._is_manual_submission_available(1, now=current))
+                self.assertEqual(controller.manual_submission_requests("night-user", "fake", [1], submit_at=current), [])
+                submitted = QSignalSpy(controller.manualSubmissionRequested)
+                waiting = QSignalSpy(controller.manualWaitingScheduled)
+                controller.toggleTaskSelection(1)
+                self.assertFalse(controller.canManualSubmitSelected)
+                controller.prepareManualSubmission()
+                controller.confirmManualSubmission()
+                self.assertEqual(submitted.count(), 0)
+                self.assertEqual(waiting.count(), 0)
+                controller.toggleTaskSelection(1)
+                controller.toggleTaskSelection(0)
+                self.assertTrue(controller.canManualSubmitSelected)
+                controller.prepareManualSubmission()
+                controller.confirmManualSubmission()
+                self.assertEqual(waiting.count(), 1)
+                self.assertEqual(submitted.count(), 0)
+                current = datetime(2026, 10, 22, 9, 59)
+                self.assertFalse(controller._is_manual_submission_available(1, now=current))
+                current = datetime(2026, 10, 22, 10)
+                self.assertFalse(controller._is_manual_submission_available(1, now=current))
+                self.assertEqual(controller.manual_submission_requests("night-user", "fake", [1], submit_at=current), [])
+                controller.replace_schedule_data({
+                    "target_date": "1151022", "actions": [{**returning, "date_offset": 0, "staff_roc_date": ""}],
+                })
+                self.assertTrue(controller._is_manual_submission_available(0, now=current))
+            finally:
+                controller.shutdown()
+        self.assertIsNotNone(app)
+
     def test_next_morning_0800_handoff_preview_includes_work_log(self) -> None:
         module = duty_rehearsal_module()
         today = module.DutySheet(
