@@ -23,7 +23,9 @@ Window {
     readonly property int dialogWidth: Math.min(naturalDialogWidth, Math.max(1, workAreaWidth - 2 * windowMargin))
     readonly property int accountCardWidth: Math.floor((dialogWidth - 44 - Math.max(0, columnCount - 1) * 8) / columnCount)
     readonly property int contentHeight: 162 + listHeight
-    readonly property int dialogHeight: Design.appTitleBarHeight + contentHeight
+    readonly property int dialogHeight: Math.min(workAreaHeight - 2 * windowMargin,
+                                                Math.max(Design.appTitleBarHeight + contentHeight,
+                                                         noticeSettingsDialog.visible ? noticeSettingsDialog.implicitHeight + 2 * windowMargin : 0))
     width: dialogWidth
     height: dialogHeight
     minimumWidth: dialogWidth
@@ -73,6 +75,10 @@ Window {
     onVisibleChanged: {
         if (visible)
             Qt.callLater(accountManagerWindow.positionInAvailableWorkArea)
+        else {
+            noticePasswordField.text = ""
+            noticeSettingsDialog.close()
+        }
     }
 
     onWidthChanged: {
@@ -303,6 +309,17 @@ Window {
         }
 
         AppleButton {
+            objectName: "noticeSettingsButton"
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            implicitHeight: 34
+            text: "通報帳號設定"
+            tone: "neutralStrong"
+            enabled: !accountManagerWindow.hostWindow.backend.readOnlyAcceptance
+            onClicked: noticeSettingsDialog.open()
+        }
+
+        AppleButton {
             objectName: "savedAccountCloseButton"
             anchors.right: parent.right
             anchors.bottom: parent.bottom
@@ -311,6 +328,282 @@ Window {
             text: "關閉"
             tone: "neutralStrong"
             onClicked: accountManagerWindow.close()
+        }
+    }
+
+    AppleDialog {
+        id: noticeSettingsDialog
+        objectName: "noticeSettingsDialog"
+        anchors.centerIn: parent
+        modal: true
+        title: "通報帳號設定"
+        standardButtons: Dialog.Close
+        width: Math.min(500, accountManagerWindow.width - 32)
+        padding: 20
+        property bool editingPassword: false
+        property bool saveAttempted: false
+        property var keyboardState: ({available: false})
+        readonly property string settingsState: accountManagerWindow.sessionController.noticeSettingsState
+        readonly property bool passwordConfigured: accountManagerWindow.sessionController.noticePasswordConfigured
+        readonly property bool verifying: settingsState === "waiting" || settingsState === "verifying"
+        readonly property bool errorVisible: settingsState === "error" && (!editingPassword || saveAttempted)
+        readonly property bool verified: settingsState === "verified" && !editingPassword
+        readonly property string resultTitle: errorVisible ? (accountManagerWindow.sessionController.noticeSettingsErrorKind === "storage" ? "密碼尚未儲存" : "登入驗證未完成")
+                                             : editingPassword ? (passwordConfigured ? "變更通報密碼" : "設定通報密碼")
+                                             : settingsState === "waiting" ? "等待驗證登入"
+                                             : settingsState === "verifying" ? "正在驗證登入"
+                                             : verified ? "登入驗證成功" : "已儲存通報密碼"
+        readonly property string resultDescription: errorVisible || verifying
+                                                   ? accountManagerWindow.sessionController.noticeSettingsStatus
+                                                   : editingPassword ? "輸入新密碼後儲存，會自動驗證登入。取消可保留原設定。"
+                                                   : verified ? "密碼已加密儲存，公務信箱登入正常。"
+                                                   : "密碼已加密儲存在此電腦。可測試登入，或變更密碼。"
+        onOpened: {
+            noticePasswordField.text = ""
+            accountManagerWindow.sessionController.refreshNoticeSettings()
+            saveAttempted = false
+            editingPassword = !passwordConfigured
+        }
+        onClosed: {
+            noticePasswordField.text = ""
+            editingPassword = false
+        }
+        onVisibleChanged: {
+            if (!visible)
+                noticePasswordField.text = ""
+        }
+
+        header: Item {
+            implicitHeight: 62
+            Column {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 20
+                spacing: 4
+                Label {
+                    text: noticeSettingsDialog.title
+                    color: Design.text
+                    font.pixelSize: Design.panelTitleSize
+                    font.weight: Font.DemiBold
+                }
+                Label {
+                    text: "新坡分隊公務信箱"
+                    color: Design.secondaryText
+                    font.pixelSize: Design.bodySize
+                }
+            }
+        }
+
+        Timer {
+            interval: 150
+            repeat: true
+            triggeredOnStart: true
+            running: noticeSettingsDialog.visible && noticeSettingsDialog.editingPassword && accountManagerWindow.active
+            onTriggered: noticeSettingsDialog.keyboardState = accountManagerWindow.sessionController.passwordKeyboardState()
+        }
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 18
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+                Label {
+                    text: "登入帳號"
+                    color: Design.secondaryText
+                    font.pixelSize: Design.labelSize
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: "tyfd01214"
+                    color: Design.text
+                    font.pixelSize: Design.sectionTitleSize
+                    font.weight: Font.DemiBold
+                }
+                Label {
+                    text: "固定帳號"
+                    color: Design.secondaryText
+                    font.pixelSize: Design.captionSize
+                }
+            }
+
+            Rectangle {
+                objectName: "noticeSettingsResult"
+                Layout.fillWidth: true
+                implicitHeight: noticeResultRow.implicitHeight + 32
+                radius: Design.radiusLarge
+                color: noticeSettingsDialog.errorVisible ? Design.dangerSurface
+                       : noticeSettingsDialog.verified ? Design.successDoneSurface : Design.subtleSurface
+                border.width: Design.borderWidth
+                border.color: noticeSettingsDialog.errorVisible ? Design.dangerBorder
+                              : noticeSettingsDialog.verified ? Design.successBorder : Design.border
+                Accessible.role: Accessible.AlertMessage
+                Accessible.name: noticeSettingsDialog.resultTitle + "。" + noticeSettingsDialog.resultDescription
+
+                RowLayout {
+                    id: noticeResultRow
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 14
+                    Rectangle {
+                        Layout.alignment: Qt.AlignTop
+                        Layout.preferredWidth: 42
+                        Layout.preferredHeight: 42
+                        radius: width / 2
+                        color: noticeSettingsDialog.errorVisible ? Design.dangerFill
+                               : noticeSettingsDialog.verified ? Design.successAction : Design.comboButton
+                        Accessible.ignored: true
+                        Label {
+                            anchors.centerIn: parent
+                            visible: !noticeSettingsDialog.verifying && (noticeSettingsDialog.errorVisible || noticeSettingsDialog.editingPassword)
+                            text: noticeSettingsDialog.errorVisible ? "!" : "+"
+                            color: noticeSettingsDialog.errorVisible || noticeSettingsDialog.verified ? Design.panel : Design.blue
+                            font.pixelSize: Design.heroTitleSize
+                            font.weight: Font.DemiBold
+                        }
+                        Canvas {
+                            anchors.centerIn: parent
+                            width: 20
+                            height: 16
+                            visible: !noticeSettingsDialog.verifying && !noticeSettingsDialog.errorVisible && !noticeSettingsDialog.editingPassword
+                            property color markColor: noticeSettingsDialog.verified ? Design.panel : Design.blue
+                            onMarkColorChanged: requestPaint()
+                            onVisibleChanged: requestPaint()
+                            onPaint: {
+                                const context = getContext("2d")
+                                context.reset()
+                                context.strokeStyle = markColor
+                                context.lineWidth = 2.5
+                                context.lineCap = "round"
+                                context.lineJoin = "round"
+                                context.beginPath()
+                                context.moveTo(2, 8)
+                                context.lineTo(7, 13)
+                                context.lineTo(18, 2)
+                                context.stroke()
+                            }
+                        }
+                        BusyIndicator {
+                            anchors.centerIn: parent
+                            width: 30
+                            height: 30
+                            running: noticeSettingsDialog.verifying
+                            visible: running
+                        }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Label {
+                            objectName: "noticeSettingsStatusTitle"
+                            Layout.fillWidth: true
+                            text: noticeSettingsDialog.resultTitle
+                            color: noticeSettingsDialog.errorVisible ? Design.dangerStrong
+                                   : noticeSettingsDialog.verified ? Design.successText : Design.text
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Design.sectionTitleSize
+                            font.weight: Font.DemiBold
+                        }
+                        Label {
+                            objectName: "noticeSettingsStatusMessage"
+                            Layout.fillWidth: true
+                            text: noticeSettingsDialog.resultDescription
+                            color: Design.secondaryText
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Design.labelSize
+                            lineHeight: 1.2
+                        }
+                    }
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                visible: noticeSettingsDialog.editingPassword
+                Label {
+                    text: noticeSettingsDialog.passwordConfigured ? "新通報密碼" : "通報密碼"
+                    color: Design.text
+                    font.pixelSize: Design.labelSize
+                    font.weight: Font.DemiBold
+                }
+                AppleTextField {
+                    id: noticePasswordField
+                    objectName: "noticePasswordField"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 42
+                    echoMode: TextInput.Password
+                    placeholderText: noticeSettingsDialog.passwordConfigured ? "輸入新密碼" : "輸入通報密碼"
+                    enabled: !accountManagerWindow.hostWindow.backend.readOnlyAcceptance && !noticeSettingsDialog.verifying
+                    onAccepted: {
+                        if (saveNoticePasswordButton.enabled)
+                            saveNoticePasswordButton.clicked()
+                    }
+                }
+                Label {
+                    objectName: "noticePasswordCaseHint"
+                    Layout.fillWidth: true
+                    visible: noticeSettingsDialog.keyboardState.available
+                    text: "目前輸入：" + (noticeSettingsDialog.keyboardState.uppercase ? "大寫" : "小寫")
+                          + (noticeSettingsDialog.keyboardState.capsLock ? " · Caps Lock 已開啟" : "")
+                    color: noticeSettingsDialog.keyboardState.capsLock ? Design.warningStrong : Design.secondaryText
+                    font.pixelSize: Design.captionSize
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                AppleButton {
+                    objectName: "noticeChangePasswordButton"
+                    visible: noticeSettingsDialog.passwordConfigured && !noticeSettingsDialog.editingPassword
+                    enabled: !noticeSettingsDialog.verifying && !accountManagerWindow.hostWindow.backend.readOnlyAcceptance
+                    text: "變更密碼"
+                    tone: "neutralStrong"
+                    onClicked: {
+                        noticeSettingsDialog.saveAttempted = false
+                        noticeSettingsDialog.editingPassword = true
+                        noticePasswordField.text = ""
+                        noticePasswordField.forceActiveFocus()
+                    }
+                }
+                AppleButton {
+                    objectName: "noticeCancelPasswordButton"
+                    visible: noticeSettingsDialog.editingPassword && noticeSettingsDialog.passwordConfigured
+                    text: "取消變更"
+                    tone: "neutralStrong"
+                    onClicked: {
+                        noticePasswordField.text = ""
+                        noticeSettingsDialog.editingPassword = false
+                    }
+                }
+                Item {
+                    Layout.fillWidth: true
+                }
+                PrimaryButton {
+                    objectName: "noticeVerifyLoginButton"
+                    visible: noticeSettingsDialog.passwordConfigured && !noticeSettingsDialog.editingPassword
+                    enabled: !noticeSettingsDialog.verifying && !accountManagerWindow.hostWindow.backend.readOnlyAcceptance
+                    text: noticeSettingsDialog.verifying ? "驗證中…"
+                          : noticeSettingsDialog.settingsState === "error" && accountManagerWindow.sessionController.noticeSettingsErrorKind === "verification" ? "再試一次" : "測試登入"
+                    onClicked: accountManagerWindow.hostWindow.backend.noticeCollectionController.verifyLogin()
+                }
+                PrimaryButton {
+                    id: saveNoticePasswordButton
+                    objectName: "saveNoticePasswordButton"
+                    visible: noticeSettingsDialog.editingPassword
+                    text: "儲存並驗證登入"
+                    enabled: !accountManagerWindow.hostWindow.backend.readOnlyAcceptance && !noticeSettingsDialog.verifying && noticePasswordField.text.length > 0
+                    onClicked: {
+                        noticeSettingsDialog.saveAttempted = true
+                        if (accountManagerWindow.sessionController.saveNoticePassword(noticePasswordField.text)) {
+                            noticePasswordField.text = ""
+                            noticeSettingsDialog.editingPassword = false
+                        }
+                    }
+                }
+            }
         }
     }
 

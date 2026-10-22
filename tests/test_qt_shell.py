@@ -11051,6 +11051,328 @@ class QtShellTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(self._flush_qt_deferred_deletes)
 
+    def test_notice_fixed_account_lookup_survives_logout_without_changing_selection(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.session_controller import SessionController
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = CredentialRepository(Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi)
+            self.assertTrue(repository.save([
+                {"user_id": "tyfd01214", "password": "synthetic-notice", "actor_no": "14"},
+                {"user_id": "other-duty", "password": "synthetic-duty", "actor_no": "7"},
+            ], "other-duty"))
+            controller = SessionController(repository=repository, read_only_acceptance=True)
+            self.addCleanup(controller.shutdown)
+            selected = repository.load().last_selected
+            controller._state.session = LoginSession("7", "other-duty", "synthetic-duty", verified=True)
+
+            account = controller.saved_account_for_automation("tyfd01214")
+            self.assertEqual(account["user_id"], "tyfd01214")
+            self.assertEqual(account["password"], "synthetic-notice")
+            account["password"] = "mutated-copy"
+            controller.logout()
+            self.assertEqual(controller.saved_account_for_automation("tyfd01214")["password"], "synthetic-notice")
+            self.assertIsNone(controller.saved_account_for_automation("missing"))
+            self.assertEqual(repository.load().last_selected, selected)
+
+    def test_notice_card_is_between_tools_and_tasks_and_hidden_until_login(self) -> None:
+        from PySide6.QtCore import QObject
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service = Mock()
+            service.counts.return_value = (5, 10)
+            controller = AppController(
+                repository=CredentialRepository(Path(temporary) / "accounts.json", "SinpoSmart", None),
+                notice_collection_service=service,
+                read_only_acceptance=True,
+            )
+            self.addCleanup(controller.shutdown)
+            engine = create_engine(controller)
+            self.assertTrue(engine.rootObjects())
+            root = engine.rootObjects()[0]
+            row = root.findChild(QObject, "noticeCollectionStatus")
+            card = root.findChild(QObject, "noticeCollectionCard")
+            tools = root.findChild(QObject, "dutyQuickToolsPanel")
+            tasks = root.findChild(QObject, "dutyTaskArea")
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(card)
+            self.assertFalse(card.property("visible"))
+            self.assertFalse(row.property("visible"))
+            controller._session_controller.sessionChanged.disconnect(controller._sync_session_actor)
+            controller._session_state.session = LoginSession("14", "synthetic-duty", "synthetic", verified=True)
+            controller._session_controller.sessionChanged.emit()
+            QTest.qWait(30)
+            self.assertTrue(card.property("visible"))
+            self.assertTrue(row.property("visible"))
+            self.assertGreaterEqual(card.property("y"), tools.property("y") + tools.property("height"))
+            self.assertGreaterEqual(tasks.property("y"), card.property("y") + card.property("height"))
+            self.assertGreater(tasks.property("height"), 0)
+            controller.noticeCollectionController.collectNow()
+            service.collect.assert_not_called()
+            root.deleteLater()
+            engine.deleteLater()
+
+    def test_notice_work_keeps_duty_logout_independent_and_blocks_update_while_running(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service = Mock()
+            service.counts.return_value = (0, 0)
+            controller = AppController(
+                repository=CredentialRepository(Path(temporary) / "accounts.json", "SinpoSmart", None),
+                notice_collection_service=service,
+                read_only_acceptance=True,
+            )
+            self.addCleanup(controller.shutdown)
+            controller._duty_controller._session_closing = True
+            self.assertEqual(controller._notice_collection_busy_reason(), "")
+            original = controller._notice_collection_controller
+            controller._notice_collection_controller = SimpleNamespace(isRunning=True)
+            try:
+                self.assertEqual(controller._stop_block_reason(), "通報收取尚未完成")
+            finally:
+                controller._notice_collection_controller = original
+
+    def test_notice_password_setting_is_encrypted_and_separate_from_duty_accounts(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.session_controller import SessionController
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = CredentialRepository(Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi)
+            self.assertTrue(repository.save([{"user_id": "duty-user", "password": "synthetic-duty"}], "duty-user"))
+            original = repository.path.read_bytes()
+            controller = SessionController(repository=repository)
+            self.addCleanup(controller.shutdown)
+            self.assertTrue(controller.saveNoticePassword("synthetic-notice-setting"))
+            self.assertFalse(controller.isLoggedIn)
+            self.assertEqual(repository.path.read_bytes(), original)
+            notice_path = Path(temporary) / "notice_login.json"
+            self.assertNotIn("synthetic-notice-setting", notice_path.read_text(encoding="utf-8"))
+            self.assertEqual(controller.saved_account_for_automation("tyfd01214")["password"], "synthetic-notice-setting")
+            self.assertEqual(controller.savedAccountsModel.rowCount(), 1)
+            self.assertFalse(controller.saveNoticePassword(""))
+            self.assertNotIn("synthetic-notice-setting", controller.noticeSettingsStatus)
+
+    def test_notice_password_setting_is_disabled_in_read_only_acceptance(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.session_controller import SessionController
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = SessionController(repository=CredentialRepository(
+                Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi), read_only_acceptance=True)
+            self.addCleanup(controller.shutdown)
+            self.assertFalse(controller.saveNoticePassword("synthetic-notice-setting"))
+            self.assertFalse((Path(temporary) / "notice_login.json").exists())
+
+    def test_notice_password_save_verifies_login_without_collecting_or_syncing(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service = Mock()
+            service.counts.return_value = (0, 0)
+            controller = AppController(repository=CredentialRepository(
+                Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi), notice_collection_service=service)
+            self.addCleanup(controller.shutdown)
+            self.assertTrue(controller.sessionController.saveNoticePassword("synthetic-auth-only"))
+            for _attempt in range(100):
+                QTest.qWait(10)
+                if "登入驗證成功" in controller.sessionController.noticeSettingsStatus:
+                    break
+            service.verify_login.assert_called_once()
+            self.assertEqual(service.verify_login.call_args.args[0], "synthetic-auth-only")
+            service.collect.assert_not_called()
+            self.assertFalse(controller.sessionController._credential_sync_workers)
+            self.assertIn("tyfd01214 登入驗證成功", controller.sessionController.noticeSettingsStatus)
+            self.assertFalse(controller.sessionController.isLoggedIn)
+
+    def test_notice_settings_dialog_never_prefills_saved_password_and_clears_on_close(self) -> None:
+        from PySide6.QtCore import QObject, QMetaObject
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.notice_collection_service import NoticeCollectionResult
+        from datetime import datetime
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service = Mock()
+            service.counts.return_value = (0, 0)
+            service.collect.return_value = NoticeCollectionResult(datetime.now())
+            controller = AppController(repository=CredentialRepository(
+                Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi), notice_collection_service=service)
+            self.addCleanup(controller.shutdown)
+            self.assertTrue(controller.sessionController.saveNoticePassword("synthetic-private"))
+            engine = create_engine(controller)
+            self.assertTrue(engine.rootObjects())
+            root = engine.rootObjects()[0]
+            account_window = root.findChild(QObject, "accountManagerWindow")
+            dialog = root.findChild(QObject, "noticeSettingsDialog")
+            field = root.findChild(QObject, "noticePasswordField")
+            QMetaObject.invokeMethod(account_window, "open")
+            QMetaObject.invokeMethod(dialog, "open")
+            QTest.qWait(30)
+            self.assertEqual(field.property("text"), "")
+            field.setProperty("text", "synthetic-private")
+            self.assertNotEqual(field.property("displayText"), "synthetic-private")
+            QMetaObject.invokeMethod(dialog, "close")
+            QTest.qWait(30)
+            self.assertEqual(field.property("text"), "")
+            QMetaObject.invokeMethod(dialog, "open")
+            field.setProperty("text", "synthetic-private")
+            account_window.close()
+            QTest.qWait(30)
+            self.assertEqual(field.property("text"), "")
+            self.assertFalse(dialog.property("visible"))
+            root.deleteLater()
+            engine.deleteLater()
+
+    def test_notice_settings_makes_saved_status_and_password_changes_explicit(self) -> None:
+        from PySide6.QtCore import QObject, QMetaObject
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.notice_collection_service import NoticeLoginRequired
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = CredentialRepository(Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi)
+            store = repository.notice_repository()
+            self.assertTrue(store.save([{"user_id": "tyfd01214", "password": "synthetic-original"}], "tyfd01214"))
+            service = Mock()
+            service.counts.return_value = (0, 0)
+            controller = AppController(repository=repository, notice_collection_service=service)
+            controller.noticeCollectionController._timer.stop()
+            self.addCleanup(controller.shutdown)
+            engine = create_engine(controller)
+            self.assertTrue(engine.rootObjects())
+            root = engine.rootObjects()[0]
+            account = root.findChild(QObject, "accountManagerWindow")
+            dialog = root.findChild(QObject, "noticeSettingsDialog")
+            change = root.findChild(QObject, "noticeChangePasswordButton")
+            self.assertIsNotNone(change)
+            field = root.findChild(QObject, "noticePasswordField")
+            title = root.findChild(QObject, "noticeSettingsStatusTitle")
+            verify = root.findChild(QObject, "noticeVerifyLoginButton")
+            cancel = root.findChild(QObject, "noticeCancelPasswordButton")
+            save = root.findChild(QObject, "saveNoticePasswordButton")
+
+            def click(button):
+                self.assertTrue(QMetaObject.invokeMethod(button, "clicked"))
+                QTest.qWait(30)
+
+            def wait_state(state):
+                for _attempt in range(100):
+                    QTest.qWait(10)
+                    if controller.sessionController.noticeSettingsState == state:
+                        return
+                self.assertEqual(controller.sessionController.noticeSettingsState, state)
+
+            QMetaObject.invokeMethod(account, "open")
+            QMetaObject.invokeMethod(dialog, "open")
+            QTest.qWait(30)
+            self.assertFalse(field.property("visible"))
+            self.assertEqual(field.property("text"), "")
+            self.assertEqual(title.property("text"), "已儲存通報密碼")
+            self.assertTrue(change.property("visible"))
+            click(verify)
+            wait_state("verified")
+            self.assertEqual(title.property("text"), "登入驗證成功")
+            self.assertGreaterEqual(title.property("font").pixelSize(), 16)
+            self.assertGreaterEqual(dialog.property("y"), 0)
+            self.assertLessEqual(dialog.property("y") + dialog.property("height"), account.height())
+            click(change)
+            self.assertTrue(field.property("visible"))
+            self.assertEqual(title.property("text"), "變更通報密碼")
+            field.setProperty("text", "synthetic-replacement")
+            click(cancel)
+            self.assertEqual(field.property("text"), "")
+            self.assertEqual(store.load().accounts[0]["password"], "synthetic-original")
+            click(change)
+            field.setProperty("text", "synthetic-replacement")
+            click(save)
+            wait_state("verified")
+            self.assertFalse(field.property("visible"))
+            self.assertEqual(field.property("text"), "")
+            self.assertEqual(store.load().accounts[0]["password"], "synthetic-replacement")
+            self.assertEqual(service.verify_login.call_args.args[0], "synthetic-replacement")
+            service.verify_login.side_effect = NoticeLoginRequired("網站暫時無法確認登入。")
+            click(verify)
+            wait_state("error")
+            self.assertEqual(title.property("text"), "登入驗證未完成")
+            self.assertEqual(verify.property("text"), "再試一次")
+            QMetaObject.invokeMethod(dialog, "close")
+            QMetaObject.invokeMethod(dialog, "open")
+            QTest.qWait(30)
+            self.assertEqual(title.property("text"), "登入驗證未完成")
+            service.collect.assert_not_called()
+            account.close()
+            root.deleteLater()
+            engine.deleteLater()
+
+    def test_notice_storage_failure_keeps_its_cause_after_cancel_and_reopening(self) -> None:
+        from PySide6.QtCore import QObject, QMetaObject
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+        from tests.test_credential_repository import FakeDpapi
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = CredentialRepository(Path(temporary) / "saved_login.json", "SinpoSmart", FakeDpapi)
+            store = repository.notice_repository()
+            self.assertTrue(store.save([{"user_id": "tyfd01214", "password": "synthetic-original"}], "tyfd01214"))
+            original = store.path.read_bytes()
+            service = Mock()
+            service.counts.return_value = (0, 0)
+            controller = AppController(repository=repository, notice_collection_service=service)
+            controller.noticeCollectionController._timer.stop()
+            self.addCleanup(controller.shutdown)
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+            account = root.findChild(QObject, "accountManagerWindow")
+            dialog = root.findChild(QObject, "noticeSettingsDialog")
+            title = root.findChild(QObject, "noticeSettingsStatusTitle")
+            QMetaObject.invokeMethod(account, "open")
+            QMetaObject.invokeMethod(dialog, "open")
+            QMetaObject.invokeMethod(root.findChild(QObject, "noticeChangePasswordButton"), "clicked")
+            field = root.findChild(QObject, "noticePasswordField")
+            field.setProperty("text", "synthetic-replacement")
+            with patch.object(CredentialRepository, "save", return_value=False):
+                QMetaObject.invokeMethod(root.findChild(QObject, "saveNoticePasswordButton"), "clicked")
+            QTest.qWait(30)
+            self.assertEqual(title.property("text"), "密碼尚未儲存")
+            QMetaObject.invokeMethod(root.findChild(QObject, "noticeCancelPasswordButton"), "clicked")
+            QTest.qWait(30)
+            self.assertEqual(title.property("text"), "密碼尚未儲存")
+            QMetaObject.invokeMethod(dialog, "close")
+            QMetaObject.invokeMethod(dialog, "open")
+            QTest.qWait(30)
+            self.assertEqual(title.property("text"), "密碼尚未儲存")
+            self.assertEqual(root.findChild(QObject, "noticeVerifyLoginButton").property("text"), "測試登入")
+            self.assertEqual(field.property("text"), "")
+            self.assertEqual(store.path.read_bytes(), original)
+            self.assertEqual(controller.sessionController.noticeSettingsErrorKind, "storage")
+            service.verify_login.assert_not_called()
+            service.collect.assert_not_called()
+            account.close()
+            root.deleteLater()
+            engine.deleteLater()
+
     @staticmethod
     def _flush_qt_deferred_deletes() -> None:
         from PySide6.QtCore import QCoreApplication, QEvent

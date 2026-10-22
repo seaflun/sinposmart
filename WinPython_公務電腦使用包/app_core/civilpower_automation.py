@@ -37,20 +37,10 @@ _DATETIME_PATTERN = re.compile(r"(?<!\d)(\d{1,4})[/-](\d{1,2})[/-](\d{1,2})[ T]+
 
 
 def _login_once(driver, request: AttendanceRequest, recognizer) -> None:
-    driver.get(OA_LOGIN_URL)
-    wait = WebDriverWait(driver, DEFAULT_WAIT_SECONDS)
-    _set_input(wait, "#login_name", request.user_id)
-    _set_input(wait, "#password", request.password)
-    captcha = wait.until(EC.visibility_of_element_located((By.ID, "checkcodeImg")))
-    wait.until(lambda _driver: captcha.get_attribute("src") and captcha.size.get("width", 0) > 0)
-    # Keep CAPTCHA bytes in memory; never save a credential-bearing screenshot.
-    text = "".join(c for c in recognizer.classification(captcha.screenshot_as_png) if c.isalnum())
-    if not text:
-        raise CivilpowerError("入口網驗證碼無法辨識。")
-    _set_input(wait, "#verify_code", text)
-    _click(wait, "#loginBtn")
-    wait.until(lambda current: not _is_oa_login_page(current))
-    open_civilpower_from_oa_dashboard(driver, wait)
+    from app_core.login_verifier import run_oa_login
+
+    run_oa_login(driver, request.user_id, request.password, recognizer, attempts=1)
+    open_civilpower_from_oa_dashboard(driver, WebDriverWait(driver, DEFAULT_WAIT_SECONDS))
 
 
 def login_attendance(driver, request: AttendanceRequest, recognizer, progress) -> None:

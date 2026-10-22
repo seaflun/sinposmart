@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.22.0816` | 2026-10-22 08:16（台北時間） | 新增通報背景自動收取、獨立帳密驗證、當班／曆日累計卡片與雲端跨年度月檔自動建立。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.0816) |
 | `2026.10.20.0126` | 2026-10-20 01:26（台北時間） | 修正 GUI 退出過渡期造成更新誤判，等待自然退出並記錄原因代碼、PID、等待時間，安裝器獨立回報後台。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.20.0126) |
 | `2026.10.19.2240` | 2026-10-19 22:40（台北時間） | 修復官方無標頭人員表的職稱同步，排除無番號實習生，保留原勤務登打與完整性檢查。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.19.2240) |
 | `2026.10.19.2224` | 2026-10-19 22:24（台北時間） | 密碼欄新增英文大小寫即時提示，支援 Caps Lock／Shift 狀態及警示色，保留密碼遮蔽與既有登入流程。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.19.2224) |

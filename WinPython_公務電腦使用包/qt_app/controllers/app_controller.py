@@ -41,6 +41,7 @@ from app_core.duty_task_projection import (
     target_short_label,
 )
 from app_core.login_verifier import LoginVerifier
+from app_core.notice_collection_service import NoticeCollectionService
 from app_core.operational_sync_service import (
     GUI_HEARTBEAT_INTERVAL_MS,
     HEARTBEAT_PHASES,
@@ -70,6 +71,7 @@ from qt_app.controllers.tool_controller import ToolController
 from qt_app.controllers.tray_controller import TrayController
 from qt_app.controllers.update_controller import UpdateController
 from qt_app.controllers.work_log_settings_controller import WorkLogSettingsController
+from qt_app.controllers.notice_collection_controller import NoticeCollectionController
 from qt_app.workers.operational_sync_worker import OperationalSyncWorker
 from qt_app.workers.schedule_capture_worker import ScheduleCaptureWorker
 from qt_app.workers.scheduled_folder_worker import ScheduledFolderWorker
@@ -118,6 +120,7 @@ class AppController(QObject):
         schedule_capture_service: ScheduleCaptureService | None = None,
         work_log_settings_service: WorkLogSettingsService | None = None,
         scheduled_folder_service: ScheduledFolderService | None = None,
+        notice_collection_service: NoticeCollectionService | None = None,
         read_only_acceptance: bool = False,
         offline_fixture_acceptance: bool = False,
         automatic_tools_enabled: bool = False,
@@ -263,6 +266,21 @@ class AppController(QObject):
         self._last_hourly_refresh_key = ""
         self._last_schedule_snapshot_signature = ""
         self._duty_mode_active = True
+        self._notice_collection_controller = NoticeCollectionController(
+            notice_collection_service or NoticeCollectionService(package_root),
+            self._session_controller.saved_account_for_automation,
+            self._notice_collection_busy_reason,
+            schedule_repository or ScheduleRepository(package_root / "runtime_outputs"),
+            self,
+            read_only_acceptance=self._read_only_acceptance,
+        )
+        self._session_controller.noticePasswordSaved.connect(self._notice_collection_controller.verifyLogin)
+        self._notice_collection_controller.verificationStatusChanged.connect(
+            lambda: self._session_controller.set_notice_verification_status(
+                self._notice_collection_controller.verificationStatus,
+                self._notice_collection_controller.verificationState,
+            )
+        )
         self._background_manual_chains: dict[str, _BackgroundManualChain] = {}
         self._background_manual_workers: dict[
             int,
@@ -301,6 +319,8 @@ class AppController(QObject):
         self._duty_controller.liveSnapshotCaptured.connect(self._live_snapshot_captured)
         self._duty_controller.liveCaptureFailed.connect(self._live_capture_failed)
         self._duty_controller.cachedScheduleLoaded.connect(self._cached_schedule_loaded)
+        self._duty_controller.liveScheduleCaptured.connect(self._notice_collection_controller.set_schedule_data)
+        self._duty_controller.cachedScheduleLoaded.connect(self._notice_collection_controller.set_schedule_data)
         self._duty_controller.fireDayChanged.connect(self._refresh_after_fire_day_change)
         self._duty_controller.fireDayChanged.connect(self._tool_controller.refreshDailyCompletion)
         self._duty_controller.dueTasksAvailable.connect(self._enqueue_due_tasks)
@@ -508,6 +528,10 @@ class AppController(QObject):
     def workLogSettingsController(self) -> WorkLogSettingsController:
         return self._work_log_settings_controller
 
+    @Property(QObject, constant=True)
+    def noticeCollectionController(self) -> NoticeCollectionController:
+        return self._notice_collection_controller
+
     @Property(bool, constant=True)
     def readOnlyAcceptance(self) -> bool:
         return self._read_only_acceptance
@@ -644,13 +668,16 @@ class AppController(QObject):
             self._daily_vehicle_controller,
             self._rescue_video_controller,
             self._civilpower_controller,
+            self._notice_collection_controller,
         ):
             prepare = getattr(controller, "prepare_shutdown_admission", None)
             if callable(prepare):
                 prepare()
         duty_ready = self._duty_controller.prepare_session_end()
         execution_ready = self._duty_execution_controller.prepare_session_end()
-        return duty_ready and execution_ready and not self._duty_execution_controller.hasPendingSubmissions
+        return (duty_ready and execution_ready
+                and not self._duty_execution_controller.hasPendingSubmissions
+                and not self._notice_collection_controller.isRunning)
 
     def _background_return_can_resume_after_restart(
         self, chain: _BackgroundManualChain, current: datetime
@@ -677,6 +704,8 @@ class AppController(QObject):
             return "程式正在關閉"
         if self._automatic_prepare_workers:
             return "勤務表資料正在讀取"
+        if self._notice_collection_controller.isRunning:
+            return "通報收取尚未完成"
         if self._background_manual_workers:
             return "到點自動登打正在執行"
         if self._background_manual_chains:
@@ -856,6 +885,27 @@ class AppController(QObject):
     def _record_automatic_notice(self, message: str) -> None:
         # No new GUI prompts; retain an auditable backend result.
         self._send_operational_event("error", status="failed", trigger_type="daily_tool_schedule", error=message)
+
+    def _notice_collection_busy_reason(self) -> str:
+        """Defer low-priority notice work without coupling it to duty logout."""
+
+        if self._worker_admissions_closed or self._update_shutdown_started:
+            return "程式正在關閉"
+        if self._automatic_prepare_workers:
+            return "勤務表資料正在讀取"
+        if (self._logout_pending or self._background_manual_workers
+                or self._duty_execution_controller.hasPendingSubmissions):
+            return "勤務登打或交接正在執行"
+        if self._session_controller.isBusy or self._session_controller.hasRunningLoginWorkers:
+            return "登入驗證正在執行"
+        if self._duty_controller.isRefreshing or self._tomorrow_schedule_workers:
+            return "勤務資料正在更新"
+        if any(controller.isRunning for controller in (
+            self._duty_sheet_controller, self._rest_monthly_controller,
+            self._civilpower_controller, self._daily_vehicle_controller,
+        )):
+            return "公務工具正在執行"
+        return ""
 
     def _register_background_manual_waiting(self, indices: list[int]) -> None:
         if self._read_only_acceptance or self._worker_admissions_closed:
@@ -3262,6 +3312,7 @@ class AppController(QObject):
             thread.wait()
             self._automatic_prepare_workers.pop(request_id, None)
             thread.deleteLater()
+        self._notice_collection_controller.shutdown()
         for request_id, (thread, _worker) in tuple(self._scheduled_folder_workers.items()):
             thread.requestInterruption()
             thread.quit()

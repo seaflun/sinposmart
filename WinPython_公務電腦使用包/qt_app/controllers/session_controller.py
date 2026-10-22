@@ -31,6 +31,8 @@ class SessionController(QObject):
     errorOccurred = Signal(str)
     loginAttemptFailed = Signal(str, str, str, str)
     credentialSyncConfirmationRequested = Signal()
+    noticeSettingsChanged = Signal()
+    noticePasswordSaved = Signal()
 
     def __init__(
         self,
@@ -60,6 +62,10 @@ class SessionController(QObject):
         self._credential_sync_warning = ""
         self._credential_sync_result = ""
         self._display_name = ""
+        self._notice_settings_status = "固定帳號 tyfd01214，密碼僅供通報收取使用。"
+        self._notice_password_configured = False
+        self._notice_settings_state = "unconfigured"
+        self._notice_settings_error_kind = ""
         self._accounts: list[dict[str, str]] = []
         self._last_selected_identity = ""
         self._saved_accounts_model = SavedAccountListModel(self)
@@ -113,6 +119,100 @@ class SessionController(QObject):
     @Property(QObject, constant=True)
     def savedAccountsModel(self) -> SavedAccountListModel:
         return self._saved_accounts_model
+
+    def saved_account_for_automation(self, user_id: str) -> dict[str, str] | None:
+        """Return one exact saved identity without changing the login selection."""
+
+        user_id = str(user_id or "").strip()
+        if user_id == "tyfd01214":
+            factory = getattr(self._repository, "notice_repository", None)
+            if callable(factory):
+                store = factory()
+                if store.path.exists():
+                    snapshot = store.load()
+                    matches = [account for account in snapshot.accounts if account.get("user_id") == user_id]
+                    return dict(matches[0]) if len(matches) == 1 and not snapshot.invalid_file else None
+        matches = [
+            account for account in self._accounts
+            if user_id and str(account.get("user_id", "") or "").strip() == user_id
+        ]
+        return dict(matches[0]) if len(matches) == 1 else None
+
+    @Property(str, notify=noticeSettingsChanged)
+    def noticeSettingsStatus(self) -> str:
+        return self._notice_settings_status
+
+    @Property(bool, notify=noticeSettingsChanged)
+    def noticePasswordConfigured(self) -> bool:
+        return self._notice_password_configured
+
+    @Property(str, notify=noticeSettingsChanged)
+    def noticeSettingsState(self) -> str:
+        return self._notice_settings_state
+
+    @Property(str, notify=noticeSettingsChanged)
+    def noticeSettingsErrorKind(self) -> str:
+        return self._notice_settings_error_kind
+
+    @Slot()
+    def refreshNoticeSettings(self) -> None:
+        account = self.saved_account_for_automation("tyfd01214")
+        configured = bool(account and account.get("password"))
+        preserve_result = (
+            self._notice_password_configured and configured
+            and self._notice_settings_state in {"waiting", "verifying", "verified", "error"}
+        )
+        self._notice_password_configured = configured
+        if not preserve_result:
+            self._notice_settings_state = "configured" if configured else "unconfigured"
+            self._notice_settings_error_kind = ""
+            self._notice_settings_status = (
+                "通報密碼已加密儲存，可測試登入或變更密碼。"
+                if configured else "尚未設定通報密碼，請輸入後加密儲存。"
+            )
+        self.noticeSettingsChanged.emit()
+
+    def set_notice_verification_status(self, message: str, state: str = "configured") -> None:
+        self._notice_settings_status = str(message or "")
+        self._notice_settings_state = state if state in {
+            "unconfigured", "configured", "saved", "waiting", "verifying", "verified", "error"
+        } else "configured"
+        self._notice_settings_error_kind = "verification" if self._notice_settings_state == "error" else ""
+        self.noticeSettingsChanged.emit()
+
+    @Slot(str, result=bool)
+    def saveNoticePassword(self, password: str) -> bool:
+        if self._read_only_acceptance or self._shutdown_admission:
+            return False
+        factory = getattr(self._repository, "notice_repository", None)
+        if not str(password or "").strip() or not callable(factory):
+            self._notice_settings_status = "請輸入通報密碼；空白不會覆蓋已儲存設定。"
+            self._notice_settings_state = "error"
+            self._notice_settings_error_kind = "storage"
+            self.noticeSettingsChanged.emit()
+            return False
+        store = factory()
+        snapshot = store.load()
+        if snapshot.invalid_file or not snapshot.can_persist:
+            self._notice_settings_status = "通報密碼無法安全儲存，原有設定已保留。"
+            self._notice_settings_state = "error"
+            self._notice_settings_error_kind = "storage"
+            self.noticeSettingsChanged.emit()
+            return False
+        saved = store.save([{"user_id": "tyfd01214", "password": password,
+                             "display_name": "通報收取專用"}], "tyfd01214")
+        self._notice_settings_status = (
+            "通報密碼已加密儲存，準備驗證背景登入。"
+            if saved else "通報密碼儲存失敗，原有設定已保留。"
+        )
+        self._notice_settings_state = "saved" if saved else "error"
+        self._notice_settings_error_kind = "" if saved else "storage"
+        if saved:
+            self._notice_password_configured = True
+        self.noticeSettingsChanged.emit()
+        if saved:
+            self.noticePasswordSaved.emit()
+        return saved
 
     @Slot(result="QVariantMap")
     def passwordKeyboardState(self) -> dict[str, bool]:

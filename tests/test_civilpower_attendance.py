@@ -20,6 +20,98 @@ from app_core.civilpower_service import AttendanceRequest, CivilpowerService, Ci
 MEMBER = {"member_id": "m1", "name": "測試義消", "title": "隊員", "unit": "大園救護分隊"}
 
 
+class OALoginTests(unittest.TestCase):
+    def make_login(self):
+        from selenium.common.exceptions import TimeoutException
+
+        driver = Mock(current_url="https://oa.tyfd.gov.tw/login.php")
+        elements = {key: Mock() for key in
+                    ("login_name", "password", "checkcodeImg", "verify_code", "loginBtn")}
+        for element in elements.values():
+            element.is_displayed.return_value = True
+            element.is_enabled.return_value = True
+        elements["checkcodeImg"].size = {"width": 100}
+        elements["checkcodeImg"].get_attribute.return_value = "captcha.php"
+        elements["checkcodeImg"].screenshot_as_png = b"synthetic-captcha"
+        driver.find_element.side_effect = lambda by, selector: elements[selector.lstrip("#")]
+        driver.find_elements.side_effect = lambda *args: (
+            [] if driver.current_url.endswith("/index.php") else [elements["login_name"]])
+        driver.get.side_effect = lambda url: setattr(driver, "current_url", url)
+        elements["loginBtn"].click.side_effect = lambda: setattr(
+            driver, "current_url", "https://oa.tyfd.gov.tw/index.php")
+
+        class ImmediateWait:
+            def __init__(self, current, timeout):
+                self.driver = current
+
+            def until(self, predicate):
+                result = predicate(self.driver)
+                if not result:
+                    raise TimeoutException("synthetic wait")
+                return result
+
+        return driver, elements, ImmediateWait
+
+    def test_shared_oa_login_uses_ocr_and_replaces_saved_fields(self):
+        from app_core.login_verifier import run_oa_login
+        driver, elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.return_value = "a 2-B3"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer)
+        elements["password"].clear.assert_called_once()
+        elements["password"].send_keys.assert_called_once_with("synthetic-password")
+        elements["verify_code"].send_keys.assert_called_once_with("a2B3")
+        recognizer.classification.assert_called_once_with(b"synthetic-captcha")
+        elements["loginBtn"].click.assert_called_once()
+
+    def test_shared_oa_login_retries_ocr_boundedly_and_hides_raw_error(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.side_effect = RuntimeError("synthetic-password")
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+            with self.assertRaises(LoginVerificationError) as caught:
+                run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=99)
+        self.assertEqual(driver.get.call_count, 3)
+        self.assertNotIn("synthetic-password", str(caught.exception))
+        elements["loginBtn"].click.assert_not_called()
+
+    def test_shared_oa_login_never_fills_redirected_foreign_or_wrong_path(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        for destination in ("https://example.invalid/login.php",
+                            "http://oa.tyfd.gov.tw/login.php",
+                            "https://oa.tyfd.gov.tw/not-login.php"):
+            driver, elements, wait = self.make_login()
+            driver.get.side_effect = lambda url: setattr(driver, "current_url", destination)
+            with self.subTest(destination=destination), \
+                    patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                    self.assertRaises(LoginVerificationError):
+                run_oa_login(driver, "tyfd01214", "synthetic-password", Mock(), attempts=1)
+            elements["login_name"].send_keys.assert_not_called()
+            elements["password"].send_keys.assert_not_called()
+
+    def test_shared_oa_login_rechecks_origin_before_each_field(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, elements, wait = self.make_login()
+        elements["login_name"].send_keys.side_effect = lambda value: setattr(
+            driver, "current_url", "https://example.invalid/login.php")
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                self.assertRaises(LoginVerificationError):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", Mock(), attempts=1)
+        elements["password"].send_keys.assert_not_called()
+
+    def test_civilpower_uses_same_oa_login_without_multiplying_retries(self):
+        from app_core import civilpower_automation as automation
+        driver, recognizer = Mock(), Mock()
+        request = Mock(user_id="duty1", password="synthetic-password")
+        with patch("app_core.login_verifier.run_oa_login") as login, \
+                patch.object(automation, "open_civilpower_from_oa_dashboard") as open_module:
+            automation._login_once(driver, request, recognizer)
+        login.assert_called_once_with(driver, "duty1", "synthetic-password", recognizer, attempts=1)
+        open_module.assert_called_once()
+
+
 class AttendanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

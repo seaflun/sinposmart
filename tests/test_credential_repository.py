@@ -169,6 +169,58 @@ class CredentialRepositoryTests(unittest.TestCase):
             self.assertTrue(repository.save([], ""))
             self.assertEqual(repository.last_error, "")
 
+    def test_notice_repository_reuses_encryption_and_keeps_duty_accounts_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            duty = self.repository(path)
+            self.assertTrue(duty.save([{"user_id": "duty-user", "password": "duty-test-secret"}], "duty-user"))
+            original = path.read_bytes()
+            notice = duty.notice_repository()
+            self.assertEqual(notice.path, path.with_name("notice_login.json"))
+            self.assertEqual(notice.app_name, duty.app_name)
+            self.assertIs(notice.dpapi, duty.dpapi)
+            self.assertFalse(notice.path.exists())
+            self.assertTrue(notice.save([{"user_id": "tyfd01214", "password": "notice-test-secret"}], "tyfd01214"))
+            raw = notice.path.read_text(encoding="utf-8")
+            self.assertNotIn("notice-test-secret", raw)
+            self.assertIn("password_dpapi", raw)
+            loaded = duty.notice_repository().load()
+            self.assertEqual(loaded.accounts[0]["user_id"], "tyfd01214")
+            self.assertEqual(loaded.accounts[0]["password"], "notice-test-secret")
+            self.assertEqual(loaded.accounts[0]["actor_no"], "")
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(duty.load().accounts[0]["user_id"], "duty-user")
+
+    def test_notice_repository_without_dpapi_does_not_create_either_credential_file(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            duty = CredentialRepository(path=path, app_name="SinpoSmart", dpapi=None)
+            notice = duty.notice_repository()
+            self.assertFalse(notice.save([{"user_id": "tyfd01214", "password": "notice-test-secret"}]))
+            self.assertIn("DPAPI", notice.last_error)
+            self.assertFalse(notice.path.exists())
+            self.assertFalse(path.exists())
+
+    def test_notice_repository_with_unreadable_password_preserves_original_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "saved_login.json"
+            duty = self.repository(path)
+            self.assertTrue(duty.save([], ""))
+            duty_original = path.read_bytes()
+            notice = duty.notice_repository()
+            self.assertTrue(notice.save([{"user_id": "tyfd01214", "password": "notice-test-secret"}], "tyfd01214"))
+            notice_original = notice.path.read_bytes()
+            with patch.object(FakeDpapi, "CryptUnprotectData", side_effect=RuntimeError("synthetic decrypt failure")):
+                snapshot = notice.load()
+            self.assertFalse(snapshot.can_persist)
+            notice.enable_persistence()
+            self.assertFalse(notice.save([{"user_id": "tyfd01214", "password": "replacement-test-secret"}]))
+            self.assertIn("無法解密", notice.last_error)
+            self.assertEqual(notice.path.read_bytes(), notice_original)
+            self.assertEqual(path.read_bytes(), duty_original)
+
 
 if __name__ == "__main__":
     unittest.main()

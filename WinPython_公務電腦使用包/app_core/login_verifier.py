@@ -375,6 +375,71 @@ def run_duty_login(driver: Any, user_id: str, password: str) -> None:
     login(driver, user_id, password)
 
 
+def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = None,
+                 *, attempts: int = 3) -> None:
+    """Log into the OA portal with the existing in-memory CAPTCHA recognizer."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    if not user_id or not password:
+        raise LoginVerificationError("請先設定入口網帳號密碼。")
+    if recognizer is None:
+        try:
+            import ddddocr
+
+            recognizer = ddddocr.DdddOcr(show_ad=False)
+        except Exception:
+            raise LoginVerificationError("入口網自動登入所需 OCR 未就緒，請確認使用包依賴。") from None
+
+    def assert_login_target() -> None:
+        target = urlsplit(str(driver.current_url or ""))
+        if (target.scheme != "https" or target.netloc != "oa.tyfd.gov.tw"
+                or target.path not in {"/login.php", "/login_main.php"}):
+            raise LoginVerificationError("入口網登入頁來源或路徑不符，已停止填入帳密。")
+
+    def set_input(wait, selector: str, value: str) -> None:
+        assert_login_target()
+        field = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, selector)))
+        assert_login_target()
+        field.clear()
+        assert_login_target()
+        field.send_keys(value)
+
+    def logged_in(current) -> bool:
+        target = urlsplit(str(current.current_url or ""))
+        if target.scheme != "https" or target.netloc != "oa.tyfd.gov.tw":
+            raise LoginVerificationError("入口網登入後來源不符，已停止操作。")
+        return (target.path not in {"/login.php", "/login_main.php"}
+                and not current.find_elements(By.CSS_SELECTOR, "#login_name, #verify_code, #loginBtn"))
+
+    for _attempt in range(max(1, min(int(attempts), 3))):
+        try:
+            driver.get("https://oa.tyfd.gov.tw/login.php")
+            assert_login_target()
+            wait = WebDriverWait(driver, 15)
+            set_input(wait, "#login_name", user_id)
+            set_input(wait, "#password", password)
+            captcha = wait.until(EC.visibility_of_element_located((By.ID, "checkcodeImg")))
+            wait.until(lambda current: captcha.get_attribute("src") and captcha.size.get("width", 0) > 0)
+            assert_login_target()
+            # CAPTCHA pixels stay in memory; never persist a login screenshot.
+            text = "".join(c for c in str(recognizer.classification(captcha.screenshot_as_png)) if c.isalnum())
+            if not text:
+                continue
+            set_input(wait, "#verify_code", text)
+            button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#loginBtn")))
+            assert_login_target()
+            button.click()
+            wait.until(logged_in)
+            return
+        except LoginVerificationError:
+            raise
+        except Exception:
+            continue
+    raise LoginVerificationError("入口網自動登入未成功，請確認已儲存的帳密與網站狀態。") from None
+
+
 AUTHENTICATED_DUTY_PAGE_SCRIPT = """
 // duty-authenticated-page: read protected controls only; never submit or read credentials.
 return Boolean(

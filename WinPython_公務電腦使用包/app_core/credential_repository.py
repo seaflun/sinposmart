@@ -38,6 +38,12 @@ class CredentialRepository:
     def account_identity(account: dict[str, str]) -> str:
         return str(account.get("user_id", "") or account.get("actor_no", "") or "").strip()
 
+    def notice_repository(self) -> CredentialRepository:
+        """Keep the notice login separate while reusing the same DPAPI contract."""
+        return CredentialRepository(
+            path=self.path.with_name("notice_login.json"), app_name=self.app_name, dpapi=self.dpapi,
+        )
+
     def protect_password(self, password: str) -> str:
         if not password or self.dpapi is None:
             return ""

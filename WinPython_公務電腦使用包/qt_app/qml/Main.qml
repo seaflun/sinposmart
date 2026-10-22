@@ -742,6 +742,49 @@ ApplicationWindow {
             civilpowerPanel: civilpowerDialog
         }
 
+        Rectangle {
+            id: noticeCollectionCard
+            objectName: "noticeCollectionCard"
+            Layout.fillWidth: true
+            implicitHeight: Math.max(24, noticeCardContent.implicitHeight) + 20
+            visible: window.backend.sessionController.isLoggedIn && modeTabs.currentIndex === 0
+            radius: Design.radius
+            color: Design.panel
+            border.width: Design.borderWidth
+            border.color: window.border
+
+            RowLayout {
+                id: noticeCardContent
+                anchors.fill: parent
+                anchors.margins: 10
+                spacing: 8
+
+                Label {
+                    Layout.preferredWidth: 58
+                    Layout.minimumWidth: 58
+                    Layout.alignment: Qt.AlignVCenter
+                    text: "通報收取"
+                    color: Design.blueHover
+                    font.bold: true
+                }
+
+                Label {
+                    id: noticeCollectionStatus
+                    objectName: "noticeCollectionStatus"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    Layout.alignment: Qt.AlignVCenter
+                    text: window.backend.noticeCollectionController.statusText
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Design.bodySize
+                    color: window.backend.noticeCollectionController.statusTone === "error"
+                           ? Design.dangerStrong
+                           : window.backend.noticeCollectionController.statusTone === "warning"
+                             ? Design.warningText : Design.text
+                }
+            }
+        }
+
         DutyTaskArea {
             id: dutyTaskArea
             backend: window.backend

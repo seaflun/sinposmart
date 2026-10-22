@@ -35,6 +35,7 @@ cache/
 .agents/
 skills-lock.json
 google_site_duty_board/**/.clasp.json
+google_notice_collection/**/.clasp.json
 
 # outputs
 outputs/

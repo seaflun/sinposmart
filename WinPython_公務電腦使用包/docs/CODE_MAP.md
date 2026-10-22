@@ -15,6 +15,7 @@
 - `controllers/session_controller.py`：登入 Slot 僅接受帳號、密碼及記住設定；包含 single-flight、120 秒安全逾時、逾時 worker 清理期間的重試阻擋、帳號選擇、DPAPI 儲存、登出與帳密同步確認，勤務番號只由登入後既有勤務網站查詢自動回填。
 - `controllers/duty_controller.py`：任務投影、勤務查詢 `isRefreshing` 狀態、審核日期、手動暫停／恢復、到點判定與自動登出條件。
 - `controllers/duty_execution_controller.py`：正式登打的 entry/work 雙通道佇列。
+- `controllers/notice_collection_controller.py`：獨立於勤務登入的通報背景排程、單工 worker、當班／曆日計數及安全結束；QML 提醒列只在值班登入後顯示。
 - `controllers/rescue_video_controller.py`：救護行車影片預覽、分類、來源清理二次確認與結果狀態協調。
 - `controllers/tool_controller.py`：原生工具目錄與可用狀態；正式 Qt 路徑不啟動任何外部 Tk 工具視窗。
 - 其他 controllers：勤務表、每日車輛、休息時間、勤務基準表、更新、工具、系統匣與工作紀錄設定。
@@ -32,6 +33,8 @@ UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
 - `rescue_video_service.py`：不載入 Tk UI 的救護影片分類邊界，沿用既有分類核心並限制預覽／確認後清理模式。
 - `work_log_settings_service.py`：工作紀錄預設值、未返隊案件車數例外與描述預覽。
 - `operational_sync_service.py`、`diagnostics_service.py`：後台事件、值班看板與去敏問題包。
+- `notice_collection_service.py`：沿用通報 Apps Script 的比對、寫入收據與去重規則，保存不含帳密及全文的本機確認紀錄；今日累積於臺灣時間 00:00 分界。
+- `notice_collection_browser.py`、`notice_collection_dom.js`：專用背景 OA Chrome、共用 OCR 自動登入、未讀篩選與分頁完整性、必要內文讀取及入表後已讀查核；新密碼使用全新工作階段驗證。
 - `scheduled_folder_service.py`：16:30／21:55 Windows 截圖資料夾排程。
 
 ## legacy_tk/duty_gui.py（回退）
