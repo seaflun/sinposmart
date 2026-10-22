@@ -598,6 +598,12 @@ def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
             record_vehicle_result(report, vehicle, "equipment", "already_done", "verified_today")
             continue
         if len(buttons) != 1 or not buttons[0].is_displayed() or not buttons[0].is_enabled():
+            views = row.find_elements(By.CSS_SELECTOR, ".k-grid-view")
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if (not buttons and any(view.is_displayed() and view.is_enabled() for view in views)
+                    and len(cells) == 10
+                    and cell_completion_text(cells[8]) in {"", "-", "—", "－"}):
+                print("[sinposmart-vehicle-diagnostic] equipment_end_time_missing", flush=True)
             fail_verification(report, "equipment", "state_unconfirmed", vehicle)
         ensure_requested_date()
         driver.execute_script("arguments[0].click();", buttons[0])

@@ -34,11 +34,13 @@ class FakeDriver:
         self.index = 0
         self.current_url = "about:blank"
         self.gets = []
+        self.refresh_calls = 0
         self.async_calls = []
         self.quit_calls = 0
         self.login_inputs = {}
         self.on_next = None
         self.on_get = None
+        self.on_refresh = None
         self.fetch_result = {"ok": True, "content": " 第一行\n第二行 "}
 
     def get(self, url):
@@ -47,6 +49,12 @@ class FakeDriver:
         self.index = 0
         if self.on_get:
             self.on_get(self)
+
+    def refresh(self):
+        self.refresh_calls += 1
+        self.index = 0
+        if self.on_refresh:
+            self.on_refresh(self)
 
     def execute_script(self, script, *args):
         if "notice:snapshot" in script:
@@ -93,6 +101,20 @@ class NoticeBrowserTests(unittest.TestCase):
         driver = FakeDriver()
         self.assertEqual(self.browser(driver).scan_unread("synthetic"), [])
         self.assertIn("is_read=0", driver.gets[-1])
+        self.assertEqual(driver.async_calls, [])
+
+    def test_repeated_scan_reloads_document_to_discover_new_unread_notice(self):
+        driver = FakeDriver([snapshot()])
+        server_pages = [snapshot()]
+        driver.on_refresh = lambda current: setattr(current, "pages", list(server_pages))
+        browser = self.browser(driver)
+        self.assertEqual(browser.scan_unread("synthetic"), [])
+
+        server_pages[:] = [snapshot([notice("101")])]
+        self.assertEqual(driver.pages[0]["records"], [])
+        result = browser.scan_unread("synthetic")
+
+        self.assertEqual([row["key"] for row in result], ["101"])
         self.assertEqual(driver.async_calls, [])
 
     def test_collects_every_unread_page_and_preserves_identity(self):
@@ -198,6 +220,25 @@ class NoticeBrowserTests(unittest.TestCase):
         self.assertEqual(browser.mark_read([notice()]), ["100"])
         self.assertIn("action=bulletin_read", driver.async_calls[0][1][1])
         self.assertGreaterEqual(len(driver.gets), 2)
+
+    def test_mark_read_reloads_document_before_confirming_server_state(self):
+        driver = FakeDriver([snapshot([notice()])])
+        server_pages = [snapshot([notice()])]
+        driver.on_refresh = lambda current: setattr(current, "pages", list(server_pages))
+        original_fetch = driver.execute_async_script
+
+        def mark_on_server(script, *args):
+            response = original_fetch(script, *args)
+            self.assertEqual(args[0], "mark")
+            server_pages[:] = [snapshot()]
+            return response
+
+        driver.execute_async_script = mark_on_server
+        browser = self.browser(driver)
+        browser.scan_unread("synthetic")
+
+        self.assertEqual(browser.mark_read([notice()]), ["100"])
+        self.assertEqual(driver.pages[0]["records"], [])
 
     def test_mark_read_keeps_unconfirmed_rows_out_of_result(self):
         driver = FakeDriver([snapshot([notice()])])
@@ -365,6 +406,37 @@ class NoticeBrowserTests(unittest.TestCase):
             browser.scan_unread("synthetic")
         self.assertEqual(browser.scan_unread("synthetic"), [])
         self.assertEqual(factory.call_count, 1)
+
+    def test_refresh_timeout_fails_closed_without_starting_another_browser(self):
+        from selenium.common.exceptions import TimeoutException
+        from app_core.notice_collection_service import NoticeCollectionError
+        from app_core.notice_collection_browser import NoticeBrowser
+        driver = FakeDriver()
+        driver.refresh = Mock(side_effect=[TimeoutException(), None])
+        factory = Mock(return_value=driver)
+        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+
+        with self.assertRaises(NoticeCollectionError):
+            browser.scan_unread("synthetic")
+        self.assertEqual(driver.async_calls, [])
+        self.assertEqual(browser.scan_unread("synthetic"), [])
+        self.assertEqual(factory.call_count, 1)
+
+    def test_closed_browser_during_refresh_is_recreated_on_next_cycle(self):
+        from selenium.common.exceptions import InvalidSessionIdException
+        from app_core.notice_collection_service import NoticeCollectionError
+        from app_core.notice_collection_browser import NoticeBrowser
+        first, second = FakeDriver(), FakeDriver()
+        first.refresh = Mock(side_effect=InvalidSessionIdException())
+        factory = Mock(side_effect=[first, second])
+        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+
+        with self.assertRaises(NoticeCollectionError):
+            browser.scan_unread("synthetic")
+        self.assertEqual(first.async_calls, [])
+        self.assertEqual(browser.scan_unread("synthetic"), [])
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(first.quit_calls, 1)
 
     def test_authenticated_session_needs_no_login_attempt_or_visible_browser(self):
         driver = FakeDriver()

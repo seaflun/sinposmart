@@ -182,6 +182,9 @@ class NoticeBrowser:
         self._check_cancel(cancel)
         try:
             self._driver.get(UNREAD_URL)
+            # The fragment route can retain an earlier document, including an
+            # empty unread list. Reload before accepting metadata or readback.
+            self._driver.refresh()
         except (InvalidSessionIdException, NoSuchWindowException):
             self.close()
             raise NoticeCollectionError("通報專用視窗已關閉，下輪將重新開啟。") from None

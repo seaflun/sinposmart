@@ -939,6 +939,48 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
             with self.subTest(changes=changes), self.assertRaises(RuntimeError):
                 self._run_operation("equipment", equipment_done=True, **changes)
 
+    def test_view_only_equipment_missing_end_time_reports_precise_diagnostic_without_saving(self) -> None:
+        module = self.module
+        for missing_end in ("", "-", "—", "－"):
+            with self.subTest(missing_end=missing_end):
+                driver, wait, state, query = self._fixture(equipment_done=True, end=missing_end)
+                driver.execute_script = mock.Mock(wraps=driver.execute_script)
+                report = module.new_vehicle_report("2026-10-17")
+                with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                        mock.patch.object(module, "ensure_requested_date"), \
+                        mock.patch("builtins.print") as output:
+                    with self.assertRaisesRegex(module.VehicleVerificationError, "state_unconfirmed"):
+                        module.process_equip_checks(driver, wait, report=report)
+
+                diagnostics = [call.args[0] for call in output.call_args_list if call.args
+                               and str(call.args[0]).startswith("[sinposmart-vehicle-diagnostic] ")]
+                self.assertEqual(diagnostics, ["[sinposmart-vehicle-diagnostic] equipment_end_time_missing"])
+                self.assertEqual(report["reason_code"], "state_unconfirmed")
+                self.assertEqual(report["items"], [{"vehicle": "CAR-01", "operation": "equipment",
+                                                   "status": "unconfirmed", "reason_code": "state_unconfirmed"}])
+                self.assertEqual(state["saved"], 0)
+                self.assertFalse(any(call.args[0] == "arguments[0].click();"
+                                     for call in driver.execute_script.call_args_list))
+
+    def test_missing_equipment_end_time_diagnostic_does_not_mask_other_states(self) -> None:
+        cases = (
+            {"equipment_done": True, "end": "99:40"},
+            {"equipment_done": False, "equipment_button": False, "end": "-"},
+            {"equipment_done": True, "contradictory_button": True, "end": "-"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), mock.patch("builtins.print") as output:
+                with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+                    self._run_operation("equipment", **changes)
+                self.assertFalse(any("equipment_end_time_missing" in str(call.args[0])
+                                     for call in output.call_args_list if call.args))
+
+    def test_missing_equipment_end_time_diagnostic_has_actionable_safe_error(self) -> None:
+        service = package_module("app_core.daily_vehicle_service").DailyVehicleService
+        output = "[sinposmart-vehicle-diagnostic] equipment_end_time_missing\n"
+        self.assertEqual(service._safe_error(output),
+                         "器材清點紀錄缺少結束時間，請先至公務網站確認或重新清點該筆紀錄。")
+
     def test_not_required_is_maintenance_only_and_can_complete_full_report(self) -> None:
         module = self.module
         report, _state = self._run_operation("maintenance", event_class="disable")
