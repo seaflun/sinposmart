@@ -489,7 +489,8 @@ print(json.dumps({'rows': rows, 'error': error, 'readiness_polls': driver.readin
                 original = driver.execute_script.side_effect
                 driver.execute_script.side_effect = lambda script, *args: (
                     {"total": 1, "page": 1, "page_size": 20, "filtered": False}
-                    if script == module.GRID_STATE_SCRIPT else original(script, *args))
+                    if script == module.GRID_STATE_SCRIPT else fixture_driver.execute_script(script, *args)
+                    if "grid.dataItem" in script else original(script, *args))
                 driver.find_elements.side_effect = rows
                 with mock.patch("builtins.print") as output:
                     module.verified_grid_rows(driver, wait, operation, module.new_vehicle_report("2026-10-17"))
@@ -749,10 +750,10 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
             "initial": True, "staleRender": False, "rendered": True, "changedRejected": True})
 
     def _fixture(self, **options):
-        from selenium.common.exceptions import StaleElementReferenceException
+        from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 
         module = self.module
-        state = {"maintenance_done": False, "equipment_done": False,
+        state = {"maintenance_done": False, "equipment_done": False, "equipment_started": False,
                  "persist": True, "event_class": "unchecked", "missing_today": False,
                  "event_classes": None, "reviewed": False,
                  "total": 1, "filtered": False, "placeholder": False,
@@ -761,24 +762,41 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
                  "contradictory_button": False, "no_paging": False,
                  "row_names": None,
                  "button_only_evidence": False, "change_after_save": False,
-                 "saved": 0}
+                 "record_id": "101", "readback_id": None, "model_vehicle": None, "model_date": None,
+                 "dialog_mode": None, "dialog_open": False, "dialog_reads": 0,
+                 "selected": False, "selection_clicks": 0, "confirm_clicks": 0, "cancel_clicks": 0,
+                 "selection_ready_after": 0, "selection_reads": 0, "selection_incomplete": False,
+                 "refresh_header_on_select": False, "header_generation": 0,
+                 "header_lookups": 0, "stale_header_uses": 0,
+                 "continue_present": True, "continue_displayed": True, "continue_enabled": True,
+                 "complete_on_view": False, "view_record_id": None,
+                 "view_clicks": 0, "continue_clicks": 0, "view_ids": [], "direct_take_gets": 0,
+                 "end_take_ready_after": 0, "end_take_reads": 0, "end_take_pending": False,
+                 "end_take_interrupted": False, "terminal_view_urls": [],
+                 "take_ids": [], "saved": 0}
         state.update(options)
 
         class Element:
-            def __init__(self, role="button", text="", displayed=True, event_class=None):
+            def __init__(self, role="button", text="", displayed=True, event_class=None, enabled=True):
                 self.role, self.text, self.displayed = role, text, displayed
-                self.event_class = event_class
+                self.event_class, self.enabled = event_class, enabled
+                self.header_generation = state["header_generation"]
 
             def is_displayed(self):
                 return self.displayed
 
             def is_enabled(self):
-                return True
+                return self.enabled
+
+            def is_selected(self):
+                return state["selected"]
 
             def get_attribute(self, name):
                 if name == "textContent":
                     return self.text
                 if name == "aria-label":
+                    if self.role == "checkbox":
+                        return "Deselect all rows" if state["selected"] else "Select all rows"
                     return "2026年10月16日" if state["missing_today"] else "2026年10月17日"
                 if name == "class":
                     return "checked" if state["maintenance_done"] else self.event_class or state["event_class"]
@@ -807,16 +825,18 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
                         cells[9] = Element(text="115/10/17" if state["maintenance_done"] else "未完成")
                         return cells
                     text = state["equipment_text"] or "115/10/17"
-                    checker = state["checker"] if state["checker"] is not None else "同仁" if state["equipment_done"] else "-"
-                    start = state["start"] if state["start"] is not None else "08:40" if state["equipment_done"] else "-"
+                    started = state["equipment_done"] or state["equipment_started"]
+                    checker = state["checker"] if state["checker"] is not None else "同仁" if started else "-"
+                    start = state["start"] if state["start"] is not None else "08:40" if started else "-"
                     end = state["end"] if state["end"] is not None else "08:40" if state["equipment_done"] else "-"
                     return [Element(), Element(), Element(), Element(text=vehicle), Element("equipment-status", text),
                             Element(text="-"), Element(text=checker), Element(text=start), Element(text=end), Element()]
                 if selector == ".k-grid-view":
-                    return [Element("view")] if state["equipment_done"] else []
+                    return [Element("view")] if state["equipment_done"] or state["equipment_started"] else []
                 if selector not in (".k-grid-check", self_module.EQUIPMENT_BUTTON_XPATH):
                     return []
-                if driver.mode == "equip" and state["equipment_button"] and (not state["equipment_done"] or state["contradictory_button"]):
+                if driver.mode == "equip" and state["equipment_button"] and (
+                        not (state["equipment_done"] or state["equipment_started"]) or state["contradictory_button"]):
                     return [Element("check")]
                 return []
 
@@ -831,11 +851,51 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
             mode = "maintain"
             current_url = "fixture://maintain"
             document_generation = 0
+            control_navigation = False
 
             def get(self, url):
+                if "/CarEquipCheck/Index" in url and state["end_take_pending"]:
+                    state["end_take_interrupted"] = True
+                    state["end_take_pending"] = False
                 self.document_generation += 1
                 self.mode = "equip" if "CarEquipCheck" in url else "maintain"
                 self.current_url = url
+                if "/CarEquipCheck/Take?id=" in url:
+                    state["take_ids"].append(url.rsplit("=", 1)[-1])
+                    if not self.control_navigation:
+                        state["direct_take_gets"] += 1
+                if "/CarEquipCheck/View?id=" in url:
+                    state["view_ids"].append(url.rsplit("=", 1)[-1])
+                    if state["complete_on_view"]:
+                        state["equipment_done"] = True
+                if "/CarEquipCheck/EndTake?id=" in url:
+                    state["end_take_pending"] = True
+                    if not state["end_take_ready_after"]:
+                        self.commit_end_take()
+
+            def commit_end_take(self):
+                if state["persist"]:
+                    state["equipment_done"] = True
+                    if state["checker"] in {"", "-", "—", "－"}:
+                        state["checker"] = "同仁"
+                state["end_take_pending"] = False
+                self.document_generation += 1
+                self.current_url = module.BASE_URL + "/CarEquipCheck/View/" + state["record_id"]
+                state["terminal_view_urls"].append(self.current_url)
+
+            def navigate_control(self, url):
+                self.control_navigation = True
+                try:
+                    self.get(url)
+                finally:
+                    self.control_navigation = False
+
+            def continue_control(self):
+                if ("/CarEquipCheck/View?id=" not in self.current_url or not state["equipment_started"]
+                        or state["equipment_done"] or not state["continue_present"]):
+                    return None
+                return Element("continue", text="繼續清點", displayed=state["continue_displayed"],
+                               enabled=state["continue_enabled"])
 
             def refresh(self):
                 self.document_generation += 1
@@ -844,6 +904,11 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
             def find_element(self, by, selector):
                 if selector == "html":
                     return Document(self.document_generation)
+                if "繼續清點" in selector:
+                    control = self.continue_control()
+                    if control is None:
+                        raise NoSuchElementException("fixture has no continue control")
+                    return control
                 if selector == "spinner-container":
                     return Element(displayed=False)
                 if "tbody/tr[" in selector:
@@ -854,19 +919,53 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
                     return Element("return")
                 if "完成清點" in selector:
                     return Element("finish")
+                if "Select all rows" in selector or "Deselect all rows" in selector:
+                    label = "Deselect all rows" if state["selected"] else "Select all rows"
+                    if label not in selector:
+                        raise NoSuchElementException("fixture header changed its selection label")
+                    state["header_lookups"] += 1
+                    return Element("checkbox")
                 if "保養" in selector:
                     return Element("maintain")
                 return Element()
 
             def find_elements(self, by, selector):
+                if "繼續清點" in selector:
+                    control = self.continue_control()
+                    return [control] if control is not None else []
                 if selector == "#scheduler .k-event":
                     return ([Element("event", event_class=value) for value in state["event_classes"]]
                             if state["event_classes"] is not None else [Element("event")])
                 if "swal-button" in selector:
-                    return []
+                    if not state["dialog_open"]:
+                        return []
+                    state["dialog_reads"] += 1
+                    visible = state["dialog_mode"] != "delayed" or state["dialog_reads"] > 2
+                    confirm = Element("confirm", displayed=visible)
+                    return ([Element("cancel"), confirm] if "swal-button--confirm" not in selector else [confirm])
                 return []
 
             def execute_script(self, script, *args):
+                if "__sinposmartEquipmentDialog" in script:
+                    return "saved notice" if state["dialog_mode"] == "two_step" and state["confirm_clicks"] else "confirm save"
+                if "__sinposmartEquipmentSelection" in script:
+                    if args[0].header_generation != state["header_generation"]:
+                        state["stale_header_uses"] += 1
+                        raise StaleElementReferenceException("fixture header was replaced by TreeList.refresh")
+                    state["selection_reads"] += 1
+                    return {"ready": state["selection_reads"] > state["selection_ready_after"],
+                            "selected": state["selected"] and not state["selection_incomplete"]}
+                if "grid.dataItem" in script:
+                    return {"id": state["readback_id"] if state["saved"] and state["readback_id"] is not None
+                            else state["record_id"], "vehicle": state["model_vehicle"] or "CAR-01",
+                            "date": state["model_date"] or "115/10/17"}
+                if "document.readyState" in script:
+                    if state["end_take_pending"]:
+                        state["end_take_reads"] += 1
+                        if state["end_take_reads"] <= state["end_take_ready_after"]:
+                            return False
+                        self.commit_end_take()
+                    return True
                 if "dataSource" in script:
                     total = len(state["row_names"]) if state["row_names"] is not None else state["total"]
                     return {"total": total, "page": None if state["no_paging"] else 1,
@@ -877,20 +976,56 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
                     self.mode = "calendar"
                 elif element.role == "return":
                     self.mode = "maintain"
-                elif element.role in ("save", "finish"):
+                elif element.role == "check":
+                    state["equipment_started"] = True
+                    self.navigate_control(module.BASE_URL + "/CarEquipCheck/Take?id=" + state["record_id"])
+                elif element.role == "view":
+                    state["view_clicks"] += 1
+                    self.navigate_control(module.BASE_URL + "/CarEquipCheck/View?id=" +
+                                          (state["view_record_id"] or state["record_id"]))
+                elif element.role == "continue":
+                    state["continue_clicks"] += 1
+                    self.navigate_control(module.BASE_URL + "/CarEquipCheck/Take?id=" + state["record_id"])
+                elif element.role == "checkbox":
+                    state["selection_clicks"] += 1
+                    state["selected"] = not state["selected"]
+                    if state["refresh_header_on_select"]:
+                        state["header_generation"] += 1
+                elif element.role == "finish" and state["dialog_mode"]:
+                    state["dialog_open"] = True
+                elif element.role == "cancel":
+                    state["cancel_clicks"] += 1
+                    state["dialog_open"] = False
+                elif element.role == "confirm" and state["dialog_mode"] == "stuck":
+                    state["confirm_clicks"] += 1
+                elif element.role == "confirm" and state["dialog_mode"] == "two_step" and state["confirm_clicks"] == 1:
+                    state["confirm_clicks"] += 1
+                    state["dialog_open"] = False
+                    self.get(module.BASE_URL + "/CarEquipCheck/EndTake?id=" + state["record_id"])
+                elif element.role in ("save", "finish", "confirm"):
+                    if element.role == "confirm":
+                        state["confirm_clicks"] += 1
+                        state["dialog_open"] = False
                     state["saved"] += 1
-                    if state["persist"]:
-                        state["maintenance_done" if element.role == "save" else "equipment_done"] = True
-                    if element.role == "finish":
-                        self.current_url = "fixture://CarEquipCheck/View"
+                    if state["persist"] and element.role == "save":
+                        state["maintenance_done"] = True
+                    if element.role != "save":
+                        if state["dialog_mode"] == "two_step" and element.role == "confirm":
+                            state["dialog_open"] = True
+                        else:
+                            self.get(module.BASE_URL + "/CarEquipCheck/EndTake?id=" + state["record_id"])
                 return None
 
         class Wait:
             def until(self, condition):
-                result = condition(driver)
-                if not result:
-                    raise module.TimeoutException("fixture condition was not confirmed")
-                return result
+                for _ in range(6):
+                    try:
+                        result = condition(driver)
+                    except NoSuchElementException:
+                        continue
+                    if result:
+                        return result
+                raise module.TimeoutException("fixture condition was not confirmed")
 
         self_module = module
         driver = Driver()
@@ -943,7 +1078,7 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
         module = self.module
         for missing_end in ("", "-", "—", "－"):
             with self.subTest(missing_end=missing_end):
-                driver, wait, state, query = self._fixture(equipment_done=True, end=missing_end)
+                driver, wait, state, query = self._fixture(equipment_done=True, end=missing_end, record_id="")
                 driver.execute_script = mock.Mock(wraps=driver.execute_script)
                 report = module.new_vehicle_report("2026-10-17")
                 with mock.patch.object(module, "query_grid_rows", side_effect=query), \
@@ -979,7 +1114,15 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
         service = package_module("app_core.daily_vehicle_service").DailyVehicleService
         output = "[sinposmart-vehicle-diagnostic] equipment_end_time_missing\n"
         self.assertEqual(service._safe_error(output),
-                         "器材清點紀錄缺少結束時間，請先至公務網站確認或重新清點該筆紀錄。")
+                         "器材清點尚未結束，無法核對原始紀錄，請至公務網站檢查。")
+        for code, expected in {
+            "equipment_continue_unavailable": "器材清點頁面未提供可用的「繼續清點」，已停止後續操作。",
+            "equipment_detail_unconfirmed": "器材清點明細尚未完整載入或紀錄不符，已停止送出。",
+            "equipment_selection_unconfirmed": "器材清點未能確認所有項目已勾選，已停止送出。",
+            "equipment_confirmation_unconfirmed": "器材清點尚未確認儲存結果，請至公務網站檢查。",
+        }.items():
+            with self.subTest(code=code):
+                self.assertEqual(service._safe_error(f"[sinposmart-vehicle-diagnostic] {code}\n"), expected)
 
     def test_not_required_is_maintenance_only_and_can_complete_full_report(self) -> None:
         module = self.module
@@ -1012,7 +1155,228 @@ JSON.stringify({replacement,rebuilt,initial,staleRender,rendered,changedRejected
     def test_equipment_save_is_verified_from_fresh_list(self) -> None:
         report, state = self._run_operation("equipment")
         self.assertEqual(state["saved"], 1)
+        self.assertEqual(state["terminal_view_urls"], [self.module.BASE_URL + "/CarEquipCheck/View/101"])
         self.assertEqual(report["items"][0]["reason_code"], "saved_verified")
+
+    def test_started_equipment_continues_original_record_and_verifies_save(self) -> None:
+        report, state = self._run_operation("equipment", equipment_started=True)
+        self.assertEqual((state["view_clicks"], state["continue_clicks"], state["direct_take_gets"]), (1, 1, 0))
+        self.assertEqual(state["view_ids"], ["101"])
+        self.assertEqual(state["take_ids"], ["101"])
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_started_equipment_without_checker_can_continue_original_record(self) -> None:
+        report, state = self._run_operation("equipment", equipment_started=True, checker="-")
+        self.assertEqual((state["view_clicks"], state["continue_clicks"], state["direct_take_gets"]), (1, 1, 0))
+        self.assertEqual(state["take_ids"], ["101"])
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_started_equipment_requires_visible_enabled_continue_before_take(self) -> None:
+        module = self.module
+        for changes in ({"continue_present": False}, {"continue_displayed": False}, {"continue_enabled": False}):
+            with self.subTest(changes=changes):
+                driver, wait, state, query = self._fixture(equipment_started=True, **changes)
+                report = module.new_vehicle_report("2026-10-17")
+                with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                        mock.patch.object(module, "ensure_requested_date"), mock.patch("builtins.print") as output:
+                    with self.assertRaisesRegex(module.VehicleVerificationError, "state_unconfirmed"):
+                        module.process_equip_checks(driver, wait, report)
+                self.assertEqual((state["view_clicks"], state["continue_clicks"], state["saved"]), (1, 0, 0))
+                self.assertEqual(state["take_ids"], [])
+                self.assertEqual(state["direct_take_gets"], 0)
+                self.assertIn("[sinposmart-vehicle-diagnostic] equipment_continue_unavailable",
+                              [call.args[0] for call in output.call_args_list if call.args])
+
+    def test_started_equipment_completed_during_view_never_reenters_take(self) -> None:
+        module = self.module
+        driver, wait, state, query = self._fixture(equipment_started=True, complete_on_view=True)
+        with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(module, "ensure_requested_date"):
+            with self.assertRaisesRegex(module.VehicleVerificationError, "state_unconfirmed"):
+                module.process_equip_checks(driver, wait, module.new_vehicle_report("2026-10-17"))
+        self.assertTrue(state["equipment_done"])
+        self.assertEqual((state["view_clicks"], state["continue_clicks"], state["saved"]), (1, 0, 0))
+        self.assertEqual(state["take_ids"], [])
+        self.assertEqual(state["direct_take_gets"], 0)
+
+    def test_started_equipment_view_requires_original_record_before_continue(self) -> None:
+        module = self.module
+        driver, wait, state, query = self._fixture(equipment_started=True, view_record_id="102")
+        with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(module, "ensure_requested_date"):
+            with self.assertRaisesRegex(module.VehicleVerificationError, "state_unconfirmed"):
+                module.process_equip_checks(driver, wait, module.new_vehicle_report("2026-10-17"))
+        self.assertEqual(state["view_ids"], ["102"])
+        self.assertEqual((state["continue_clicks"], state["saved"]), (0, 0))
+        self.assertEqual(state["take_ids"], [])
+        self.assertEqual(state["direct_take_gets"], 0)
+
+    def test_first_equipment_confirmation_never_clicks_cancel(self) -> None:
+        report, state = self._run_operation("equipment", dialog_mode="cancel_first")
+        self.assertEqual((state["cancel_clicks"], state["confirm_clicks"], state["saved"]), (0, 1, 1))
+        self.assertEqual(report["items"][0]["reason_code"], "saved_verified")
+
+    def test_first_equipment_waits_for_visible_confirmation(self) -> None:
+        report, state = self._run_operation("equipment", dialog_mode="delayed")
+        self.assertEqual(state["confirm_clicks"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_equipment_confirmation_then_saved_notice_is_acknowledged_once_each(self) -> None:
+        report, state = self._run_operation("equipment", dialog_mode="two_step")
+        self.assertEqual((state["saved"], state["confirm_clicks"], state["cancel_clicks"]), (1, 2, 0))
+        self.assertEqual(report["items"][0]["reason_code"], "saved_verified")
+
+    def test_equipment_same_visible_confirmation_is_never_clicked_twice(self) -> None:
+        driver, wait, state, query = self._fixture(dialog_mode="stuck")
+        with mock.patch.object(self.module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(self.module, "ensure_requested_date"):
+            with self.assertRaisesRegex(RuntimeError, "save_unconfirmed"):
+                self.module.process_equip_checks(driver, wait, self.module.new_vehicle_report("2026-10-17"))
+        self.assertEqual((state["confirm_clicks"], state["cancel_clicks"], state["saved"]), (1, 0, 0))
+
+    def test_equipment_already_selected_header_is_not_toggled_off(self) -> None:
+        _report, state = self._run_operation("equipment", selected=True)
+        self.assertEqual(state["selection_clicks"], 0)
+        self.assertTrue(state["selected"])
+
+    def test_equipment_waits_for_loaded_details_before_selection(self) -> None:
+        _report, state = self._run_operation("equipment", selection_ready_after=2)
+        self.assertGreaterEqual(state["selection_reads"], 3)
+        self.assertEqual(state["saved"], 1)
+
+    def test_equipment_reacquires_header_after_selection_refresh(self) -> None:
+        report, state = self._run_operation("equipment", refresh_header_on_select=True)
+        self.assertGreaterEqual(state["header_lookups"], 2)
+        self.assertEqual(state["stale_header_uses"], 0)
+        self.assertEqual(state["selection_clicks"], 1)
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_equipment_waits_for_end_take_commit_before_returning_to_index(self) -> None:
+        report, state = self._run_operation("equipment", end_take_ready_after=2)
+        self.assertGreaterEqual(state["end_take_reads"], 3)
+        self.assertFalse(state["end_take_interrupted"])
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["status"], "completed")
+
+    def test_equipment_selection_requires_full_bound_rows_and_checked_details(self) -> None:
+        javascript = """
+let records = [], rows = [], total = 0;
+const box = {checked:false, indeterminate:false};
+const checks = [{checked:false, indeterminate:false}, {checked:false, indeterminate:false}];
+const grid = {dataSource:{data:()=>records,total:()=>total},tbody:{find:()=>rows}};
+const host = {data:name=>name==='kendoTreeList'?grid:null};
+var window = {jQuery:()=>({closest:()=>host})}; window.jQuery.active=0;
+function snapshot() { return (function() {
+""" + self.module.EQUIPMENT_SELECTION_SCRIPT + """
+}).apply(null,[box]); }
+const empty = snapshot();
+records = [{uid:'a',Checked:'N'},{uid:'b',Checked:'N'}]; total=2;
+rows = ['a','b'].map((uid,index)=>({getAttribute:()=>uid,querySelectorAll:()=>[checks[index]]}));
+const loaded = snapshot(); box.checked=true; checks[0].checked=true;
+const partial = snapshot(); checks[1].checked=true; const domOnly = snapshot();
+records.forEach(record=>record.Checked='Y'); const selected = snapshot();
+records[1].Checked=true; const unknownModel = snapshot(); records[1].Checked='Y';
+box.indeterminate=true; const indeterminate = snapshot(); box.indeterminate=false;
+rows[1]={getAttribute:()=>'stale',querySelectorAll:()=>[checks[1]]}; const stale=snapshot();
+rows[1]={getAttribute:()=>'b',querySelectorAll:()=>[checks[1]]}; total=3; const paged=snapshot();
+JSON.stringify({empty,loaded,partial,domOnly,selected,unknownModel,indeterminate,stale,paged});
+"""
+        runner = ("from PySide6.QtCore import QCoreApplication\nfrom PySide6.QtQml import QJSEngine\n"
+                  "app=QCoreApplication([])\nengine=QJSEngine()\nresult=engine.evaluate(" + repr(javascript) + ")\n"
+                  "assert not result.isError(),result.toString()\nprint(result.toString())\n")
+        result = subprocess.run([sys.executable, "-B", "-c", runner], capture_output=True,
+                                text=True, encoding="utf-8", timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "empty": None, "loaded": {"ready": True, "selected": False},
+            "domOnly": {"ready": True, "selected": False}, "unknownModel": {"ready": True, "selected": False},
+            "partial": {"ready": True, "selected": False}, "selected": {"ready": True, "selected": True},
+            "indeterminate": {"ready": True, "selected": False}, "stale": None, "paged": None,
+        })
+
+    def test_equipment_incomplete_selection_never_submits(self) -> None:
+        driver, wait, state, query = self._fixture(selection_incomplete=True)
+        with mock.patch.object(self.module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(self.module, "ensure_requested_date"):
+            with self.assertRaises(RuntimeError):
+                self.module.process_equip_checks(driver, wait, self.module.new_vehicle_report("2026-10-17"))
+        self.assertEqual(state["saved"], 0)
+
+    def test_equipment_continuation_rejects_wrong_date_vehicle_or_record(self) -> None:
+        for options in ({"equipment_text": "115/10/16"}, {"model_date": "115/10/16"},
+                        {"model_vehicle": "CAR-02"}, {"record_id": "../Duplicate/101"},
+                        {"start": "99:40"}):
+            with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+                self._run_operation("equipment", equipment_started=True, **options)
+
+    def test_equipment_save_requires_original_record_id_on_readback(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "save_unconfirmed"):
+            self._run_operation("equipment", readback_id="102")
+
+    def _equipment_inventory(self, records):
+        module = self.module
+        rows = []
+        for record in records:
+            vehicle, started = record.get("vehicle", "CAR-01"), record.get("start", "08:40")
+            completed = record.get("completed", True)
+            texts = ["", "", "", vehicle, record.get("date", "115/10/17"), "-",
+                     record.get("checker", "同仁" if completed else "-"), started,
+                     record.get("end", "08:41" if completed else "-"), ""]
+            cells = []
+            for text in texts:
+                cell = mock.Mock()
+                cell.get_attribute.side_effect = lambda name, value=text: value if name == "textContent" else ""
+                cell.find_elements.return_value = []
+                cells.append(cell)
+            view = mock.Mock()
+            view.is_displayed.return_value = view.is_enabled.return_value = True
+            row = mock.Mock()
+            row.record = {"id": record["id"], "vehicle": vehicle, "date": texts[4]}
+            row.find_elements.side_effect = lambda by, selector, values=cells, button=view: (
+                values if selector == "td" else [button] if selector == ".k-grid-view" else [])
+            rows.append(row)
+        driver = mock.Mock()
+        driver.execute_script.side_effect = lambda script, *args: (
+            {"total": len(rows), "page": 1, "page_size": 20, "filtered": False}
+            if script == module.GRID_STATE_SCRIPT else dict(args[0].record))
+        report = module.new_vehicle_report("2026-10-17")
+        with mock.patch.object(module, "query_grid_rows", return_value=rows):
+            inventory = module.verified_grid_rows(driver, mock.Mock(), "equipment", report)
+        return inventory, rows, report
+
+    def test_equipment_inventory_selects_only_unfinished_record_with_completed_history(self) -> None:
+        inventory, rows, report = self._equipment_inventory([
+            {"id": "101"}, {"id": "102", "completed": False},
+        ])
+        self.assertEqual(set(inventory), {"CAR-01"})
+        self.assertIs(inventory["CAR-01"][1], rows[1])
+        self.assertEqual(report["items"], [])
+
+    def test_equipment_inventory_all_completed_uses_latest_numeric_record(self) -> None:
+        inventory, rows, report = self._equipment_inventory([{"id": "101"}, {"id": "9"}])
+        self.assertEqual(set(inventory), {"CAR-01"})
+        self.assertIs(inventory["CAR-01"][1], rows[0])
+        self.assertEqual(report["items"], [])
+
+    def test_equipment_inventory_rejects_ambiguous_or_mismatched_duplicates(self) -> None:
+        cases = (
+            [{"id": "101", "completed": False}, {"id": "102", "completed": False}],
+            [{"id": "101", "completed": False}, {"id": "101", "vehicle": "CAR-02", "completed": False}],
+            [{"id": "../Duplicate/101"}],
+            [{"id": "101", "completed": False}, {"id": "102"}],
+            [{"id": "101"}, {"id": "101"}],
+            [{"id": "101", "date": "115/10/16"}, {"id": "102", "completed": False}],
+            [{"id": "101"}, {"id": "102", "vehicle": "car-01"}],
+            [{"id": "101", "checker": "-"}, {"id": "102", "completed": False}],
+            [{"id": "../Duplicate/101"}, {"id": "102", "completed": False}],
+        )
+        for records in cases:
+            with self.subTest(records=records), self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
+                self._equipment_inventory(records)
 
     def test_today_completed_text_with_pending_button_is_unconfirmed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "state_unconfirmed"):
@@ -3435,7 +3799,7 @@ try {
         self.assertNotIn("self.credential_export_button = ctk.CTkButton", source)
         self.assertIn("sync_credentials_after_login", {node.func.attr for node in ast.walk(login_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)})
 
-    def test_auto_credential_sync_sends_login_name_with_saved_accounts(self) -> None:
+    def test_auto_credential_sync_sends_only_verified_login_person(self) -> None:
         module = duty_gui_module()
         gui = object.__new__(module.DutyGui)
         captured: list[tuple[dict[str, object], int, bool]] = []
@@ -3452,6 +3816,7 @@ try {
             {"actor_no": "8", "user_id": "tyfd01510", "password": "old-pass", "display_name": "8番 tyfd01510", "id_number": "B123017532"},
             {"actor_no": "9", "user_id": "tyfd00009", "password": "pass9", "display_name": "9番 王小明", "name": "王小明"},
         ]
+        gui.session = module.LoginSession("8", "tyfd01510", "new-pass", verified=True)
         gui.duty_staff = {}
         gui.staff = {}
         gui.duty_data = {}
@@ -3474,7 +3839,8 @@ try {
         accounts = payload["accounts"]
         synced_8 = next(account for account in accounts if account["actor_no"] == "8")
 
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 1)
+        self.assertEqual([account["user_id"] for account in accounts], ["tyfd01510"])
         self.assertFalse(notify_user)
         self.assertEqual(synced_8["user_id"], "tyfd01510")
         self.assertEqual(synced_8["password"], "new-pass")
@@ -3506,18 +3872,49 @@ try {
 
         self.assertEqual(gui.identify_logged_in_actor(Driver()), ("", "曾彥綸"))
 
-    def test_auto_credential_sync_uses_saved_accounts_after_login(self) -> None:
-        source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
-        tree = ast.parse(source)
-        sync_fn = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "sync_credentials_after_login"
-        )
-        calls = {node.func.attr for node in ast.walk(sync_fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+    def test_auto_credential_sync_rejects_unverified_or_mismatched_login(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.saved_accounts = [{"actor_no": "9", "user_id": "other-user", "password": "other-password"}]
+        gui.saved_accounts_for_credential_sync = mock.Mock(return_value=[{
+            "actor_no": "9", "user_id": "other-user", "password": "other-password",
+            "display_name": "其他人", "name": "其他人", "id_number": ""}])
+        gui.account_for_credential_sync = mock.Mock(return_value={
+            "actor_no": "8", "user_id": "current-user", "password": "current-password",
+            "display_name": "當次登入者", "name": "測試員", "id_number": ""})
+        gui._credential_sync_send_worker = mock.Mock()
+        gui._credential_sync_send_failed = mock.Mock()
+        for session in (None, module.LoginSession("8", "current-user", "current-password"),
+                        module.LoginSession("9", "other-user", "other-password", verified=True)):
+            with self.subTest(session=session is not None):
+                gui.session = session
+                with mock.patch.object(module, "credential_sync_enabled", return_value=True), \
+                        mock.patch.object(module.threading, "Thread") as thread:
+                    gui.sync_credentials_after_login("8", "current-user", "current-password")
+                thread.assert_not_called()
 
-        self.assertIn("account_for_credential_sync", calls)
-        self.assertIn("saved_accounts_for_credential_sync", calls)
+    def test_manual_credential_sync_sends_verified_session_instead_of_saved_accounts(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.session = module.LoginSession("8", "current-user", "verified-password", verified=True)
+        gui.saved_accounts = [{"actor_no": "8", "user_id": "current-user", "password": "stale-password"},
+                              {"actor_no": "9", "user_id": "other-user", "password": "other-password"}]
+        gui.saved_accounts_for_credential_sync = mock.Mock(return_value=[{
+            **account, "display_name": "測試員", "name": "測試員", "id_number": ""}
+            for account in gui.saved_accounts])
+        gui.account_for_credential_sync = mock.Mock(side_effect=lambda actor, user, password, **_kwargs: {
+            "actor_no": actor, "user_id": user, "password": password,
+            "display_name": "當次登入者", "name": "測試員", "id_number": ""})
+        gui.status_text = mock.Mock()
+        with mock.patch.object(module, "credential_sync_enabled", return_value=True), \
+                mock.patch.object(module.messagebox, "askyesno", return_value=True), \
+                mock.patch.object(module.threading, "Thread") as thread:
+            gui.sync_current_account_dialog()
+        payload, count, notify_user = thread.call_args.kwargs["args"]
+        self.assertEqual(count, 1)
+        self.assertTrue(notify_user)
+        self.assertEqual([row["user_id"] for row in payload["accounts"]], ["current-user"])
+        self.assertEqual(payload["accounts"][0]["password"], "verified-password")
 
     def test_credential_sync_worker_supports_silent_background_mode(self) -> None:
         source = legacy_tk_path("duty_gui.py").read_text(encoding="utf-8-sig")
@@ -3525,6 +3922,65 @@ try {
         self.assertIn("notify_user: bool = True", source)
         self.assertIn("notify_user=False", source)
         self.assertIn("if notify_user:", source)
+
+    def test_manual_credential_sync_rechecks_session_after_each_dialog(self) -> None:
+        module = duty_gui_module()
+        for stage in ("relay_confirm", "export_confirm", "export_path"):
+            for change in ("logout", "switch", "password", "unverified"):
+                with self.subTest(stage=stage, change=change):
+                    gui = object.__new__(module.DutyGui)
+                    gui.session = module.LoginSession("8", "current-user", "verified-password", verified=True)
+                    gui.account_for_credential_sync = mock.Mock(side_effect=lambda actor, user, password, **_kwargs: {
+                        "actor_no": actor, "user_id": user, "password": password,
+                        "display_name": "當次登入者", "name": "測試員", "id_number": ""})
+                    gui.status_text = mock.Mock()
+
+                    def change_session(*_args):
+                        if change == "logout":
+                            gui.session = None
+                        elif change == "switch":
+                            gui.session = module.LoginSession("9", "other-user", "other-password", verified=True)
+                        elif change == "password":
+                            gui.session.password = "changed-password"
+                        else:
+                            gui.session.verified = False
+                        return True
+
+                    def choose_path(**_kwargs):
+                        if stage == "export_path":
+                            change_session()
+                        return "fixture-credential-export.json"
+
+                    with mock.patch.object(module, "credential_sync_enabled", return_value=stage == "relay_confirm"), \
+                            mock.patch.object(module.messagebox, "askyesno", side_effect=(
+                                change_session if stage != "export_path" else lambda *_args: True)), \
+                            mock.patch.object(module.messagebox, "showinfo"), \
+                            mock.patch.object(module.filedialog, "asksaveasfilename", side_effect=choose_path) as choose, \
+                            mock.patch.object(module.threading, "Thread") as thread, \
+                            mock.patch.object(Path, "write_text") as write:
+                        gui.sync_current_account_dialog()
+                    thread.assert_not_called()
+                    write.assert_not_called()
+                    if stage == "export_confirm":
+                        choose.assert_not_called()
+
+    def test_manual_credential_export_keeps_unchanged_verified_session(self) -> None:
+        module = duty_gui_module()
+        gui = object.__new__(module.DutyGui)
+        gui.session = module.LoginSession("8", "current-user", "verified-password", verified=True)
+        gui.account_for_credential_sync = mock.Mock(side_effect=lambda actor, user, password, **_kwargs: {
+            "actor_no": actor, "user_id": user, "password": password,
+            "display_name": "當次登入者", "name": "測試員", "id_number": ""})
+        gui.status_text = mock.Mock()
+        with mock.patch.object(module, "credential_sync_enabled", return_value=False), \
+                mock.patch.object(module.messagebox, "askyesno", return_value=True), \
+                mock.patch.object(module.messagebox, "showinfo"), \
+                mock.patch.object(module.filedialog, "asksaveasfilename", return_value="fixture-credential-export.json"), \
+                mock.patch.object(Path, "write_text") as write:
+            gui.sync_current_account_dialog()
+        payload = json.loads(write.call_args.args[0])
+        self.assertEqual([row["user_id"] for row in payload["accounts"]], ["current-user"])
+        self.assertEqual(payload["accounts"][0]["password"], "verified-password")
 
     def test_build_driver_retries_only_with_its_own_temporary_profile(self) -> None:
         module = duty_rehearsal_module()

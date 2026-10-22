@@ -742,6 +742,21 @@ class SessionController(QObject):
             return
         if self._shutdown_admission:
             return
+        session = self._state.session
+        if session is None or not session.verified or not session.user_id or not session.password:
+            if notify_user:
+                self._set_status("請先登入後再同步本人帳密。", error=True)
+            return
+        if not session.actor_no:
+            if notify_user:
+                self._set_status("請先確認登入者番號後再同步本人帳密。", error=True)
+            return
+        if extra_account is not None and (
+            extra_account.get("user_id") != session.user_id
+            or extra_account.get("password") != session.password
+            or extra_account.get("actor_no") != session.actor_no
+        ):
+            return
         if not self._credential_sync_service.enabled:
             message = "尚未設定 NAS 帳密同步 URL 或 token。"
             self._credential_sync_warning = message
@@ -751,22 +766,22 @@ class SessionController(QObject):
             elif self.isLoggedIn:
                 self._set_status(f"登入成功；{message}", tone="warning")
             return
-        accounts = [dict(account, duty_pc_save_status="saved") for account in self._accounts]
-        if extra_account and extra_account.get("user_id") and extra_account.get("password"):
-            extra_account = dict(extra_account)
-            stored = self._account_by_user_id(extra_account["user_id"])
-            saved = stored is not None and stored.get("password") == extra_account["password"]
-            extra_account["duty_pc_save_status"] = (
-                "saved" if saved else "failed" if self._local_save_warning else "not_saved"
-            )
-            accounts = [
-                account
-                for account in accounts
-                if str(account.get("user_id", "") or "") != extra_account["user_id"]
-            ]
-            accounts.insert(0, dict(extra_account))
+        stored = self._account_by_user_id(session.user_id)
+        account = dict(extra_account or stored or {})
+        account.update(
+            actor_no=session.actor_no,
+            user_id=session.user_id,
+            password=session.password,
+            display_name=self._display_name or str(account.get("display_name", "") or ""),
+            name=session.actor_name or str(account.get("name", "") or ""),
+        )
+        saved = stored is not None and stored.get("password") == session.password
+        account["duty_pc_save_status"] = (
+            "saved" if saved else "failed" if self._local_save_warning else "not_saved"
+        )
+        accounts = [account]
         if notify_user:
-            self._set_status("帳密同步傳送中…")
+            self._set_status("本人帳密同步傳送中…")
 
         self._credential_sync_request_id += 1
         request_id = self._credential_sync_request_id
@@ -807,9 +822,9 @@ class SessionController(QObject):
         if not self._credential_sync_is_current(request_id):
             return
         self._credential_sync_warning = ""
-        self._credential_sync_result = f"NAS 已收到 {count} 組帳密。"
+        self._credential_sync_result = f"NAS 已收到 {count} 組本人帳密。"
         if notify_user:
-            self._set_status(f"已同步 {count} 組帳密。")
+            self._set_status("已同步本人帳密。")
         else:
             self._refresh_status()
 

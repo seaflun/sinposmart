@@ -156,9 +156,9 @@ Item {
         anchors.centerIn: parent
         width: Math.min(actionConfirmations.hostWindow.width - 72, 540)
         modal: true
-        title: "確認同步帳密"
+        title: "確認同步本人帳密"
         standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "開始同步"
+        acceptText: "同步本人帳密"
         onAccepted: {
             if (!actionConfirmations.backend.readOnlyAcceptance) {
                 actionConfirmations.backend.sessionController.syncSavedAccounts()
@@ -167,7 +167,7 @@ Item {
 
         Label {
             width: parent.width
-            text: "將透過已設定的 NAS relay 傳送這台電腦已儲存的勤務系統帳號、密碼與人員資料，供指定公務電腦取用。是否繼續？"
+            text: "將傳送目前成功登入值班人員本人的帳號、密碼與人員資料，供救護 Worker 使用；其他人員的帳密保持不變。是否繼續？"
             color: actionConfirmations.hostWindow.ink
             wrapMode: Text.Wrap
         }

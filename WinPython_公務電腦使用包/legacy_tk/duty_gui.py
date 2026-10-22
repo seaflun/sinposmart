@@ -2800,14 +2800,15 @@ class DutyGui(ctk.CTk):
 
     def sync_credentials_after_login(self, actor_no: str, user_id: str, password: str, name: str = "") -> None:
         try:
+            session = self.session
+            if (session is None or not session.verified or not session.actor_no
+                    or not session.user_id or not session.password
+                    or (actor_no, user_id, password) != (session.actor_no, session.user_id, session.password)):
+                return
             if not credential_sync_enabled():
                 return
             account = self.account_for_credential_sync(actor_no, user_id, password, name=name)
-            accounts = self.saved_accounts_for_credential_sync()
-            if account["user_id"] and account["password"]:
-                self.upsert_credential_sync_account(accounts, account)
-            if not accounts:
-                return
+            accounts = [account]
             payload = self.credential_sync_payload(
                 accounts,
                 sync_code=f"sinposmart-login-{datetime.now():%Y%m%d%H%M%S}-{uuid4().hex}",
@@ -2831,36 +2832,45 @@ class DutyGui(ctk.CTk):
 
     def sync_current_account_dialog(self) -> None:
         if not self.can_export_credentials():
-            messagebox.showwarning("尚未登入", "請先登入後再同步帳密。")
+            messagebox.showwarning("尚未登入", "請先登入後再同步本人帳密。")
             return
 
-        accounts = self.saved_accounts_for_credential_sync()
-        if not accounts:
-            messagebox.showwarning("資料不足", "目前沒有可匯出的已儲存帳號密碼。")
+        session = self.session
+        if not session.actor_no or not session.user_id or not session.password:
+            messagebox.showwarning("資料不足", "請先確認登入者番號與帳密後再同步本人帳密。")
             return
-
-        account_names = "、".join(account["user_id"] for account in accounts[:5])
-        if len(accounts) > 5:
-            account_names += f" 等 {len(accounts)} 組"
+        accounts = [self.account_for_credential_sync(
+            session.actor_no, session.user_id, session.password, name=session.actor_name)]
+        account_names = session.user_id
         payload = self.credential_sync_payload(accounts, sync_code=f"sinposmart-{datetime.now():%Y%m%d%H%M%S}-{uuid4().hex}")
+        credential_snapshot = (payload["actor_no"], payload["user_id"], payload["password"])
+
+        def session_still_matches() -> bool:
+            return (self.session is session and session.verified
+                    and (session.actor_no, session.user_id, session.password) == credential_snapshot)
+
         if credential_sync_enabled():
             if not messagebox.askyesno(
-                "傳送帳密同步",
-                f"將透過 NAS relay 傳送 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號。\n\n"
+                "同步本人帳密",
+                "將透過 NAS relay 傳送目前成功登入者本人的帳號、密碼、姓名與身分證字號，其他人員的帳密保持不變。\n\n"
                 f"帳號：{account_names}\n\n"
                 "NAS 只作為中繼暫存，公務電腦 worker 拉取後會刪除暫存資料。確定傳送？",
             ):
                 return
-            self.status_text.set("帳密同步傳送中。")
+            if not session_still_matches():
+                return
+            self.status_text.set("本人帳密同步傳送中。")
             threading.Thread(target=self._credential_sync_send_worker, args=(payload, len(accounts), True), daemon=True).start()
             return
 
         if not messagebox.askyesno(
-            "匯出帳密 JSON",
-            f"將匯出 {len(accounts)} 組已儲存的勤務系統帳號、密碼、姓名與身分證字號。\n\n"
+            "匯出本人帳密 JSON",
+            "將匯出目前成功登入者本人的帳號、密碼、姓名與身分證字號。\n\n"
             f"帳號：{account_names}\n\n"
             "這個 JSON 檔含有明文密碼與身分證字號，請只交給指定電腦使用。確定匯出？",
         ):
+            return
+        if not session_still_matches():
             return
 
         default_name = f"credential_sync_{datetime.now():%Y%m%d_%H%M%S}.json"
@@ -2870,7 +2880,7 @@ class DutyGui(ctk.CTk):
             initialfile=default_name,
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
-        if not path:
+        if not path or not session_still_matches():
             return
 
         export_path = Path(path)
@@ -2889,9 +2899,9 @@ class DutyGui(ctk.CTk):
     def _credential_sync_send_succeeded(self, count: int, response: dict[str, Any], notify_user: bool = True) -> None:
         ack_id = str(response.get("ack_id") or "")
         suffix = f"；同步代碼 {ack_id}" if ack_id else ""
-        self.status_text.set(f"帳密同步已送到 NAS relay：{count} 組{suffix}")
+        self.status_text.set(f"本人帳密同步已送到 NAS relay：{count} 組{suffix}")
         if notify_user:
-            messagebox.showinfo("傳送完成", f"已送出 {count} 組帳密同步資料，等待公務電腦 worker 拉取。")
+            messagebox.showinfo("傳送完成", "已送出本人帳密同步資料，等待公務電腦 worker 拉取。")
 
     def _credential_sync_send_failed(self, error: str, notify_user: bool = True) -> None:
         self.status_text.set(f"帳密同步傳送失敗：{error}")

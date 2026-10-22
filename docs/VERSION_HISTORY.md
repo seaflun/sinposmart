@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.22.1148` | 2026-10-22 11:48（台北時間） | 帳密同步限成功登入本人，保留 Worker 其他人員密碼；器材依檢視／繼續清點接續原筆，等待正式完成並核對明細、日期與紀錄 ID。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1148) |
 | `2026.10.22.1011` | 2026-10-22 10:11（台北時間） | 通報每輪強制重載列表，修正漏收新件與已讀假警告；器材清點缺少結束時間時顯示明確原因，保留原紀錄。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1011) |
 | `2026.10.22.0816` | 2026-10-22 08:16（台北時間） | 新增通報背景自動收取、獨立帳密驗證、當班／曆日累計卡片與雲端跨年度月檔自動建立。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.0816) |
 | `2026.10.20.0126` | 2026-10-20 01:26（台北時間） | 修正 GUI 退出過渡期造成更新誤判，等待自然退出並記錄原因代碼、PID、等待時間，安裝器獨立回報後台。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.20.0126) |

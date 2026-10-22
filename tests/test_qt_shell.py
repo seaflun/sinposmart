@@ -151,8 +151,11 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             control.is_displayed.return_value = True
             control.is_enabled.return_value = True
         driver = Mock()
+        driver.current_url = module.EQUIP_CHECK_LIST_URL
         document_generation = 0
         midnight = False
+        selected = False
+        checkbox.is_selected.side_effect = lambda: selected
 
         class Document:
             def __init__(self):
@@ -180,10 +183,25 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
         driver.get.side_effect = navigate
         driver.refresh.side_effect = navigate
         driver.find_element.side_effect = find_element
-        driver.execute_script.side_effect = lambda script, *_args: (
-            {"total": 1, "filtered": False, "page": 1, "page_size": 20}
-            if script == module.GRID_STATE_SCRIPT else None
-        )
+        def execute(script, *args):
+            nonlocal selected
+            if script == module.GRID_STATE_SCRIPT:
+                return {"total": 1, "filtered": False, "page": 1, "page_size": 20}
+            if "grid.dataItem" in script:
+                return {"id": "101", "vehicle": "test-car", "date": module.dt.date.today().isoformat()}
+            if script == module.EQUIPMENT_SELECTION_SCRIPT:
+                return {"ready": True, "selected": selected}
+            if "__sinposmartEquipmentDialog" in script:
+                return "測試確認"
+            if "document.readyState" in script:
+                return True
+            if script == "arguments[0].click();" and args[0] is check:
+                navigate()
+                driver.current_url = module.BASE_URL + "/CarEquipCheck/Take?id=101"
+            elif script == "arguments[0].click();" and args[0] is checkbox:
+                selected = True
+
+        driver.execute_script.side_effect = execute
         driver.find_elements.side_effect = find_confirm
         confirm.is_displayed.return_value = True
 
@@ -197,7 +215,8 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "每日點車已跨日"):
                 module.process_equip_checks(driver, WebDriverWait(driver, 0.2, poll_frequency=0.01))
         self.assertTrue(any(call.args[-1] is submit for call in driver.execute_script.call_args_list))
-        self.assertFalse(any(call.args[-1] is confirm for call in driver.execute_script.call_args_list))
+        self.assertFalse(any(call.args[0] == "arguments[0].click();" and call.args[-1] is confirm
+                             for call in driver.execute_script.call_args_list))
         clicked = [call.args[-1] for call in driver.execute_script.call_args_list
                    if call.args[0] == "arguments[0].click();"]
         self.assertEqual(clicked, [check, checkbox, submit])
@@ -27265,6 +27284,7 @@ if return_code != 0 or loaded:
 
     def test_session_controller_shutdown_waits_for_credential_sync_worker(self) -> None:
         from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
         from qt_app.controllers.session_controller import SessionController
 
         class SlowCredentialSyncService:
@@ -27293,6 +27313,8 @@ if return_code != 0 or loaded:
                     "display_name": "12番 測試員",
                 }
             ]
+            attempt = controller._state.begin_login()
+            controller._state.complete_login(attempt, LoginSession("12", "user12", "secret12", verified=True))
             controller.syncSavedAccounts()
             self.assertTrue(sync_service.started.wait(1))
             release_timer = threading.Timer(0.05, sync_service.release.set)
@@ -27308,6 +27330,7 @@ if return_code != 0 or loaded:
 
         from app_core.credential_repository import CredentialRepository
         from app_core.credential_sync_service import CredentialSyncError
+        from app_core.session import LoginSession
         from qt_app.controllers.session_controller import SessionController
 
         class FailingCredentialSyncService:
@@ -27324,6 +27347,8 @@ if return_code != 0 or loaded:
             controller._accounts = [
                 {"actor_no": "12", "user_id": "user12", "password": "secret12"}
             ]
+            attempt = controller._state.begin_login()
+            controller._state.complete_login(attempt, LoginSession("12", "user12", "secret12", verified=True))
             error_spy = QSignalSpy(controller.errorOccurred)
 
             controller.syncSavedAccounts()
@@ -27794,11 +27819,11 @@ class SavedLoginPersistenceTests(unittest.TestCase):
         self.addCleanup(controller.shutdown)
         return controller
 
-    def succeed(self, controller, *, remember=True, actor_no="7", user_id="probe-user"):
+    def succeed(self, controller, *, remember=True, actor_no="7", user_id="probe-user", login_method="manual"):
         from app_core.login_verifier import LoginResult
 
         attempt = controller._state.begin_login()
-        controller._pending_credentials[attempt] = (user_id, "synthetic-password", remember, "manual")
+        controller._pending_credentials[attempt] = (user_id, "synthetic-password", remember, login_method)
         controller._login_succeeded(attempt, LoginResult(actor_no, user_id, "測試人員"))
 
     def wait_sync(self, controller):
@@ -27839,7 +27864,88 @@ class SavedLoginPersistenceTests(unittest.TestCase):
         self.assertEqual([row["user_id"] for row in controller._accounts], ["old-user"])
         self.assertEqual(self.posted[0]["accounts"][0]["user_id"], "probe-user")
         self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "failed")
-        self.assertEqual(self.posted[0]["accounts"][1]["duty_pc_save_status"], "saved")
+        self.assertEqual(len(self.posted[0]["accounts"]), 1)
+
+    def test_successful_login_syncs_only_current_person_and_preserves_other_saved_accounts(self):
+        other = {"actor_no": "2", "user_id": "other-user", "password": "other-local-password"}
+        self.repository.save([other], "other-user")
+        original = self.path.read_bytes()
+        for login_method in ("manual", "automatic"):
+            with self.subTest(login_method=login_method):
+                controller = self.controller()
+                self.succeed(controller, remember=False, login_method=login_method)
+                self.wait_sync(controller)
+                self.assertEqual([row["user_id"] for row in self.posted[-1]["accounts"]], ["probe-user"])
+                self.assertEqual(self.posted[-1]["accounts"][0]["password"], "synthetic-password")
+                self.assertEqual(self.posted[-1]["accounts"][0]["duty_pc_save_status"], "not_saved")
+                self.assertEqual(self.path.read_bytes(), original)
+                self.assertEqual(controller._accounts[0]["password"], other["password"])
+
+    def test_manual_sync_uses_verified_session_password_instead_of_saved_passwords(self):
+        from app_core.session import LoginSession
+
+        self.repository.save([
+            {"actor_no": "7", "user_id": "probe-user", "password": "stale-local-password"},
+            {"actor_no": "2", "user_id": "other-user", "password": "other-local-password"},
+        ], "probe-user")
+        controller = self.controller()
+        original = self.path.read_bytes()
+        attempt = controller._state.begin_login()
+        controller._state.complete_login(attempt, LoginSession("7", "probe-user", "verified-password", verified=True))
+        controller.syncSavedAccounts()
+        self.wait_sync(controller)
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual([row["user_id"] for row in self.posted[0]["accounts"]], ["probe-user"])
+        self.assertEqual(self.posted[0]["accounts"][0]["password"], "verified-password")
+        self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "not_saved")
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_login_does_not_overwrite_another_person_password_already_changed_in_worker(self):
+        from app_core.credential_sync_service import CredentialSyncService
+
+        self.repository.save([
+            {"actor_no": "7", "user_id": "probe-user", "password": "old-current-password"},
+            {"actor_no": "2", "user_id": "other-user", "password": "stale-other-password"},
+        ], "probe-user")
+        worker_passwords = {"probe-user": "old-current-password", "other-user": "new-worker-password"}
+        posted = []
+
+        def merge(payload):
+            posted.append(payload)
+            for account in payload["accounts"]:
+                worker_passwords[account["user_id"]] = account["password"]
+            return {"ok": True}
+
+        controller = self.controller(sync_service=CredentialSyncService(poster=merge))
+        self.succeed(controller)
+        self.wait_sync(controller)
+        self.assertEqual(worker_passwords, {"probe-user": "synthetic-password", "other-user": "new-worker-password"})
+        self.assertEqual([row["user_id"] for row in posted[0]["accounts"]], ["probe-user"])
+        self.assertEqual(next(row for row in controller._accounts if row["user_id"] == "other-user")["password"],
+                         "stale-other-password")
+
+    def test_sync_rejects_extra_account_from_another_person(self):
+        controller = self.controller()
+        self.succeed(controller)
+        self.wait_sync(controller)
+        self.posted.clear()
+        controller._start_credential_sync(extra_account={
+            "actor_no": "2", "user_id": "other-user", "password": "other-password"}, notify_user=False)
+        self.wait_sync(controller)
+        self.assertEqual(self.posted, [])
+
+    def test_manual_sync_rejects_logged_out_and_unverified_sessions(self):
+        from app_core.session import LoginSession
+
+        self.repository.save([{"actor_no": "2", "user_id": "other-user", "password": "other-local-password"}], "other-user")
+        controller = self.controller()
+        for session in (None, LoginSession("7", "probe-user", "unverified-password", verified=False)):
+            with self.subTest(verified=session is not None):
+                controller._state.session = session
+                controller.syncSavedAccounts()
+                self.wait_sync(controller)
+                self.assertEqual(self.posted, [])
+                self.assertFalse(controller._credential_sync_workers)
 
     def test_successful_save_reports_saved_and_reopens_selection(self):
         controller = self.controller()
@@ -27861,12 +27967,14 @@ class SavedLoginPersistenceTests(unittest.TestCase):
         self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "not_saved")
 
     def test_deferred_actor_resolution_saves_and_reports_status(self):
+        self.repository.save([{"actor_no": "2", "user_id": "other-user", "password": "other-local-password"}], "other-user")
         controller = self.controller()
         self.succeed(controller, actor_no="")
-        self.assertFalse(self.path.exists())
+        self.assertEqual(self.posted, [])
         self.assertTrue(controller.resolve_actor_no("7", "測試人員"))
         self.wait_sync(controller)
         self.assertEqual(self.posted[0]["accounts"][0]["duty_pc_save_status"], "saved")
+        self.assertEqual([row["user_id"] for row in self.posted[0]["accounts"]], ["probe-user"])
 
     def test_nas_failure_survives_schedule_status_and_successful_retry_clears_it(self):
         self.nas_result = {"ok": False}

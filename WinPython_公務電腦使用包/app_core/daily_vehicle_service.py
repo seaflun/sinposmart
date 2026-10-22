@@ -307,7 +307,11 @@ class DailyVehicleService:
     @staticmethod
     def _safe_error(output: str) -> str:
         diagnostics = {
-            "equipment_end_time_missing": "器材清點紀錄缺少結束時間，請先至公務網站確認或重新清點該筆紀錄。",
+            "equipment_end_time_missing": "器材清點尚未結束，無法核對原始紀錄，請至公務網站檢查。",
+            "equipment_detail_unconfirmed": "器材清點明細尚未完整載入或紀錄不符，已停止送出。",
+            "equipment_continue_unavailable": "器材清點頁面未提供可用的「繼續清點」，已停止後續操作。",
+            "equipment_selection_unconfirmed": "器材清點未能確認所有項目已勾選，已停止送出。",
+            "equipment_confirmation_unconfirmed": "器材清點尚未確認儲存結果，請至公務網站檢查。",
             "query_spinner_timeout": "保養清點查詢的載入遮罩未結束，已停止後續操作。",
             "query_spinner_driver_error": "保養清點查詢無法確認載入遮罩狀態，已停止後續操作。",
             "query_source_changed_before_read": "保養清點查詢在讀取前的清單驗證未通過，已停止後續操作。",
