@@ -203,10 +203,10 @@ def normalize_duty_board_day(raw_day: Mapping[str, Any]) -> dict[str, Any] | Non
         if match is None or not isinstance(duty_nos, list):
             continue
         numbers = [str(number).strip() for number in duty_nos if str(number).strip()]
-        names = [
-            str(staff.get(number, {}).get("name", "")).strip()
+        members = [
+            (str(info.get("name", "")).strip(), info.get("role", ""))
             for number in numbers
-            if isinstance(staff.get(number, {}), Mapping)
+            if isinstance(info := staff.get(number, {}), Mapping)
         ]
         slots.append(
             {
@@ -214,7 +214,8 @@ def normalize_duty_board_day(raw_day: Mapping[str, Any]) -> dict[str, Any] | Non
                 "start_hour": int(match.group(1)),
                 "end_hour": int(match.group(2)),
                 "duty_nos": numbers,
-                "names": [name for name in names if name],
+                "names": [name for name, _role in members if name],
+                "roles": [role.strip() if isinstance(role, str) else "" for name, role in members if name],
             }
         )
     return {"roc_date": roc_day, "slots": slots}

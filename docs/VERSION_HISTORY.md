@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.22.2011` | 2026-10-22 20:11（台北時間） | 同步班表職稱，修正小隊長「姓＋小」與分隊長「姓＋分」簽收，維持下拉驗證與一般人員姓名對應。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.2011) |
 | `2026.10.22.1750` | 2026-10-22 17:50（台北時間） | 值班後台新增已收通報監看，回報當班／曆日計數、檢查時間、入表與已讀狀態，支援分片續傳、跨日去重及來源篩選。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1750) |
 | `2026.10.22.1148` | 2026-10-22 11:48（台北時間） | 帳密同步限成功登入本人，保留 Worker 其他人員密碼；器材依檢視／繼續清點接續原筆，等待正式完成並核對明細、日期與紀錄 ID。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1148) |
 | `2026.10.22.1011` | 2026-10-22 10:11（台北時間） | 通報每輪強制重載列表，修正漏收新件與已讀假警告；器材清點缺少結束時間時顯示明確原因，保留原紀錄。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1011) |

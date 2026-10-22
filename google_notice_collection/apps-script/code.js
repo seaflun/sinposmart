@@ -1,6 +1,7 @@
 var WRITE_RECEIPT_CACHE_PREFIX = "noticeWriteReceipt:";
 var WRITE_RECEIPT_TTL_SECONDS = 10 * 60;
 var MAX_RECORDS_PER_REQUEST = 200;
+var DUTY_RECIPIENT_CACHE_PREFIX = "noticeDutyRecipient:v2:";
 
 function doPost(e) {
   var startedAt = Date.now();
@@ -431,7 +432,7 @@ function getCurrentDutyRecipient() {
   var cache = null;
   try {
     cache = CacheService.getScriptCache();
-    var cachedRecipient = cache.get("noticeDutyRecipient:" + context.slotKey);
+    var cachedRecipient = cache.get(DUTY_RECIPIENT_CACHE_PREFIX + context.slotKey);
     if (cachedRecipient) {
       return { slotKey: context.slotKey, recipient: cachedRecipient };
     }
@@ -447,7 +448,7 @@ function getCurrentDutyRecipient() {
     var recipient = findDutyRecipient(board, context.rocDate, context.hour);
     if (recipient && cache) {
       try {
-        cache.put("noticeDutyRecipient:" + context.slotKey, recipient, 300);
+        cache.put(DUTY_RECIPIENT_CACHE_PREFIX + context.slotKey, recipient, 300);
       } catch (cacheErr) {
         console.log("Duty recipient cache save failed: " + cacheErr.toString());
       }
@@ -482,15 +483,22 @@ function findDutyRecipient(board, rocDate, hour) {
       var slot = slots[slotIndex];
       if (Number(slot.start_hour) !== hour) continue;
       var names = Array.isArray(slot.names) ? slot.names : [];
-      if (names.length !== 1) return "";
+      var dutyNos = Array.isArray(slot.duty_nos) ? slot.duty_nos : [];
+      if (names.length !== 1 || dutyNos.length !== 1) return "";
       var fullName = norm(names[0]);
-      return fullName.length > 1 ? fullName.slice(1) : "";
+      if (fullName.length < 2) return "";
+      var roles = Array.isArray(slot.roles) && slot.roles.length === names.length ? slot.roles : [];
+      var role = norm(roles[0]);
+      if (role === "小隊長") return fullName.charAt(0) + "小";
+      if (role === "分隊長") return fullName.charAt(0) + "分";
+      return fullName;
     }
   }
   return "";
 }
 
 function getValidDutyRecipient(sheet, recipient) {
+  recipient = norm(recipient);
   if (!recipient) return "";
   try {
     var rule = sheet.getRange(3, 6).getDataValidation();
@@ -498,8 +506,12 @@ function getValidDutyRecipient(sheet, recipient) {
     var sourceRange = criteria[0];
     if (!sourceRange || typeof sourceRange.getDisplayValues !== "function") return "";
     var names = sourceRange.getDisplayValues();
-    for (var index = 0; index < names.length; index++) {
-      if (norm(names[index][0]) === recipient) return recipient;
+    var candidates = [recipient, recipient.slice(1)];
+    for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+      if (!candidates[candidateIndex]) continue;
+      for (var index = 0; index < names.length; index++) {
+        if (norm(names[index][0]) === candidates[candidateIndex]) return candidates[candidateIndex];
+      }
     }
   } catch (err) {
     return "";

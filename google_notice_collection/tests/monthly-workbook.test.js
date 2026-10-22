@@ -348,3 +348,85 @@ test('a busy script lock never starts creating folders or monthly files', () => 
   assert.equal(f.events.copies.length, 0);
   assert.equal(f.events.foldersCreated.length, 0);
 });
+
+function dutyRecipientBoard(name, role, changes = {}) {
+  const slot = { start_hour: 19, duty_nos: ['2'], names: [name], ...changes };
+  if (role !== undefined) slot.roles = [role];
+  return { days: [{ roc_date: '1151022', slots: [slot] }] };
+}
+
+function recipientSheet(choices) {
+  return { getRange(row, column) {
+    assert.equal(row, 3);
+    assert.equal(column, 6);
+    return { getDataValidation: () => ({ getCriteriaValues: () => [
+      { getDisplayValues: () => choices.map((name) => [name]) },
+    ] }) };
+  } };
+}
+
+test('duty recipients use verified leadership roles and retain ordinary dropdown names', () => {
+  const s = fixture().sandbox;
+  const sheet = recipientSheet(['鄧分', '莊小', '孫小', '簡小', '張小', '宏澤', '小明']);
+  for (const [name, role, expected] of [
+    ['莊勝斌', '小隊長', '莊小'], ['孫領班', '小隊長', '孫小'],
+    ['簡永豐', '小隊長', '簡小'], ['張領班', '小隊長', '張小'],
+    ['鄧主管', '分隊長', '鄧分'], ['林宏澤', '隊員', '宏澤'],
+    ['王小明', '隊員', '小明'], ['林宏澤', undefined, '宏澤'],
+    ['莊小', undefined, '莊小'], ['宏澤', undefined, '宏澤'],
+  ]) {
+    const candidate = s.findDutyRecipient(dutyRecipientBoard(name, role), '1151022', 19);
+    assert.equal(s.getValidDutyRecipient(sheet, candidate), expected, `${name}/${role}`);
+  }
+});
+
+test('a surname alone never assigns an officer recipient or bypasses validation', () => {
+  const s = fixture().sandbox;
+  const sheet = recipientSheet(['莊小', '張小', '宏澤']);
+  for (const [name, role] of [
+    ['莊隊員', '隊員'], ['莊隊員', undefined], ['張隊員', '副小隊長'],
+    ['莊勝斌', undefined], ['許主管', '小隊長'],
+  ]) {
+    assert.equal(s.getValidDutyRecipient(sheet,
+      s.findDutyRecipient(dutyRecipientBoard(name, role), '1151022', 19)), '');
+  }
+  const ambiguous = dutyRecipientBoard('莊勝斌', '小隊長', { duty_nos: ['2', '10'] });
+  assert.equal(s.findDutyRecipient(ambiguous, '1151022', 19), '');
+  const misaligned = dutyRecipientBoard('莊勝斌', undefined, { roles: ['小隊長', '隊員'] });
+  assert.equal(s.getValidDutyRecipient(sheet, s.findDutyRecipient(misaligned, '1151022', 19)), '');
+  assert.equal(s.findDutyRecipient(dutyRecipientBoard('莊勝斌', '小隊長'), '1151023', 19), '');
+});
+
+test('officer signing writes a validated F value while keeping notice columns unchanged', () => {
+  const s = fixture().sandbox;
+  const sheet = recipientSheet(['莊小']);
+  const record = { sender: 'fixture sender', subject: 'fixture subject', content: 'fixture content' };
+  const batch = { groups: { day: { target: { sheet }, entries: [{ record, key: 'fixture-key', token: 'one' }] } }, tokenResults: {} };
+  let written;
+  s.getWritableRows = () => [47];
+  s.writeRows = (_sheet, _rows, values) => { written = values; return [{ success: true }]; };
+  const result = s.createWriteResult();
+  s.writeGroups(batch, {}, result,
+    s.findDutyRecipient(dutyRecipientBoard('莊勝斌', '小隊長'), '1151022', 19));
+  assert.deepEqual(Array.from(written[0]), ['fixture sender', 'fixture subject', 'fixture content', '莊小']);
+  assert.equal(result.success, 1);
+});
+
+test('the recipient cache cannot reuse a pre-role cropped name after deployment', () => {
+  const s = fixture().sandbox;
+  const cache = new Map([['noticeDutyRecipient:1151022|19', '勝斌']]);
+  s.CacheService = { getScriptCache: () => ({
+    get: (key) => cache.get(key) || null,
+    put: (key, value) => cache.set(key, value),
+  }) };
+  s.getDutyRecipientContext = () => ({ rocDate: '1151022', hour: 19, slotKey: '1151022|19' });
+  let reads = 0;
+  s.DriveApp.getFileById = () => ({ getBlob: () => ({ getDataAsString: () => {
+    reads++;
+    return JSON.stringify(dutyRecipientBoard('莊勝斌', '小隊長'));
+  } }) });
+  assert.equal(s.getCurrentDutyRecipient().recipient, '莊小');
+  assert.equal(s.getCurrentDutyRecipient().recipient, '莊小');
+  assert.equal(reads, 1);
+  assert.equal(cache.get('noticeDutyRecipient:1151022|19'), '勝斌');
+});

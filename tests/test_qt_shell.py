@@ -10950,6 +10950,51 @@ class OperationalSyncServiceTests(unittest.TestCase):
             self.assertEqual(payload["days"][0]["slots"][0]["start_hour"], 8)
             self.assertEqual(payload["days"][0]["slots"][0]["end_hour"], 10)
 
+    def test_board_payload_preserves_names_and_parallel_authoritative_roles(self) -> None:
+        from app_core.operational_sync_service import build_duty_board_payload
+
+        schedule = {"today": {"roc_date": "1151022",
+            "rows": [{"slot": "18-20", "columns": {"值班": ["1", "2", "6", "7"]}}],
+            "staff": {"1": {"name": "鄧測試", "role": "分隊長"},
+                      "2": {"name": "莊測試", "role": " 小隊長 "},
+                      "6": {"name": "莊一般", "role": "隊員"},
+                      "7": {"name": "其他人員", "role": "其他職稱"}}}}
+        slot = build_duty_board_payload(schedule)["days"][0]["slots"][0]
+
+        self.assertEqual(slot["duty_nos"], ["1", "2", "6", "7"])
+        self.assertEqual(slot["names"], ["鄧測試", "莊測試", "莊一般", "其他人員"])
+        self.assertEqual(slot["roles"], ["分隊長", "小隊長", "隊員", "其他職稱"])
+
+    def test_board_payload_role_alignment_survives_empty_names_and_invalid_staff(self) -> None:
+        from app_core.operational_sync_service import build_duty_board_payload
+
+        schedule = {"today": {"roc_date": "1151022",
+            "rows": [{"slot": "18-20", "columns": {"值班": ["1", "2", "3", "4", "5", "6", "7"]}}],
+            "staff": {"1": {"name": " ", "role": "分隊長"}, "2": None,
+                      "3": {"name": "缺職稱"}, "4": {"name": "無效職稱", "role": 5},
+                      "5": {"name": " 小隊人員 ", "role": "小隊長"},
+                      "6": {"name": "空職稱", "role": " "}}}}
+        slot = build_duty_board_payload(schedule)["days"][0]["slots"][0]
+
+        self.assertEqual(slot["duty_nos"], ["1", "2", "3", "4", "5", "6", "7"])
+        self.assertEqual(slot["names"], ["缺職稱", "無效職稱", "小隊人員", "空職稱"])
+        self.assertEqual(slot["roles"], ["", "", "小隊長", ""])
+
+    def test_board_payload_hash_tracks_role_changes_and_remains_stable(self) -> None:
+        from app_core.operational_sync_service import build_duty_board_payload
+
+        schedule = {"today": {"roc_date": "1151022",
+            "rows": [{"slot": "18-20", "columns": {"值班": ["2"]}}],
+            "staff": {"2": {"name": "莊測試", "role": "隊員"}}}}
+        first = build_duty_board_payload(schedule)
+        self.assertEqual(first, build_duty_board_payload(schedule))
+        schedule["today"]["staff"]["2"]["role"] = "小隊長"
+        changed = build_duty_board_payload(schedule)
+
+        self.assertNotEqual(first["content_hash"], changed["content_hash"])
+        self.assertEqual(changed, build_duty_board_payload(schedule))
+        self.assertEqual(first["days"][0]["slots"][0]["names"], changed["days"][0]["slots"][0]["names"])
+
     def test_managed_board_sync_is_synchronous_and_deduplicates_content(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
 
