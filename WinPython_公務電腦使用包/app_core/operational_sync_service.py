@@ -92,6 +92,10 @@ def _valid_heartbeat_payload(payload: Mapping[str, Any]) -> bool:
     return len(json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")) <= 4096
 
 
+def canonical_workstation_name() -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:64] or "sinposmart-duty-gui"
+
+
 class GuiHeartbeatReporter:
     """Coalesce producer pulses; network work never creates proof of UI liveness."""
 
@@ -101,7 +105,7 @@ class GuiHeartbeatReporter:
         self._service = service
         self._base = {
             "schema_version": 1,
-            "workstation": re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:64] or "sinposmart-duty-gui",
+            "workstation": canonical_workstation_name(),
             "component": component,
             "instance_id": instance_id if instance_id is not None else str(uuid4()),
             "process_started_at": process_started_at if process_started_at is not None else datetime.now(timezone.utc).isoformat(timespec="microseconds"),
@@ -252,6 +256,7 @@ class OperationalSyncService:
         self._event_poster = event_poster
         self._board_poster = board_poster
         self._event_lock = threading.Lock()
+        self._event_send_lock = threading.Lock()
         self._board_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_board_hash = ""
@@ -406,6 +411,13 @@ class OperationalSyncService:
 
     def build_event_payload(self, record_type: str, **fields: Any) -> dict[str, Any]:
         now = datetime.now()
+        if record_type == "notice_collection":
+            snapshot = fields.get("snapshot") or {}
+            report = snapshot.get("notice_collection") or {}
+            now = datetime.fromisoformat(report.get("reported_at", ""))
+            if now.tzinfo is None:
+                raise ValueError("Notice reports require an aware reported_at timestamp")
+            now = now.astimezone(timezone(timedelta(hours=8)))
         business_day = now.date() if now.hour >= 8 else (now - timedelta(days=1)).date()
         action = fields.get("action") if isinstance(fields.get("action"), Mapping) else {}
         action_fields = action.get("fields") if isinstance(action.get("fields"), Mapping) else {}
@@ -416,7 +428,7 @@ class OperationalSyncService:
             item_title = f"{item_title} ｜ {target}"
         payload = {
             "event_id": f"sinposmart-{now:%Y%m%d%H%M%S%f}-{uuid4().hex}",
-            "occurred_at": now.isoformat(timespec="seconds"),
+            "occurred_at": now.isoformat() if record_type == "notice_collection" else now.isoformat(timespec="seconds"),
             "fire_day": business_day.isoformat(),
             "record_type": str(record_type or ""),
             "trigger_type": str(fields.get("trigger_type") or ""),
@@ -445,41 +457,41 @@ class OperationalSyncService:
             payload["snapshot"].setdefault("app_version", version_path.read_text(encoding="utf-8-sig").strip())
         except OSError:
             payload["snapshot"].setdefault("app_version", "")
-        payload["snapshot"].setdefault("workstation", socket.gethostname())
+        if record_type == "notice_collection":
+            payload["snapshot"]["workstation"] = canonical_workstation_name()
+        else:
+            payload["snapshot"].setdefault("workstation", socket.gethostname())
         return sanitize_payload(payload)
 
     def send_event_payload(self, payload: dict[str, Any]) -> None:
-        with self._event_lock:
-            pending = [*self._load_pending_events(), sanitize_payload(payload)]
-            self._write_pending_events(pending)
-            sent_count = 0
-            try:
-                for index, entry in enumerate(pending, start=1):
+        self.persist_event_payload(payload)
+        self.drain_event_queue()
+
+    def drain_event_queue(self) -> None:
+        """Deliver existing IDs without holding the local admission lock during HTTP."""
+        with self._event_send_lock:
+            with self._event_lock:
+                pending = self._load_pending_events()
+            for entry in pending:
+                try:
                     response = self._post_event(entry)
                     if str(response.get("ack_id") or "") != str(entry.get("event_id") or ""):
-                        break
-                    sent_count = index
-            except Exception as exc:
-                remaining = pending[sent_count:]
-                self._write_pending_events(remaining)
-                self._record_sync_status(
-                    "event",
-                    "failed",
-                    self._safe_failure_detail(exc, "NAS 後台事件"),
-                    pending_count=len(remaining),
-                )
-                return
-            remaining = pending[sent_count:]
-            self._write_pending_events(remaining)
-            if remaining:
-                self._record_sync_status(
-                    "event",
-                    "failed",
-                    "NAS 後台事件同步失敗：未收到正確確認。",
-                    pending_count=len(remaining),
-                )
-                return
-            self._record_sync_status("event", "ok", "NAS 後台事件已同步。", pending_count=0)
+                        raise RuntimeError("NAS 後台事件同步失敗：未收到正確確認。")
+                except Exception as exc:
+                    with self._event_lock:
+                        remaining = self._load_pending_events()
+                    self._record_sync_status("event", "failed", self._safe_failure_detail(exc, "NAS 後台事件"),
+                                             pending_count=len(remaining))
+                    return
+                with self._event_lock:
+                    # Admission may have added more parts while this HTTP request was in flight.
+                    remaining = [item for item in self._load_pending_events()
+                                 if str(item.get("event_id") or "") != str(entry.get("event_id") or "")]
+                    self._write_pending_events(remaining)
+            with self._event_lock:
+                remaining = self._load_pending_events()
+            self._record_sync_status("event", "pending" if remaining else "ok",
+                "NAS 後台事件已安全排入本機佇列。" if remaining else "NAS 後台事件已同步。", pending_count=len(remaining))
 
     def persist_event_payload(self, payload: Mapping[str, Any]) -> None:
         """Durably queue one event without waiting for NAS HTTP delivery."""

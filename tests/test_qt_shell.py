@@ -10553,6 +10553,113 @@ class DiagnosticsServiceTests(unittest.TestCase):
 
 
 class OperationalSyncServiceTests(unittest.TestCase):
+    def test_event_journal_admission_does_not_wait_for_http_or_lose_concurrent_payload(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+        entered, release, admitted = threading.Event(), threading.Event(), threading.Event()
+        sent = []
+
+        def poster(payload):
+            sent.append(payload["event_id"])
+            entered.set()
+            release.wait(3)
+            return {"ack_id": payload["event_id"]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory), event_poster=poster)
+            first, second = (service.build_event_payload("login") for _ in range(2))
+            sender = threading.Thread(target=service.send_event_payload, args=(first,))
+            sender.start()
+            self.assertTrue(entered.wait(1))
+
+            def admit():
+                service.persist_event_payload(second)
+                admitted.set()
+
+            admission = threading.Thread(target=admit)
+            admission.start()
+            try:
+                self.assertTrue(admitted.wait(0.5), "Local admission must not wait for a NAS response")
+                self.assertIn(second["event_id"], service.pending_path.read_text(encoding="utf-8"))
+            finally:
+                release.set()
+                sender.join(3)
+                admission.join(3)
+            service.drain_event_queue()
+            self.assertEqual(sent, [first["event_id"], second["event_id"]])
+            self.assertEqual(service.pending_path.read_text(encoding="utf-8"), "")
+
+    def test_event_drain_worker_restarts_all_persisted_notice_parts_without_new_ids(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.workers.operational_sync_worker import OperationalSyncWorker
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory), event_poster=lambda _payload: {})
+            originals = []
+            for index in range(3):
+                payload = service.build_event_payload("notice_collection", status="running", snapshot={
+                    "notice_collection": {"reported_at": "2026-10-22T09:00:00+08:00", "part_index": index, "part_count": 3}})
+                service.persist_event_payload(payload)
+                originals.append(payload["event_id"])
+            sent = []
+            restarted = OperationalSyncService(Path(directory), event_poster=lambda payload: (
+                sent.append(payload["event_id"]) or {"ack_id": payload["event_id"]}))
+            with patch.object(restarted, "build_event_payload") as rebuild:
+                OperationalSyncWorker(1, restarted, "event_drain").run()
+            self.assertEqual(sent, originals)
+            rebuild.assert_not_called()
+            self.assertEqual(service.pending_path.read_text(encoding="utf-8"), "")
+
+    def test_notice_workstation_matches_heartbeat_canonical_identity(self) -> None:
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app_core.operational_sync_service.socket.gethostname", return_value="新坡值班台-" + "x" * 80
+        ):
+            service = OperationalSyncService(Path(directory), event_poster=lambda _payload: {})
+            heartbeat = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.22.1200")
+            payload = service.build_event_payload("notice_collection", snapshot={"notice_collection": {
+                "reported_at": "2026-10-22T09:00:00+08:00"}})
+            self.assertEqual(payload["snapshot"]["workstation"], heartbeat._base["workstation"])
+            self.assertLessEqual(len(payload["snapshot"]["workstation"]), 64)
+
+    def test_notice_report_transport_keeps_aware_time_typed_metadata_and_retry_identity(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+        sent = []
+        fail = [True]
+        def poster(payload):
+            sent.append(payload)
+            if fail[0]:
+                raise TimeoutError("fixture transport unavailable")
+            return {"ack_id": payload["event_id"]}
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory), event_poster=poster)
+            report = {"reported_at": "2026-10-22T00:05:00.123456+08:00", "unread_count": None,
+                      "new_count": 0, "records": [{"key": "a" * 64, "subject": "測試通報"}],
+                      "password": "fixture-not-for-transport"}
+            payload = service.build_event_payload("notice_collection", status="success",
+                snapshot={"run_id": "fixture-run", "notice_collection": report})
+            self.assertEqual(payload["occurred_at"], report["reported_at"])
+            self.assertEqual(payload["fire_day"], "2026-10-21")
+            self.assertIsNone(payload["snapshot"]["notice_collection"]["unread_count"])
+            self.assertIs(type(payload["snapshot"]["notice_collection"]["new_count"]), int)
+            self.assertEqual(len(payload["snapshot"]["notice_collection"]["records"]), 1)
+            self.assertNotIn("fixture-not-for-transport", str(payload))
+            self.assertTrue(payload["snapshot"]["workstation"])
+            service.send_event_payload(payload)
+            original_id = json.loads(service.pending_path.read_text(encoding="utf-8").splitlines()[0])["event_id"]
+            fail[0] = False
+            service.send_event_payload(service.build_event_payload("login"))
+            self.assertEqual(sent[0]["event_id"], original_id)
+            self.assertEqual(sent[1]["event_id"], original_id)
+            self.assertEqual(service.pending_path.read_text(encoding="utf-8"), "")
+
+    def test_notice_report_requires_aware_reported_time_without_changing_other_events(self) -> None:
+        from app_core.operational_sync_service import OperationalSyncService
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory), event_poster=lambda _payload: {})
+            with self.assertRaises(ValueError):
+                service.build_event_payload("notice_collection", snapshot={"notice_collection": {
+                    "reported_at": "2026-10-22T00:05:00"}})
+            self.assertTrue(service.build_event_payload("login")["occurred_at"])
+
     def test_heartbeat_redirect_never_contacts_redirect_destination(self) -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
@@ -11061,6 +11168,78 @@ class CredentialSyncServiceTests(unittest.TestCase):
 
 
 class QtShellTests(unittest.TestCase):
+    def test_notice_reports_use_operational_queue_without_duty_identity_and_respect_read_only(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        with tempfile.TemporaryDirectory() as directory:
+            notice = Mock()
+            notice.counts.return_value = (0, 0)
+            controller = AppController(repository=CredentialRepository(Path(directory) / "accounts.json", "test", None),
+                operational_sync_service=Mock(), notice_collection_service=notice, read_only_acceptance=True)
+            self.addCleanup(controller.shutdown)
+            controller._start_operational_sync = Mock()
+            payload = {"event_id": "durable-notice-fixture"}
+            controller._operational_sync_service.build_event_payload.return_value = payload
+            report = {"run_id": "34d199b1-aa93-4668-8080-b9394981184b", "state": "success",
+                      "reported_at": "2026-10-22T00:05:00+08:00", "message": "本輪沒有未讀通報。",
+                      "unread_count": 0, "records": []}
+            controller.noticeCollectionController.reportReady.emit(report)
+            controller._start_operational_sync.assert_not_called()
+            controller._operational_sync_service.persist_event_payload.assert_not_called()
+            controller._read_only_acceptance = False
+            controller.noticeCollectionController.reportReady.emit(report)
+            call = controller._start_operational_sync.call_args
+            self.assertEqual(call.args, ("event_drain",))
+            build = controller._operational_sync_service.build_event_payload.call_args
+            self.assertEqual(build.args, ("notice_collection",))
+            fields = build.kwargs
+            self.assertEqual(fields["trigger_type"], "notice_poll")
+            self.assertEqual(fields["snapshot"]["notice_collection"], report)
+            self.assertEqual(fields["snapshot"]["run_id"], report["run_id"])
+            self.assertEqual((fields["actor_no"], fields["user_id"], fields["display_name"]), ("", "", ""))
+            controller._operational_sync_service.persist_event_payload.assert_called_once_with(payload)
+
+    def test_notice_report_parts_are_durable_before_a_busy_operational_worker_can_start(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory), event_poster=lambda _payload: self.fail("No HTTP during admission"))
+            notice = Mock()
+            notice.counts.return_value = (0, 0)
+            controller = AppController(repository=CredentialRepository(Path(directory) / "accounts.json", "test", None),
+                operational_sync_service=service, notice_collection_service=notice, read_only_acceptance=True)
+            self.addCleanup(controller.shutdown)
+            controller._read_only_acceptance = False
+            controller._start_next_operational_sync = Mock()
+            try:
+                for index in range(3):
+                    controller._notice_collection_report_ready({"run_id": "34d199b1-aa93-4668-8080-b9394981184b",
+                        "state": "success", "reported_at": "2026-10-22T09:00:00+08:00", "message": "",
+                        "part_index": index, "part_count": 3, "records": []})
+                entries = [json.loads(line) for line in service.pending_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len({entry["event_id"] for entry in entries}), 3)
+                self.assertEqual([entry["snapshot"]["notice_collection"]["part_index"] for entry in entries], [0, 1, 2])
+            finally:
+                controller._operational_sync_queue.clear()
+                controller._read_only_acceptance = True
+
+    def test_notice_journal_failure_is_reported_without_interrupting_collection(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.app_controller import AppController
+        with tempfile.TemporaryDirectory() as directory:
+            service, notice = Mock(), Mock()
+            notice.counts.return_value = (0, 0)
+            service.persist_event_payload.side_effect = OSError("synthetic journal unavailable")
+            controller = AppController(repository=CredentialRepository(Path(directory) / "accounts.json", "test", None),
+                operational_sync_service=service, notice_collection_service=notice, read_only_acceptance=True)
+            self.addCleanup(controller.shutdown)
+            controller._read_only_acceptance = False
+            controller._start_operational_sync = Mock()
+            controller._notice_collection_report_ready({"state": "success", "run_id": "fixture-run", "message": ""})
+            controller._start_operational_sync.assert_not_called()
+            self.assertEqual(service.record_unhandled_failure.call_args.args[0], "event")
+
     @classmethod
     def setUpClass(cls) -> None:
         from PySide6.QtWidgets import QApplication
@@ -11069,6 +11248,14 @@ class QtShellTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.addCleanup(self._flush_qt_deferred_deletes)
+        from qt_app.controllers.notice_collection_controller import NoticeCollectionController
+
+        def notice_controller_without_background_poll(*args, **kwargs):
+            kwargs["timer_start"] = False
+            return NoticeCollectionController(*args, **kwargs)
+
+        self.enterContext(patch("qt_app.controllers.app_controller.NoticeCollectionController",
+            side_effect=notice_controller_without_background_poll))
 
     def test_notice_fixed_account_lookup_survives_logout_without_changing_selection(self) -> None:
         from app_core.credential_repository import CredentialRepository

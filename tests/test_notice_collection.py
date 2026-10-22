@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -51,6 +52,85 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_report_bootstraps_legacy_counts_without_inventing_subject_or_read_confirmation(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "runtime_outputs/notice_collection/state.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"schema_version": 1, "collected": {
+                "1": "2026-10-21T09:00:00+08:00"}, "pending": []}), encoding="utf-8")
+            service = NoticeCollectionService(root, browser=FakeBrowser())
+            now = datetime(2026, 10, 21, 10, tzinfo=timezone(timedelta(hours=8)))
+            parts = service.report_parts("067f3bf8-c404-4431-8607-1f78d2187d80", "running", now,
+                                         started_at=now, next_check=now + timedelta(minutes=3))
+            self.assertEqual(parts[0]["records"], [{"key": hashlib.sha256(b"1").hexdigest(),
+                "subject": "", "received_at": "2026-10-21T09:00:00+08:00", "read_state": "unknown"}])
+            self.assertIsNone(parts[0]["unread_count"])
+            self.assertEqual(parts[0]["calendar_day"], "2026-10-21")
+
+    def test_report_retains_subject_and_separates_write_confirmation_from_failed_read_marker(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        browser = FakeBrowser([notice(1), notice(2)])
+        browser.mark_read = lambda _rows, cancel=None: []
+        def poster(payload):
+            return ({"status": "success", "existingKeys": ["2"]} if payload["action"] == "checkExisting"
+                    else write_response(payload, ["1"]))
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            started = datetime(2026, 10, 21, 23, 59)
+            result = service.collect("fixture-private-password", started)
+            parts = service.report_parts("067f3bf8-c404-4431-8607-1f78d2187d80", result.status,
+                started, started_at=started, next_check=started + timedelta(minutes=1), result=result)
+            self.assertEqual(parts[0]["state"], "partial")
+            self.assertEqual((parts[0]["new_count"], parts[0]["marked_read_count"], parts[0]["pending_read_count"]), (1, 0, 2))
+            self.assertEqual(parts[0]["records"][0]["subject"], "測試主旨")
+            self.assertEqual(parts[0]["records"][0]["read_state"], "pending")
+            self.assertEqual(parts[0]["error_stage"], "mark_read")
+            saved = service.state_path.read_text(encoding="utf-8")
+            self.assertNotIn("fixture-private-password", saved + str(parts))
+            self.assertNotIn("有效通報內文", saved + str(parts))
+            self.assertEqual(len(parts[0]["records"]), 1)  # Cloud duplicates are not this PC's new receipts.
+
+    def test_reporting_chunks_all_records_and_preserves_confirmed_writes_after_later_failure(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError
+        calls = [0]
+        def poster(payload):
+            if payload["action"] == "checkExisting":
+                calls[0] += 1
+                if calls[0] == 2:
+                    raise TimeoutError("fixture should never be exported")
+                return {"status": "success", "existingKeys": []}
+            return write_response(payload, [row["key"] for row in payload["records"]])
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser([notice(i) for i in range(201)]), poster=poster)
+            now = datetime(2026, 10, 21, 23, 59)
+            with self.assertRaises(NoticeCollectionError):
+                service.collect("fixture-private-password", now)
+            result = service.last_result
+            self.assertEqual((result.status, len(result.written_keys)), ("partial", 200))
+            report = service.report_parts("067f3bf8-c404-4431-8607-1f78d2187d80", result.status,
+                now + timedelta(minutes=2), started_at=now, next_check=now + timedelta(minutes=31), result=result)[0]
+            self.assertEqual((report["calendar_day"], report["new_count"]), ("2026-10-22", 200))
+            self.assertEqual(len(report["records"]), 200)  # Previous-date receipts still appear in this result.
+            self.assertTrue(all(row["received_at"].startswith("2026-10-21T23:59") for row in report["records"]))
+            self.assertEqual(report["pending_read_count"], 200)
+            self.assertNotIn("fixture should never be exported", str(report))
+            self.assertEqual(service.counts(datetime(2026, 10, 22, 0, 1)), (0, 0))
+
+    def test_bootstrap_splits_more_than_two_hundred_records_without_truncation(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            service._state["collected"] = {str(i): "2026-10-21T09:00:00+08:00" for i in range(401)}
+            now = datetime(2026, 10, 21, 10)
+            parts = service.report_parts("067f3bf8-c404-4431-8607-1f78d2187d80", "running", now,
+                started_at=now, next_check=now + timedelta(minutes=3))
+            self.assertEqual([len(part["records"]) for part in parts], [200, 200, 1])
+            self.assertEqual([part["part_index"] for part in parts], [0, 1, 2])
+            self.assertTrue(all(part["part_count"] == 3 for part in parts))
+            self.assertEqual(len({row["key"] for part in parts for row in part["records"]}), 401)
+
     def test_no_unread_finishes_without_content_or_apps_script(self):
         from app_core.notice_collection_service import NoticeCollectionService
 
@@ -286,6 +366,12 @@ class NoticeCollectionTests(unittest.TestCase):
             self.assertEqual(result.error_count, 0)
             self.assertEqual(result.marked_read_count, 0)
             self.assertEqual(browser.events, ["scan"])
+            parts = service.report_parts("067f3bf8-c404-4431-8607-1f78d2187d80", result.status,
+                datetime(2026, 10, 21, 9, 3), next_check=datetime(2026, 10, 21, 9, 6), result=result)
+            self.assertEqual(parts[0]["records"][0]["read_state"], "confirmed")
+            self.assertEqual(parts[0]["pending_read_count"], 0)
+            restarted = NoticeCollectionService(root, browser=FakeBrowser())
+            self.assertEqual(restarted._state["confirmed"]["1"]["read_state"], "confirmed")
 
     def test_requests_are_chunked_to_existing_two_hundred_record_limit(self):
         from app_core.notice_collection_service import NoticeCollectionService

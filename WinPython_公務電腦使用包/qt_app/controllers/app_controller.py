@@ -275,6 +275,7 @@ class AppController(QObject):
             read_only_acceptance=self._read_only_acceptance,
         )
         self._session_controller.noticePasswordSaved.connect(self._notice_collection_controller.verifyLogin)
+        self._notice_collection_controller.reportReady.connect(self._notice_collection_report_ready)
         self._notice_collection_controller.verificationStatusChanged.connect(
             lambda: self._session_controller.set_notice_verification_status(
                 self._notice_collection_controller.verificationStatus,
@@ -2858,6 +2859,25 @@ class AppController(QObject):
             return ""
         month_digits = "".join(character for character in str(month) if character.isdigit())
         return f"{self._rest_monthly_controller.rocYear:03d}{int(month_digits or '0'):02d}"
+
+    @Slot(object)
+    def _notice_collection_report_ready(self, report: dict) -> None:
+        if self._read_only_acceptance:
+            return
+        fields = {
+            "status": report["state"], "trigger_type": "notice_poll",
+            "actor_no": "", "user_id": "", "display_name": "",
+            "content": "通報收取檢查", "error": report["message"] if report["state"] in {"failed", "partial", "uncertain"} else "",
+            "snapshot": {"run_id": report["run_id"], "notice_collection": report},
+        }
+        try:
+            payload = self._operational_sync_service.build_event_payload("notice_collection", **fields)
+            self._operational_sync_service.persist_event_payload(payload)
+        except Exception as exc:
+            self._operational_sync_service.record_unhandled_failure("event", exc)
+            return
+        if not self._worker_admissions_closed:
+            self._start_operational_sync("event_drain")
 
     def _send_operational_event(self, record_type: str, **fields) -> None:
         if self._read_only_acceptance:

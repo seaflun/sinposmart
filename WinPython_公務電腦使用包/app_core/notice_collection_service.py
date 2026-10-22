@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import copy
+import hashlib
 import json
 import re
 import urllib.request
@@ -44,11 +45,14 @@ class NoticeShift:
 class NoticeCollectionResult:
     checked_at: datetime
     written_keys: list[str] = field(default_factory=list)
-    unread_count: int = 0
-    marked_read_count: int = 0
+    unread_count: int | None = 0
+    marked_read_count: int | None = 0
     error_count: int = 0
     status: str = "success"
     message: str = "本次沒有未讀通報。"
+    pending_write_count: int | None = None
+    pending_read_count: int | None = None
+    error_stage: str = ""
 
 
 def _local_time(value: datetime) -> datetime:
@@ -113,7 +117,11 @@ class NoticeCollectionService:
         self._now = now_factory or (lambda: datetime.now(TAIPEI))
         self.state_path = self.package_root / "runtime_outputs" / "notice_collection" / "state.json"
         self._state_error = False
-        self._state = {"schema_version": 1, "collected": {}, "pending": []}
+        self.last_result: NoticeCollectionResult | None = None
+        self._collection_stage = "scan"
+        self._confirmed_for_read: set[str] = set()
+        self._marked_for_read: set[str] = set()
+        self._state = {"schema_version": 1, "collected": {}, "pending": [], "confirmed": {}}
         if self.state_path.exists():
             try:
                 state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -136,6 +144,14 @@ class NoticeCollectionService:
                             or not all(isinstance(key, str) for key in repair_keys)
                             or not set(repair_keys) <= {row["key"] for row in intent["records"]}):
                         raise ValueError("invalid pending repair classification")
+                metadata = state.setdefault("confirmed", {})
+                if not isinstance(metadata, dict):
+                    raise ValueError("invalid confirmed metadata")
+                for key, record in metadata.items():
+                    if (key not in state["collected"] or not isinstance(record, dict)
+                            or not isinstance(record.get("subject", ""), str)
+                            or record.get("read_state", "unknown") not in {"confirmed", "pending", "unknown"}):
+                        raise ValueError("invalid confirmed record")
                 self._state = state
             except (OSError, ValueError, KeyError, TypeError, AttributeError, NoticeCollectionError):
                 self._state_error = True
@@ -167,6 +183,27 @@ class NoticeCollectionService:
         )
 
     def collect(self, password: str, received_at: datetime, cancel=None) -> NoticeCollectionResult:
+        received_at = _local_time(received_at)
+        before = set(self._state["collected"])
+        self.last_result = NoticeCollectionResult(received_at, unread_count=None, marked_read_count=None)
+        self._confirmed_for_read, self._marked_for_read = set(), set()
+        self._collection_stage = "scan"
+        try:
+            return self._collect(password, received_at, cancel)
+        except Exception as exc:
+            result = self.last_result
+            result.written_keys = sorted(set(result.written_keys) | (set(self._state["collected"]) - before))
+            result.status = ("uncertain" if self._state["pending"] else
+                             "partial" if result.written_keys else "failed")
+            result.error_stage = ("state" if isinstance(exc, _NoticeStateError) or self._state_error
+                                  else "login" if isinstance(exc, NoticeLoginRequired)
+                                  else self._collection_stage if isinstance(exc, NoticeCollectionError) else "unknown")
+            if result.unread_count is not None:
+                result.pending_write_count = self._pending_write_count()
+                result.pending_read_count = len((self._confirmed_for_read | set(result.written_keys)) - self._marked_for_read)
+            raise
+
+    def _collect(self, password: str, received_at: datetime, cancel=None) -> NoticeCollectionResult:
         self._check_cancel(cancel)
         if self._state_error:
             raise NoticeCollectionError("通報收取紀錄無法讀取，請先確認本機紀錄；未送出通報。")
@@ -176,10 +213,14 @@ class NoticeCollectionService:
         scanned = self._browser.scan_unread(password, cancel=cancel)
         rows = list({self._record_key(row): dict(row) for row in scanned}.values())
         received_at = _local_time(received_at)
-        result = NoticeCollectionResult(received_at, unread_count=len(rows))
+        result = self.last_result
+        result.unread_count, result.marked_read_count = len(rows), 0
+        result.pending_write_count, result.pending_read_count = 0, 0
         if not rows and not self._state["pending"]:
             return result
+        self._collection_stage = "write"
         confirmed, recovered = self._recover_pending(cancel)
+        self._confirmed_for_read = confirmed
         result.written_keys.extend(recovered)
         blocked = {row["key"] for intent in self._state["pending"] for row in intent["records"]}
         for offset in range(0, len(rows), MAX_RECORDS):
@@ -187,6 +228,7 @@ class NoticeCollectionService:
             if not batch:
                 continue
             self._check_cancel(cancel)
+            self._collection_stage = "write"
             existing, repairs = self._check_existing(batch)
             confirmed.update(existing)
             records = []
@@ -194,20 +236,24 @@ class NoticeCollectionService:
                 if row["key"] in existing:
                     continue
                 self._check_cancel(cancel)
+                self._collection_stage = "scan"
                 try:
                     content = str(self._browser.read_content(row, cancel=cancel)).strip()
                 except NoticeLoginRequired:
                     raise
                 except Exception:
                     result.error_count += 1
+                    result.error_stage = "scan"
                     continue
                 if content in ("", "內文抓取失敗", "讀取失敗", "權限限制"):
                     result.error_count += 1
+                    result.error_stage = "scan"
                     continue
                 records.append({**self._metadata(row), "content": content,
                                 "receivedAt": received_at.strftime("%Y.%m.%d.%H%M")})
             if records:
                 self._check_cancel(cancel)
+                self._collection_stage = "state"
                 intent = {"request_id": "notice-" + uuid4().hex,
                           "received_at": received_at.isoformat(),
                           "records": [self._metadata(row) for row in records],
@@ -215,6 +261,7 @@ class NoticeCollectionService:
                 state = copy.deepcopy(self._state)
                 state["pending"].append(intent)
                 self._persist(state)
+                self._collection_stage = "write"
                 payload = {"action": "writeRecords", "requestId": intent["request_id"], "records": records}
                 try:
                     handled, written = self._write_with_recovery(intent, payload, cancel)
@@ -228,15 +275,37 @@ class NoticeCollectionService:
         to_mark = [row for row in rows if row["key"] in confirmed]
         if to_mark:
             self._check_cancel(cancel)
+            self._collection_stage = "mark_read"
             try:
                 marked = set(self._browser.mark_read(to_mark, cancel=cancel))
                 expected = {row["key"] for row in to_mark}
                 result.marked_read_count = len(marked & expected)
                 result.error_count += len(expected - marked)
+                self._marked_for_read = marked & expected
             except Exception:
                 result.error_count += len(to_mark)
+            result.pending_read_count = len({row["key"] for row in to_mark} - self._marked_for_read)
+            if result.pending_read_count:
+                result.error_stage = "mark_read"
+        # A complete unread scan also confirms recovered receipts already absent
+        # from that list, without claiming we marked them during this attempt.
+        confirmed_read = self._marked_for_read | (confirmed - {row["key"] for row in rows})
+        state = copy.deepcopy(self._state)
+        changed = False
+        for key in confirmed_read:
+            if key in state["collected"]:
+                record = state.setdefault("confirmed", {}).setdefault(key, {})
+                if record.get("read_state") != "confirmed":
+                    record["read_state"] = "confirmed"
+                    changed = True
+        if changed:
+            self._collection_stage = "state"
+            self._persist(state)
         pending_keys = {row["key"] for intent in self._state["pending"] for row in intent["records"]}
         result.error_count += len({row["key"] for row in rows} & (blocked - confirmed))
+        result.pending_write_count = len(pending_keys)
+        if pending_keys:
+            result.error_stage = "write"
         result.status = "uncertain" if pending_keys else "partial" if result.error_count else "success"
         result.message = (f"已確認收取 {len(result.written_keys)} 則通報。" if not result.error_count
                           else "部分通報尚未完成收取或已讀確認，將保留未完成狀態。")
@@ -350,9 +419,63 @@ class NoticeCollectionService:
         newly_written = sorted(written - set(intent.get("repair_keys", [])) - state["collected"].keys())
         for key in newly_written:
             state["collected"][key] = intent["received_at"]
+            row = next(row for row in intent["records"] if row["key"] == key)
+            state.setdefault("confirmed", {})[key] = {
+                "subject": str(row.get("subject", ""))[:240], "read_state": "pending",
+            }
         state["pending"] = [p for p in state["pending"] if p["request_id"] != intent["request_id"]]
         self._persist(state)
         return handled, newly_written
+
+    def _pending_write_count(self) -> int:
+        return len({row["key"] for intent in self._state["pending"] for row in intent["records"]})
+
+    def report_parts(self, run_id: str, state: str, reported_at: datetime, *, started_at=None,
+                     next_check: datetime, shift: NoticeShift | None = None,
+                     result: NoticeCollectionResult | None = None, error_stage: str = "") -> list[dict]:
+        """Export only confirmed metadata, keeping original receipt times and typed unknowns."""
+        now = _local_time(reported_at)
+        terminal = state not in {"running", "waiting", "missing_credentials"}
+        if self._state_error:
+            error_stage, result = "state", None
+        raw_new = set(result.written_keys) if result is not None else set()
+        records = []
+        for key, received in self._state["collected"].items() if not self._state_error else ():
+            received_at = _local_time(datetime.fromisoformat(received))
+            if (received_at.date() != now.date() and key not in raw_new
+                    and not (shift is not None and _local_time(shift.start) <= received_at < _local_time(shift.end))):
+                continue
+            metadata = self._state.get("confirmed", {}).get(key, {})
+            records.append({"key": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                "subject": str(metadata.get("subject", ""))[:240], "received_at": received_at.isoformat(),
+                "read_state": metadata.get("read_state", "unknown")})
+        records.sort(key=lambda row: (row["received_at"], row["key"]))
+        new_keys = {hashlib.sha256(key.encode("utf-8")).hexdigest() for key in raw_new}
+        messages = {
+            "running": "正在檢查未讀通報。", "waiting": "等待公務作業完成後檢查通報。",
+            "missing_credentials": "通報專用帳號尚未完成密碼設定。",
+            "success": "本輪通報檢查已完成。", "partial": "部分通報尚未完成入表或已讀確認。",
+            "uncertain": "通報寫入收據仍待確認，不會重複送出。",
+            "failed": "通報檢查未完成，請確認網站、登入或本機紀錄狀態。",
+        }
+        count = max(1, (len(records) + MAX_RECORDS - 1) // MAX_RECORDS)
+        report = {"schema_version": 1, "run_id": run_id, "part_count": count, "state": state,
+            "started_at": _local_time(started_at).isoformat() if started_at is not None else "",
+            "completed_at": now.isoformat() if terminal else "", "reported_at": now.isoformat(),
+            "next_check_at": _local_time(next_check).isoformat(), "calendar_day": now.date().isoformat(),
+            "shift_start": _local_time(shift.start).isoformat() if shift is not None else "",
+            "shift_end": _local_time(shift.end).isoformat() if shift is not None else "",
+            "unread_count": result.unread_count if result is not None else None,
+            "new_count": len(raw_new) if result is not None else None,
+            "marked_read_count": result.marked_read_count if result is not None else None,
+            "pending_write_count": result.pending_write_count if result is not None else None,
+            "pending_read_count": result.pending_read_count if result is not None else None,
+            "error_stage": error_stage or (result.error_stage if result is not None else ""),
+            "message": messages[state]}
+        return [{**report, "part_index": index,
+                 "records": records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS],
+                 "new_keys": sorted(new_keys & {row["key"] for row in records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS]})}
+                for index in range(count)]
 
     def _persist(self, state: dict) -> None:
         try:

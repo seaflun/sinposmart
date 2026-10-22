@@ -34,6 +34,8 @@ class OperationalSyncWorker(QObject):
         try:
             if self.operation == "event":
                 self._send_event()
+            elif self.operation == "event_drain":
+                self.service.drain_event_queue()
             elif self.operation == "board":
                 self._sync_board()
         except Exception as exc:

@@ -1,8 +1,9 @@
 """Independent notice polling; browser and network work stay off the GUI thread."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
@@ -10,6 +11,7 @@ from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
     TAIPEI,
     NoticeCollectionError,
+    NoticeCollectionResult,
     NoticeLoginRequired,
     current_shift,
     next_check_at,
@@ -28,6 +30,7 @@ class _NoticeCollectionJob(QThread):
         self._password = password
         self._received_at = received_at
         self.verify_only = bool(verify_only)
+        self.poll_outcome: tuple[str, object] | None = None
 
     def run(self) -> None:
         try:
@@ -38,17 +41,22 @@ class _NoticeCollectionJob(QThread):
                 result = self._service.collect(
                     self._password, self._received_at, cancel=self.isInterruptionRequested,
                 )
+                self.poll_outcome = ("collected", result)
                 self.collected.emit(result)
         except NoticeLoginRequired as exc:
-            self.failed.emit(self._safe_message(exc), "warning")
+            self._report_failure(self._safe_message(exc), "warning")
         except NoticeCollectionError as exc:
-            self.failed.emit(self._safe_message(exc), "error")
+            self._report_failure(self._safe_message(exc), "error")
         except Exception:
             message = ("通報帳號登入驗證失敗，請檢查帳號密碼或網站狀態。" if self.verify_only
                        else "通報收取未完成，請確認網站與連線狀態。")
-            self.failed.emit(message, "error")
+            self._report_failure(message, "error")
         finally:
             self._password = ""
+
+    def _report_failure(self, message: str, tone: str) -> None:
+        self.poll_outcome = ("failed", (message, tone))
+        self.failed.emit(message, tone)
 
     def _safe_message(self, error: Exception) -> str:
         message = str(error)
@@ -60,6 +68,7 @@ class _NoticeCollectionJob(QThread):
 class NoticeCollectionController(QObject):
     stateChanged = Signal()
     verificationStatusChanged = Signal()
+    reportReady = Signal(object)
 
     def __init__(
         self, service, saved_account_lookup: Callable, busy_reason: Callable,
@@ -84,6 +93,9 @@ class NoticeCollectionController(QObject):
         self._verification_status = "尚未驗證通報帳號。"
         self._verification_state = "configured"
         self._verification_pending = False
+        self._poll_run_id = ""
+        self._poll_started_at = None
+        self._last_wait_report_at = None
         self._next_check = self._now()
         self._timer = QTimer(self)
         self._timer.setInterval(1_000)
@@ -201,6 +213,10 @@ class NoticeCollectionController(QObject):
                 self._set_verification_status(f"等待{reason}完成後驗證通報帳號。", "waiting")
                 return
             self._set_notice(f"等待{reason}完成後檢查通報。", "muted")
+            if self._last_wait_report_at is None or now - self._last_wait_report_at >= timedelta(seconds=60):
+                self._ensure_poll_run()
+                self._emit_report("waiting", error_stage="busy", next_check=now + timedelta(seconds=60))
+                self._last_wait_report_at = now
             return
         try:
             account = self._lookup(FIXED_NOTICE_ACCOUNT)
@@ -218,6 +234,9 @@ class NoticeCollectionController(QObject):
                 self._set_verification_status(f"尚未儲存通報帳號 {FIXED_NOTICE_ACCOUNT} 的密碼，無法驗證登入。", "error")
                 return
             self._set_notice(f"請先儲存通報帳號 {FIXED_NOTICE_ACCOUNT} 的密碼。", "warning")
+            self._ensure_poll_run()
+            self._emit_report("missing_credentials", error_stage="configuration")
+            self._clear_poll_run()
             return
         if verify_only:
             self._verification_pending = False
@@ -230,20 +249,61 @@ class NoticeCollectionController(QObject):
         job.failed.connect(self._verification_failed if verify_only else self._failed)
         job.finished.connect(self._job_finished)
         self._job = job
+        if not verify_only:
+            self._ensure_poll_run()
+            self._poll_started_at = now
+            self._emit_report("running")
         self._refresh_status()
         self.stateChanged.emit()
         job.start()
 
     @Slot(object)
     def _collected(self, result) -> None:
+        if not self._poll_run_id:
+            return
         self._notice = str(result.message or "")
         self._status_tone = (
             "success" if result.status == "success" and not result.error_count else "warning"
         )
+        state = result.status if result.status in {"success", "partial", "uncertain"} else "failed"
+        self._emit_report(state, result=result)
+        self._clear_poll_run()
 
     @Slot(str, str)
     def _failed(self, message: str, tone: str) -> None:
+        if not self._poll_run_id:
+            return
         self._notice, self._status_tone = message, tone
+        result = getattr(self._service, "last_result", None)
+        if not isinstance(result, NoticeCollectionResult) or result.checked_at != self._poll_started_at:
+            result = None
+        state = result.status if result is not None and result.status in {"partial", "uncertain"} else "failed"
+        self._emit_report(state, result=result,
+                          error_stage=(result.error_stage if result is not None else "login" if tone == "warning" else "unknown"))
+        self._clear_poll_run()
+
+    def _ensure_poll_run(self) -> None:
+        if not self._poll_run_id:
+            self._poll_run_id = str(uuid4())
+
+    def _clear_poll_run(self) -> None:
+        self._poll_run_id = ""
+        self._poll_started_at = None
+        self._last_wait_report_at = None
+
+    def _emit_report(self, state: str, *, result=None, error_stage="", next_check=None) -> None:
+        if self._read_only or not self._poll_run_id:
+            return
+        now = self._now()
+        try:
+            parts = self._service.report_parts(self._poll_run_id, state, now,
+                started_at=self._poll_started_at, next_check=next_check or next_check_at(now),
+                shift=current_shift(self._schedule_data, now), result=result, error_stage=error_stage)
+        except Exception:
+            return  # Reporting cannot repeat or interrupt an official collection action.
+        if isinstance(parts, list):
+            for report in parts:
+                self.reportReady.emit(report)
 
     @Slot()
     def _verified(self) -> None:
@@ -290,6 +350,12 @@ class NoticeCollectionController(QObject):
         if self._job is not None:
             if not self._job.wait(15_000):
                 self._job.wait()
+            if self._poll_run_id and not self._job.verify_only and self._job.poll_outcome is not None:
+                kind, outcome = self._job.poll_outcome
+                if kind == "collected":
+                    self._collected(outcome)
+                else:
+                    self._failed(*outcome)
             self._job_finished()
         if not self._closed:
             self._service.close()

@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import unittest
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -71,6 +72,118 @@ class NoticeCollectionControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.statusTone, "warning")
         self.controller.check_due()
         self.lookup.assert_called_once()
+
+    def test_zero_unread_poll_reports_running_then_success_with_the_same_run_id(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        from tests.test_notice_collection import FakeBrowser
+        self.controller.shutdown()
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser(),
+                                              poster=lambda _payload: self.fail("no Sheets write"))
+            self.controller = NoticeCollectionController(service, self.lookup, self.busy,
+                now_factory=lambda: self.now, timer_start=False)
+            self.lookup.return_value = {"user_id": "tyfd01214", "password": "fixture-password"}
+            reports = []
+            self.controller.reportReady.connect(reports.append)
+            self.controller.collectNow()
+            self.wait_for(lambda: not self.controller.isRunning)
+            self.assertEqual([report["state"] for report in reports], ["running", "success"])
+            self.assertEqual(reports[0]["run_id"], reports[1]["run_id"])
+            self.assertIsNone(reports[0]["unread_count"])
+            self.assertEqual(reports[1]["unread_count"], 0)
+            self.assertEqual(reports[1]["records"], [])
+            self.assertNotIn("fixture-password", str(reports))
+
+    def test_shutdown_reports_each_finished_poll_once_without_processing_queued_signals(self):
+        for state in ("success", "partial", "failed"):
+            with self.subTest(state=state):
+                self.controller.shutdown()
+                service = Mock()
+                service.counts.return_value = (0, 0)
+                result = NoticeCollectionResult(self.now, status=state,
+                    unread_count=1 if state == "partial" else 0,
+                    error_count=int(state != "success"), error_stage="write" if state == "partial" else "")
+                service.last_result = result
+                service.report_parts.side_effect = lambda run_id, state, *_args, **_kwargs: [
+                    {"run_id": run_id, "state": state}]
+                def collect(_password, _received_at, cancel):
+                    while not cancel():
+                        time.sleep(0.001)
+                    if state == "failed":
+                        raise NoticeLoginRequired("fixture-password https://example.invalid/private")
+                    return result
+                service.collect.side_effect = collect
+                self.controller = NoticeCollectionController(service, self.lookup, self.busy,
+                    now_factory=lambda: self.now, timer_start=False)
+                self.lookup.return_value = {"user_id": "tyfd01214", "password": "fixture-password"}
+                reports = []
+                self.controller.reportReady.connect(reports.append)
+                self.controller.collectNow()
+                self.assertTrue(self.controller.shutdown())
+                self.assertEqual([report["state"] for report in reports], ["running", state])
+                self.assertEqual(reports[0]["run_id"], reports[1]["run_id"])
+                self.assertIs(service.report_parts.call_args.kwargs["result"], result)
+                self.assertNotIn("fixture-password", str(reports))
+                self.app.processEvents()
+                self.assertEqual(len(reports), 2)
+                service.close.assert_called_once()
+
+    def test_waiting_report_is_rate_limited_and_missing_credentials_does_not_claim_a_scan(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        from tests.test_notice_collection import FakeBrowser
+        self.controller.shutdown()
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            self.controller = NoticeCollectionController(service, self.lookup, self.busy,
+                now_factory=lambda: self.now, timer_start=False)
+            reports = []
+            self.controller.reportReady.connect(reports.append)
+            self.busy.return_value = "fixture private exception https://example.invalid"
+            self.controller.check_due()
+            self.now += timedelta(seconds=59)
+            self.controller.check_due()
+            self.assertEqual(len(reports), 1)
+            self.now += timedelta(seconds=1)
+            self.controller.check_due()
+            self.assertEqual(len(reports), 2)
+            self.assertEqual(reports[0]["run_id"], reports[1]["run_id"])
+            self.assertTrue(all(row["state"] == "waiting" and not row["started_at"] for row in reports))
+            self.busy.return_value = ""
+            self.controller.check_due()
+            missing = reports[-1]
+            self.assertEqual(missing["state"], "missing_credentials")
+            self.assertEqual(missing["error_stage"], "configuration")
+            self.assertIsNone(missing["unread_count"])
+            self.assertEqual((missing["started_at"], missing["completed_at"]), ("", ""))
+            self.assertNotIn("example.invalid", str(reports))
+            self.assertNotIn("fixture private exception", str(reports))
+
+    def test_failed_scan_reports_unknown_counts_without_raw_error_and_verification_is_not_a_poll(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        from tests.test_notice_collection import FakeBrowser
+        self.controller.shutdown()
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            self.controller = NoticeCollectionController(service, self.lookup, self.busy,
+                now_factory=lambda: self.now, timer_start=False)
+            self.lookup.return_value = {"user_id": "tyfd01214", "password": "fixture-password"}
+            reports = []
+            self.controller.reportReady.connect(reports.append)
+            self.controller.verifyLogin()
+            self.wait_for(lambda: not self.controller.isRunning)
+            self.assertEqual(reports, [])
+            def fail_scan(_password, cancel=None):
+                raise NoticeLoginRequired("fixture-password https://example.invalid/private")
+            browser.scan_unread = fail_scan
+            self.controller.collectNow()
+            self.wait_for(lambda: not self.controller.isRunning)
+            self.assertEqual([row["state"] for row in reports], ["running", "failed"])
+            self.assertEqual(reports[-1]["error_stage"], "login")
+            self.assertIsNone(reports[-1]["unread_count"])
+            self.assertIsNone(reports[-1]["marked_read_count"])
+            self.assertNotIn("fixture-password", str(reports))
+            self.assertNotIn("example.invalid", str(reports))
 
     def test_login_verification_checks_saved_fixed_password_without_collecting_notices(self):
         self.enable_saved_account()
