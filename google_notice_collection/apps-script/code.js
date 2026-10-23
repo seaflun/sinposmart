@@ -6,7 +6,7 @@ var DUTY_RECIPIENT_CACHE_PREFIX = "noticeDutyRecipient:v2:";
 function doPost(e) {
   var startedAt = Date.now();
   var res = createWriteResult();
-  var ctx = newContext();
+  var ctx = null;
   var lock = null;
   var locked = false;
   var requestId = "";
@@ -14,7 +14,14 @@ function doPost(e) {
   var writeMayHaveStarted = false;
   var retryable = false;
   try {
-    var data = JSON.parse(e.postData.contents);
+    var data;
+    try {
+      data = JSON.parse(e.postData.contents);
+    } catch (_parseError) {
+      throw new Error("Invalid request payload");
+    }
+    authorizeNoticeCollection_(data);
+    ctx = newContext();
     if (data && data.action === "checkExisting") {
       return checkExisting(validateRecords(data.records || []), ctx);
     }
@@ -95,6 +102,33 @@ function doPost(e) {
   } finally {
     if (locked) lock.releaseLock();
   }
+}
+
+function authorizeNoticeCollection_(data) {
+  var key = data && typeof data.sync_key === "string" ? data.sync_key : "";
+  var verifier = String(PropertiesService.getScriptProperties()
+    .getProperty("NOTICE_COLLECTION_SYNC_KEY_SHA256") || "").toLowerCase();
+  if (!key || !/^[a-f0-9]{64}$/.test(verifier)) {
+    throw new Error("Unauthorized notice request");
+  }
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, key, Utilities.Charset.UTF_8)
+    .map(function(value) { return ("0" + ((value + 256) % 256).toString(16)).slice(-2); }).join("");
+  var difference = 0;
+  for (var index = 0; index < 64; index++) {
+    difference |= verifier.charCodeAt(index) ^ digest.charCodeAt(index);
+  }
+  if (difference !== 0) throw new Error("Unauthorized notice request");
+}
+
+function configureNoticeCollectionAuthorization(verifierSha256) {
+  var email = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+  if (email !== "sinpo666@gmail.com") throw new Error("Unauthorized configuration");
+  if (typeof verifierSha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(verifierSha256)) {
+    throw new Error("Invalid authorization verifier");
+  }
+  PropertiesService.getScriptProperties().setProperty(
+    "NOTICE_COLLECTION_SYNC_KEY_SHA256", verifierSha256.toLowerCase());
+  return { configured: true };
 }
 
 function createWriteResult() {

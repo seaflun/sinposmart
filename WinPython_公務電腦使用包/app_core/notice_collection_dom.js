@@ -12,6 +12,7 @@ return (function (operation, payload, done) {
       ? Array.from(accounts[0].childNodes).filter(n => n.nodeType === 3)
         .map(n => n.textContent).join('').trim() : '';
     return { origin: window.location.origin, account, accountCount: accounts.length,
+      sessionExpired: window.location.pathname === '/sess_exceed.php',
       login: !!document.querySelector('#login_name') && !!document.querySelector('input[type="password"]') };
   }
 
@@ -79,7 +80,7 @@ return (function (operation, payload, done) {
       const finalUrl = new URL(response.url);
       const html = await response.text();
       const parsed = new DOMParser().parseFromString(html, 'text/html');
-      const login = /\/login(?:_main)?\.php$/.test(finalUrl.pathname) || !!parsed.querySelector('#login_name');
+      const login = /\/(?:login(?:_main)?|sess_exceed)\.php$/.test(finalUrl.pathname) || !!parsed.querySelector('#login_name');
       if (!response.ok || finalUrl.origin !== expectedOrigin || login) {
         done({ ok: false, login });
         return;
@@ -93,7 +94,11 @@ return (function (operation, payload, done) {
         done({ ok: false });
         return;
       }
-      const target = parsed.querySelector('div[style*="word-break"]') || parsed.body;
+      const target = parsed.querySelector('div[style*="word-break"]');
+      if (!target) {
+        done({ ok: false });
+        return;
+      }
       target.querySelectorAll('script,style,noscript').forEach(node => node.remove());
       target.querySelectorAll('br').forEach(node => node.replaceWith('\n'));
       target.querySelectorAll('p,div,li').forEach(node => node.append('\n'));

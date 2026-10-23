@@ -6,9 +6,11 @@ import tempfile
 import unittest
 import json
 import hashlib
+import hmac
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "WinPython_公務電腦使用包"
@@ -257,7 +259,46 @@ class NoticeCollectionTests(unittest.TestCase):
             self.assertEqual(result.marked_read_count, 1)
             self.assertNotIn("read:1", browser.events)
 
-    def test_unresolved_pending_write_is_not_resent_or_marked_after_restart(self):
+    def test_unreached_write_recovers_after_restart_with_original_request_and_time(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+
+        original_writes = []
+
+        def unavailable(payload):
+            if payload["action"] == "checkExisting":
+                return {"status": "success", "existingKeys": [], "retryKeys": []}
+            if payload["action"] == "getWriteResult":
+                return {"status": "success", "found": False, "requestId": payload["requestId"]}
+            original_writes.append(payload)
+            raise TimeoutError("synthetic request never reached the server")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = NoticeCollectionService(root, browser=FakeBrowser([notice(1)]), poster=unavailable)
+            first.collect("synthetic-password", datetime(2026, 10, 21, 23, 59))
+            self.assertEqual(len(original_writes), 2)
+            replayed = []
+
+            def recovered(payload):
+                if payload["action"] == "getWriteResult":
+                    return {"status": "success", "found": False, "requestId": payload["requestId"]}
+                if payload["action"] == "checkExisting":
+                    return {"status": "success", "existingKeys": [], "retryKeys": []}
+                replayed.append(payload)
+                return write_response(payload, ["1"])
+
+            browser = FakeBrowser([notice(1)])
+            restarted = NoticeCollectionService(root, browser=browser, poster=recovered)
+            result = restarted.collect("synthetic-password", datetime(2026, 10, 22, 0, 3))
+            self.assertEqual(replayed, [original_writes[0]])
+            self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("success", ["1"], 1))
+            self.assertEqual(restarted.counts(datetime(2026, 10, 21, 23, 59)), (0, 1))
+            self.assertEqual(restarted.counts(datetime(2026, 10, 22, 0, 3)), (0, 0))
+            state = json.loads(restarted.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["pending"], [])
+            self.assertNotIn("有效通報內文", json.dumps(state, ensure_ascii=False))
+
+    def test_unknown_receipt_is_not_resent_or_marked_after_restart(self):
         from app_core.notice_collection_service import NoticeCollectionService
 
         def initial(payload):
@@ -275,6 +316,8 @@ class NoticeCollectionTests(unittest.TestCase):
 
             def unresolved(payload):
                 self.assertNotEqual(payload["action"], "writeRecords")
+                if payload["action"] == "getWriteResult":
+                    raise TimeoutError("synthetic receipt lookup unavailable")
                 return initial(payload)
 
             restarted = NoticeCollectionService(root, browser=browser, poster=unresolved)
@@ -528,6 +571,198 @@ class NoticeCollectionTests(unittest.TestCase):
                     service.collect("synthetic-password", datetime(2026, 10, 21, 9))
                 self.assertEqual(browser.events, [])
                 self.assertEqual(state_path.read_text(encoding="utf-8"), content)
+
+
+class PendingNoticeRecoveryTests(unittest.TestCase):
+    def pending_service(self, *, records=None, rows=None, existing=(), repairs=(), receipt=None,
+                        fail_action="", written=(), handled=None, repair_keys=()):
+        from app_core.notice_collection_service import NoticeCollectionService
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        records = [notice(1)] if records is None else records
+        browser = FakeBrowser(records if rows is None else rows)
+        intent = {"request_id": "notice-recovery-fixture", "received_at": "2026-10-21T09:00:00+08:00",
+                  "records": [NoticeCollectionService._metadata(row) for row in records],
+                  "repair_keys": list(repair_keys)}
+        state_path = root / "runtime_outputs" / "notice_collection" / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({"schema_version": 1, "collected": {}, "pending": [intent]}),
+                              encoding="utf-8")
+        requests = []
+
+        def poster(payload):
+            requests.append(payload)
+            if payload["action"] == fail_action:
+                raise TimeoutError("synthetic service unavailable")
+            if payload["action"] == "getWriteResult":
+                return (receipt if receipt is not None else
+                        {"status": "success", "found": False, "requestId": payload["requestId"]})
+            if payload["action"] == "checkExisting":
+                return {"status": "success", "existingKeys": list(existing), "retryKeys": list(repairs)}
+            return write_response(payload, written, handled=handled)
+
+        service = NoticeCollectionService(root, browser=browser, poster=poster)
+        return service, browser, requests, intent
+
+    def test_expired_receipt_with_complete_durable_rows_settles_without_guessing_counts(self):
+        service, browser, requests, _intent = self.pending_service(existing=["1"])
+        result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+        self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("success", [], 1))
+        self.assertEqual(service.counts(datetime(2026, 10, 21, 9, 3)), (0, 0))
+        self.assertEqual(json.loads(service.state_path.read_text(encoding="utf-8"))["pending"], [])
+        self.assertEqual([payload["action"] for payload in requests], ["getWriteResult", "checkExisting"])
+        self.assertNotIn("read:1", browser.events)
+
+    def test_unknown_or_mismatched_receipts_never_authorize_replay(self):
+        for receipt in ({}, {"status": "success", "found": "false", "requestId": "notice-recovery-fixture"},
+                        {"status": "success", "found": False, "requestId": "another-request"},
+                        {"status": "success", "found": True, "requestId": "notice-recovery-fixture", "result": {}}):
+            with self.subTest(receipt=receipt):
+                service, browser, requests, _intent = self.pending_service(receipt=receipt)
+                result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+                self.assertEqual(result.status, "uncertain")
+                self.assertEqual(browser.events, ["scan"])
+                self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+
+    def test_unavailable_remote_checks_do_not_read_content_or_replay(self):
+        for action in ("getWriteResult", "checkExisting"):
+            with self.subTest(action=action):
+                service, browser, requests, _intent = self.pending_service(fail_action=action)
+                result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+                self.assertEqual(result.status, "uncertain")
+                self.assertEqual(browser.events, ["scan"])
+                self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+
+    def test_missing_or_changed_original_notices_never_replay(self):
+        cases = [[], [notice(1)], [notice(1), {**notice(2), "subject": "主旨已變更"}],
+                 [notice(1), {**notice(2), "date": "115-10-22"}],
+                 [notice(1), {**notice(2), "sender": "不同發布者"}],
+                 [notice(1), {**notice(2), "noticeId": "3"}]]
+        for rows in cases:
+            with self.subTest(rows=rows):
+                service, browser, requests, _intent = self.pending_service(records=[notice(1), notice(2)], rows=rows)
+                result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+                self.assertEqual(result.status, "uncertain")
+                self.assertEqual(browser.events, ["scan"])
+                self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+
+    def test_all_original_content_must_be_read_before_replay(self):
+        service, browser, requests, _intent = self.pending_service(records=[notice(1), notice(2)])
+        with patch.object(browser, "read_content", side_effect=["第一則有效內文", "權限限制"]):
+            result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+        self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("uncertain", [], 0))
+        self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+
+    def test_replay_counts_only_new_rows_and_retains_original_repair_classification(self):
+        service, browser, requests, intent = self.pending_service(
+            records=[notice(1), notice(2), notice(3)], existing=["2"], repairs=["3"],
+            written=["1", "3"], handled=["1", "2", "3"], repair_keys=["3"])
+        result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+        replayed = [payload for payload in requests if payload["action"] == "writeRecords"]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0]["requestId"], intent["request_id"])
+        self.assertEqual([row["key"] for row in replayed[0]["records"]], ["1", "2", "3"])
+        self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("success", ["1"], 3))
+        self.assertEqual(service.counts(datetime(2026, 10, 21, 9, 3)), (0, 1))
+
+    def test_local_settlement_failure_stops_before_marking_read(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+
+        service, browser, requests, _intent = self.pending_service(existing=["1"])
+        with patch.object(Path, "replace", side_effect=PermissionError("synthetic ledger failure")), \
+                self.assertRaises(NoticeCollectionError):
+            service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
+        self.assertEqual(browser.events, ["scan"])
+        self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+
+    def test_cancel_after_refetch_stops_before_replay(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+
+        service, browser, requests, _intent = self.pending_service()
+        cancelled = False
+
+        def content(_record, cancel=None):
+            nonlocal cancelled
+            cancelled = True
+            return "有效內文"
+
+        with patch.object(browser, "read_content", side_effect=content), self.assertRaises(NoticeCollectionError):
+            service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3), cancel=lambda: cancelled)
+        self.assertNotIn("writeRecords", [payload["action"] for payload in requests])
+        self.assertFalse(any(event.startswith("mark:") for event in browser.events))
+
+
+class NoticeAuthorizationTests(unittest.TestCase):
+    def network_service(self, **kwargs):
+        from app_core.notice_collection_service import NoticeCollectionService
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"status":"success"}'
+        return NoticeCollectionService(Path(directory.name), **kwargs), response
+
+    def test_network_requests_derive_separate_notice_key_from_existing_token(self):
+        token = "synthetic-nas-token"
+        expected = hmac.new(token.encode("utf-8"), b"SinpoSmartNoticeCollection:v1", hashlib.sha256).hexdigest()
+        payload = {"action": "checkExisting", "records": []}
+        with patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": token}, clear=True):
+            service, response = self.network_service()
+            with patch("urllib.request.urlopen", return_value=response) as opened:
+                self.assertEqual(service._post(payload), {"status": "success"})
+        body = json.loads(opened.call_args.args[0].data)
+        self.assertEqual(body["sync_key"], expected)
+        self.assertNotIn(token, json.dumps(body))
+        self.assertEqual(payload, {"action": "checkExisting", "records": []})
+        self.assertFalse(service.state_path.exists())
+
+    def test_explicit_notice_environment_key_takes_precedence_over_token(self):
+        with patch.dict(os.environ, {"SINPOSMART_NOTICE_COLLECTION_SYNC_KEY": "synthetic-explicit-key",
+                                     "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-nas-token"}, clear=True):
+            service, response = self.network_service()
+            with patch("urllib.request.urlopen", return_value=response) as opened:
+                service._post({"action": "getWriteResult", "requestId": "notice-fixture"})
+        self.assertEqual(json.loads(opened.call_args.args[0].data)["sync_key"], "synthetic-explicit-key")
+
+    def test_callback_is_resolved_for_each_network_call(self):
+        lookup = Mock(side_effect=["synthetic-first-key", "synthetic-rotated-key"])
+        service, response = self.network_service(sync_key_lookup=lookup)
+        with patch("urllib.request.urlopen", return_value=response) as opened:
+            service._post({"action": "checkExisting", "records": []})
+            service._post({"action": "getWriteResult", "requestId": "notice-fixture"})
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual([json.loads(call.args[0].data)["sync_key"] for call in opened.call_args_list],
+                         ["synthetic-first-key", "synthetic-rotated-key"])
+
+    def test_missing_authentication_stops_before_network_access(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+
+        with patch.dict(os.environ, {}, clear=True):
+            service, _response = self.network_service()
+            with patch("urllib.request.urlopen") as opened, self.assertRaises(NoticeCollectionError):
+                service._post({"action": "checkExisting", "records": []})
+        opened.assert_not_called()
+
+    def test_poster_seam_never_receives_or_loads_authentication_secrets(self):
+        lookup = Mock(side_effect=RuntimeError("synthetic-secret-must-not-load"))
+        poster = Mock(return_value={"status": "success"})
+        service, _response = self.network_service(sync_key_lookup=lookup, poster=poster)
+        payload = {"action": "checkExisting", "records": []}
+        self.assertEqual(service._post(payload), {"status": "success"})
+        poster.assert_called_once_with(payload)
+        lookup.assert_not_called()
+
+    def test_key_lookup_failure_never_exposes_secret_or_sends_request(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+
+        lookup = Mock(side_effect=RuntimeError("synthetic-secret-value"))
+        service, _response = self.network_service(sync_key_lookup=lookup)
+        with patch("urllib.request.urlopen") as opened, self.assertRaises(NoticeCollectionError) as caught:
+            service._post({"action": "checkExisting", "records": []})
+        opened.assert_not_called()
+        self.assertNotIn("synthetic-secret-value", str(caught.exception))
 
 
 class NoticeLoginVerificationTests(unittest.TestCase):

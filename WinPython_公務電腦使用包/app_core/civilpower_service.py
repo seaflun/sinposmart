@@ -132,6 +132,7 @@ class CivilpowerService:
 
     @staticmethod
     def _fetch_roster() -> dict:
+        from app_core.credential_sync_service import open_sync_request
         from app_core.operational_sync_service import DEFAULT_SINPOSMART_BACKEND_EVENT_URL
         base = os.environ.get("SINPOSMART_BACKEND_EVENT_URL", DEFAULT_SINPOSMART_BACKEND_EVENT_URL).strip()
         parts = urlsplit(base)
@@ -142,7 +143,7 @@ class CivilpowerService:
             raise CivilpowerError("尚未設定既有值班後台同步授權。")
         url = urlunsplit((parts.scheme, parts.netloc, "/api/sinposmart/civilpower-roster", "", ""))
         req = urllib.request.Request(url, headers={"X-Credential-Sync-Token": token})
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with open_sync_request(req, timeout=8) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if not payload.get("ok"):
             raise CivilpowerError("救護台名冊讀取失敗。")

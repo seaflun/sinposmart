@@ -6357,6 +6357,100 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
 
 class DailyVehicleServiceTests(unittest.TestCase):
+    def test_ppe_login_rejects_untrusted_initial_page_without_filling_credentials(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for target in (
+            "https://outside.example/",
+            "http://ppe.tyfd.gov.tw/",
+            "https://ppe.tyfd.gov.tw.outside.example/",
+            "https://ppe.tyfd.gov.tw:444/",
+            "https://ppe.tyfd.gov.tw:invalid/",
+            "https://user:synthetic-secret@ppe.tyfd.gov.tw/",
+            "https://ppe.tyfd.gov.tw/unknown-login",
+        ):
+            with self.subTest(target=target):
+                driver = SimpleNamespace(current_url=target, get=Mock())
+                field = Mock()
+                wait = Mock()
+                wait.until.return_value = field
+
+                with self.assertRaisesRegex(RuntimeError, "授權") as raised:
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+
+                field.send_keys.assert_not_called()
+                field.click.assert_not_called()
+                self.assertNotIn("synthetic-secret", str(raised.exception))
+
+
+    def test_ppe_login_rechecks_target_after_field_and_button_lookups(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for redirect_at in (1, 2, 3):
+            with self.subTest(redirect_at=redirect_at):
+                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock())
+                sent = []
+                fields = [Mock() for _ in range(3)]
+                for field in fields[:2]:
+                    field.send_keys.side_effect = lambda value: sent.append((driver.current_url, value))
+                lookup_count = 0
+
+                def locate(_condition):
+                    nonlocal lookup_count
+                    lookup_count += 1
+                    if lookup_count == redirect_at:
+                        driver.current_url = "https://outside.example/"
+                    return fields[min(lookup_count - 1, 2)]
+
+                wait = SimpleNamespace(until=locate)
+                with self.assertRaisesRegex(RuntimeError, "授權"):
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+
+                self.assertTrue(all(target == automation.LOGIN_URL for target, _value in sent))
+                self.assertEqual(len(sent), redirect_at - 1)
+                fields[2].click.assert_not_called()
+
+
+    def test_ppe_login_checks_post_login_origin_and_allows_authorized_routes(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for destination, allowed, redirect_after_wait in (
+            ("https://ppe.tyfd.gov.tw/CarMaintainCheck/Index", True, False),
+            ("https://ppe.tyfd.gov.tw:443/Home/Index", True, False),
+            ("https://outside.example/Home/Index", False, False),
+            ("http://ppe.tyfd.gov.tw/Home/Index", False, False),
+            ("https://outside.example/Home/Index", False, True),
+        ):
+            with self.subTest(destination=destination, redirect_after_wait=redirect_after_wait):
+                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock())
+                fields = [Mock() for _ in range(4)]
+                fields[2].click.side_effect = lambda: setattr(
+                    driver, "current_url", automation.LOGIN_URL if redirect_after_wait else destination,
+                )
+                driver.find_element = Mock(return_value=fields[3])
+                lookup_count = 0
+
+                def locate(condition):
+                    nonlocal lookup_count
+                    lookup_count += 1
+                    if lookup_count < 4:
+                        return fields[lookup_count - 1]
+                    result = condition(driver)
+                    if redirect_after_wait:
+                        driver.current_url = destination
+                    return result
+
+                wait = SimpleNamespace(until=locate)
+                if allowed:
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "授權"):
+                        automation.login(driver, wait, "synthetic-user", "synthetic-password")
+                fields[0].send_keys.assert_called_once_with("synthetic-user")
+                fields[1].send_keys.assert_called_once_with("synthetic-password")
+                fields[2].click.assert_called_once_with()
+
+
     @staticmethod
     def _verified_report():
         from datetime import date
@@ -10901,9 +10995,9 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 "SINPOSMART_BACKEND_EVENT_URL": f"http://127.0.0.1:{server.server_port}/api/sinposmart/events",
                 "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-only-token",
                 "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
-            }):
+            }), patch("app_core.credential_sync_service._sync_target", side_effect=lambda url: (url, True)):
                 service = OperationalSyncService(Path(directory))
-                with self.assertRaisesRegex(RuntimeError, "心跳無法確認連線"):
+                with self.assertRaisesRegex(RuntimeError, "未授權轉址"):
                     service.send_heartbeat(captured[0])
                 self.assertFalse(service.pending_path.exists())
             self.assertEqual(origin, [True])
@@ -10934,7 +11028,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             return handle
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
-            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid:8080/api/sinposmart/events?discard=1#discard",
+            "SINPOSMART_BACKEND_EVENT_URL": "https://nas.invalid:8080/api/sinposmart/events?discard=1#discard",
             "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
         }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
             service = OperationalSyncService(Path(directory))
@@ -10944,8 +11038,8 @@ class OperationalSyncServiceTests(unittest.TestCase):
             self.assertFalse(service.pending_path.exists())
 
         self.assertEqual([request.method for request in requests], ["GET", "POST"])
-        self.assertEqual(requests[0].full_url, "http://nas.invalid:8080/api/sinposmart/identity")
-        self.assertEqual(requests[1].full_url, "http://nas.invalid:8080/api/sinposmart/heartbeat")
+        self.assertEqual(requests[0].full_url, "https://nas.invalid:8080/api/sinposmart/identity")
+        self.assertEqual(requests[1].full_url, "https://nas.invalid:8080/api/sinposmart/heartbeat")
         payload = json.loads(requests[1].data)
         self.assertEqual(payload["route"], {"name": "configured", "identity_status": "verified", "instance_id": server_id})
         self.assertEqual(payload["app_version"], "2026.10.18.1350")
@@ -11008,7 +11102,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             return handle
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
-            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid/api/sinposmart/events",
+            "SINPOSMART_BACKEND_EVENT_URL": "https://nas.invalid/api/sinposmart/events",
             "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
         }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
             service = OperationalSyncService(Path(directory))
@@ -11022,7 +11116,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             self.assertNotIn("nas.invalid", status)
             self.assertNotIn("test-only-token", status)
             self.assertEqual(len([row for row in requests if row.method == "GET"]), 1)
-            self.assertTrue(all(row.full_url.startswith("http://nas.invalid/") for row in requests))
+            self.assertTrue(all(row.full_url.startswith("https://nas.invalid/") for row in requests))
             self.assertTrue(all(json.loads(row.data)["route"]["instance_id"] == original_id
                                 for row in requests if row.method == "POST"))
             with patch("urllib.request.OpenerDirector.open") as network:
@@ -11327,7 +11421,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(posted, [payload])
         self.assertEqual(pending, "")
 
-    def test_event_uses_legacy_default_url_when_only_token_is_configured(self) -> None:
+    def test_event_uses_overlay_default_url_when_only_token_is_configured(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11341,7 +11435,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 self.assertTrue(service.event_enabled)
                 self.assertEqual(
                     service.event_url,
-                    "http://10.30.65.30:8080/api/sinposmart/events",
+                    "http://100.114.126.58:8080/api/sinposmart/events",
                 )
 
     def test_event_failure_is_safely_recorded_and_kept_for_retry(self) -> None:
@@ -11386,6 +11480,164 @@ class OperationalSyncServiceTests(unittest.TestCase):
 
         self.assertEqual(status["board"]["state"], "failed")
         self.assertIn("同步失敗", status["board"]["detail"])
+
+
+class SecureSyncTransportTests(unittest.TestCase):
+    def test_plain_http_cannot_send_credentials_before_transport_is_verified(self) -> None:
+        from app_core.credential_sync_service import CredentialSyncError, CredentialSyncService
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok":true}'
+        with patch.dict(os.environ, {
+            "SINPOSMART_CREDENTIAL_SYNC_URL": "http://192.168.1.10/api/credential-sync",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+        }), patch("urllib.request.urlopen", return_value=response) as unguarded:
+            with self.assertRaises(CredentialSyncError):
+                CredentialSyncService().sync([{"user_id": "synthetic-user", "password": "synthetic-password"}])
+            unguarded.assert_not_called()
+
+    def test_invalid_http_targets_are_rejected_without_opening_a_connection(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        for url in ("http://example.invalid/api", "http://127.0.0.1/api",
+                    "http://10.30.65.30:8080/unknown", "http://100.114.126.58:invalid/api",
+                    "http://user:synthetic-secret@100.114.126.58/api", "file:///tmp/example"):
+            with self.subTest(url=url), patch.object(transport.urllib.request, "build_opener") as build:
+                with self.assertRaises(transport.SyncTransportError) as caught:
+                    transport.open_sync_request(transport.urllib.request.Request(url), timeout=1)
+                build.assert_not_called()
+                self.assertNotIn("synthetic-secret", str(caught.exception))
+
+    def test_overlay_http_requires_verified_peer_and_bypasses_proxies(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        request = transport.urllib.request.Request(
+            "http://10.30.65.30:8080/api/credential-sync", data=b"synthetic-body",
+            headers={"X-Credential-Sync-Token": "synthetic-token"}, method="POST",
+        )
+        with patch.object(transport, "_tailscale_peer_verified", return_value=False), \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            with self.assertRaises(transport.SyncTransportError):
+                transport.open_sync_request(request, timeout=1)
+            build.assert_not_called()
+        with patch.object(transport, "_tailscale_peer_verified", return_value=True) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            transport.open_sync_request(request, timeout=2)
+            verify.assert_called_once_with("100.114.126.58")
+            sent = build.return_value.open.call_args.args[0]
+            self.assertEqual(sent.full_url, "http://100.114.126.58:8080/api/credential-sync")
+            self.assertEqual(sent.data, b"synthetic-body")
+            proxies = [handler for handler in build.call_args.args
+                       if isinstance(handler, transport.urllib.request.ProxyHandler)]
+            self.assertEqual([handler.proxies for handler in proxies], [{}])
+
+    def test_tailscale_verification_uses_installed_cli_and_authenticated_live_peer(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        state = {"BackendState": "Running", "Self": {"Online": True, "TailscaleIPs": ["100.80.1.2"]},
+                 "Peer": {"node": {"Online": True, "TailscaleIPs": ["100.114.126.58"]}}}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(state))
+        with patch.object(Path, "is_file", return_value=True), \
+                patch.object(transport.subprocess, "run", return_value=completed) as run:
+            self.assertTrue(transport._tailscale_peer_verified("100.114.126.58"))
+            command = run.call_args.args[0]
+            self.assertTrue(Path(command[0]).is_absolute())
+            self.assertEqual(command[1:], ["status", "--json"])
+            self.assertFalse(run.call_args.kwargs.get("shell", False))
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        for invalid in (
+            {**state, "BackendState": "NeedsLogin"},
+            {**state, "Self": {"Online": False, "TailscaleIPs": ["100.80.1.2"]}},
+            {**state, "Peer": {}},
+            {**state, "Peer": {"node": {"Online": False, "TailscaleIPs": ["100.114.126.58"]}}},
+        ):
+            with self.subTest(state=invalid), patch.object(Path, "is_file", return_value=True), \
+                    patch.object(transport.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(invalid))):
+                self.assertFalse(transport._tailscale_peer_verified("100.114.126.58"))
+
+    def test_nas_redirects_are_blocked_and_google_get_redirects_drop_secrets(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        request = transport.urllib.request.Request(
+            "https://script.google.com/macros/s/example/exec", data=b"synthetic-secret",
+            headers={"X-Credential-Sync-Token": "synthetic-token", "Authorization": "synthetic-auth"},
+            method="POST",
+        )
+        destination = "https://script.googleusercontent.com/macros/echo?opaque=synthetic"
+        with self.assertRaises(transport.SyncTransportError):
+            transport.SyncRedirectHandler().redirect_request(request, None, 302, "", {}, destination)
+        handler = transport.SyncRedirectHandler(allow_google_redirects=True)
+        redirected = handler.redirect_request(request, None, 302, "", {}, destination)
+        self.assertEqual(redirected.get_method(), "GET")
+        self.assertIsNone(redirected.data)
+        self.assertFalse(redirected.has_header("Authorization"))
+        self.assertFalse(redirected.has_header("X-credential-sync-token"))
+        for destination in ("http://script.googleusercontent.com/macros/echo", "https://outside.example/echo"):
+            with self.subTest(destination=destination), self.assertRaises(transport.SyncTransportError):
+                handler.redirect_request(request, None, 302, "", {}, destination)
+
+    def test_https_and_all_nas_callers_use_the_guarded_transport(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.civilpower_service import CivilpowerService
+        from app_core.operational_sync_service import OperationalSyncService
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"ok": True, "server": {
+            "instance_id": "366be866-51b0-49df-8712-a6d4f56f592d", "version": "fixture", "deployment": "fixture",
+        }, "received_at": "2026-10-24T10:30:00+08:00"}).encode()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_CREDENTIAL_SYNC_URL": "http://10.30.65.30:8080/api/credential-sync",
+            "SINPOSMART_BACKEND_EVENT_URL": "http://10.30.65.30:8080/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+            "SINPOSMART_DUTY_BOARD_SYNC_URL": "https://script.google.com/macros/s/example/exec",
+            "SINPOSMART_DUTY_BOARD_SYNC_KEY": "synthetic-key",
+        }), patch.object(transport, "_tailscale_peer_verified", return_value=True) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = response
+            transport.CredentialSyncService().sync([{"user_id": "synthetic-user", "password": "synthetic-password"}])
+            operational = OperationalSyncService(Path(directory))
+            operational._post_event({"event_id": "synthetic-event"})
+            CivilpowerService._fetch_roster()
+            operational._heartbeat_request("/identity")
+            operational._heartbeat_request("/heartbeat", {"synthetic": True})
+            operational._post_board({"content_hash": "synthetic-hash"})
+            sent = [call.args[0].full_url for call in build.return_value.open.call_args_list]
+            self.assertEqual(sent, [
+                "http://100.114.126.58:8080/api/credential-sync",
+                "http://100.114.126.58:8080/api/sinposmart/events",
+                "http://100.114.126.58:8080/api/sinposmart/civilpower-roster",
+                "http://100.114.126.58:8080/api/sinposmart/identity",
+                "http://100.114.126.58:8080/api/sinposmart/heartbeat",
+                "https://script.google.com/macros/s/example/exec",
+            ])
+            self.assertEqual(verify.call_count, 5)
+
+    def test_unverified_overlay_preserves_pending_event_without_sending_token(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_BACKEND_EVENT_URL": "http://100.114.126.58:8080/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+        }), patch.object(transport, "_tailscale_peer_verified", return_value=False), \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            service = OperationalSyncService(Path(directory))
+            payload = service.build_event_payload("login", actor_no="synthetic-actor")
+            service.send_event_payload(payload)
+            pending = service.pending_path.read_text(encoding="utf-8")
+            status = json.loads(service.status_path.read_text(encoding="utf-8"))
+            self.assertIn(payload["event_id"], pending)
+            self.assertEqual(status["event"]["state"], "failed")
+            self.assertIn("Tailscale", status["event"]["detail"])
+            self.assertNotIn("synthetic-token", pending + json.dumps(status))
+            with self.assertRaises(transport.SyncTransportError):
+                service._heartbeat_request("/identity")
+            build.assert_not_called()
 
 
 class CredentialSyncServiceTests(unittest.TestCase):

@@ -92,6 +92,21 @@ class CredentialRepositoryTests(unittest.TestCase):
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "{invalid-json")
             self.assertFalse(repository.needs_backup)
 
+    def test_non_object_json_is_preserved_as_invalid_account_file(self) -> None:
+        for payload in ([], None, "invalid account file", 123):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "saved_login.json"
+                original = json.dumps(payload)
+                path.write_text(original, encoding="utf-8")
+                repository = self.repository(path)
+
+                snapshot = repository.load()
+
+                self.assertTrue(snapshot.invalid_file)
+                self.assertEqual(snapshot.accounts, [])
+                self.assertEqual(path.read_text(encoding="utf-8"), original)
+                self.assertTrue(repository.needs_backup)
+
     def test_missing_dpapi_refuses_to_persist(self) -> None:
         from app_core.credential_repository import CredentialRepository
 

@@ -131,6 +131,74 @@ class NoticeBrowserTests(unittest.TestCase):
             self.browser(driver).scan_unread("synthetic")
         self.assertEqual(driver.async_calls, [])
 
+    def test_expired_session_reopens_fixed_login_page_then_reloads_unread(self):
+        from app_core.notice_collection_browser import OA_LOGIN_URL, UNREAD_URL
+        driver = FakeDriver([snapshot(account="", accountCount=0, sessionExpired=True)])
+        authenticated = False
+
+        def on_get(current):
+            if current.current_url == UNREAD_URL and not authenticated:
+                current.current_url = "https://oa.tyfd.gov.tw/sess_exceed.php"
+
+        def login(current, account, password, *, attempts):
+            nonlocal authenticated
+            self.assertEqual(current.current_url, OA_LOGIN_URL)
+            self.assertEqual((account, attempts), ("tyfd01214", 3))
+            authenticated = True
+            current.pages = [snapshot()]
+
+        driver.on_get = on_get
+        self.assertEqual(self.browser(driver, login_runner=login).scan_unread("synthetic-password"), [])
+        self.assertTrue(authenticated)
+        self.assertEqual(driver.gets, [UNREAD_URL, OA_LOGIN_URL, UNREAD_URL])
+        self.assertEqual(driver.async_calls, [])
+
+    def test_expired_session_login_redirect_is_rechecked_before_credentials(self):
+        from app_core.notice_collection_browser import OA_LOGIN_URL, UNREAD_URL
+        from app_core.notice_collection_service import NoticeCollectionError
+        driver = FakeDriver([snapshot(account="", accountCount=0, sessionExpired=True)])
+
+        def on_get(current):
+            current.current_url = ("https://oa.tyfd.gov.tw/sess_exceed.php"
+                                   if current.current_url == UNREAD_URL else "https://example.invalid/login.php")
+
+        driver.on_get = on_get
+        login = Mock()
+        with self.assertRaises(NoticeCollectionError):
+            self.browser(driver, login_runner=login).scan_unread("synthetic-password")
+        self.assertEqual(driver.gets, [UNREAD_URL, OA_LOGIN_URL])
+        login.assert_not_called()
+        self.assertEqual(driver.async_calls, [])
+
+    def test_shared_oa_login_session_timeout_never_reports_success(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        from tests.test_civilpower_attendance import OALoginTests
+        driver, elements, wait = OALoginTests().make_login()
+        driver.find_elements.side_effect = lambda *args: (
+            [] if driver.current_url.endswith("/sess_exceed.php") else [elements["login_name"]])
+        elements["loginBtn"].click.side_effect = lambda: setattr(
+            driver, "current_url", "https://oa.tyfd.gov.tw/sess_exceed.php")
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                self.assertRaisesRegex(LoginVerificationError, "作業逾時.*重新登入") as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=3)
+        elements["loginBtn"].click.assert_called_once()
+        driver.get.assert_called_once_with("https://oa.tyfd.gov.tw/login.php")
+        self.assertNotIn("synthetic-password", str(caught.exception))
+
+    def test_timeout_after_login_keeps_safe_message_and_stops_this_cycle(self):
+        from app_core.login_verifier import OASessionExpiredError
+        from app_core.notice_collection_service import NoticeLoginRequired
+        driver = FakeDriver([snapshot(login=True)])
+        driver.on_get = lambda current: setattr(current, "current_url", "https://oa.tyfd.gov.tw/login.php")
+        login = Mock(side_effect=OASessionExpiredError("入口網作業逾時，請重新登入。"))
+        with self.assertRaisesRegex(NoticeLoginRequired, "作業逾時") as caught:
+            self.browser(driver, login_runner=login).scan_unread("synthetic-password")
+        login.assert_called_once_with(driver, "tyfd01214", "synthetic-password", attempts=3)
+        self.assertNotIn("synthetic-password", str(caught.exception))
+        self.assertEqual(driver.async_calls, [])
+
     def test_foreign_login_redirect_cannot_receive_saved_credentials(self):
         from app_core.notice_collection_service import NoticeCollectionError, NoticeLoginRequired
         driver = FakeDriver([snapshot(origin="https://example.com", login=True)])
@@ -473,7 +541,7 @@ const row = {nextElementSibling:detail,innerText:'公告人員：測試隊/測�
     {innerText:'電子通報 download\n 測試主旨\n公告對象全體',getAttribute:()=>null}]:[link]};
 const account = {childNodes:[{nodeType:3,textContent:' 新坡分隊/新坡分隊公務信箱(公務信箱) '}]};
 const pager = {getAttribute:()=>`changeForm('bulletin_list&is_read=${state.filter}&list_condition=all');`};
-global.location={origin:'https://oa.tyfd.gov.tw',hash:'#bulletin/bulletin.php?action=bulletin_list&is_read=0&list_condition=all'};
+global.location={origin:'https://oa.tyfd.gov.tw',pathname:'/module_page.php',hash:'#bulletin/bulletin.php?action=bulletin_list&is_read=0&list_condition=all'};
 global.window={location:global.location,jQuery:{active:0}};
 global.document={body:{innerText:''},querySelector:()=>null,querySelectorAll:s=>{
   if(s==='.user-menu .user-details')return [account];
@@ -487,7 +555,9 @@ state.filter=2;
 const stale=run('snapshot',null);
 state.filter=0;state.empty=true;
 const empty=run('snapshot',null);
-console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty}));
+global.location.pathname='/sess_exceed.php';
+const sessionExpired=run('snapshot',null).sessionExpired;
+console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty,sessionExpired}));
 """
         asset = PACKAGE / "app_core" / "notice_collection_dom.js"
         completed = subprocess.run([shutil.which("node"), "-e", script, str(asset)],
@@ -498,6 +568,46 @@ console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty}));
         self.assertEqual(result["result"]["records"], [{**notice(), "subject": "測試主旨"}])
         self.assertFalse(result["staleFiltered"])
         self.assertEqual((result["empty"]["total"], result["empty"]["records"]), (0, []))
+        self.assertFalse(result["result"]["sessionExpired"])
+        self.assertTrue(result["sessionExpired"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is unavailable for the DOM bridge fixture")
+    def test_dom_content_requires_notice_container_before_accepting_text(self):
+        script = r"""
+const fs = require('fs');
+const run = new Function(fs.readFileSync(process.argv[1], 'utf8'));
+const url = 'https://oa.tyfd.gov.tw/bulletin/bulletin_content.php?id=100';
+const account = {childNodes:[{nodeType:3,textContent:'新坡分隊/新坡分隊公務信箱(公務信箱)'}]};
+global.window = {location:{origin:'https://oa.tyfd.gov.tw'},setTimeout,clearTimeout};
+global.document = {querySelector:()=>null,querySelectorAll:s=>
+  s === '.user-menu .user-details' ? [account] : []};
+let container = null;
+const body = {textContent:'系統發生錯誤，請稍後再試',querySelectorAll:()=>[]};
+global.DOMParser = class {parseFromString() {return {body,querySelector:s=>
+  s === 'div[style*="word-break"]' ? container : null};}};
+let responseUrl = url;
+global.fetch = async () => ({ok:true,url:responseUrl,text:async()=>'<html></html>'});
+const fetchContent = () => new Promise(resolve=>run('content',url,resolve));
+(async () => {
+  const errorPage = await fetchContent();
+  container = {textContent:' 第一行\n第二行 ',querySelectorAll:()=>[]};
+  const notice = await fetchContent();
+  container = {textContent:'附件：值勤注意事項.pdf',querySelectorAll:()=>[]};
+  const attachment = await fetchContent();
+  responseUrl = 'https://oa.tyfd.gov.tw/sess_exceed.php';
+  const expired = await fetchContent();
+  console.log(JSON.stringify({errorPage,notice,attachment,expired}));
+})();
+"""
+        asset = PACKAGE / "app_core" / "notice_collection_dom.js"
+        completed = subprocess.run([shutil.which("node"), "-e", script, str(asset)],
+                                   capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertFalse(result["errorPage"]["ok"])
+        self.assertEqual(result["notice"], {"ok": True, "content": "第一行\n第二行"})
+        self.assertEqual(result["attachment"], {"ok": True, "content": "附件：值勤注意事項.pdf"})
+        self.assertEqual(result["expired"], {"ok": False, "login": True})
 
 
 if __name__ == "__main__":

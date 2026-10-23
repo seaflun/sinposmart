@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -10,6 +11,8 @@ const ROOT_ID = '1HDPbtqU_87StkzOcxLub2utVU_UGF8FJ';
 const TEMPLATE_ID = '1AUj5M4wwYg29aTwa70EtAkDB8W37LuWsP8uqNXtbKJU';
 const SHEETS_MIME = 'application/vnd.google-apps.spreadsheet';
 const SOURCE_DIR = path.join(__dirname, '..', 'apps-script');
+const FIXTURE_SYNC_KEY = 'synthetic-notice-sync-key';
+const FIXTURE_VERIFIER = crypto.createHash('sha256').update(FIXTURE_SYNC_KEY).digest('hex');
 
 function iterator(items) {
   let index = 0;
@@ -19,8 +22,9 @@ function iterator(items) {
 function fixture() {
   const files = new Map();
   const folders = new Map();
-  const properties = new Map();
-  const events = { copies: [], foldersCreated: [], opened: [], locked: false, lockCalls: 0 };
+  const properties = new Map([['NOTICE_COLLECTION_SYNC_KEY_SHA256', FIXTURE_VERIFIER]]);
+  const events = { copies: [], foldersCreated: [], opened: [], locked: false, lockCalls: 0, driveReads: 0 };
+  let effectiveUser = 'sinpo666@gmail.com';
   let nextId = 1;
   let openFailures = 0;
   let lockFailure = false;
@@ -92,10 +96,15 @@ function fixture() {
   const sandbox = {
     console,
     MimeType: { GOOGLE_SHEETS: SHEETS_MIME },
+    Session: { getEffectiveUser: () => ({ getEmail: () => effectiveUser }) },
+    Utilities: {
+      DigestAlgorithm: { SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' },
+      computeDigest: (algorithm, value, encoding) => Array.from(crypto.createHash(algorithm).update(value, encoding).digest()),
+    },
     DriveApp: {
-      getFolderById(id) { assert.ok(folders.has(id), `unexpected folder ID ${id}`); return folders.get(id); },
-      getFileById(id) { assert.ok(files.has(id), `unexpected file ID ${id}`); return files.get(id); },
-      getFilesByName: (name) => iterator([...files.values()].filter((item) => item.name === name)),
+      getFolderById(id) { events.driveReads++; assert.ok(folders.has(id), `unexpected folder ID ${id}`); return folders.get(id); },
+      getFileById(id) { events.driveReads++; assert.ok(files.has(id), `unexpected file ID ${id}`); return files.get(id); },
+      getFilesByName(name) { events.driveReads++; return iterator([...files.values()].filter((item) => item.name === name)); },
     },
     SpreadsheetApp: {
       open,
@@ -127,6 +136,7 @@ function fixture() {
     },
     failNextOpen() { openFailures++; },
     failLock() { lockFailure = true; },
+    setEffectiveUser(email) { effectiveUser = email; },
   };
 }
 
@@ -304,12 +314,93 @@ function stubWritePipeline(f) {
   return s;
 }
 
-function request(action) {
+function request(action, changes = {}) {
   return { postData: { contents: JSON.stringify({
-    action, requestId: 'notice-fixture-123',
+    action, requestId: 'notice-fixture-123', sync_key: FIXTURE_SYNC_KEY,
     records: [{ key: '123', noticeId: '123', date: '115-11-01', subject: 'fixture', sender: 'fixture', content: 'fixture' }],
+    ...changes,
   }) } };
 }
+
+test('missing or wrong keys are rejected before context, Drive, locks or receipts', () => {
+  for (const action of ['checkExisting', 'getWriteResult', 'writeRecords']) {
+    for (const syncKey of [undefined, '', 'wrong-synthetic-key', FIXTURE_VERIFIER]) {
+      const f = fixture();
+      const s = stubWritePipeline(f);
+      let contexts = 0, receipts = 0;
+      const originalContext = s.newContext;
+      s.newContext = () => { contexts++; return originalContext(); };
+      s.getWriteReceipt = () => { receipts++; return null; };
+      const result = s.doPost(request(action, { sync_key: syncKey }));
+      assert.equal(result.status, 'error');
+      assert.match(result.message, /unauthorized/i);
+      assert.equal(contexts, 0);
+      assert.equal(receipts, 0);
+      assert.equal(f.events.driveReads, 0);
+      assert.equal(f.events.lockCalls, 0);
+      assert.equal(f.events.opened.length, 0);
+      assert.equal(f.events.copies.length, 0);
+      assert.equal(result.uncertain, false);
+      assert.equal(JSON.stringify(result).includes(FIXTURE_SYNC_KEY), false);
+      assert.equal(JSON.stringify(result).includes(FIXTURE_VERIFIER), false);
+    }
+  }
+});
+
+test('an unset or malformed verifier refuses even a correct key before accessing records', () => {
+  for (const verifier of [undefined, '', 'invalid-verifier']) {
+    const f = fixture();
+    f.properties.set('NOTICE_COLLECTION_SYNC_KEY_SHA256', verifier);
+    const s = stubWritePipeline(f);
+    const result = s.doPost(request('checkExisting'));
+    assert.equal(result.status, 'error');
+    assert.match(result.message, /unauthorized/i);
+    assert.equal(f.events.driveReads, 0);
+    assert.equal(f.events.lockCalls, 0);
+  }
+});
+
+test('malformed request syntax never echoes an authentication key', () => {
+  const f = fixture();
+  const s = stubWritePipeline(f);
+  const result = s.doPost({ postData: { contents: `{"sync_key":"${FIXTURE_SYNC_KEY}"` } });
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /invalid request payload/i);
+  assert.equal(JSON.stringify(result).includes(FIXTURE_SYNC_KEY), false);
+  assert.equal(f.events.driveReads, 0);
+  assert.equal(f.events.lockCalls, 0);
+});
+
+test('a correct key permits the existing receipt lookup contract', () => {
+  const f = fixture();
+  const s = stubWritePipeline(f);
+  let receipts = 0;
+  s.getWriteReceipt = () => { receipts++; return null; };
+  const result = s.doPost(request('getWriteResult'));
+  assert.equal(result.status, 'success');
+  assert.equal(result.found, false);
+  assert.equal(receipts, 1);
+});
+
+test('only the owner can configure a verifier and configuration never returns it', () => {
+  const f = fixture();
+  f.properties.delete('NOTICE_COLLECTION_SYNC_KEY_SHA256');
+  const configured = f.sandbox.configureNoticeCollectionAuthorization(FIXTURE_VERIFIER.toUpperCase());
+  assert.equal(JSON.stringify(configured), '{"configured":true}');
+  assert.equal(f.properties.get('NOTICE_COLLECTION_SYNC_KEY_SHA256'), FIXTURE_VERIFIER);
+  f.setEffectiveUser('other@example.invalid');
+  assert.throws(() => f.sandbox.configureNoticeCollectionAuthorization('a'.repeat(64)), /unauthorized/i);
+  assert.equal(f.properties.get('NOTICE_COLLECTION_SYNC_KEY_SHA256'), FIXTURE_VERIFIER);
+});
+
+test('owner configuration accepts only a SHA256 verifier and never stores a raw key', () => {
+  for (const value of [undefined, '', FIXTURE_SYNC_KEY, 'g'.repeat(64), { verifier: FIXTURE_VERIFIER }]) {
+    const f = fixture();
+    assert.throws(() => f.sandbox.configureNoticeCollectionAuthorization(value), /invalid.*verifier/i);
+    assert.equal(f.properties.get('NOTICE_COLLECTION_SYNC_KEY_SHA256'), FIXTURE_VERIFIER);
+    assert.equal(Array.from(f.properties.values()).includes(FIXTURE_SYNC_KEY), false);
+  }
+});
 
 test('checkExisting is read-only even when the year and month do not exist', () => {
   const f = fixture();

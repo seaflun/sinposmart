@@ -316,6 +316,10 @@ def capture_login_diagnostic(
     return diagnostic
 
 
+class OASessionExpiredError(LoginVerificationError):
+    """The OA portal returned its session-timeout page after a login attempt."""
+
+
 @dataclass(frozen=True)
 class LoginResult:
     actor_no: str
@@ -436,6 +440,8 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
         target = urlsplit(str(current.current_url or ""))
         if target.scheme != "https" or target.netloc != "oa.tyfd.gov.tw":
             raise LoginVerificationError("入口網登入後來源不符，已停止操作。")
+        if target.path == "/sess_exceed.php":
+            raise OASessionExpiredError("入口網作業逾時，請重新登入。")
         return (target.path not in {"/login.php", "/login_main.php"}
                 and not current.find_elements(By.CSS_SELECTOR, "#login_name, #verify_code, #loginBtn"))
 

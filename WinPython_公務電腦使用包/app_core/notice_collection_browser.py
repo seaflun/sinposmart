@@ -13,6 +13,7 @@ from uuid import uuid4
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 from selenium.webdriver.common.by import By
 
+from app_core.login_verifier import OASessionExpiredError
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
     NoticeCollectionError,
@@ -105,6 +106,8 @@ class NoticeBrowser:
     def _assert_identity(self, state: dict) -> None:
         if state.get("origin") != OA_ORIGIN:
             raise NoticeCollectionError("通報頁來源不符，已停止操作。")
+        if state.get("sessionExpired") is True:
+            raise NoticeLoginRequired("入口網作業逾時，請重新登入。")
         if state.get("login") or self._is_session_exceeded_page():
             raise NoticeLoginRequired("通報背景登入狀態已失效。")
         if state.get("accountCount") != 1 or state.get("account") != EXPECTED_ACCOUNT_LABEL:
@@ -139,6 +142,8 @@ class NoticeBrowser:
             self._check_cancel(cancel)
             try:
                 self._login_runner(self._driver, FIXED_NOTICE_ACCOUNT, password, attempts=3)
+            except OASessionExpiredError:
+                raise NoticeLoginRequired("入口網作業逾時，將於下輪重新登入。") from None
             except Exception:
                 raise NoticeLoginRequired("通報背景登入未成功，請確認已儲存的密碼與網站狀態。") from None
             self._check_cancel(cancel)

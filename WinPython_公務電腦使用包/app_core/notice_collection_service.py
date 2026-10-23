@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import copy
 import hashlib
+import hmac
 import json
+import os
 import re
 import urllib.request
 from uuid import uuid4
@@ -110,10 +112,11 @@ def current_shift(schedule_data: dict, now: datetime) -> NoticeShift | None:
 
 
 class NoticeCollectionService:
-    def __init__(self, package_root: Path, *, browser=None, poster=None, now_factory=None):
+    def __init__(self, package_root: Path, *, browser=None, poster=None, now_factory=None, sync_key_lookup=None):
         self.package_root = Path(package_root)
         self._browser = browser
         self._poster = poster
+        self._sync_key_lookup = sync_key_lookup if sync_key_lookup is not None else self._default_sync_key
         self._now = now_factory or (lambda: datetime.now(TAIPEI))
         self.state_path = self.package_root / "runtime_outputs" / "notice_collection" / "state.json"
         self._state_error = False
@@ -219,12 +222,13 @@ class NoticeCollectionService:
         if not rows and not self._state["pending"]:
             return result
         self._collection_stage = "write"
-        confirmed, recovered = self._recover_pending(cancel)
+        confirmed, recovered = self._recover_pending(cancel, rows)
         self._confirmed_for_read = confirmed
         result.written_keys.extend(recovered)
         blocked = {row["key"] for intent in self._state["pending"] for row in intent["records"]}
         for offset in range(0, len(rows), MAX_RECORDS):
-            batch = [row for row in rows[offset:offset + MAX_RECORDS] if row["key"] not in blocked]
+            batch = [row for row in rows[offset:offset + MAX_RECORDS]
+                     if row["key"] not in blocked and row["key"] not in confirmed]
             if not batch:
                 continue
             self._check_cancel(cancel)
@@ -310,25 +314,26 @@ class NoticeCollectionService:
         result.message = (f"已確認收取 {len(result.written_keys)} 則通報。" if not result.error_count
                           else "部分通報尚未完成收取或已讀確認，將保留未完成狀態。")
         if pending_keys:
-            result.message = "通報寫入收據仍待確認；不重複送出，未確認的通報保留未讀。"
+            result.message = "通報寫入收據仍待確認；未確認的通報保留未讀，待下輪安全重試。"
         return result
 
     def _receipt(self, intent: dict) -> dict | None:
         try:
             response = self._post({"action": "getWriteResult", "requestId": intent["request_id"]})
-            if (response.get("status") == "success" and response.get("found") is True
+            if (response.get("status") == "success" and isinstance(response.get("found"), bool)
                     and response.get("requestId") == intent["request_id"]):
-                return {"status": "success", "requestId": intent["request_id"], "result": response.get("result")}
+                return {"status": "success", "requestId": intent["request_id"],
+                        "found": response["found"], "result": response.get("result")}
         except NoticeCollectionError:
             pass
         return None
 
-    def _recover_pending(self, cancel) -> tuple[set[str], list[str]]:
+    def _recover_pending(self, cancel, rows: list[dict]) -> tuple[set[str], list[str]]:
         confirmed, written = set(), []
         for intent in list(self._state["pending"]):
             self._check_cancel(cancel)
             receipt = self._receipt(intent)
-            if receipt is not None:
+            if receipt is not None and receipt["found"]:
                 try:
                     handled, recovered = self._finish_write(intent, receipt)
                     confirmed.update(handled)
@@ -338,14 +343,65 @@ class NoticeCollectionService:
                     raise
                 except NoticeCollectionError:
                     pass
-            # Existence permits marking, but cannot prove who added the row.
-            # Keep the receipt intent and do not inflate the GUI's new count.
             try:
                 existing, _repairs = self._check_existing(intent["records"])
                 confirmed.update(existing)
             except NoticeCollectionError:
+                continue
+            # Receipts expire after ten minutes. Complete durable rows settle an
+            # old intent without guessing who wrote them or adding new counts.
+            if existing == {row["key"] for row in intent["records"]}:
+                state = copy.deepcopy(self._state)
+                state["pending"] = [p for p in state["pending"] if p["request_id"] != intent["request_id"]]
+                self._persist(state)
+                continue
+            if receipt is None or receipt["found"] is not False:
+                continue
+            records = self._rehydrate_pending(intent, rows, cancel)
+            if records is None:
+                continue
+            self._check_cancel(cancel)
+            self._collection_stage = "write"
+            payload = {"action": "writeRecords", "requestId": intent["request_id"], "records": records}
+            try:
+                handled, recovered = self._write_with_recovery(intent, payload, cancel)
+                confirmed.update(handled)
+                written.extend(recovered)
+            except _NoticeStateError:
+                raise
+            except NoticeCollectionError:
                 pass
         return confirmed, written
+
+    def _rehydrate_pending(self, intent: dict, rows: list[dict], cancel) -> list[dict] | None:
+        """Re-read the same live notices; never persist their full content locally."""
+        originals = intent["records"]
+        current = {row["key"]: row for row in rows}
+        if (not 0 < len(originals) <= MAX_RECORDS
+                or len({row["key"] for row in originals}) != len(originals)):
+            return None
+        for row in originals:
+            notice_id = str(row.get("noticeId", ""))
+            if (not re.fullmatch(r"\d+", notice_id) or row["key"] != notice_id
+                    or row["key"] not in current
+                    or self._metadata(current[row["key"]]) != self._metadata(row)):
+                return None
+        received_at = _local_time(datetime.fromisoformat(intent["received_at"]))
+        records = []
+        for row in originals:
+            self._check_cancel(cancel)
+            self._collection_stage = "scan"
+            try:
+                content = str(self._browser.read_content(current[row["key"]], cancel=cancel)).strip()
+            except NoticeLoginRequired:
+                raise
+            except Exception:
+                return None
+            if content in ("", "內文抓取失敗", "讀取失敗", "權限限制"):
+                return None
+            records.append({**self._metadata(row), "content": content,
+                            "receivedAt": received_at.strftime("%Y.%m.%d.%H%M")})
+        return records
 
     def _write_with_recovery(self, intent: dict, payload: dict, cancel) -> tuple[set[str], list[str]]:
         for attempt in range(2):
@@ -361,7 +417,7 @@ class NoticeCollectionService:
                     return set(), []
             self._check_cancel(cancel)
             receipt = self._receipt(intent)
-            if receipt is not None:
+            if receipt is not None and receipt["found"]:
                 try:
                     return self._finish_write(intent, receipt)
                 except _NoticeStateError:
@@ -455,7 +511,7 @@ class NoticeCollectionService:
             "running": "正在檢查未讀通報。", "waiting": "等待公務作業完成後檢查通報。",
             "missing_credentials": "通報專用帳號尚未完成密碼設定。",
             "success": "本輪通報檢查已完成。", "partial": "部分通報尚未完成入表或已讀確認。",
-            "uncertain": "通報寫入收據仍待確認，不會重複送出。",
+            "uncertain": "通報寫入收據仍待確認，未確認的通報保留未讀。",
             "failed": "通報檢查未完成，請確認網站、登入或本機紀錄狀態。",
         }
         count = max(1, (len(records) + MAX_RECORDS - 1) // MAX_RECORDS)
@@ -487,13 +543,26 @@ class NoticeCollectionService:
             raise _NoticeStateError("通報收取紀錄無法安全儲存，已停止寫入及已讀操作。") from None
         self._state = state
 
+    @staticmethod
+    def _default_sync_key() -> str:
+        explicit = os.environ.get("SINPOSMART_NOTICE_COLLECTION_SYNC_KEY", "").strip()
+        if explicit:
+            return explicit
+        token = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
+        return (hmac.new(token.encode("utf-8"), b"SinpoSmartNoticeCollection:v1", hashlib.sha256).hexdigest()
+                if token else "")
+
     def _post(self, payload: dict) -> dict:
         try:
             if self._poster is not None:
                 response = self._poster(payload)
             else:
+                sync_key = self._sync_key_lookup()
+                if not isinstance(sync_key, str) or not sync_key.strip():
+                    raise ValueError("notice authorization is not configured")
+                body = {**payload, "sync_key": sync_key.strip()}
                 request = urllib.request.Request(
-                    APPS_SCRIPT_URL, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    APPS_SCRIPT_URL, json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     {"Content-Type": "text/plain;charset=utf-8"}, method="POST")
                 with urllib.request.urlopen(request, timeout=45) as opened:
                     response = json.loads(opened.read(5 * 1024 * 1024))

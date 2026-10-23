@@ -23,3 +23,11 @@
 2026-10-22 以 sinpo666@gmail.com 實測建立 115 年 11 月與 116 年 1 月，確認唯一年度位置、相同檔案 ID 重查、各 33 分頁與 3,416 條公式、主要格式、93 個人員下拉規則及日期運算。僅用空白格暫測公式，完成後清空；沒有建立測試通報列，母檔未修改。
 
 後續部署須另有使用者授權，以 sinpo666@gmail.com 更新既有 deployment 並維持 GUI 使用的網址。第一次使用新增 Drive 功能時須確認已授權，不能只用唯讀查詢成功判斷複製權限。不要將暫時驗收入口加入正式部署。
+
+## 請求授權與收據復原
+
+- 每個 `checkExisting`、`getWriteResult`、`writeRecords` 請求均需頂層 `sync_key`；未設定、缺少或錯誤的密鑰會在存取正式資料與收據前拒絕。
+- Apps Script 的 Script Properties 只保存 `NOTICE_COLLECTION_SYNC_KEY_SHA256` 驗證碼，不保存原密鑰。擁有者可透過 `configureNoticeCollectionAuthorization(verifierSha256)` 設定；設定函式只允許 `sinpo666@gmail.com` 且不回傳驗證碼。
+- 公務包優先使用受控設定 `SINPOSMART_NOTICE_COLLECTION_SYNC_KEY`；未另設定時，由既有 `SINPOSMART_CREDENTIAL_SYNC_TOKEN` 以 HMAC-SHA256、固定用途字串 `SinpoSmartNoticeCollection:v1` 派生獨立密鑰。密鑰、原 token 與驗證碼皆不納入 Git、更新包、日誌或通報紀錄。
+- 輪替受控密鑰或原 token 時，應先準備對應 Script Property，並在維護時段協調公務包與同一 Web App deployment；不要藉由保留匿名寫入來繞過授權。
+- 收據未找到不代表原本沒有寫入。只有健康比對及原批次識別資料、正文皆可確認時，才沿用原請求識別碼復原；遠端已存在的資料不重複計入新增筆數，也不覆寫歷史內容。

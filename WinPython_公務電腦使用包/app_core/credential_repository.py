@@ -99,6 +99,8 @@ class CredentialRepository:
             return SavedAccountsSnapshot([], "", self.can_persist)
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Saved account file must contain an object.")
         except Exception:
             self.needs_backup = True
             return SavedAccountsSnapshot([], "", self.can_persist, invalid_file=True)
