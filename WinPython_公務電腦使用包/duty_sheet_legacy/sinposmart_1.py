@@ -342,7 +342,7 @@ def expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers):
     return expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
 
 def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers):
-    """檢查每日勤務表是否有同時段重複排班或漏排。"""
+    """檢查每日勤務表是否有指揮官未排、同時段重複排班或漏排。"""
     issues = []
     start_col = find_header_column(sheet, 5, "值班")
     end_col = find_header_column(sheet, 6, "指揮官")
@@ -371,6 +371,8 @@ def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers)
 
         missing = [person for person in expected if person not in seen]
         row_errors = []
+        if not clean_to_list_excluding(get_merged_val(sheet, row, end_col), excluded_numbers):
+            row_errors.append("【指揮官未排】")
         if formula_errors:
             row_errors.append(f"【公式錯誤】{','.join(formula_errors)}")
         if duplicates:
@@ -1821,7 +1823,7 @@ def start_automation(
         ordered_excluded = sorted(excluded_numbers, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
         log_status(f"ℹ️ 已略過實習生番號：{', '.join(ordered_excluded)}")
     sheet = wb[f"{day_int}號"]
-    daily_standby_numbers = expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
+    daily_standby_numbers = expected_on_duty_numbers(wb, sheet, day_int, excluded_numbers)
     
     ex_map = {"時間": 2, "值班": 3}
     for r in [5, 6]:
@@ -1831,6 +1833,20 @@ def start_automation(
             if "備勤緊急救護" in v: ex_map["救護_Excel"] = c
             if "備勤救災" in v: ex_map["備勤_Excel"] = c
             if "指揮官" in v: ex_map["指揮官"] = c
+
+    normal_on_duty = {normalize_staff_number(number) for number in daily_standby_numbers}
+    if normal_on_duty:
+        non_working_numbers = {
+            number
+            for row in range(10, 34)
+            for col in range(ex_map["值班"], ex_map["指揮官"] + 1)
+            for number in clean_to_list_excluding(get_merged_val(sheet, row, col), excluded_numbers)
+            if normalize_staff_number(number) not in normal_on_duty
+        }
+        excluded_numbers.update(non_working_numbers)
+        if non_working_numbers:
+            ordered_non_working = sorted(non_working_numbers, key=lambda number: int(number))
+            log_status(f"ℹ️ 依 Excel 正常上班名單略過非上班番號（含停休）：{', '.join(ordered_non_working)}")
 
     cmd_all = []
     for r in range(10, 34):
@@ -1857,7 +1873,7 @@ def start_automation(
     if num_out > 6:
         preflight_issues.append(f"{sheet.title}：外勤項目超過 6 項，無法對應勤務設定第 2–7 欄，已停止登打。")
     if not daily_standby_numbers:
-        preflight_issues.append(f"{sheet.title}：找不到第 22 列「備勤」欄位人員，無法比對勤務番號維護休假別。")
+        preflight_issues.append(f"{sheet.title}：找不到輪休基準表或每日備勤名單的正常上班人員，無法比對勤務番號維護休假別。")
     if preflight_issues:
         preflight_message = format_daily_sheet_preflight_message(preflight_issues)
         log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
@@ -2053,7 +2069,7 @@ def start_automation(
                 amb1_members = []
                 for c in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
                     amb1_members.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
-                amb1_members = unique_member_ids(amb1_members)[:2]
+                amb1_members = unique_member_ids(amb1_members)
                 
                 disaster_ids = []
                 for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):

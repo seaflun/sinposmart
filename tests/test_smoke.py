@@ -2644,8 +2644,8 @@ try {
         for row in range(10, 34):
             sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
             sheet.cell(row=row, column=3).value = "1"
-            sheet.cell(row=row, column=4).value = "2"
-        sheet.cell(row=10, column=4).value = "1"
+            sheet.cell(row=row, column=8).value = "2"
+        sheet.cell(row=10, column=8).value = "1"
         sheet.cell(row=10, column=5).value = "29"
 
         issues = module.validate_daily_sheet_assignments(workbook, sheet, 7, {"29"})
@@ -2676,9 +2676,31 @@ try {
         for row in range(10, 34):
             sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
             sheet.cell(row=row, column=3).value = "1"
-            sheet.cell(row=row, column=4).value = "2"
+            sheet.cell(row=row, column=8).value = "2"
 
         self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
+
+    def test_daily_sheet_preflight_requires_commander_in_each_merged_time_slot(self) -> None:
+        module = legacy_duty_sheet_module()
+        for commander in (None, " \t\n\u3000", 0, "0"):
+            with self.subTest(commander=commander):
+                workbook = module.openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "24號"
+                sheet.cell(5, 3, "值班")
+                sheet.cell(6, 8, "指揮官")
+                for row in range(10, 34):
+                    sheet.cell(row, 2, f"{row - 2:02d}-{row - 1:02d}")
+                    sheet.cell(row, 3, "16")
+                    sheet.cell(row, 4, "28,1")
+                    sheet.cell(row, 8, "2")
+                sheet.cell(12, 8).value = commander
+                sheet.merge_cells("H12:H13")
+                with mock.patch.object(module, "expected_on_duty_numbers", return_value=["16", "28", "1", "2"]):
+                    issues = module.validate_daily_sheet_assignments(workbook, sheet, 24, set())
+                self.assertEqual(len(issues), 2)
+                self.assertTrue(any("10-11" in issue and "【指揮官未排】" in issue for issue in issues))
+                self.assertTrue(any("11-12" in issue and "【指揮官未排】" in issue for issue in issues))
 
     def test_daily_sheet_preflight_counts_merged_assignments_for_each_time_slot(self) -> None:
         module = legacy_duty_sheet_module()
@@ -2702,9 +2724,9 @@ try {
         for row in range(10, 34):
             sheet.cell(row=row, column=2).value = f"{row - 2:02d}-{row - 1:02d}"
             sheet.cell(row=row, column=3).value = "1"
-            sheet.cell(row=row, column=4).value = "2"
+            sheet.cell(row=row, column=8).value = "2"
         sheet.merge_cells(start_row=10, start_column=3, end_row=11, end_column=3)
-        sheet.merge_cells(start_row=10, start_column=4, end_row=11, end_column=4)
+        sheet.merge_cells(start_row=10, start_column=8, end_row=11, end_column=8)
 
         self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
 
@@ -4717,7 +4739,7 @@ try {
                     return driver
                 with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
                     module, "trainee_numbers_from_workbook", return_value=set()
-                ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["3"]), mock.patch.object(
+                ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["3", "6", "7", "8", "10", "11", "12", "17", "18", "19", "30", "31", "99"]), mock.patch.object(
                     module, "validate_daily_sheet_assignments", return_value=[]
                 ), mock.patch.object(module, "ThreadPoolExecutor"), mock.patch.object(
                     module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")
@@ -4748,6 +4770,191 @@ try {
                 fire_members = set((mission_map["_pln_8_1"] + "," + mission_map["_pln_8_2"]).split(","))
                 self.assertEqual(fire_members, {"10", "11", "12", "99", "3"})
                 build_driver.assert_not_called()
+
+    def test_duty_sheet_only_submits_excel_normal_on_duty_staff(self) -> None:
+        module = legacy_duty_sheet_module()
+        normal_staff = ["2", "8", "9", "10", "11", "12", "16", "20", "24", "28", "30", "31"]
+        off_duty_staff = {"1", "3", "7", "18", "19", "21", "22"}
+        for source in ("roster", "daily_summary"):
+            with self.subTest(source=source):
+                workbook = module.openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "23號"
+                for column, label in {3: "值班", 4: "外勤", 5: "休息", 6: "備勤緊急救護", 10: "備勤救災"}.items():
+                    sheet.cell(5, column, label)
+                sheet.cell(6, 15, "停休休息班")
+                sheet.cell(6, 16, "指揮官")
+                sheet.cell(22, 20, "備勤")
+                sheet.cell(22, 21, ",".join(normal_staff + (["1"] if source == "roster" else [])))
+                for row in range(10, 34):
+                    hour = (row - 2) % 24
+                    for column, value in {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20,18", 4: "31,19",
+                        5: "30,21", 6: "16,7", 7: "28,24", 11: "8,9,10,11,12", 12: "29", 15: "3,22", 16: "1,2"}.items():
+                        sheet.cell(row, column, value)
+                if source == "roster":
+                    roster = workbook.create_sheet("輪休基準表")
+                    params = workbook.create_sheet("班別參數")
+                    params.cell(1, 1, "停")
+                    params.cell(1, 2, "停休")
+                    roster.cell(5, 3, "日期")
+                    roster.cell(6, 3, 23)
+                    for column, number in enumerate(normal_staff + sorted(off_duty_staff) + ["29"], start=5):
+                        roster.cell(4, column, number)
+                        roster.cell(5, column, f"人員{number}")
+                        if number in off_duty_staff:
+                            roster.cell(6, column, "停")
+                driver = mock.Mock()
+                driver.execute_script.return_value = False
+                error = mock.Mock()
+                def use_mock_browser(_open_browser, verify, **_kwargs):
+                    verify(driver)
+                    return driver
+                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+                    module, "trainee_numbers_from_workbook", return_value={"29"}
+                ), mock.patch.object(module, "ThreadPoolExecutor"), mock.patch.object(
+                    module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")
+                ) as build_driver, mock.patch.object(
+                    module, "retry_duty_number_popup_preflight", side_effect=use_mock_browser
+                ), mock.patch.object(module, "preflight_duty_number_popup", return_value="main") as preflight, mock.patch.object(
+                    module, "step_config_popups"
+                ) as configure, mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
+                    module, "step_batch_fill_duty"
+                ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
+                    module, "super_js_execute", return_value=True
+                ), mock.patch.object(module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")) as fill_mission, mock.patch.object(
+                    module.time, "sleep"
+                ), mock.patch.object(module, "log_status"):
+                    result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
+                        error_callback=error, show_dialogs=False)
+                self.assertFalse(result)
+                error.assert_called_once_with("offline-stop-before-save")
+                self.assertEqual(configure.call_args.args[3], 2)
+                self.assertEqual(preflight.call_args.args[2], normal_staff)
+                duty_map = fill_duty.call_args.args[1]
+                mission_map = fill_mission.call_args.args[1]
+                for hour in range(24):
+                    self.assertEqual([duty_map[f"_pln_{hour}_{column}"] for column in range(1, 6)],
+                        ["20", "31", "16,28,24", "8,9,10,11,12,2", "30"])
+                    self.assertEqual(mission_map[f"_pln_{hour}_6"], "16,28,24")
+                for payload in (duty_map, mission_map):
+                    assigned = {number for key, value in payload.items() if key.startswith("_pln_")
+                        for number in value.split(",") if number}
+                    self.assertTrue(assigned.issubset(set(normal_staff)))
+                    self.assertTrue(assigned.isdisjoint(off_duty_staff | {"29"}))
+                self.assertEqual(sheet.cell(10, 15).value, "3,22")
+                build_driver.assert_not_called()
+
+    def test_duty_sheet_off_duty_commander_stops_before_browser_or_capture(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "23號"
+        for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 13, "指揮官")
+        sheet.cell(22, 16, "備勤")
+        sheet.cell(22, 17, "20")
+        for row in range(10, 34):
+            hour = (row - 2) % 24
+            sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
+            sheet.cell(row, 3, "20")
+            sheet.cell(row, 13, "1")
+        error = mock.Mock()
+        with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+            module, "ThreadPoolExecutor", side_effect=AssertionError("測試不得啟動截圖")
+        ) as executor, mock.patch.object(module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")) as build_driver, mock.patch.object(
+            module, "log_status"
+        ):
+            result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
+                error_callback=error, show_dialogs=False)
+        self.assertFalse(result)
+        self.assertIn("【指揮官未排】", error.call_args.args[0])
+        executor.assert_not_called()
+        build_driver.assert_not_called()
+
+    def test_duty_sheet_commander_moved_to_ambulance_stops_before_browser_or_capture(self) -> None:
+        module = legacy_duty_sheet_module()
+        for commander in (None, " \t\n\u3000", 0, "0"):
+            with self.subTest(commander=commander):
+                workbook = module.openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "24號"
+                for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+                    sheet.cell(5, column, label)
+                sheet.cell(6, 13, "指揮官")
+                for row in range(10, 34):
+                    hour = (row - 2) % 24
+                    sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
+                    sheet.cell(row, 3, "20")
+                    sheet.cell(row, 5, "16")
+                    sheet.cell(row, 6, "28")
+                    sheet.cell(row, 13, "1")
+                for row in (12, 13):
+                    sheet.cell(row, 6, "28,1")
+                    sheet.cell(row, 13).value = commander
+                error = mock.Mock()
+                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+                    module, "trainee_numbers_from_workbook", return_value=set()
+                ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["20", "16", "28", "1"]), mock.patch.object(
+                    module, "ThreadPoolExecutor", side_effect=AssertionError("測試不得啟動截圖")
+                ) as executor, mock.patch.object(module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")) as build_driver, mock.patch.object(
+                    module, "capture_duty_sheet_images", side_effect=AssertionError("測試不得啟動截圖")
+                ) as capture, mock.patch.object(module, "log_status"):
+                    result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                        error_callback=error, show_dialogs=False)
+                self.assertFalse(result)
+                self.assertIn("10-11：【指揮官未排】", error.call_args.args[0])
+                self.assertIn("11-12：【指揮官未排】", error.call_args.args[0])
+                self.assertNotIn("【漏排】", error.call_args.args[0])
+                executor.assert_not_called()
+                capture.assert_not_called()
+                build_driver.assert_not_called()
+
+    def test_duty_sheet_keeps_three_ambulance_members_in_duty_and_mission_payloads(self) -> None:
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "24號"
+        for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 13, "指揮官")
+        for row in range(10, 34):
+            hour = (row - 2) % 24
+            for column, value in {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20", 5: "16", 6: "28,1",
+                10: "8,9,10,11,12", 13: "2"}.items():
+                sheet.cell(row, column, value)
+        driver = mock.Mock()
+        driver.execute_script.return_value = False
+        error = mock.Mock()
+        def use_mock_browser(_open_browser, verify, **_kwargs):
+            verify(driver)
+            return driver
+        with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+            module, "trainee_numbers_from_workbook", return_value=set()
+        ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["20", "16", "28", "1", "8", "9", "10", "11", "12", "2"]), mock.patch.object(
+            module, "ThreadPoolExecutor"
+        ), mock.patch.object(module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")) as build_driver, mock.patch.object(
+            module, "retry_duty_number_popup_preflight", side_effect=use_mock_browser
+        ), mock.patch.object(module, "preflight_duty_number_popup", return_value="main"), mock.patch.object(
+            module, "step_config_popups"
+        ), mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
+            module, "step_batch_fill_duty"
+        ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
+            module, "super_js_execute", return_value=True
+        ), mock.patch.object(module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")) as fill_mission, mock.patch.object(
+            module.time, "sleep"
+        ), mock.patch.object(module, "log_status"):
+            result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                error_callback=error, show_dialogs=False)
+        self.assertFalse(result)
+        error.assert_called_once_with("offline-stop-before-save")
+        duty_map = fill_duty.call_args.args[1]
+        mission_map = fill_mission.call_args.args[1]
+        for hour in range(24):
+            self.assertEqual(duty_map[f"_pln_{hour}_2"], "16,28,1")
+            self.assertEqual(mission_map[f"_pln_{hour}_6"], "16,28,1")
+            self.assertTrue(set(mission_map[f"_pln_{hour}_7"].split(",")).isdisjoint({"16", "28", "1"}))
+        build_driver.assert_not_called()
 
     def test_duty_result_grid_missing_rescue_column_is_rejected(self) -> None:
         from selenium.common.exceptions import TimeoutException
