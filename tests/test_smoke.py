@@ -4692,6 +4692,63 @@ try {
         self.assertIn("外勤項目超過 6 項", error.call_args.args[0])
         build_driver.assert_not_called()
 
+    def test_duty_sheet_matches_main_rest_header_and_keeps_extra_staff_on_standby(self) -> None:
+        import openpyxl
+        module = legacy_duty_sheet_module()
+        for rest_label, extra_label in (("休息", "停休休息班"), ("休\n息", "停休休息班"), ("休息", "休息")):
+            with self.subTest(rest=rest_label, extra=extra_label):
+                workbook = openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "23號"
+                headers = {3: "值班", 4: "領取氣瓶", 5: "外出採買", 6: "公所進駐", 7: rest_label,
+                    8: "在隊訓練", 9: "備勤緊急救護", 13: "備勤救災"}
+                for column, label in headers.items():
+                    sheet.cell(5, column, label)
+                sheet.cell(6, 29, extra_label)
+                sheet.cell(6, 32, "指揮官")
+                for column, value in {2: "08-09", 3: "8", 4: "17", 5: "18", 6: "19", 7: "30",
+                    8: "31", 9: "6,7", 14: "10,11,12", 29: "99", 32: "3"}.items():
+                    sheet.cell(10, column, value)
+                driver = mock.Mock()
+                driver.execute_script.return_value = False
+                error = mock.Mock()
+                def use_mock_browser(_open_browser, verify, **_kwargs):
+                    verify(driver)
+                    return driver
+                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+                    module, "trainee_numbers_from_workbook", return_value=set()
+                ), mock.patch.object(module, "expected_on_duty_numbers_from_daily_sheet", return_value=["3"]), mock.patch.object(
+                    module, "validate_daily_sheet_assignments", return_value=[]
+                ), mock.patch.object(module, "ThreadPoolExecutor"), mock.patch.object(
+                    module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")
+                ) as build_driver, mock.patch.object(
+                    module, "retry_duty_number_popup_preflight", side_effect=use_mock_browser
+                ), mock.patch.object(module, "preflight_duty_number_popup", return_value="main"), mock.patch.object(
+                    module, "step_config_popups"
+                ) as configure, mock.patch.object(
+                    module, "wait_for_duty_result_grid", return_value=True
+                ), mock.patch.object(module, "step_batch_fill_duty") as fill_duty, mock.patch.object(
+                    module, "step_navigate_to_task_table"
+                ), mock.patch.object(module, "super_js_execute", return_value=True), mock.patch.object(
+                    module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")
+                ) as fill_mission, mock.patch.object(module.time, "sleep"), mock.patch.object(module, "log_status"):
+                    result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
+                        error_callback=error, show_dialogs=False)
+                self.assertFalse(result)
+                error.assert_called_once_with("offline-stop-before-save")
+                self.assertEqual(configure.call_args.args[2], ["領取氣瓶", "外出採買", "公所進駐"])
+                duty_map = fill_duty.call_args.args[1]
+                self.assertEqual({key: duty_map[key] for key in ("_pln_8_2", "_pln_8_3", "_pln_8_4")},
+                    {"_pln_8_2": "17", "_pln_8_3": "18", "_pln_8_4": "19"})
+                self.assertEqual(duty_map["_pln_8_5"], "6,7")
+                self.assertEqual(duty_map["_pln_8_6"], "10,11,12,99,3")
+                self.assertEqual(duty_map["_pln_8_7"], "30")
+                self.assertNotIn("_pln_8_8", duty_map)
+                mission_map = fill_mission.call_args.args[1]
+                fire_members = set((mission_map["_pln_8_1"] + "," + mission_map["_pln_8_2"]).split(","))
+                self.assertEqual(fire_members, {"10", "11", "12", "99", "3"})
+                build_driver.assert_not_called()
+
     def test_duty_result_grid_missing_rescue_column_is_rejected(self) -> None:
         from selenium.common.exceptions import TimeoutException
         module = legacy_duty_sheet_module()

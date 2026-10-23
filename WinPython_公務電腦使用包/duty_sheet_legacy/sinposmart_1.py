@@ -1827,7 +1827,7 @@ def start_automation(
     for r in [5, 6]:
         for c in range(1, 100):
             v = str(sheet.cell(row=r, column=c).value or "").strip()
-            if "休息" in v: ex_map["休息_Excel"] = c
+            if r == 5 and normalize_header_text(v) == "休息": ex_map["休息_Excel"] = c
             if "備勤緊急救護" in v: ex_map["救護_Excel"] = c
             if "備勤救災" in v: ex_map["備勤_Excel"] = c
             if "指揮官" in v: ex_map["指揮官"] = c
