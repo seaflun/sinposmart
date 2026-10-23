@@ -10376,7 +10376,7 @@ class UpdateControllerTests(unittest.TestCase):
             controller._remote_workers.clear()
             controller.shutdown()
 
-    def test_remote_update_button_keeps_session_until_updater_restarts_gui(self) -> None:
+    def test_remote_update_button_logs_out_before_updater_restarts_gui(self) -> None:
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
 
@@ -10395,11 +10395,72 @@ class UpdateControllerTests(unittest.TestCase):
         )
         try:
             controller.requestLogout()
-            self.assertTrue(controller.sessionController.isLoggedIn)
+            self.assertFalse(controller.sessionController.isLoggedIn)
             self.assertEqual(launched, [("remote-logout-test", "ApplyStaged")])
             self.assertEqual(controller.updateController.logoutActionText, "登出並更新")
         finally:
             controller.shutdown()
+
+    def test_remote_update_wait_or_failure_does_not_prevent_handoff_logout(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for mode in ("preparing", "blocked", "launch_failed"):
+            for pending in (False, True):
+                with self.subTest(mode=mode, pending=pending), tempfile.TemporaryDirectory() as directory, patch.dict(
+                    os.environ, {"LOCALAPPDATA": directory}
+                ):
+                    controller = AppController(
+                        repository=CredentialRepository(Path(directory) / "accounts.json", "SinpoSmart", None),
+                        read_only_acceptance=True,
+                    )
+                    controller.dutyController.load_current_schedule = lambda: None
+                    controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+                    attempt = controller._session_state.begin_login()
+                    controller._session_state.complete_login(
+                        attempt, LoginSession("27", "user27", "synthetic-password", verified=True)
+                    )
+                    controller.sessionController.sessionChanged.emit()
+                    controller.dutyController._last_auto_logout_successor_actor_no = "10"
+                    update = controller.updateController
+                    update._remote_update_active = True
+                    update._remote_update_ready = mode != "preparing"
+                    update._remote_update_request_id = "handoff-logout-update"
+                    update._stop_guard = lambda: "尚有 1 筆到點自動登打等待中" if mode == "blocked" else ""
+                    update._remote_process_launcher = Mock(side_effect=OSError("synthetic launch failure"))
+                    if pending:
+                        controller.dutyExecutionController._entry_active_request_id = 41
+                    try:
+                        with patch.object(update, "_check_remote_stage"), patch.object(
+                            update, "_send_remote_status", return_value=False
+                        ), patch.object(controller, "_persist_auto_login_marker"), patch.object(
+                            controller, "_clear_auto_login_marker"
+                        ) as clear_marker, patch.object(controller, "_auto_login_successor") as resume:
+                            controller._auto_logout("27")
+                            if pending:
+                                self.assertTrue(controller.sessionController.isLoggedIn)
+                                controller.dutyExecutionController._entry_active_request_id = None
+                                controller._finish_pending_logout()
+                            self.assertFalse(controller.sessionController.isLoggedIn)
+                            if mode != "launch_failed":
+                                self.assertTrue(update.remoteUpdateActive)
+                                resume.assert_not_called()
+                                if mode == "blocked":
+                                    self.assertTrue(update.updateDeferred)
+                                update._fail_remote_update("更新等待超過 5 分鐘")
+                            self.assertFalse(update.remoteUpdateActive)
+                            QTest.qWait(1)
+                            resume.assert_called_once_with("10")
+                            clear_marker.assert_called_once_with()
+                            update.stateChanged.emit()
+                            QTest.qWait(1)
+                            resume.assert_called_once_with("10")
+                    finally:
+                        controller.dutyExecutionController._entry_active_request_id = None
+                        controller.shutdown()
 
     def test_remote_update_logout_falls_back_when_stage_is_already_terminal(self) -> None:
         from app_core.update_repository import UpdateRepository

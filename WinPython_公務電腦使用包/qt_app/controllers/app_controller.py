@@ -254,6 +254,7 @@ class AppController(QObject):
         self._pending_update_auto_login = False
         self._update_login_notice_retries = 40
         self._pending_update_logout = False
+        self._logout_waiting_for_update = False
         self._auto_login_marker_path = self._auto_login_marker_file(package_root)
         self._restore_auto_login_marker()
         self._update_shutdown_started = False
@@ -341,6 +342,7 @@ class AppController(QObject):
         )
         self._duty_controller.unreturnedReturnEvent.connect(self._publish_unreturned_return_event)
         self._update_controller.unreturnedCancellationsReceived.connect(self._duty_controller.cancel_unreturned_records)
+        self._update_controller.stateChanged.connect(self._resume_auto_login_after_logout_update)
         self._duty_controller.scheduleChanged.connect(self._retry_pending_live_refresh)
         self._work_log_settings_controller.settingsSaved.connect(self._refresh_after_settings_save)
         self._duty_execution_controller.allLanesUnavailable.connect(self._handle_execution_unavailable)
@@ -1441,17 +1443,7 @@ class AppController(QObject):
         self._pending_live_refresh_generation = None
         self._duty_controller.prepare_session_end()
         if self._duty_execution_controller.prepare_session_end():
-            if self._pending_update_logout:
-                if self._update_controller.applyRemoteUpdate():
-                    self._pending_update_logout = False
-                    return
-                self._clear_auto_login_marker()
-            self._pending_update_logout = False
-            if message:
-                self._session_controller.systemLogout(message)
-            else:
-                self._session_controller.logout()
-            self._schedule_auto_login_successor()
+            self._complete_session_logout(message, apply_update=self._pending_update_logout)
             return
         self._logout_pending = True
         self._pending_logout_message = str(message or "")
@@ -1468,15 +1460,30 @@ class AppController(QObject):
         apply_update = self._pending_update_logout
         self._logout_pending = False
         self._pending_logout_message = ""
+        self._complete_session_logout(message, apply_update=apply_update)
+
+    def _complete_session_logout(self, message: str, *, apply_update: bool) -> None:
         self._pending_update_logout = False
-        if apply_update:
-            if self._update_controller.applyRemoteUpdate():
-                return
-            self._clear_auto_login_marker()
         if message:
             self._session_controller.systemLogout(message)
         else:
             self._session_controller.logout()
+        self._logout_waiting_for_update = bool(apply_update)
+        if apply_update:
+            if self._update_controller.applyRemoteUpdate():
+                return
+            if not self._logout_waiting_for_update:
+                return
+            self._logout_waiting_for_update = False
+            self._clear_auto_login_marker()
+        self._schedule_auto_login_successor()
+
+    @Slot()
+    def _resume_auto_login_after_logout_update(self) -> None:
+        if not self._logout_waiting_for_update or self._update_controller.remoteUpdateActive:
+            return
+        self._logout_waiting_for_update = False
+        self._clear_auto_login_marker()
         self._schedule_auto_login_successor()
 
     def _schedule_auto_login_successor(self) -> None:
