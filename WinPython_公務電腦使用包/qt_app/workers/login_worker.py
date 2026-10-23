@@ -8,7 +8,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from app_core.login_verifier import LoginVerificationError, LoginVerifier, capture_login_diagnostic
+from app_core.login_verifier import LOGIN_PAGE_LOAD_MESSAGES, LoginVerificationError, LoginVerifier, capture_login_diagnostic
 
 
 class LoginWorker(QObject):
@@ -55,7 +55,9 @@ class LoginWorker(QObject):
             self.failure_diagnostic = dict(exc.login_diagnostic) or capture_login_diagnostic(
                 None, str(exc), user_id=self.user_id, password=self.password, reason_code=exc.reason_code,
             )
-            message = self.failure_diagnostic['reason']
+            message = LOGIN_PAGE_LOAD_MESSAGES.get(
+                self.failure_diagnostic.get('reason_code'), self.failure_diagnostic['reason'],
+            )
             if self.failure_diagnostic.get('reason_code') == 'password_change_required':
                 message = '密碼須更新：請至勤務網站手動完成密碼變更後，再重新登入。'
             self.failed.emit(self.attempt_id, message)

@@ -18,6 +18,15 @@ DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 45
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30
 
 
+LOGIN_PAGE_LOAD_MESSAGES = {
+    'website_dns_failed': '勤務網站暫時無法開啟：找不到伺服器 IP 位址（DNS 解析失敗）。請確認網路連線，稍後重新登入。',
+    'website_offline': '勤務網站暫時無法開啟：目前網路未連線。請恢復網路後重新登入。',
+    'website_timeout': '勤務網站讀取逾時，請確認網路與網站狀態，稍後重新登入。',
+    'website_certificate_failed': '勤務網站無法開啟：安全憑證驗證失敗。請確認電腦日期時間或通知管理人員。',
+    'website_connection_failed': '勤務網站暫時無法開啟：網站連線失敗或已中斷。請確認網路與網站狀態，稍後重新登入。',
+}
+
+
 CAPTURE_ERROR_MESSAGES = {
     'driver_unavailable': '瀏覽器尚未建立或已無法使用，無法擷取截圖。',
     'frame_context_failed': '無法切回主頁面，未執行截圖。',
@@ -206,10 +215,27 @@ def _login_page_probe(driver: Any) -> dict:
         return {}
 
 
-def _login_failure_code(error: Exception) -> str:
+def _login_failure_code(error: Exception, *, page_text: str = '') -> str:
+    text = str(error or '')
+    network_error = re.search(r'\bnet::(ERR_[A-Z0-9_]+)\b', text, re.I)
+    if not network_error and re.search(
+        r'無法連上這個網站|無法存取這個網站|(?:你|您)的連線不是私人連線|'
+        r'this site can.t be reached|your connection is not private', page_text, re.I,
+    ):
+        network_error = re.search(r'\b(ERR_[A-Z0-9_]+)\b', page_text, re.I)
+    if network_error:
+        code = network_error.group(1).upper()
+        if code == 'ERR_NAME_NOT_RESOLVED' or code.startswith('ERR_DNS_'):
+            return 'website_dns_failed'
+        if code == 'ERR_INTERNET_DISCONNECTED':
+            return 'website_offline'
+        if code in {'ERR_TIMED_OUT', 'ERR_CONNECTION_TIMED_OUT'}:
+            return 'website_timeout'
+        if code.startswith(('ERR_CERT_', 'ERR_SSL_')):
+            return 'website_certificate_failed'
+        return 'website_connection_failed'
     if isinstance(error, LoginVerificationError) and error.reason_code != 'login_failed':
         return error.reason_code
-    text = str(error or '')
     if _password_change_required(text):
         return 'password_change_required'
     if getattr(error, 'diagnostic_category', ''):
@@ -701,6 +727,10 @@ class LoginVerifier:
                         user_id=user_id, password=password, stage=failure_stage,
                         reason_code='browser_start_failed' if configuring else _login_failure_code(exc),
                     )
+                    if not configuring:
+                        failure_diagnostic['reason_code'] = _login_failure_code(
+                            exc, page_text=failure_diagnostic.get('page_text', ''),
+                        )
                     raise
 
             driver = retry_duty_browser_session_open(
@@ -763,7 +793,8 @@ class LoginVerifier:
                     user_id=user_id, password=password, stage='post_login' if driver is not None else 'login',
                     reason_code=reason_code,
                 )
-            if getattr(exc, 'diagnostic_category', ''):
+            if (getattr(exc, 'diagnostic_category', '')
+                    and failure_diagnostic['reason_code'] not in LOGIN_PAGE_LOAD_MESSAGES):
                 failure_diagnostic['reason_code'] = 'browser_start_failed'
                 exc.login_diagnostic = failure_diagnostic
                 raise

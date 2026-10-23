@@ -868,6 +868,98 @@ const NodeFilter = {SHOW_TEXT:4};
         self.assertIn("密碼須更新", failed[0][1])
         self.assertEqual(worker.password, "")
 
+    def test_login_network_failure_keeps_site_reason_after_browser_session_retry(self):
+        from selenium.common.exceptions import WebDriverException
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        cases = (
+            ('ERR_NAME_NOT_RESOLVED', 'website_dns_failed'),
+            ('ERR_INTERNET_DISCONNECTED', 'website_offline'),
+            ('ERR_CONNECTION_REFUSED', 'website_connection_failed'),
+            ('ERR_CONNECTION_RESET', 'website_connection_failed'),
+            ('ERR_CONNECTION_TIMED_OUT', 'website_timeout'),
+            ('ERR_CERT_DATE_INVALID', 'website_certificate_failed'),
+            ('ERR_EMPTY_RESPONSE', 'website_connection_failed'),
+        )
+        for error, expected in cases:
+            for stage in ('login', 'post_login'):
+                with self.subTest(error=error, stage=stage):
+                    drivers = []
+
+                    def create_driver(_options):
+                        driver = self.DiagnosticDriver(text='', password_fields=0)
+                        if stage == 'post_login':
+                            driver.authenticated = WebDriverException('unknown error: net::' + error)
+                        drivers.append(driver)
+                        return driver
+
+                    login = Mock(side_effect=WebDriverException('unknown error: net::' + error)
+                                 if stage == 'login' else None)
+                    verifier = LoginVerifier(
+                        options_factory=object, driver_factory=create_driver,
+                        configure_driver=lambda _: None, login_function=login,
+                        driver_cleanup=lambda driver: driver.events.append('cleanup'),
+                        session_open_diagnostics=False,
+                    )
+                    with (
+                        patch('selenium.webdriver.support.ui.WebDriverWait', side_effect=self.authentication_wait_once),
+                        patch('app_core.login_verifier.identify_logged_in_actor', return_value=('', '測試員')),
+                        self.assertRaises(LoginVerificationError) as caught,
+                    ):
+                        verifier.verify(typed_actor_no='', user_id='user10', password='secret',
+                                        actor_no_from_user_id=lambda _: '', actor_no_from_name=lambda _: '', staff={})
+                    self.assertEqual(caught.exception.reason_code, expected)
+                    diagnostic = caught.exception.login_diagnostic
+                    self.assertEqual(diagnostic['reason_code'], expected)
+                    self.assertEqual(diagnostic['stage'], stage)
+                    self.assertIn(error, diagnostic['reason'])
+                    self.assertEqual(len(drivers), 2)
+                    self.assertTrue(all(driver.events.count('cleanup') == 1 for driver in drivers))
+
+    def test_login_worker_recognizes_chrome_error_page_when_navigation_only_times_out(self):
+        from selenium.common.exceptions import TimeoutException
+        from app_core.login_verifier import LoginVerifier
+        from qt_app.workers.login_worker import LoginWorker
+
+        cases = (
+            ('login', '無法連上這個網站\nERR_NAME_NOT_RESOLVED', 'website_dns_failed', 'DNS'),
+            ('login', 'This site can\u2019t be reached\nERR_INTERNET_DISCONNECTED', 'website_offline', '網路未連線'),
+            ('login', '你的連線不是私人連線\nNET::ERR_CERT_AUTHORITY_INVALID', 'website_certificate_failed', '憑證'),
+            ('login', '網站公告\nERR_NAME_NOT_RESOLVED', 'login_timeout', 'wait for login'),
+            ('post_login', '無法連上這個網站\nERR_NAME_NOT_RESOLVED', 'website_dns_failed', 'DNS'),
+            ('post_login', 'Your connection is not private\nNET::ERR_CERT_DATE_INVALID', 'website_certificate_failed', '憑證'),
+        )
+        for stage, text, expected, visible in cases:
+            with self.subTest(stage=stage, expected=expected):
+                driver = self.DiagnosticDriver(text=text, password_fields=0, authenticated=False)
+                verifier = LoginVerifier(
+                    options_factory=object, driver_factory=lambda _: driver,
+                    configure_driver=lambda _: None,
+                    login_function=Mock(side_effect=TimeoutException('wait for login user10 secret')
+                                        if stage == 'login' else None),
+                    driver_cleanup=lambda current: current.events.append('cleanup'),
+                    session_open_diagnostics=False,
+                )
+                worker = LoginWorker(attempt_id=7, verifier=verifier, actor_no='', user_id='user10', password='secret',
+                                     actor_no_from_user_id=lambda _: '', actor_no_from_name=lambda _: '', staff={})
+                failed, succeeded = [], []
+                worker.failed.connect(lambda attempt, message: failed.append((attempt, message)))
+                worker.succeeded.connect(lambda *_: succeeded.append(True))
+                with (
+                    patch('selenium.webdriver.support.ui.WebDriverWait', side_effect=self.authentication_wait_once),
+                    patch('app_core.login_verifier.identify_logged_in_actor', return_value=('', '測試員')),
+                ):
+                    worker.run()
+                self.assertEqual(worker.failure_diagnostic['reason_code'], expected)
+                self.assertEqual(worker.failure_diagnostic['stage'], stage)
+                self.assertEqual(len(failed), 1)
+                self.assertIn(visible, failed[0][1])
+                for secret in ('user10', 'secret', 'token=', '專用瀏覽器啟動失敗'):
+                    self.assertNotIn(secret, failed[0][1])
+                self.assertFalse(succeeded)
+                self.assertEqual(driver.events.count('cleanup'), 1)
+                self.assertEqual(worker.password, '')
+
     def test_browser_factory_failure_has_safe_unavailable_evidence(self):
         from app_core.login_verifier import LoginVerificationError, LoginVerifier
 
@@ -7346,6 +7438,49 @@ class RescueVideoServiceTests(unittest.TestCase):
 
 
 class SessionControllerTests(unittest.TestCase):
+    def test_login_page_shows_dns_failure_for_manual_and_automatic_login(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+        from selenium.common.exceptions import WebDriverException
+        from app_core.login_verifier import LoginVerifier
+        from qt_app.controllers.session_controller import SessionController
+
+        self._network_app = QApplication.instance() or QApplication(['network-login-test'])
+        for method in ('manual', 'automatic'):
+            with self.subTest(method=method):
+                repository = Mock()
+                repository.load.return_value = SimpleNamespace(
+                    accounts=[], last_selected='', can_persist=True, needs_rewrite=False, invalid_file=False,
+                )
+                verifier = LoginVerifier(
+                    options_factory=object,
+                    driver_factory=lambda _: LoginVerifierTests.DiagnosticDriver(text='', password_fields=0),
+                    configure_driver=lambda _: None,
+                    login_function=Mock(side_effect=WebDriverException('unknown error: net::ERR_NAME_NOT_RESOLVED')),
+                    driver_cleanup=lambda _: None, session_open_diagnostics=False,
+                )
+                controller = SessionController(repository=repository, verifier=verifier, login_timeout_ms=5000)
+                diagnostics = []
+                controller.loginAttemptFailed.connect(lambda *_: diagnostics.append(controller.take_login_diagnostic()))
+                try:
+                    with patch.object(controller, '_start_credential_sync') as sync:
+                        controller.login('user10', 'secret', True, login_method=method)
+                        for _ in range(100):
+                            if not controller.hasRunningLoginWorkers:
+                                break
+                            QTest.qWait(10)
+                        self.assertFalse(controller.hasRunningLoginWorkers)
+                        self.assertFalse(controller.isLoggedIn)
+                        self.assertEqual(controller.loginStatusTone, 'error')
+                        self.assertIn('勤務網站', controller.loginStatus)
+                        self.assertIn('DNS', controller.loginStatus)
+                        self.assertNotIn('專用瀏覽器啟動失敗', controller.loginStatus)
+                        self.assertEqual(diagnostics[0]['reason_code'], 'website_dns_failed')
+                        repository.save.assert_not_called()
+                        sync.assert_not_called()
+                finally:
+                    controller.shutdown()
+
     def controller_for_accounts(self, accounts):
         from qt_app.controllers.session_controller import SessionController
 
