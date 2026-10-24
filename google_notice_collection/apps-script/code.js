@@ -21,6 +21,9 @@ function doPost(e) {
       throw new Error("Invalid request payload");
     }
     authorizeNoticeCollection_(data);
+    if (data && data.action === "getMonthlySpreadsheetLink") {
+      return out(getMonthlySpreadsheetLink(data));
+    }
     ctx = newContext();
     if (data && data.action === "checkExisting") {
       return checkExisting(validateRecords(data.records || []), ctx);
@@ -562,6 +565,40 @@ function newContext() {
     noticeCache: {},
     rowCache: {}
   };
+}
+
+function getMonthlySpreadsheetLink(data) {
+  var year = data.year;
+  var month = data.month;
+  if (typeof year !== "number" || year !== Math.floor(year) || year < 2011 || year > 2910
+      || typeof month !== "number" || month !== Math.floor(month) || month < 1 || month > 12) {
+    return { status: "error", error: "invalid_month" };
+  }
+  try {
+    var rocYear = year - 1911;
+    var root = DriveApp.getFolderById(NOTICE_WORKBOOK_ROOT_FOLDER_ID);
+    var folders = root.getFoldersByName(rocYear + "年");
+    var folder = folders.hasNext() ? folders.next() : null;
+    if (folders.hasNext()) return { status: "error", error: "ambiguous_spreadsheet" };
+    if (!folder) return { status: "error", error: "spreadsheet_not_found" };
+    var files = folder.getFilesByName(rocYear + "年" + month + "月電子通報");
+    var file = files.hasNext() ? files.next() : null;
+    if (files.hasNext()) return { status: "error", error: "ambiguous_spreadsheet" };
+    if (!file || file.isTrashed()) return { status: "error", error: "spreadsheet_not_found" };
+    if (file.getMimeType() !== MimeType.GOOGLE_SHEETS) {
+      return { status: "error", error: "invalid_spreadsheet" };
+    }
+    var id = file.getId();
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{20,128}$/.test(id)) {
+      return { status: "error", error: "invalid_spreadsheet" };
+    }
+    return {
+      status: "success", year: year, month: month, spreadsheetId: id,
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/" + id + "/edit"
+    };
+  } catch (_lookupError) {
+    return { status: "error", error: "lookup_failed" };
+  }
 }
 
 function getTarget(dateText, ctx) {

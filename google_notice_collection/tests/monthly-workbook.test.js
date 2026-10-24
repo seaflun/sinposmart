@@ -521,3 +521,173 @@ test('the recipient cache cannot reuse a pre-role cropped name after deployment'
   assert.equal(reads, 1);
   assert.equal(cache.get('noticeDutyRecipient:1151022|19'), '勝斌');
 });
+
+function readonlyLinkFixture() {
+  const f = fixture();
+  const blocked = [];
+  const forbid = (name) => () => { blocked.push(name); throw new Error('forbidden ' + name); };
+  f.sandbox.out = (value) => value;
+  f.sandbox.logWriteTiming = () => {};
+  f.sandbox.newContext = forbid('newContext');
+  f.sandbox.PropertiesService.getScriptProperties = () => ({
+    getProperty(key) {
+      assert.equal(key, 'NOTICE_COLLECTION_SYNC_KEY_SHA256');
+      return f.properties.get(key) || null;
+    },
+    setProperty: forbid('setProperty'), deleteProperty: forbid('deleteProperty'),
+  });
+  f.sandbox.CacheService = { getScriptCache: forbid('cache') };
+  f.sandbox.LockService = { getScriptLock: forbid('lock') };
+  f.sandbox.SpreadsheetApp = {
+    open: forbid('open'), openById: forbid('openById'),
+    create: forbid('create'), flush: forbid('flush'),
+  };
+  f.sandbox.DriveApp.getFileById = forbid('getFileById');
+  f.sandbox.DriveApp.getFilesByName = forbid('globalFileSearch');
+  for (const folder of f.folders.values()) folder.createFolder = forbid('createFolder');
+  const addFolder = f.folder;
+  f.folder = (...args) => {
+    const result = addFolder(...args);
+    result.createFolder = forbid('createFolder');
+    return result;
+  };
+  const addFile = f.file;
+  f.file = (name, parent, options = {}) => {
+    const result = addFile(name, parent, {
+      id: `1ReadonlyMonthlyFixture_${f.files.size}_0123456789`, ...options,
+    });
+    result.makeCopy = forbid('makeCopy');
+    return result;
+  };
+  f.template.makeCopy = forbid('makeCopy');
+  f.link = (changes = {}) => JSON.parse(JSON.stringify(f.sandbox.doPost({ postData: {
+    contents: JSON.stringify({ action: 'getMonthlySpreadsheetLink', year: 2026, month: 10,
+      sync_key: FIXTURE_SYNC_KEY, ...changes }),
+  } })));
+  f.blocked = blocked;
+  return f;
+}
+
+test('monthly spreadsheet link resolves exact ROC month metadata without opening or changing a sheet', () => {
+  const f = readonlyLinkFixture();
+  for (const [year, month, roc, id] of [
+    [2026, 10, 115, '1NoticeOctoberWorkbook_0123456789abc'],
+    [2027, 1, 116, '1NoticeJanuaryWorkbook_0123456789abc'],
+  ]) {
+    const folder = f.folder(`${roc}年`, f.root);
+    f.file(`${roc}年${month}月電子通報`, folder, { id, data: { sheets: [] } });
+    assert.deepEqual(f.link({ year, month }), {
+      status: 'success', year, month, spreadsheetId: id,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${id}/edit`,
+    });
+  }
+  assert.deepEqual(f.blocked, []);
+  assert.deepEqual(f.events.copies, []);
+  assert.deepEqual(f.events.foldersCreated, []);
+  assert.deepEqual(f.events.opened, []);
+  assert.equal(f.events.lockCalls, 0);
+  assert.deepEqual([...f.properties], [['NOTICE_COLLECTION_SYNC_KEY_SHA256', FIXTURE_VERIFIER]]);
+});
+
+test('monthly spreadsheet link rejects invalid or coerced months before Drive access', () => {
+  for (const changes of [{ year: '2026' }, { year: true }, { year: 2026.5 }, { year: 2010 },
+    { year: 2911 }, { year: null }, { month: '10' }, { month: true }, { month: 10.5 },
+    { month: 0 }, { month: 13 }, { month: null }]) {
+    const f = readonlyLinkFixture();
+    assert.deepEqual(f.link(changes), { status: 'error', error: 'invalid_month' });
+    assert.equal(f.events.driveReads, 0);
+    assert.deepEqual(f.blocked, []);
+  }
+});
+
+test('monthly spreadsheet link reports a missing year or month without creating anything or searching elsewhere', () => {
+  for (const placement of ['missing-year', 'missing-month', 'wrong-parent']) {
+    const f = readonlyLinkFixture();
+    if (placement !== 'missing-year') f.folder('115年', f.root);
+    if (placement === 'wrong-parent') {
+      const other = f.folder('116年', f.root);
+      f.file('115年10月電子通報', other);
+      f.file('115年10月電子通報', f.root);
+    }
+    assert.deepEqual(f.link(), { status: 'error', error: 'spreadsheet_not_found' });
+    assert.deepEqual(f.blocked, []);
+    assert.deepEqual(f.events.copies, []);
+    assert.deepEqual(f.events.foldersCreated, []);
+  }
+});
+
+test('monthly spreadsheet link refuses ambiguous year folders or monthly files', () => {
+  for (const duplicate of ['year', 'month']) {
+    const f = readonlyLinkFixture();
+    const year = f.folder('115年', f.root);
+    f.file('115年10月電子通報', year);
+    if (duplicate === 'year') f.folder('115年', f.root);
+    else f.file('115年10月電子通報', year);
+    assert.deepEqual(f.link(), { status: 'error', error: 'ambiguous_spreadsheet' });
+    assert.deepEqual(f.blocked, []);
+  }
+});
+
+test('monthly spreadsheet link rejects a same-name non-Sheets file', () => {
+  const f = readonlyLinkFixture();
+  const year = f.folder('115年', f.root);
+  f.file('115年10月電子通報', year, { mime: 'application/pdf' });
+  assert.deepEqual(f.link(), { status: 'error', error: 'invalid_spreadsheet' });
+  assert.deepEqual(f.blocked, []);
+});
+
+test('monthly spreadsheet link does not return a trashed workbook', () => {
+  const f = readonlyLinkFixture();
+  const year = f.folder('115年', f.root);
+  const file = f.file('115年10月電子通報', year);
+  file.isTrashed = () => true;
+  assert.deepEqual(f.link(), { status: 'error', error: 'spreadsheet_not_found' });
+  assert.deepEqual(f.blocked, []);
+});
+
+test('monthly spreadsheet link rejects an invalid metadata ID rather than constructing an unsafe URL', () => {
+  for (const id of ['https://unsafe.invalid/private', 'A'.repeat(19), 'A'.repeat(129)]) {
+    const f = readonlyLinkFixture();
+    const year = f.folder('115年', f.root);
+    f.file('115年10月電子通報', year, { id });
+    assert.deepEqual(f.link(), { status: 'error', error: 'invalid_spreadsheet' });
+    assert.deepEqual(f.blocked, []);
+  }
+});
+
+test('monthly spreadsheet link keeps lookup failure distinct from a missing file without private error text', () => {
+  const f = readonlyLinkFixture();
+  const year = f.folder('115年', f.root);
+  year.getFilesByName = () => { throw new Error('synthetic-private-detail'); };
+  const result = f.link();
+  assert.deepEqual(result, { status: 'error', error: 'lookup_failed' });
+  assert.ok(!JSON.stringify(result).includes('synthetic-private-detail'));
+  assert.deepEqual(f.blocked, []);
+});
+
+test('monthly spreadsheet link rejects missing wrong or unconfigured authorization before metadata access', () => {
+  for (const scenario of ['missing', 'wrong', 'unconfigured']) {
+    const f = readonlyLinkFixture();
+    if (scenario === 'unconfigured') f.properties.delete('NOTICE_COLLECTION_SYNC_KEY_SHA256');
+    const result = f.link(scenario === 'missing' ? { sync_key: undefined } :
+      scenario === 'wrong' ? { sync_key: 'synthetic-wrong-private-key' } : {});
+    assert.equal(result.status, 'error');
+    assert.match(result.message, /Unauthorized notice request/);
+    assert.ok(!JSON.stringify(result).includes('synthetic-wrong-private-key'));
+    assert.equal(f.events.driveReads, 0);
+    assert.deepEqual(f.blocked, []);
+  }
+});
+
+test('monthly spreadsheet link ignores stale cached IDs and leaves properties unchanged', () => {
+  const f = readonlyLinkFixture();
+  const year = f.folder('115年', f.root);
+  const id = '1CorrectMonthlyWorkbook_0123456789abc';
+  f.file('115年10月電子通報', year, { id });
+  f.properties.set('spreadsheetId:115年10月電子通報', 'unrelated-cached-workbook');
+  const before = [...f.properties];
+  assert.equal(f.link().spreadsheetId, id);
+  assert.equal(f.link().spreadsheetId, id);
+  assert.deepEqual([...f.properties], before);
+  assert.deepEqual(f.blocked, []);
+});
