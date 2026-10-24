@@ -8195,7 +8195,7 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertIs(result, False)
 
-    def _parse_captioned_official_staff_cases(self) -> dict:
+    def _parse_captioned_official_staff_cases(self, *, live_unassigned_members: bool = False) -> dict:
         import ast
         import shutil
         import duty_rehearsal
@@ -8213,7 +8213,12 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         names = ["人員甲"] + [f"人員{chr(0x7533 + index)}" for index in range(24)]
         groups = [["", str(actor), "分隊長" if actor == 1 else "小隊長" if actor <= 5 else "隊員", name]
                   for actor, name in zip(actors, names)]
-        groups.extend([["", "", "實習生", "人員畋"], ["", "", "實習生", "人員界"]])
+        if live_unassigned_members:
+            # The 2026-10-23/24 table also has two unnumbered members outside the formal numbered roster.
+            groups.extend([["", "", "隊員", "人員增"], ["", "", "實習生", "人員畋"],
+                           ["", "", "實習生", "人員界"], ["", "", "隊員", "人員補"]])
+        else:
+            groups.extend([["", "", "實習生", "人員畋"], ["", "", "實習生", "人員界"]])
         groups.extend([["", "", "", ""] for _ in range(32 - len(groups))])
         rows = [[{"text": "當日勤務輪流順序與值勤人員對照表(替代役人數:0人)", "colSpan": 32, "rowSpan": 1}]]
         rows.extend([[{"text": text, "colSpan": 1, "rowSpan": 1} for group in groups[start:start + 8] for text in group]
@@ -8235,10 +8240,16 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'extra-column') rows[2].push({text:'未知欄', colSpan:1, rowSpan:1});
           if (change === 'separator') rows[1][4].text = '未知欄';
           if (change === 'blank-actor') rows[1][5].text = '';
+          if (change === 'blank-last-actor') rows[4][1].text = '';
           if (change === 'bad-actor') rows[1][5].text = 'X2';
           if (change === 'duplicate') rows[1][5].text = '1';
           if (change === 'canonical-duplicate') rows[1][5].text = '01';
           if (change === 'duplicate-name') rows[1][7].text = rows[1][3].text;
+          if (change === 'unnumbered-duplicate-name') rows[4][7].text = rows[1][3].text;
+          if (change === 'unnumbered-duplicate-extra-name') rows[4][19].text = rows[4][7].text;
+          if (change === 'supplemental-wrong-column') [rows[4][22].text, rows[4][23].text] = ['隊員', '人員補'];
+          if (change === 'supplemental-wrong-row') [rows[3][5].text, rows[3][6].text] = ['', '隊員'];
+          if (change === 'supplemental-control') {rows[4][6].text = '隊員'; rows[4][5].hasControl = true;}
           if (change === 'header-in-captioned') [rows[1][5].text, rows[1][6].text, rows[1][7].text] = ['番號','職稱','姓名'];
           if (change === 'unknown-role') rows[1][6].text = '其他人員';
           if (change === 'empty-name') rows[1][7].text = '';
@@ -8246,7 +8257,8 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'unknown-unnumbered') rows[4][6].text = '其他人員';
           if (change === 'numbered-trainee') rows[4][5].text = '29';
           if (change === 'unnamed-trainee') rows[4][7].text = '';
-          const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan, querySelectorAll:()=>[]});
+          const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan,
+            querySelectorAll:()=>value.hasControl?[{tagName:'INPUT', type:'text', value:''}]:[]});
           const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
           const schedule = table(Array.from({length:24}, (_,i)=>[
             {text:`${(i+8)%24}~${(i+9)%24}`}, {text:'1'}, {text:''}]));
@@ -8255,14 +8267,16 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'two-tables') tables.push(table(rows));
           if (change === 'headered-and-captioned') tables.push(table([
             ['番號','職稱','姓名'].map(text=>({text})), ['1','分隊長','人員甲'].map(text=>({text}))]));
-          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}};
+          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}, getComputedStyle:()=>({display:'block'})};
           global.document = {readyState:change === 'loading' ? 'loading' : 'complete', body:{innerText:''},
             querySelectorAll:()=>tables, getElementById:()=>({value:change === 'wrong-date' ? '1151018' : '1151019'})};
           return new Function(source)('1151019');
         }
         const cases = ['ready','bad-caption','missing-caption','caption-span','cell-span','row-span',
           'missing-first-row','missing-middle-row','missing-last-row','extra-row','partial-row',
-          'extra-column','separator','blank-actor','bad-actor','duplicate','canonical-duplicate','duplicate-name',
+          'extra-column','separator','blank-actor','blank-last-actor','bad-actor','duplicate','canonical-duplicate','duplicate-name',
+          'unnumbered-duplicate-name','unnumbered-duplicate-extra-name',
+          'supplemental-wrong-column','supplemental-wrong-row','supplemental-control',
           'header-in-captioned','unknown-role','empty-name',
           'unsafe-name','unknown-unnumbered','numbered-trainee','unnamed-trainee','class','two-tables',
           'headered-and-captioned','ajax','loading','wrong-date'];
@@ -8299,6 +8313,24 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
                 snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
                 self.assertIs(snapshot["complete"], False)
                 self.assertEqual(snapshot["members"], [])
+
+    def test_official_captioned_staff_keeps_titles_when_live_table_has_unnumbered_supplemental_members(self) -> None:
+        from qt_app.controllers.app_controller import official_personnel_title_snapshot
+
+        results = self._parse_captioned_official_staff_cases(live_unassigned_members=True)
+        parsed = results["ready"]
+        self.assertTrue(parsed["staff_complete"])
+        self.assertEqual(len(parsed["staff"]), 25)
+        snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
+        self.assertIs(snapshot["complete"], True)
+        self.assertEqual(len(snapshot["members"]), 25)
+        self.assertFalse(any(member["name"] in {"人員增", "人員補", "人員畋", "人員界"}
+                             for member in snapshot["members"]))
+        for change in ("blank-actor", "blank-last-actor", "unknown-role", "unknown-unnumbered", "empty-name",
+                       "duplicate", "duplicate-name", "unnumbered-duplicate-name", "unnumbered-duplicate-extra-name",
+                       "supplemental-wrong-column", "supplemental-wrong-row", "supplemental-control", "unnamed-trainee"):
+            with self.subTest(change=change):
+                self.assertIs(results[change]["staff_complete"], False)
 
     def test_control_wait_returns_immediately_when_form_is_ready(self) -> None:
         import duty_rehearsal

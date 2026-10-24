@@ -1967,9 +1967,16 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
               const name = (row[i + 2] || '').trim();
               if ((!no && !role && !name) || (!captioned && isHeader([no, role, name]))) continue;
               if (captioned) {
-                if (!no && role === '實習生' && validName(name)) continue;
-                const actor = String(Number(no));
                 const key = name.replace(/\\s+/g, '').toLocaleLowerCase();
+                // The observed final row has two unnumbered supplemental members outside the numbered roster.
+                const supplemental = role === '隊員' && row === matrix[4] && [5, 17].includes(i) &&
+                  Array.from(trs[4].children).slice(i, i + 3).every(cell => cell.querySelectorAll('input,select,textarea').length === 0);
+                if (!no && (role === '實習生' || supplemental) && validName(name)) {
+                  if (names.has(key)) complete = false;
+                  names.add(key);
+                  continue;
+                }
+                const actor = String(Number(no));
                 if (!['分隊長', '小隊長', '隊員'].includes(role) || !validName(name) || actors.has(actor) || names.has(key)) complete = false;
                 actors.add(actor);
                 names.add(key);
