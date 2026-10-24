@@ -21,10 +21,25 @@ FIXED_NOTICE_ACCOUNT = "tyfd01214"
 TAIPEI = timezone(timedelta(hours=8))
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw5yM8234CMi67hkox091wgoubwNIuWC8yxtNsQ024SpbpXhAGWVC5hB-HU4UQQavPO1A/exec"
 MAX_RECORDS = 200
+NOTICE_ERROR_CODES = frozenset({
+    "browser_start_failed", "browser_window_closed", "snapshot_failed", "snapshot_invalid",
+    "origin_mismatch", "account_mismatch", "login_target_mismatch", "login_page_failed",
+    "list_navigation_failed", "list_wait_timeout", "page_limit", "list_changed", "duplicate_notice_id",
+    "next_page_ambiguous", "count_mismatch", "notice_url_invalid", "scan_unexpected",
+    "session_expired", "login_failed", "credentials_missing", "cancelled",
+})
+
+
+def _safe_notice_error_code(value: object) -> str:
+    return value if isinstance(value, str) and value in NOTICE_ERROR_CODES else ""
 
 
 class NoticeCollectionError(RuntimeError):
     """Collection stopped without assuming an unconfirmed write succeeded."""
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = _safe_notice_error_code(code)
 
 
 class NoticeLoginRequired(NoticeCollectionError):
@@ -55,6 +70,7 @@ class NoticeCollectionResult:
     pending_write_count: int | None = None
     pending_read_count: int | None = None
     error_stage: str = ""
+    error_code: str = ""
 
 
 def _local_time(value: datetime) -> datetime:
@@ -201,6 +217,7 @@ class NoticeCollectionService:
             result.error_stage = ("state" if isinstance(exc, _NoticeStateError) or self._state_error
                                   else "login" if isinstance(exc, NoticeLoginRequired)
                                   else self._collection_stage if isinstance(exc, NoticeCollectionError) else "unknown")
+            result.error_code = _safe_notice_error_code(getattr(exc, "code", ""))
             if result.unread_count is not None:
                 result.pending_write_count = self._pending_write_count()
                 result.pending_read_count = len((self._confirmed_for_read | set(result.written_keys)) - self._marked_for_read)
@@ -528,6 +545,9 @@ class NoticeCollectionService:
             "pending_read_count": result.pending_read_count if result is not None else None,
             "error_stage": error_stage or (result.error_stage if result is not None else ""),
             "message": messages[state]}
+        error_code = _safe_notice_error_code(getattr(result, "error_code", ""))
+        if state in {"failed", "partial", "uncertain"} and error_code:
+            report["error_code"] = error_code
         return [{**report, "part_index": index,
                  "records": records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS],
                  "new_keys": sorted(new_keys & {row["key"] for row in records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS]})}
@@ -589,7 +609,7 @@ class NoticeCollectionService:
     @staticmethod
     def _check_cancel(cancel) -> None:
         if cancel is not None and cancel():
-            raise NoticeCollectionError("通報收取已停止，未開始新的寫入或已讀操作。")
+            raise NoticeCollectionError("通報收取已停止，未開始新的寫入或已讀操作。", code="cancelled")
 
     def counts(self, now: datetime, shift: NoticeShift | None = None) -> tuple[int, int]:
         if self._state_error:

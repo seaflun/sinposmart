@@ -4,6 +4,7 @@ import sys
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -102,6 +103,38 @@ class NoticeBrowserTests(unittest.TestCase):
         self.assertEqual(self.browser(driver).scan_unread("synthetic"), [])
         self.assertIn("is_read=0", driver.gets[-1])
         self.assertEqual(driver.async_calls, [])
+
+    def test_scan_start_identity_and_invalid_url_codes_reach_safe_failure_reports(self):
+        from datetime import datetime, timedelta
+        from app_core.notice_collection_browser import NoticeBrowser
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+
+        cases = (
+            ("browser_start_failed", None),
+            ("origin_mismatch", FakeDriver([snapshot(origin="https://private.invalid")])),
+            ("account_mismatch", FakeDriver([snapshot(account="private account")])),
+            ("notice_url_invalid", FakeDriver([snapshot([{**notice(),
+                "contentUrl": "https://private.invalid/path?token=synthetic-password"}])])),
+        )
+        for code, driver in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                factory = (Mock(side_effect=RuntimeError("private path synthetic-password")) if driver is None
+                           else Mock(return_value=driver))
+                browser = NoticeBrowser(Path(directory), driver_factory=factory)
+                service = NoticeCollectionService(Path(directory), browser=browser)
+                now = datetime(2026, 10, 24, 12)
+                with self.assertRaises(NoticeCollectionError) as caught:
+                    service.collect("synthetic-password", now)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(service.last_result.error_code, code)
+                report = service.report_parts("synthetic-run", "failed", now,
+                    next_check=now + timedelta(minutes=3), result=service.last_result)[0]
+                self.assertEqual(report["error_code"], code)
+                self.assertIsNone(report["unread_count"])
+                self.assertNotIn("private", json.dumps(report))
+                self.assertNotIn("synthetic-password", json.dumps(report))
+                if driver is not None:
+                    self.assertEqual(driver.async_calls, [])
 
     def test_repeated_scan_reloads_document_to_discover_new_unread_notice(self):
         driver = FakeDriver([snapshot()])

@@ -54,6 +54,67 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_failure_report_exports_only_allowlisted_error_code(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+
+        now = datetime(2026, 10, 24, 12)
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            browser.scan_unread = Mock(side_effect=NoticeCollectionError(
+                "private https://private.invalid/path synthetic-password", code="account_mismatch"))
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            with self.assertRaises(NoticeCollectionError):
+                service.collect("synthetic-password", now)
+            self.assertEqual(service.last_result.error_code, "account_mismatch")
+            report = service.report_parts("synthetic-run", "failed", now,
+                next_check=now + timedelta(minutes=3), result=service.last_result)[0]
+            self.assertEqual(report["error_code"], "account_mismatch")
+            self.assertIsNone(report["unread_count"])
+            self.assertNotIn("private", json.dumps(report))
+            self.assertNotIn("synthetic-password", json.dumps(report))
+
+    def test_unknown_or_malicious_error_code_never_reaches_result_or_report(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+
+        now = datetime(2026, 10, 24, 12)
+        for code in ("unknown", "account_mismatch https://private.invalid/?token=synthetic-password", None, [], {"secret": "value"}):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(NoticeCollectionError("private underlying exception", code=code).code, "")
+                error = NoticeCollectionError("private underlying exception")
+                error.code = code
+                browser = FakeBrowser()
+                browser.scan_unread = Mock(side_effect=error)
+                service = NoticeCollectionService(Path(directory), browser=browser)
+                with self.assertRaises(NoticeCollectionError):
+                    service.collect("synthetic-password", now)
+                self.assertEqual(service.last_result.error_code, "")
+                service.last_result.error_code = code  # The export boundary validates again.
+                report = service.report_parts("synthetic-run", "failed", now,
+                    next_check=now + timedelta(minutes=3), result=service.last_result)[0]
+                self.assertNotIn("error_code", report)
+                self.assertNotIn("private", json.dumps(report))
+                self.assertNotIn("synthetic-password", json.dumps(report))
+
+    def test_success_nonfailure_and_legacy_reports_keep_the_original_payload_shape(self):
+        from app_core.notice_collection_service import NoticeCollectionResult, NoticeCollectionService
+
+        now = datetime(2026, 10, 24, 12)
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            result = NoticeCollectionResult(now)
+            expected_keys = {"schema_version", "run_id", "part_count", "state", "started_at", "completed_at",
+                "reported_at", "next_check_at", "calendar_day", "shift_start", "shift_end", "unread_count",
+                "new_count", "marked_read_count", "pending_write_count", "pending_read_count", "error_stage",
+                "message", "part_index", "records", "new_keys"}
+            for state in ("success", "running", "waiting", "missing_credentials", "failed", "partial", "uncertain"):
+                with self.subTest(state=state):
+                    for code in ("", "account_mismatch"):
+                        result.error_code = code
+                        report = service.report_parts("synthetic-run", state, now,
+                            next_check=now + timedelta(minutes=3), result=result)[0]
+                        added = {"error_code"} if code and state in {"failed", "partial", "uncertain"} else set()
+                        self.assertEqual(set(report), expected_keys | added)
+
     def test_report_bootstraps_legacy_counts_without_inventing_subject_or_read_confirmation(self):
         from app_core.notice_collection_service import NoticeCollectionService
         with tempfile.TemporaryDirectory() as directory:
