@@ -4955,19 +4955,23 @@ class DutySubmissionServiceTests(unittest.TestCase):
         from datetime import datetime
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
 
-        reason = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        ranked = reason.replace("案發地點：", "案發地點：二級火警-")
         for trigger in ("due", "recovery"):
             for reverse_rows in (False, True):
                 for case, departure_reason, return_reason, expected_status in (
                     ("incident_description", reason, reason + "-電桿起火", "handoff_preflight_ready"),
-                    ("different_house", reason, reason.replace("89號", "90號") + "-電桿起火", "paused_external"),
+                    ("fire_alarm_prefix", reason, ranked, "handoff_preflight_ready"),
+                    ("fire_alarm_prefix_on_departure", ranked, reason, "handoff_preflight_ready"),
+                    ("different_house", reason, reason.replace("123號", "124號") + "-電桿起火", "paused_external"),
+                    ("different_lane_with_prefix", reason, ranked.replace("1227巷", "1228巷"), "paused_external"),
                     ("different_dispatch", reason + " 梯次：1", reason + "-電桿起火 梯次：2", "paused_external"),
                 ):
                     with self.subTest(trigger=trigger, reverse_rows=reverse_rows, case=case), \
                             tempfile.TemporaryDirectory() as directory:
                         records = [
-                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", departure_reason],
-                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", return_reason],
+                            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", departure_reason],
+                            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", return_reason],
                         ]
                         if reverse_rows:
                             records.reverse()
@@ -4985,10 +4989,10 @@ class DutySubmissionServiceTests(unittest.TestCase):
                         )
                         data = {
                             "target_date": "1151021",
-                            "today": {"staff": {"25": {"name": "值班員"}, "27": {"name": "林宏為"}}},
+                            "today": {"staff": {"25": {"name": "值班員"}, "15": {"name": "測試15番"}}},
                             "actions": [{
                                 "kind": "handoff_preflight", "time": "14:00", "actor": "25",
-                                "target": "27", "source": "值班交接",
+                                "target": "15", "source": "值班交接",
                                 "fields": {"出或入": "值班", "領用事由及地點": "值班"},
                             }],
                         }

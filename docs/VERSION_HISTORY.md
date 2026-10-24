@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.24.1734` | 2026-10-24 17:34（台北時間） | 修正同址出入紀錄因二級火警等前綴而誤判未返隊，保留人員、時間、門牌與梯次安全檢查。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1734) |
 | `2026.10.24.1216` | 2026-10-24 12:16（台北時間） | 通報接回既有 Chrome 啟動失敗重試，以專用新 profile 復原，保留舊資料及收據／已讀守門。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1216) |
 | `2026.10.24.1149` | 2026-10-24 11:49（台北時間） | 通報失敗回報固定安全代碼，供後台區分瀏覽器、登入及列表讀取問題，保留既有收取流程。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1149) |
 | `2026.10.24.1057` | 2026-10-24 10:57（台北時間） | 恢復固定公務內網 NAS 預設路徑與心跳、更新完成回報，保留其他 HTTP 與轉址限制。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1057) |

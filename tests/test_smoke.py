@@ -6092,6 +6092,72 @@ try {
                         current_at=datetime(2026, 10, 21, 14, 0),
                     ))
 
+    def test_same_minute_case_return_accepts_explicit_fire_alarm_level_prefix(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        for prefix in ("一級火警-", "二級火警-", "三級火警-", "四級火警-", "五級火警-",
+                       "1級火警-", "2級火警-", "3級火警-", "4級火警-", "5級火警-",
+                       "二級火警－", "二級火警—", "二級火警–", "二級火警:", "二級火警："):
+            ranked = reason.replace("案發地點：", "案發地點：" + prefix)
+            for outgoing, incoming in ((reason, ranked), (ranked, reason),
+                                       (reason + "-電線冒煙", ranked + "（屋內冒煙）")):
+                records = [
+                    ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", outgoing],
+                    ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", incoming],
+                ]
+                for raw_rows in (records, list(reversed(records)), records + records):
+                    with self.subTest(prefix=prefix, outgoing=outgoing, rows=raw_rows):
+                        self.assertIsNone(module.find_open_external_assignment(
+                            module.flatten_rows(raw_rows, "1151021"), "1151021",
+                            {"15": {"name": "測試15番"}}, {"target": "15"},
+                            current_at=datetime(2026, 10, 21, 14, 0),
+                        ))
+
+    def test_fire_alarm_level_prefix_preserves_address_identity_time_and_pairing_boundaries(self) -> None:
+        from itertools import permutations
+
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        ranked = reason.replace("案發地點：", "案發地點：二級火警-")
+        for stamp, name, direction, incoming in (
+            ("115/10/21 12:41", "另一人", "入", ranked),
+            ("115/10/20 12:41", "測試15番", "入", ranked),
+            ("115/10/21 12:40", "測試15番", "入", ranked),
+            ("115/10/21 14:01", "測試15番", "入", ranked),
+            ("115/10/21 12:41", "測試15番", "出", ranked),
+            *(("115/10/21 12:41", "測試15番", "入", value) for value in (
+                ranked.replace("1227巷", "1228巷"), ranked.replace("1227巷", "1227巷1弄"),
+                ranked.replace("123號", "1230號"), ranked.replace("123號", "123-1號"),
+                ranked + "之1", ranked + "-二樓", ranked + "-第一梯", ranked + " 梯次：2",
+                ranked.replace("火災-一般(集合)住宅", "火災-其他"),
+                *(ranked.replace("二級火警-", value) for value in (
+                    "六級火警-", "6級火警-", "第二級火警-", "二級火災-", "重大火警-",
+                    "二級火警", "備註二級火警-", "二級火警-二級火警-")),
+            )),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", reason],
+                [stamp, "新坡分隊", name, "隊員", direction, incoming],
+            ]
+            for raw_rows in (records, list(reversed(records))):
+                with self.subTest(stamp=stamp, name=name, direction=direction, incoming=incoming):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151021", start_date="1151020"), "1151021",
+                        {"15": {"name": "測試15番"}}, {"target": "15"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ), "2026-10-21T12:41")
+        records = [
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", reason],
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", ranked],
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", ranked.replace("二級火警", "三級火警")],
+        ]
+        for raw_rows in permutations(records):
+            self.assertEqual(module.find_open_external_assignment(
+                module.flatten_rows(list(raw_rows), "1151021"), "1151021",
+                {"15": {"name": "測試15番"}}, {"target": "15"},
+                current_at=datetime(2026, 10, 21, 14, 0),
+            ), "2026-10-21T12:41")
+
     def test_same_minute_incident_notes_preserve_address_and_identity_boundaries(self) -> None:
         module = package_module("compare_rehearsal_records")
         prefix = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
