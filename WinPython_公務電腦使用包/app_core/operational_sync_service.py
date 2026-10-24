@@ -24,7 +24,7 @@ from app_core.credential_sync_service import SyncTransportError, open_sync_reque
 
 JsonPoster = Callable[[dict[str, Any]], dict[str, Any]]
 SENSITIVE_KEY_PARTS = ("password", "passwd", "token", "secret", "cookie", "authorization")
-DEFAULT_SINPOSMART_BACKEND_EVENT_URL = "http://100.114.126.58:8080/api/sinposmart/events"
+DEFAULT_SINPOSMART_BACKEND_EVENT_URL = "http://10.30.65.30:8080/api/sinposmart/events"
 SYNC_STATUS_FILENAME = "sinposmart_operational_sync_status.json"
 GUI_HEARTBEAT_INTERVAL_MS = 10_000
 HEARTBEAT_STATES = frozenset({"starting", "idle", "busy", "updating", "failed", "stopping"})

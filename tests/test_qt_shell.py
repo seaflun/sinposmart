@@ -11421,7 +11421,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(posted, [payload])
         self.assertEqual(pending, "")
 
-    def test_event_uses_overlay_default_url_when_only_token_is_configured(self) -> None:
+    def test_event_preserves_legacy_lan_default_url_when_only_token_is_configured(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11435,8 +11435,29 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 self.assertTrue(service.event_enabled)
                 self.assertEqual(
                     service.event_url,
-                    "http://100.114.126.58:8080/api/sinposmart/events",
+                    "http://10.30.65.30:8080/api/sinposmart/events",
                 )
+
+    def test_remote_update_callback_preserves_legacy_lan_default_when_only_token_is_configured(self) -> None:
+        from qt_app.controllers.update_controller import _remote_update_endpoint
+        from qt_app.workers.update_check_worker import RemoteUpdateWorker
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok":true}'
+        request_id = "44444444-4444-4444-8444-444444444444"
+        with patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token"}, clear=True), \
+                patch("urllib.request.urlopen", return_value=response) as open_request:
+            endpoint = _remote_update_endpoint()
+            self.assertEqual(endpoint, "http://10.30.65.30:8080/api/sinposmart/remote-update")
+            worker = RemoteUpdateWorker(1, endpoint, "synthetic-token", "synthetic-worker", "2026.10.24.0209",
+                status_request={"request_id": request_id, "status": "completed", "installed_version": "2026.10.24.0209"})
+            self.assertTrue(worker._request()["ok"])
+            sent = open_request.call_args.args[0]
+            self.assertEqual(sent.full_url, endpoint + "/" + request_id + "/status")
+            self.assertEqual(sent.get_method(), "POST")
+            self.assertEqual(json.loads(sent.data)["status"], "completed")
 
     def test_event_failure_is_safely_recorded_and_kept_for_retry(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
@@ -11503,6 +11524,11 @@ class SecureSyncTransportTests(unittest.TestCase):
 
         for url in ("http://example.invalid/api", "http://127.0.0.1/api",
                     "http://10.30.65.30:8080/unknown", "http://100.114.126.58:invalid/api",
+                    "http://10.30.65.31:8080/api/credential-sync",
+                    "http://10.30.65.30:8081/api/credential-sync",
+                    "http://10.30.65.30:8080/api/credential-sync?extra=1",
+                    "http://10.30.65.30:8080/api/credential-sync#fragment",
+                    "http://user:synthetic-secret@10.30.65.30:8080/api/credential-sync",
                     "http://user:synthetic-secret@100.114.126.58/api", "file:///tmp/example"):
             with self.subTest(url=url), patch.object(transport.urllib.request, "build_opener") as build:
                 with self.assertRaises(transport.SyncTransportError) as caught:
@@ -11514,7 +11540,7 @@ class SecureSyncTransportTests(unittest.TestCase):
         import app_core.credential_sync_service as transport
 
         request = transport.urllib.request.Request(
-            "http://10.30.65.30:8080/api/credential-sync", data=b"synthetic-body",
+            "http://100.114.126.58:8080/api/credential-sync", data=b"synthetic-body",
             headers={"X-Credential-Sync-Token": "synthetic-token"}, method="POST",
         )
         with patch.object(transport, "_tailscale_peer_verified", return_value=False), \
@@ -11532,6 +11558,42 @@ class SecureSyncTransportTests(unittest.TestCase):
             proxies = [handler for handler in build.call_args.args
                        if isinstance(handler, transport.urllib.request.ProxyHandler)]
             self.assertEqual([handler.proxies for handler in proxies], [{}])
+
+    def test_token_only_legacy_lan_heartbeat_reaches_identity_and_heartbeat_without_tailscale(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        server = {"instance_id": "366be866-51b0-49df-8712-a6d4f56f592d", "version": "fixture", "deployment": "fixture"}
+        requests = []
+
+        def open_request(request, **_kwargs):
+            requests.append(request)
+            response = {"ok": True, "server": server}
+            if request.get_method() == "POST":
+                response.update(accepted=True, received_at="2026-10-24T10:30:00+08:00")
+            handle = Mock()
+            handle.__enter__ = Mock(return_value=handle)
+            handle.__exit__ = Mock(return_value=False)
+            handle.read.return_value = json.dumps(response).encode()
+            return handle
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token"}, clear=True), \
+                patch.object(transport, "_tailscale_peer_verified", return_value=False) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = open_request
+            service = OperationalSyncService(Path(directory))
+            reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.24.0209")
+            payload = {**reporter._base, "sequence": 1, "state": "idle", "login_state": "logged_out", "phase": "idle",
+                       "result_code": "", "exit_code": None, "progress_percent": None}
+            self.assertTrue(service.send_heartbeat(payload)["accepted"])
+            verify.assert_not_called()
+            self.assertEqual([request.full_url for request in requests], [
+                "http://10.30.65.30:8080/api/sinposmart/identity",
+                "http://10.30.65.30:8080/api/sinposmart/heartbeat",
+            ])
+            self.assertEqual(json.loads(requests[1].data)["route"]["identity_status"], "verified")
+            self.assertEqual(json.loads(service.status_path.read_text(encoding="utf-8"))["heartbeat"]["state"], "ok")
 
     def test_tailscale_verification_uses_installed_cli_and_authenticated_live_peer(self) -> None:
         import app_core.credential_sync_service as transport
@@ -11596,7 +11658,7 @@ class SecureSyncTransportTests(unittest.TestCase):
             "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
             "SINPOSMART_DUTY_BOARD_SYNC_URL": "https://script.google.com/macros/s/example/exec",
             "SINPOSMART_DUTY_BOARD_SYNC_KEY": "synthetic-key",
-        }), patch.object(transport, "_tailscale_peer_verified", return_value=True) as verify, \
+        }), patch.object(transport, "_tailscale_peer_verified", return_value=False) as verify, \
                 patch.object(transport.urllib.request, "build_opener") as build:
             build.return_value.open.return_value = response
             transport.CredentialSyncService().sync([{"user_id": "synthetic-user", "password": "synthetic-password"}])
@@ -11608,14 +11670,18 @@ class SecureSyncTransportTests(unittest.TestCase):
             operational._post_board({"content_hash": "synthetic-hash"})
             sent = [call.args[0].full_url for call in build.return_value.open.call_args_list]
             self.assertEqual(sent, [
-                "http://100.114.126.58:8080/api/credential-sync",
-                "http://100.114.126.58:8080/api/sinposmart/events",
-                "http://100.114.126.58:8080/api/sinposmart/civilpower-roster",
-                "http://100.114.126.58:8080/api/sinposmart/identity",
-                "http://100.114.126.58:8080/api/sinposmart/heartbeat",
+                "http://10.30.65.30:8080/api/credential-sync",
+                "http://10.30.65.30:8080/api/sinposmart/events",
+                "http://10.30.65.30:8080/api/sinposmart/civilpower-roster",
+                "http://10.30.65.30:8080/api/sinposmart/identity",
+                "http://10.30.65.30:8080/api/sinposmart/heartbeat",
                 "https://script.google.com/macros/s/example/exec",
             ])
-            self.assertEqual(verify.call_count, 5)
+            verify.assert_not_called()
+            for call in build.call_args_list[:5]:
+                proxies = [handler for handler in call.args
+                           if isinstance(handler, transport.urllib.request.ProxyHandler)]
+                self.assertEqual([handler.proxies for handler in proxies], [{}])
 
     def test_unverified_overlay_preserves_pending_event_without_sending_token(self) -> None:
         import app_core.credential_sync_service as transport

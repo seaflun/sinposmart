@@ -13,13 +13,12 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 
 CredentialPoster = Callable[[dict[str, Any]], dict[str, Any]]
 ACCOUNT_FIELDS = ("actor_no", "user_id", "password", "display_name", "name", "id_number", "duty_pc_save_status")
-NAS_OVERLAY_IP = "100.114.126.58"
 _OVERLAY_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _NAS_API_PATHS = {"/api/credential-sync", "/api/sinposmart/events", "/api/sinposmart/civilpower-roster",
                   "/api/sinposmart/identity", "/api/sinposmart/heartbeat"}
@@ -71,8 +70,7 @@ def _sync_target(url: str) -> tuple[str, bool]:
             return url, False
         if (parsed.hostname == "10.30.65.30" and parsed.port == 8080
                 and parsed.path in _NAS_API_PATHS and not parsed.query):
-            url = urlunsplit(("http", NAS_OVERLAY_IP + ":8080", parsed.path, "", ""))
-            parsed = urlsplit(url)
+            return url, True  # Preserve the fixed NAS LAN route without using proxies.
         address = ipaddress.ip_address(parsed.hostname)
         if address not in _OVERLAY_NETWORK:
             raise ValueError()
@@ -109,12 +107,12 @@ class SyncRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def open_sync_request(request: urllib.request.Request, *, timeout: int,
                       allow_google_redirects: bool = False):
-    url, overlay = _sync_target(request.full_url)
+    url, direct = _sync_target(request.full_url)
     if url != request.full_url:
         request = urllib.request.Request(url, data=request.data, headers=dict(request.header_items()),
                                          method=request.get_method())
     handlers = [SyncRedirectHandler(allow_google_redirects=allow_google_redirects)]
-    if overlay:
+    if direct:
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
 

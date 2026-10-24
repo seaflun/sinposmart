@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.24.1057` | 2026-10-24 10:57（台北時間） | 恢復固定公務內網 NAS 預設路徑與心跳、更新完成回報，保留其他 HTTP 與轉址限制。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1057) |
 | `2026.10.24.0209` | 2026-10-24 02:09（台北時間） | 完整分頁與查詢新資料驗證、通報登入及收據安全復原、雲端授權、加密同步與更新包完整性修正。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.0209) |
 | `2026.10.22.2011` | 2026-10-22 20:11（台北時間） | 同步班表職稱，修正小隊長「姓＋小」與分隊長「姓＋分」簽收，維持下拉驗證與一般人員姓名對應。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.2011) |
 | `2026.10.22.1750` | 2026-10-22 17:50（台北時間） | 值班後台新增已收通報監看，回報當班／曆日計數、檢查時間、入表與已讀狀態，支援分片續傳、跨日去重及來源篩選。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.22.1750) |
