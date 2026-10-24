@@ -41,25 +41,17 @@ class NoticeBrowser:
         self._driver = None
         local_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SinpoSmart"
         self._profile_root = local_root
-        self._profile_dir = local_root / "notice_browser_profile"
+        self._profile_dir = local_root / "notice_browser_profiles"
         self._wait_seconds = wait_seconds
         self._poll_seconds = poll_seconds
         self._max_pages = max_pages
 
     def _create_driver(self):
-        from selenium.webdriver.chrome.options import Options
-        from duty_rehearsal import create_webdriver_chrome_with_timeout
+        from duty_rehearsal import build_driver
 
-        profile = self._profile_dir
-        profile.mkdir(parents=True, exist_ok=True)
-        options = Options()
-        options.add_argument(f"--user-data-dir={profile}")
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1120,800")
-        options.add_argument("--disable-popup-blocking")
-        options.add_experimental_option("prefs", {"credentials_enable_service": False,
-                                                 "profile.password_manager_enabled": False})
-        return create_webdriver_chrome_with_timeout(options)
+        return build_driver(headless=True, profile_root=self._profile_dir,
+            prune_profiles=False, write_diagnostics=False, option_arguments=("--window-size=1120,800",),
+            preferences={"credentials_enable_service": False, "profile.password_manager_enabled": False})
 
     @staticmethod
     def _run_oa_login(driver, account: str, password: str, *, attempts: int) -> None:
@@ -285,6 +277,8 @@ class NoticeBrowser:
         driver, self._driver = self._driver, None
         if driver is not None:
             try:
-                driver.quit()
+                from duty_rehearsal import quit_driver
+
+                quit_driver(driver)
             except Exception:
                 pass

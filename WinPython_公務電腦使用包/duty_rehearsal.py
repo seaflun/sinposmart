@@ -3890,6 +3890,7 @@ def build_driver(
     profile_root: Path | None = None,
     prune_profiles: bool = True,
     write_diagnostics: bool = True,
+    preferences: dict[str, object] | None = None,
 ) -> webdriver.Chrome:
     attempts = chrome_start_attempts()
     selected_profile_root = Path(profile_root) if profile_root is not None else None
@@ -3909,6 +3910,8 @@ def build_driver(
             else duty_browser_profile_dir()
         )
         options = Options()
+        if preferences is not None:
+            options.add_experimental_option("prefs", dict(preferences))
         options.add_argument(f"--user-data-dir={profile_dir}")
         if headless:
             options.add_argument("--headless=new")

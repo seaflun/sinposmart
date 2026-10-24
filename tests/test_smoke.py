@@ -4055,6 +4055,32 @@ try {
         self.assertNotEqual(profiles[0], profiles[1])
         self.assertEqual(getattr(driver, "_sinposmart_duty_browser_profile"), str(profiles[1]))
 
+    def test_build_driver_passes_only_explicit_preferences_as_a_copy(self) -> None:
+        module = duty_rehearsal_module()
+        preferences = {"credentials_enable_service": False, "profile.password_manager_enabled": False}
+        for supplied in (False, True):
+            with self.subTest(supplied=supplied):
+                driver = mock.Mock()
+                with mock.patch.object(module, "chrome_start_attempts", return_value=1), mock.patch.object(
+                    module, "duty_browser_profile_dir", return_value=Path("C:/Temp/duty_gui_preferences")
+                ), mock.patch.object(
+                    module, "create_webdriver_chrome_with_timeout", return_value=driver
+                ) as start_chrome:
+                    result = module.build_driver(
+                        headless=True,
+                        prune_profiles=False,
+                        write_diagnostics=False,
+                        **({"preferences": preferences} if supplied else {}),
+                    )
+
+                self.assertIs(result, driver)
+                options = start_chrome.call_args.args[0]
+                if supplied:
+                    self.assertEqual(options.experimental_options["prefs"], preferences)
+                    self.assertIsNot(options.experimental_options["prefs"], preferences)
+                else:
+                    self.assertNotIn("prefs", options.experimental_options)
+
     def test_prewrite_session_open_retries_with_a_fresh_driver_only(self) -> None:
         module = duty_rehearsal_module()
         first_driver = object()

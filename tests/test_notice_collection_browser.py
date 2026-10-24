@@ -433,13 +433,111 @@ class NoticeBrowserTests(unittest.TestCase):
 
     def test_daily_browser_options_are_actually_headless(self):
         from app_core.notice_collection_browser import NoticeBrowser
-        browser = NoticeBrowser(PACKAGE)
-        with patch("duty_rehearsal.create_webdriver_chrome_with_timeout") as create, \
-                patch("pathlib.Path.mkdir"):
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
+                patch("duty_rehearsal.create_webdriver_chrome_with_timeout") as create, \
+                patch("duty_rehearsal.prune_stale_duty_browser_profiles") as prune:
+            browser = NoticeBrowser(PACKAGE)
             browser._create_driver()
         options = create.call_args.args[0]
         self.assertIn("--headless=new", options.arguments)
         self.assertTrue(any(a.startswith("--user-data-dir=") for a in options.arguments))
+        self.assertEqual([a for a in options.arguments if a.startswith("--window-size=")][-1], "--window-size=1120,800")
+        self.assertEqual(options.experimental_options["prefs"], {
+            "credentials_enable_service": False, "profile.password_manager_enabled": False})
+        prune.assert_not_called()
+
+    def test_notice_driver_delegates_startup_to_shared_builder(self):
+        from app_core.notice_collection_browser import NoticeBrowser
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
+                patch("duty_rehearsal.build_driver", return_value=FakeDriver()) as build, \
+                patch("duty_rehearsal.create_webdriver_chrome_with_timeout", side_effect=AssertionError("unexpected direct startup")):
+            browser = NoticeBrowser(PACKAGE)
+            self.assertIs(browser._create_driver(), build.return_value)
+            self.assertEqual(browser._profile_dir, Path(directory) / "SinpoSmart/notice_browser_profiles")
+            build.assert_called_once_with(headless=True, profile_root=browser._profile_dir,
+                prune_profiles=False, write_diagnostics=False, option_arguments=("--window-size=1120,800",),
+                preferences={"credentials_enable_service": False, "profile.password_manager_enabled": False})
+
+    def test_shared_startup_retry_recovers_with_new_owned_profiles_and_preserves_legacy_profile(self):
+        import duty_rehearsal
+        from selenium.common.exceptions import SessionNotCreatedException
+        from app_core.notice_collection_browser import NoticeBrowser
+
+        driver, options = FakeDriver(), []
+        cleanup = duty_rehearsal.cleanup_duty_browser_profile
+
+        def safe_cleanup(profile, *, root=None, terminate_processes=False):
+            cleanup(profile, root=root, terminate_processes=False)
+
+        def create(option):
+            options.append(option)
+            if len(options) == 1:
+                raise SessionNotCreatedException("Chrome instance exited synthetic-private-detail")
+            return driver
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
+                patch("duty_rehearsal.chrome_start_attempts", return_value=2), \
+                patch("duty_rehearsal.create_webdriver_chrome_with_timeout", side_effect=create) as start, \
+                patch("duty_rehearsal.time.sleep"), \
+                patch("duty_rehearsal.cleanup_duty_browser_profile", side_effect=safe_cleanup) as cleaned, \
+                patch("duty_rehearsal.prune_stale_duty_browser_profiles") as prune, \
+                patch("duty_rehearsal._write_duty_browser_startup_diagnostic") as diagnostic:
+            root = Path(directory) / "SinpoSmart"
+            legacy = root / "notice_browser_profile/keep.txt"
+            other = root / "notice_browser_profiles/duty_gui_other/keep.txt"
+            for path in (legacy, other):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("keep", encoding="utf-8")
+            browser = NoticeBrowser(PACKAGE)
+            self.assertEqual(browser.scan_unread("synthetic-password"), [])
+            self.assertEqual(browser.scan_unread("synthetic-password"), [])
+            self.assertEqual(start.call_count, 2)  # The successful driver is reused by the next scan.
+            profiles = [Path(next(a.split("=", 1)[1] for a in option.arguments if a.startswith("--user-data-dir=")))
+                        for option in options]
+            self.assertNotEqual(profiles[0], profiles[1])
+            self.assertTrue(all(path.parent == root / "notice_browser_profiles" for path in profiles))
+            self.assertFalse(profiles[0].exists())
+            self.assertTrue(profiles[1].is_dir())
+            self.assertEqual(driver.async_calls, [])
+            browser.close()
+            browser.close()
+            self.assertEqual(driver.quit_calls, 1)
+            self.assertEqual([call.args[0] for call in cleaned.call_args_list], profiles)
+            self.assertFalse(profiles[1].exists())
+            self.assertEqual(legacy.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(other.read_text(encoding="utf-8"), "keep")
+            prune.assert_not_called()
+            diagnostic.assert_not_called()
+
+    def test_shared_startup_retry_stops_after_two_attempts_without_leaking_details(self):
+        import duty_rehearsal
+        from selenium.common.exceptions import SessionNotCreatedException
+        from app_core.notice_collection_browser import NoticeBrowser
+        from app_core.notice_collection_service import NoticeCollectionError
+
+        cleanup = duty_rehearsal.cleanup_duty_browser_profile
+
+        def safe_cleanup(profile, *, root=None, terminate_processes=False):
+            cleanup(profile, root=root, terminate_processes=False)
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
+                patch("duty_rehearsal.chrome_start_attempts", return_value=2), \
+                patch("duty_rehearsal.create_webdriver_chrome_with_timeout",
+                      side_effect=SessionNotCreatedException("synthetic-private-detail")) as start, \
+                patch("duty_rehearsal.time.sleep"), \
+                patch("duty_rehearsal.cleanup_duty_browser_profile", side_effect=safe_cleanup) as cleaned:
+            browser = NoticeBrowser(PACKAGE)
+            with self.assertRaises(NoticeCollectionError) as caught:
+                browser.scan_unread("synthetic-password")
+            self.assertEqual(caught.exception.code, "browser_start_failed")
+            self.assertNotIn("synthetic-private-detail", str(caught.exception))
+            self.assertNotIn("synthetic-password", str(caught.exception))
+            self.assertEqual(start.call_count, 2)
+            profiles = [call.args[0] for call in cleaned.call_args_list]
+            self.assertEqual(len(set(profiles)), 2)
+            self.assertTrue(all(path.parent == browser._profile_dir and not path.exists() for path in profiles))
+            self.assertIsNone(browser._driver)
 
     def test_force_verification_rebuilds_a_fresh_profile_and_uses_new_password(self):
         from app_core.notice_collection_browser import NoticeBrowser
