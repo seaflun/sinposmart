@@ -169,7 +169,7 @@ function withNoticeIdNote(note, noticeId) {
   return withNoticeMetadataNote(note, noticeId, "");
 }
 
-function withNoticeMetadataNote(note, noticeId, receivedAt) {
+function withNoticeMetadataNote(note, noticeId, receivedAt, entry) {
   var current = String(note || "");
   var normalizedNoticeId = norm(noticeId);
   var normalizedReceivedAt = norm(receivedAt);
@@ -202,6 +202,14 @@ function withNoticeMetadataNote(note, noticeId, receivedAt) {
     if (!receivedAtUpdated) lines.push(receivedAtMarker);
   }
 
+  if (entry && typeof entry.signingRecipient === "string") {
+    lines = lines.filter(function(line) { return !/^SinpoSmart signing:/.test(line); });
+    var proof = entry.record.responsibility;
+    var signing = "SinpoSmart signing: unconfirmed; manual confirmation required";
+    if (entry.signingRecipient) signing = "SinpoSmart signing: " + proof.actorNo + "番 " + proof.name
+      + " (" + entry.signingRecipient + "); capturedAt=" + proof.capturedAt + "; evidence=" + proof.evidenceKey;
+    lines.push(signing);
+  }
   return lines.join("\n");
 }
 
@@ -276,7 +284,8 @@ function writeNoticeNotes(sheet, rows, entries, start, end, outcomes) {
       notes[noteIndex - start][0] = withNoticeMetadataNote(
         notes[noteIndex - start][0],
         record.noticeId,
-        record.receivedAt
+        record.receivedAt,
+        entries[noteIndex]
       );
     }
     noteRange.setNotes(notes);
@@ -300,7 +309,8 @@ function writeNoticeNotesIndividually(sheet, rows, entries, start, end, outcomes
       noteRange.setNote(withNoticeMetadataNote(
         noteRange.getNote(),
         record.noticeId,
-        record.receivedAt
+        record.receivedAt,
+        entries[index]
       ));
       outcomes[index] = { success: true };
     } catch (err) {

@@ -782,6 +782,13 @@ ApplicationWindow {
                            : window.backend.noticeCollectionController.statusTone === "warning"
                              ? Design.warningText : Design.text
                 }
+
+                DutyTaskStatusPill {
+                    objectName: "noticeCollectionActivityPill"
+                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                    tone: window.backend.noticeCollectionController.activityTone
+                    statusText: window.backend.noticeCollectionController.activityLabel
+                }
             }
         }
 

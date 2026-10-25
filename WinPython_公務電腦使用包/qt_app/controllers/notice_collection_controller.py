@@ -1,6 +1,7 @@
 """Independent notice polling; browser and network work stay off the GUI thread."""
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta
 from typing import Callable
 from uuid import uuid4
@@ -24,12 +25,13 @@ class _NoticeCollectionJob(QThread):
     verified = Signal()
     failed = Signal(str, str)
 
-    def __init__(self, service, password: str, received_at: datetime, parent=None, *, verify_only=False):
+    def __init__(self, service, password: str, received_at: datetime, parent=None, *, verify_only=False, responsibility=None):
         super().__init__(parent)
         self._service = service
         self._password = password
         self._received_at = received_at
         self.verify_only = bool(verify_only)
+        self._responsibility = copy.deepcopy(responsibility)
         self.poll_outcome: tuple[str, object] | None = None
 
     def run(self) -> None:
@@ -40,6 +42,7 @@ class _NoticeCollectionJob(QThread):
             else:
                 result = self._service.collect(
                     self._password, self._received_at, cancel=self.isInterruptionRequested,
+                    responsibility=self._responsibility,
                 )
                 self.poll_outcome = ("collected", result)
                 self.collected.emit(result)
@@ -73,12 +76,13 @@ class NoticeCollectionController(QObject):
     def __init__(
         self, service, saved_account_lookup: Callable, busy_reason: Callable,
         schedule_repository=None, parent=None, *, now_factory=None,
-        read_only_acceptance=False, timer_start=True,
+        read_only_acceptance=False, timer_start=True, responsibility_provider=None,
     ):
         super().__init__(parent)
         self._service = service
         self._lookup = saved_account_lookup
         self._busy_reason = busy_reason
+        self._responsibility_provider = responsibility_provider
         self._schedule_repository = schedule_repository
         self._now_factory = now_factory or (lambda: datetime.now(TAIPEI))
         self._read_only = bool(read_only_acceptance)
@@ -116,6 +120,27 @@ class NoticeCollectionController(QObject):
     @Property(bool, notify=stateChanged)
     def isRunning(self) -> bool:
         return self._job is not None
+
+    @Property(str, notify=stateChanged)
+    def activityLabel(self) -> str:
+        if self._closing:
+            return "停止中" if self.isRunning else "已停止"
+        if self._read_only:
+            return "已停止"
+        if self.isRunning:
+            return "登入驗證中" if self._job.verify_only else "執行中"
+        if self._status_tone == "error":
+            return "失敗"
+        if self._status_tone == "warning":
+            return "待確認"
+        if self._last_wait_report_at is not None:
+            return "等待作業"
+        return "等待排程"
+
+    @Property(str, notify=stateChanged)
+    def activityTone(self) -> str:
+        return ("ready" if self._closing else "running" if self.isRunning else "manual" if self.activityLabel in {"失敗", "待確認"}
+                else "triggered" if self._status_tone == "success" and not self._closing else "ready")
 
     @Property(str, notify=stateChanged)
     def currentShiftText(self) -> str:
@@ -243,7 +268,12 @@ class NoticeCollectionController(QObject):
             self._set_verification_status(f"正在驗證通報帳號 {FIXED_NOTICE_ACCOUNT}…", "verifying")
         self._notice = ""
         self._status_tone = "muted"
-        job = _NoticeCollectionJob(self._service, password, now, self, verify_only=verify_only)
+        try:
+            responsibility = self._responsibility_provider(now) if self._responsibility_provider else None
+        except Exception:
+            responsibility = None
+        job = _NoticeCollectionJob(self._service, password, now, self, verify_only=verify_only,
+                                   responsibility=responsibility)
         job.collected.connect(self._collected)
         job.verified.connect(self._verified)
         job.failed.connect(self._verification_failed if verify_only else self._failed)
@@ -344,6 +374,7 @@ class NoticeCollectionController(QObject):
         self._timer.stop()
         if self._job is not None:
             self._job.requestInterruption()
+        self.stateChanged.emit()
 
     def shutdown(self) -> bool:
         self.prepare_shutdown_admission()

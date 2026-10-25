@@ -54,10 +54,131 @@ def notice(key, date="115-10-21"):
 def write_response(payload, written, *, handled=None, errors=0):
     return {"status": "success", "requestId": payload["requestId"],
             "result": {"writtenKeys": list(written), "handledKeys": list(handled or written),
-                       "success": len(written), "errors": errors}}
+                       "success": len(written), "errors": errors,
+                       "signingResults": [{"key": row["key"],
+                           "status": "confirmed" if row.get("responsibility", {}).get("status") == "confirmed" else "unknown",
+                           "recipient": row.get("responsibility", {}).get("name", "")
+                               if row.get("responsibility", {}).get("status") == "confirmed" else ""}
+                           for row in payload.get("records", []) if row["key"] in written]}}
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_responsibility_follows_confirmed_handoff_instead_of_the_clock(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        actions = []
+        for hour, outgoing, incoming in ((8, "3", "1"), (10, "1", "2")):
+            for kind, target in (("值退", outgoing), ("值班", incoming)):
+                actions.append({"kind": "entry_log", "source": "值班交接", "actor": outgoing,
+                    "target": target, "time": f"{hour:02d}:00", "fields": {"出或入": kind},
+                    "duplicate_key": f"{hour}:{kind}:{target}"})
+        data = {"target_date": "1151021", "actions": actions,
+                "today": {"staff": {"1": {"name": "持續值班甲", "role": "隊員"},
+                                     "2": {"name": "接班乙", "role": "小隊長"}}}}
+        now = datetime(2026, 10, 21, 10, 5)
+        comparisons = {0: {"group": "done"}, 1: {"group": "done"},
+                       2: {"group": "paused"}, 3: {"group": "paused"}}
+        resolve = lambda rows, live=True: confirmed_notice_responsibility(data, rows, set(), now, live=live)
+        self.assertEqual(resolve(comparisons)["actorNo"], "1")
+        self.assertEqual(resolve(comparisons)["status"], "confirmed")
+        self.assertEqual(resolve({**comparisons, 2: {"group": "done"}})["status"], "unknown")
+        finished = {index: {"group": "done"} for index in range(4)}
+        self.assertEqual(resolve(finished)["actorNo"], "2")
+        self.assertEqual(resolve(finished)["role"], "小隊長")
+        self.assertEqual(resolve(finished, live=False)["status"], "unknown")
+        self.assertEqual(confirmed_notice_responsibility(data, finished, {0, 1, 2, 3}, now, live=False)["status"], "unknown")
+        self.assertEqual(resolve({**comparisons, 2: {"group": "done", "cancelled": True}})["status"], "unknown")
+        self.assertEqual(resolve({**comparisons, 3: {"group": "near"}})["status"], "unknown")
+
+    def test_midnight_and_next_morning_do_not_transfer_responsibility_without_confirmation(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        actions = []
+        for time, offset, outgoing, incoming in (("22:00", 0, "3", "1"), ("08:00", 1, "1", "2")):
+            for kind, target in (("值退", outgoing), ("值班", incoming)):
+                actions.append({"kind": "entry_log", "source": "值班交接", "actor": outgoing,
+                    "target": target, "time": time, "date_offset": offset, "fields": {"出或入": kind}})
+        data = {"target_date": "1151021", "actions": actions, "today": {"staff": {
+            "1": {"name": "跨夜續班甲"}, "2": {"name": "早班乙"}}}}
+        rows = {0: {"group": "done"}, 1: {"group": "done"}, 2: {"group": "paused"}, 3: {"group": "paused"}}
+        self.assertEqual(confirmed_notice_responsibility(data, rows, set(), datetime(2026, 10, 22, 8, 5), live=True)["actorNo"], "1")
+        previous = confirmed_notice_responsibility(data, rows, set(), datetime(2026, 10, 22, 7, 59), live=True)
+        refreshed = {**data, "target_date": "1151022", "actions": [
+            {**action, "date_offset": 0} for action in actions[2:]]}
+        paused = {0: {"group": "paused"}, 1: {"group": "paused"}}
+        self.assertEqual(confirmed_notice_responsibility(refreshed, paused, set(),
+            datetime(2026, 10, 22, 8, 5), live=True, previous=previous)["actorNo"], "1")
+        self.assertEqual(confirmed_notice_responsibility(refreshed, paused, set(),
+            datetime(2026, 10, 22, 8, 5), live=False, previous=previous)["status"], "unknown")
+
+    def test_daily_total_counts_unique_manual_publications_as_well_as_automatic_receipts(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            service._state["collected"] = {"same": "2026-10-21T08:00:00+08:00"}
+            service._state["manual"] = {key: {"published_date": day} for key, day in
+                (("same", "2026-10-21"), ("manual", "2026-10-21"), ("yesterday", "2026-10-20"))}
+            self.assertEqual(service.counts(datetime(2026, 10, 21, 10)), (0, 2))
+
+    def test_collection_freezes_recipient_in_the_durable_intent_and_write(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        captured = []
+        proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",
+                 "role": "隊員", "capturedAt": "2026-10-21T10:05:00+08:00",
+                 "handoffSlotAt": "2026-10-21T08:00:00+08:00", "evidenceKey": "a" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            service = None
+            def poster(payload):
+                if payload["action"] == "checkExisting":
+                    return {"status": "success", "existingKeys": [], "retryKeys": []}
+                captured.append(json.loads(service.state_path.read_text("utf-8"))["pending"][0])
+                self.assertEqual(payload["records"][0]["responsibility"], proof)
+                return write_response(payload, ["1"])
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser([notice(1)]), poster=poster)
+            result = service.collect("synthetic", datetime(2026, 10, 21, 10, 5), responsibility=proof)
+            self.assertEqual(result.status, "success")
+            self.assertEqual(captured[0]["records"][0]["responsibility"], proof)
+            replay = service._rehydrate_pending(captured[0], [notice(1)], None)
+            self.assertEqual(replay[0]["responsibility"], proof)
+            self.assertEqual(replay[0]["receivedAt"], "2026.10.21.1005")
+
+    def test_a_receipt_for_another_signer_cannot_be_settled_by_content_deduplication(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError
+        proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",
+                 "role": "隊員", "capturedAt": "2026-10-21T10:05:00+08:00",
+                 "handoffSlotAt": "2026-10-21T08:00:00+08:00", "evidenceKey": "a" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser([notice(1)])
+            def poster(payload):
+                if payload["action"] == "checkExisting":
+                    return {"status": "success", "existingKeys": [], "retryKeys": []}
+                result = write_response(payload, ["1"])
+                result["result"]["signingResults"][0]["recipient"] = "另一位乙"
+                return result
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            with self.assertRaises(NoticeCollectionError):
+                service.collect("synthetic", datetime(2026, 10, 21, 10, 5), responsibility=proof)
+            self.assertEqual(len(service._state["pending"]), 1)
+            self.assertFalse(any(event.startswith("mark:") for event in browser.events))
+
+    def test_malformed_signing_receipt_cannot_be_hidden_by_a_later_existing_content_match(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError
+        checks = []
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser([notice(1)])
+            def poster(payload):
+                if payload["action"] == "checkExisting":
+                    checks.append(1)
+                    return {"status": "success", "existingKeys": [] if len(checks) == 1 else ["1"], "retryKeys": []}
+                if payload["action"] == "getWriteResult":
+                    return {"status": "success", "found": False, "requestId": payload["requestId"]}
+                response = write_response(payload, ["1"])
+                response["result"]["signingResults"] = "invalid receipt"
+                return response
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            with self.assertRaises(NoticeCollectionError):
+                service.collect("synthetic", datetime(2026, 10, 21, 10, 5))
+            self.assertEqual(len(service._state["pending"]), 1)
+            self.assertFalse(any(event.startswith("mark:") for event in browser.events))
+
     def test_already_read_notice_is_reported_by_publication_day_without_an_automatic_write(self):
         from app_core.notice_collection_service import NoticeCollectionService
 
@@ -411,7 +532,8 @@ class NoticeCollectionTests(unittest.TestCase):
             restarted = NoticeCollectionService(root, browser=browser, poster=recovered)
             result = restarted.collect("synthetic-password", datetime(2026, 10, 22, 0, 3))
             self.assertEqual(replayed, [original_writes[0]])
-            self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("success", ["1"], 1))
+            self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("partial", ["1"], 1))
+            self.assertEqual(result.error_code, "recipient_unconfirmed")
             self.assertEqual(restarted.counts(datetime(2026, 10, 21, 23, 59)), (0, 1))
             self.assertEqual(restarted.counts(datetime(2026, 10, 22, 0, 3)), (0, 0))
             state = json.loads(restarted.state_path.read_text(encoding="utf-8"))
@@ -525,7 +647,8 @@ class NoticeCollectionTests(unittest.TestCase):
                 "status": "success", "found": True, "requestId": "notice-pending-1",
                 "result": {"writtenKeys": ["1"], "handledKeys": ["1"]}})
             result = service.collect("synthetic-password", datetime(2026, 10, 21, 9, 3))
-            self.assertEqual(result.status, "success")
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.error_code, "recipient_unconfirmed")
             self.assertEqual(result.error_count, 0)
             self.assertEqual(result.marked_read_count, 0)
             self.assertEqual(browser.events, ["scan"])
@@ -694,6 +817,23 @@ class NoticeCollectionTests(unittest.TestCase):
 
 
 class PendingNoticeRecoveryTests(unittest.TestCase):
+    def test_restart_and_next_day_retry_keep_the_original_responsible_person(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        service, browser, requests, _intent = self.pending_service(written=["1"])
+        original = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "原續班甲", "role": "隊員",
+            "capturedAt": "2026-10-21T23:59:00+08:00", "handoffSlotAt": "2026-10-21T22:00:00+08:00", "evidenceKey": "a" * 64}
+        service._state["pending"][0]["received_at"] = original["capturedAt"]
+        service._state["pending"][0]["records"][0]["responsibility"] = original
+        service._persist(service._state)
+        restarted = NoticeCollectionService(service.package_root, browser=browser, poster=service._poster)
+        replacement = {**original, "actorNo": "2", "name": "新接班乙", "capturedAt": "2026-10-22T00:03:00+08:00"}
+        result = restarted.collect("synthetic", datetime(2026, 10, 22, 0, 3), responsibility=replacement)
+        write = next(item for item in requests if item["action"] == "writeRecords")
+        self.assertEqual(write["records"][0]["responsibility"], original)
+        self.assertEqual(write["records"][0]["receivedAt"], "2026.10.21.2359")
+        self.assertEqual(restarted._state["confirmed"]["1"]["signed_by"], "原續班甲")
+        self.assertEqual(result.status, "success")
+
     def pending_service(self, *, records=None, rows=None, existing=(), repairs=(), receipt=None,
                         fail_action="", written=(), handled=None, repair_keys=()):
         from app_core.notice_collection_service import NoticeCollectionService
@@ -784,7 +924,8 @@ class PendingNoticeRecoveryTests(unittest.TestCase):
         self.assertEqual(len(replayed), 1)
         self.assertEqual(replayed[0]["requestId"], intent["request_id"])
         self.assertEqual([row["key"] for row in replayed[0]["records"]], ["1", "2", "3"])
-        self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("success", ["1"], 3))
+        self.assertEqual((result.status, result.written_keys, result.marked_read_count), ("partial", ["1"], 3))
+        self.assertEqual(result.error_code, "recipient_unconfirmed")
         self.assertEqual(service.counts(datetime(2026, 10, 21, 9, 3)), (0, 1))
 
     def test_local_settlement_failure_stops_before_marking_read(self):

@@ -440,12 +440,6 @@ test('a busy script lock never starts creating folders or monthly files', () => 
   assert.equal(f.events.foldersCreated.length, 0);
 });
 
-function dutyRecipientBoard(name, role, changes = {}) {
-  const slot = { start_hour: 19, duty_nos: ['2'], names: [name], ...changes };
-  if (role !== undefined) slot.roles = [role];
-  return { days: [{ roc_date: '1151022', slots: [slot] }] };
-}
-
 function recipientSheet(choices) {
   return { getRange(row, column) {
     assert.equal(row, 3);
@@ -455,6 +449,52 @@ function recipientSheet(choices) {
     ] }) };
   } };
 }
+
+function confirmedRecipientRecord(name = '莊勝斌', role = '小隊長') {
+  return { key: 'responsibility-notice', sender: '測試單位', subject: '責任歸屬測試', content: '有效內文',
+    receivedAt: '2026.10.21.1005', responsibility: { schema_version: 1, status: 'confirmed',
+      actorNo: '1', name, role, capturedAt: '2026-10-21T10:05:00+08:00',
+      handoffSlotAt: '2026-10-21T08:00:00+08:00', evidenceKey: 'a'.repeat(64) } };
+}
+
+test('notice signing uses each frozen confirmed person and never a scheduled fallback', () => {
+  const s = fixture().sandbox;
+  const records = [confirmedRecipientRecord(), confirmedRecipientRecord('林宏澤', '隊員'),
+    { ...confirmedRecipientRecord(), responsibility: undefined }];
+  records[1].key = 'second'; records[2].key = 'legacy';
+  let written;
+  s.getWritableRows = () => [3, 4, 5];
+  s.writeRows = (_sheet, _rows, values) => { written = values; return values.map(() => ({ success: true })); };
+  const batch = { groups: { day: { target: { sheet: recipientSheet(['莊小', '宏澤', '預定接班乙']) },
+    entries: records.map(record => ({ record, key: record.key, token: record.key })) } }, tokenResults: {} };
+  s.writeGroups(batch, {}, s.createWriteResult(), '預定接班乙');
+  assert.deepEqual(written.map(row => row[3]), ['莊小', '宏澤', '']);
+});
+
+test('unknown malformed or mismatched responsibility never signs a notice', () => {
+  const s = fixture().sandbox;
+  for (const change of [{ status: 'unknown' }, { actorNo: '' }, { handoffSlotAt: '2026-10-21T11:00:00+08:00' },
+    { capturedAt: '2026-10-21T10:06:00+08:00' }, { evidenceKey: '' }, { name: '私人\n資料' }]) {
+    const record = confirmedRecipientRecord(); Object.assign(record.responsibility, change);
+    assert.equal(s.getCurrentDutyRecipient(record).recipient, '');
+  }
+});
+
+test('new-row notes retain the full actor and frozen proof without erasing human notes', () => {
+  const s = fixture().sandbox;
+  const entry = { record: confirmedRecipientRecord(), signingRecipient: '莊小' };
+  const note = s.withNoticeMetadataNote('人工備註', '123', '2026.10.21.1005', entry);
+  assert.match(note, /人工備註/);
+  assert.match(note, /1番 莊勝斌/);
+  assert.match(note, /2026-10-21T10:05:00\+08:00/);
+  assert.match(note, /evidence=aaaaaaaa/);
+  const again = s.withNoticeMetadataNote(note, '123', '2026.10.21.1005', entry);
+  assert.equal(again, note);
+  entry.signingRecipient = '';
+  const unknown = s.withNoticeMetadataNote('人工備註', '123', '2026.10.21.1005', entry);
+  assert.match(unknown, /signing: unconfirmed/);
+  assert.doesNotMatch(unknown, /莊勝斌/);
+});
 
 test('duty recipients use verified leadership roles and retain ordinary dropdown names', () => {
   const s = fixture().sandbox;
@@ -466,7 +506,7 @@ test('duty recipients use verified leadership roles and retain ordinary dropdown
     ['王小明', '隊員', '小明'], ['林宏澤', undefined, '宏澤'],
     ['莊小', undefined, '莊小'], ['宏澤', undefined, '宏澤'],
   ]) {
-    const candidate = s.findDutyRecipient(dutyRecipientBoard(name, role), '1151022', 19);
+    const candidate = s.getCurrentDutyRecipient(confirmedRecipientRecord(name, role || '')).recipient;
     assert.equal(s.getValidDutyRecipient(sheet, candidate), expected, `${name}/${role}`);
   }
 });
@@ -479,26 +519,27 @@ test('a surname alone never assigns an officer recipient or bypasses validation'
     ['莊勝斌', undefined], ['許主管', '小隊長'],
   ]) {
     assert.equal(s.getValidDutyRecipient(sheet,
-      s.findDutyRecipient(dutyRecipientBoard(name, role), '1151022', 19)), '');
+      s.getCurrentDutyRecipient(confirmedRecipientRecord(name, role || '')).recipient), '');
   }
-  const ambiguous = dutyRecipientBoard('莊勝斌', '小隊長', { duty_nos: ['2', '10'] });
-  assert.equal(s.findDutyRecipient(ambiguous, '1151022', 19), '');
-  const misaligned = dutyRecipientBoard('莊勝斌', undefined, { roles: ['小隊長', '隊員'] });
-  assert.equal(s.getValidDutyRecipient(sheet, s.findDutyRecipient(misaligned, '1151022', 19)), '');
-  assert.equal(s.findDutyRecipient(dutyRecipientBoard('莊勝斌', '小隊長'), '1151023', 19), '');
+  const ambiguous = confirmedRecipientRecord();
+  ambiguous.responsibility.actorNo = ['2', '10'];
+  assert.equal(s.getCurrentDutyRecipient(ambiguous).recipient, '');
+  const misaligned = confirmedRecipientRecord();
+  misaligned.responsibility.role = ['小隊長', '隊員'];
+  assert.equal(s.getCurrentDutyRecipient(misaligned).recipient, '');
+
 });
 
 test('officer signing writes a validated F value while keeping notice columns unchanged', () => {
   const s = fixture().sandbox;
   const sheet = recipientSheet(['莊小']);
-  const record = { sender: 'fixture sender', subject: 'fixture subject', content: 'fixture content' };
+  const record = { ...confirmedRecipientRecord(), sender: 'fixture sender', subject: 'fixture subject', content: 'fixture content' };
   const batch = { groups: { day: { target: { sheet }, entries: [{ record, key: 'fixture-key', token: 'one' }] } }, tokenResults: {} };
   let written;
   s.getWritableRows = () => [47];
   s.writeRows = (_sheet, _rows, values) => { written = values; return [{ success: true }]; };
   const result = s.createWriteResult();
-  s.writeGroups(batch, {}, result,
-    s.findDutyRecipient(dutyRecipientBoard('莊勝斌', '小隊長'), '1151022', 19));
+  s.writeGroups(batch, {}, result);
   assert.deepEqual(Array.from(written[0]), ['fixture sender', 'fixture subject', 'fixture content', '莊小']);
   assert.equal(result.success, 1);
 });
@@ -514,11 +555,12 @@ test('the recipient cache cannot reuse a pre-role cropped name after deployment'
   let reads = 0;
   s.DriveApp.getFileById = () => ({ getBlob: () => ({ getDataAsString: () => {
     reads++;
-    return JSON.stringify(dutyRecipientBoard('莊勝斌', '小隊長'));
+    throw new Error('Signing must not read the roster');
   } }) });
-  assert.equal(s.getCurrentDutyRecipient().recipient, '莊小');
-  assert.equal(s.getCurrentDutyRecipient().recipient, '莊小');
-  assert.equal(reads, 1);
+  assert.equal(s.getCurrentDutyRecipient(confirmedRecipientRecord()).recipient, '莊小');
+  assert.equal(s.getCurrentDutyRecipient(confirmedRecipientRecord()).recipient, '莊小');
+  assert.equal(s.getCurrentDutyRecipient().recipient, '');
+  assert.equal(reads, 0);
   assert.equal(cache.get('noticeDutyRecipient:1151022|19'), '勝斌');
 });
 

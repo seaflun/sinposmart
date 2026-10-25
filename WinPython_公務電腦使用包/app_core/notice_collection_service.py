@@ -30,6 +30,7 @@ NOTICE_ERROR_CODES = frozenset({
     "oa_ocr_unavailable", "oa_captcha_not_ready", "oa_captcha_unrecognized", "oa_captcha_ocr_failed",
     "oa_captcha_rejected", "oa_credentials_rejected", "oa_login_page_failed", "oa_login_form_timeout",
     "oa_login_verification_timeout",
+    "recipient_unconfirmed",
 })
 
 
@@ -51,6 +52,10 @@ class NoticeLoginRequired(NoticeCollectionError):
 
 class _NoticeStateError(NoticeCollectionError):
     """A durable checkpoint could not be saved; do not continue official actions."""
+
+
+class _NoticeSigningError(NoticeCollectionError):
+    """A receipt contradicts frozen responsibility; retain the intent without marking read."""
 
 
 @dataclass(frozen=True)
@@ -78,10 +83,109 @@ class NoticeCollectionResult:
     scan_from: str = ""
     scan_to: str = ""
     scan_verified_at: str = ""
+    signing_pending_count: int = 0
 
 
 def _local_time(value: datetime) -> datetime:
     return value.replace(tzinfo=TAIPEI) if value.tzinfo is None else value.astimezone(TAIPEI)
+
+
+def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *, live=False, previous=None) -> dict:
+    """Use completed official handoffs; a scheduled boundary never transfers ownership."""
+    from app_core.duty_task_projection import action_datetime, action_completion_key, action_staff, action_time_value, parse_roc_date
+
+    now = _local_time(now)
+    unknown = {"schema_version": 1, "status": "unknown", "capturedAt": now.isoformat()}
+    if not live:
+        return unknown
+    if not isinstance(data, dict) or not re.fullmatch(r"\d{7}", str(data.get("target_date", ""))):
+        return unknown
+    try:
+        parse_roc_date(data["target_date"])
+    except ValueError:
+        return unknown
+    groups = {}
+    for index, action in enumerate(data.get("actions", [])):
+        if (not isinstance(action, dict) or action.get("kind") != "entry_log"
+                or action.get("source") != "值班交接"
+                or action.get("fields", {}).get("出或入") not in {"值班", "值退"}):
+            continue
+        try:
+            if not re.fullmatch(r"(?:[0-2]?\d|3[0-2]):[0-5]\d", action_time_value(action)):
+                return unknown
+            at = _local_time(action_datetime(action, data["target_date"]))
+        except (ValueError, TypeError, OverflowError):
+            return unknown
+        if not now - timedelta(hours=24) <= at <= now:
+            continue
+        comparison = comparisons.get(index, {})
+        cancelled = bool(comparison.get("cancelled")) or comparison.get("group") in {"near", "review"}
+        done = not cancelled and (index in executed or live and comparison.get("group") == "done")
+        groups.setdefault((at, str(action.get("actor", ""))), []).append((action, done, cancelled))
+    completed = []
+    for (at, _actor), entries in groups.items():
+        incoming = [action for action, _done, _cancelled in entries if action["fields"]["出或入"] == "值班"]
+        targets = {str(action.get("target", "")) for action in incoming}
+        if len(targets) == 1 and all(done for _action, done, _cancelled in entries):
+            completed.append((at, incoming[0], entries))
+    prior = None
+    if live and isinstance(previous, dict):
+        try:
+            prior = _frozen_responsibility(previous, datetime.fromisoformat(previous["capturedAt"]))
+            prior_at = _local_time(datetime.fromisoformat(prior["handoffSlotAt"]))
+            if not now - timedelta(hours=24) <= prior_at <= now:
+                prior = None
+        except (ValueError, TypeError, KeyError):
+            prior = None
+    if prior and (not completed or prior_at > max(at for at, _action, _entries in completed)):
+        if any(at > prior_at and any(done or cancelled for _action, done, cancelled in entries)
+               for (at, _actor), entries in groups.items()):
+            return unknown
+        return {**prior, "capturedAt": now.isoformat()}
+    if not completed:
+        return unknown
+    latest = max(at for at, _action, _entries in completed)
+    latest_entries = [entry for entry in completed if entry[0] == latest]
+    if len(latest_entries) != 1:
+        return unknown
+    # Partial submission, cancellation, or competing handoffs cannot certify who owns the desk.
+    if any(at > latest and any(done or cancelled for _action, done, cancelled in entries)
+           for (at, _actor), entries in groups.items()):
+        return unknown
+    at, incoming, entries = latest_entries[0]
+    actor = str(incoming.get("target", ""))
+    member = action_staff(data, incoming).get(actor, {})
+    name = str(member.get("name", "")).strip()
+    if not re.fullmatch(r"[1-9]\d{0,2}", actor) or not 2 <= len(name) <= 40:
+        return unknown
+    evidence = sorted(action_completion_key(action) for action, _done, _cancelled in entries)
+    return {"schema_version": 1, "status": "confirmed", "actorNo": actor, "name": name,
+            "role": str(member.get("role", "")).strip()[:20], "capturedAt": now.isoformat(),
+            "handoffSlotAt": at.isoformat(), "evidenceKey": hashlib.sha256(json.dumps(evidence).encode()).hexdigest()}
+
+
+def _frozen_responsibility(value, received_at: datetime) -> dict:
+    now = _local_time(received_at)
+    unknown = {"schema_version": 1, "status": "unknown", "capturedAt": now.isoformat()}
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value.get("schema_version") != 1 or value.get("status") != "confirmed"):
+        return unknown
+    try:
+        captured, effective = (datetime.fromisoformat(value[key]) for key in ("capturedAt", "handoffSlotAt"))
+        if captured.utcoffset() is None or effective.utcoffset() is None:
+            return unknown
+        if captured != now or not captured - timedelta(hours=24) <= effective <= captured:
+            return unknown
+        if (not re.fullmatch(r"[1-9]\d{0,2}", value.get("actorNo", ""))
+                or not re.fullmatch(r"[0-9a-f]{64}", value.get("evidenceKey", ""))
+                or not isinstance(value.get("name"), str) or not 2 <= len(value["name"]) <= 40
+                or not isinstance(value.get("role"), str) or len(value["role"]) > 20
+                or any(ord(char) < 32 for char in value["name"] + value["role"])):
+            return unknown
+    except (ValueError, TypeError, KeyError):
+        return unknown
+    return {key: value[key] for key in ("schema_version", "status", "actorNo", "name", "role",
+                                      "capturedAt", "handoffSlotAt", "evidenceKey")}
 
 
 def next_check_at(now: datetime) -> datetime:
@@ -178,6 +282,12 @@ class NoticeCollectionService:
                             or not isinstance(record.get("subject", ""), str)
                             or record.get("read_state", "unknown") not in {"confirmed", "pending", "unknown"}):
                         raise ValueError("invalid confirmed record")
+                    if "signing_state" in record:
+                        signing, signed_by = record["signing_state"], record.get("signed_by")
+                        if (signing not in {"confirmed", "unknown"} or not isinstance(signed_by, str)
+                                or len(signed_by) > 40 or any(ord(char) < 32 for char in signed_by)
+                                or (signing == "confirmed") != bool(signed_by)):
+                            raise ValueError("invalid signing receipt")
                 manual = state.setdefault("manual", {})
                 if not isinstance(manual, dict):
                     raise ValueError("invalid manual observations")
@@ -220,8 +330,9 @@ class NoticeCollectionService:
             message="通報帳號 tyfd01214 登入驗證成功。",
         )
 
-    def collect(self, password: str, received_at: datetime, cancel=None) -> NoticeCollectionResult:
+    def collect(self, password: str, received_at: datetime, cancel=None, *, responsibility=None) -> NoticeCollectionResult:
         received_at = _local_time(received_at)
+        self._responsibility = _frozen_responsibility(responsibility, received_at)
         before = set(self._state["collected"])
         self.last_result = NoticeCollectionResult(received_at, unread_count=None, marked_read_count=None)
         self._confirmed_for_read, self._marked_for_read = set(), set()
@@ -230,6 +341,11 @@ class NoticeCollectionService:
             result = self._collect(password, received_at, cancel)
             self._collection_stage = "scan"
             self._reconcile_recent(password, received_at, cancel)
+            result.signing_pending_count = sum(self._state["confirmed"].get(key, {}).get("signing_state") != "confirmed"
+                                               for key in result.written_keys)
+            if result.signing_pending_count and result.status == "success":
+                result.status, result.error_stage, result.error_code = "partial", "write", "recipient_unconfirmed"
+                result.message = f"已入表；{result.signing_pending_count} 則簽收人員待人工確認。"
             return result
         except Exception as exc:
             result = self.last_result
@@ -331,13 +447,15 @@ class NoticeCollectionService:
                     result.error_stage = "scan"
                     continue
                 records.append({**self._metadata(row), "content": content,
-                                "receivedAt": received_at.strftime("%Y.%m.%d.%H%M")})
+                                "receivedAt": received_at.strftime("%Y.%m.%d.%H%M"),
+                                "responsibility": copy.deepcopy(self._responsibility)})
             if records:
                 self._check_cancel(cancel)
                 self._collection_stage = "state"
                 intent = {"request_id": "notice-" + uuid4().hex,
                           "received_at": received_at.isoformat(),
-                          "records": [self._metadata(row) for row in records],
+                          "records": [{**self._metadata(row), "responsibility": copy.deepcopy(row["responsibility"])}
+                                      for row in records],
                           "repair_keys": sorted(repairs & {row["key"] for row in records})}
                 state = copy.deepcopy(self._state)
                 state["pending"].append(intent)
@@ -346,7 +464,7 @@ class NoticeCollectionService:
                 payload = {"action": "writeRecords", "requestId": intent["request_id"], "records": records}
                 try:
                     handled, written = self._write_with_recovery(intent, payload, cancel)
-                except _NoticeStateError:
+                except (_NoticeStateError, _NoticeSigningError):
                     raise
                 except NoticeCollectionError:
                     handled, written = set(), []
@@ -416,7 +534,7 @@ class NoticeCollectionService:
                     confirmed.update(handled)
                     written.extend(recovered)
                     continue
-                except _NoticeStateError:
+                except (_NoticeStateError, _NoticeSigningError):
                     raise
                 except NoticeCollectionError:
                     pass
@@ -444,7 +562,7 @@ class NoticeCollectionService:
                 handled, recovered = self._write_with_recovery(intent, payload, cancel)
                 confirmed.update(handled)
                 written.extend(recovered)
-            except _NoticeStateError:
+            except (_NoticeStateError, _NoticeSigningError):
                 raise
             except NoticeCollectionError:
                 pass
@@ -477,7 +595,8 @@ class NoticeCollectionService:
             if content in ("", "內文抓取失敗", "讀取失敗", "權限限制"):
                 return None
             records.append({**self._metadata(row), "content": content,
-                            "receivedAt": received_at.strftime("%Y.%m.%d.%H%M")})
+                            "receivedAt": received_at.strftime("%Y.%m.%d.%H%M"),
+                            "responsibility": _frozen_responsibility(row.get("responsibility"), received_at)})
         return records
 
     def _write_with_recovery(self, intent: dict, payload: dict, cancel) -> tuple[set[str], list[str]]:
@@ -487,7 +606,7 @@ class NoticeCollectionService:
             try:
                 response = self._post(payload)
                 return self._finish_write(intent, response)
-            except _NoticeStateError:
+            except (_NoticeStateError, _NoticeSigningError):
                 raise
             except NoticeCollectionError:
                 if not any(p["request_id"] == intent["request_id"] for p in self._state["pending"]):
@@ -497,7 +616,7 @@ class NoticeCollectionService:
             if receipt is not None and receipt["found"]:
                 try:
                     return self._finish_write(intent, receipt)
-                except _NoticeStateError:
+                except (_NoticeStateError, _NoticeSigningError):
                     raise
                 except NoticeCollectionError:
                     pass
@@ -550,11 +669,30 @@ class NoticeCollectionService:
             raise NoticeCollectionError("試算表寫入收據通報識別碼不符，保留待確認紀錄。")
         state = copy.deepcopy(self._state)
         newly_written = sorted(written - set(intent.get("repair_keys", [])) - state["collected"].keys())
+        signatures = response.get("result", {}).get("signingResults", [])
+        if (not isinstance(signatures, list) or any(not isinstance(item, dict) or item.get("key") not in written
+                or item.get("status") not in {"confirmed", "unknown"} or not isinstance(item.get("recipient"), str)
+                or len(item["recipient"]) > 40 or any(ord(char) < 32 for char in item["recipient"])
+                or (item["status"] == "confirmed") != bool(item["recipient"]) for item in signatures)
+                or len({item["key"] for item in signatures}) != len(signatures)):
+            raise _NoticeSigningError("試算表簽收回報無法確認，保留待確認紀錄。", code="recipient_unconfirmed")
+        signed = {item["key"]: item for item in signatures}
         for key in newly_written:
             state["collected"][key] = intent["received_at"]
             row = next(row for row in intent["records"] if row["key"] == key)
+            proof = row.get("responsibility", {})
+            signature = signed.get(key, {})
+            if signature.get("status") == "confirmed":
+                name, role = proof.get("name", ""), proof.get("role", "")
+                candidate = name[:1] + "小" if role == "小隊長" else name[:1] + "分" if role == "分隊長" else name
+                allowed = {candidate} if role in {"小隊長", "分隊長"} else {candidate, candidate[1:]}
+                if proof.get("status") != "confirmed" or signature["recipient"] not in allowed:
+                    raise _NoticeSigningError("簽收回報與收取時責任人不符，保留待確認。", code="recipient_unconfirmed")
             state.setdefault("confirmed", {})[key] = {
                 "subject": str(row.get("subject", ""))[:240], "read_state": "pending",
+                "responsibility": copy.deepcopy(row.get("responsibility", {})),
+                "signing_state": signed.get(key, {}).get("status", "unknown"),
+                "signed_by": signed.get(key, {}).get("recipient", ""),
             }
         state["pending"] = [p for p in state["pending"] if p["request_id"] != intent["request_id"]]
         self._persist(state)
@@ -582,6 +720,8 @@ class NoticeCollectionService:
             records.append({"key": hashlib.sha256(key.encode("utf-8")).hexdigest(),
                 "subject": str(metadata.get("subject", ""))[:240], "received_at": received_at.isoformat(),
                 "read_state": metadata.get("read_state", "unknown"),
+                **({"signing_state": metadata["signing_state"], "signed_by": metadata.get("signed_by", "")}
+                   if "signing_state" in metadata else {}),
                 **({"published_at": metadata["published_at"]} if metadata.get("published_at") else {})})
         records.sort(key=lambda row: (row["received_at"], row["key"]))
         new_keys = {hashlib.sha256(key.encode("utf-8")).hexdigest() for key in raw_new}
@@ -689,6 +829,8 @@ class NoticeCollectionService:
         local = _local_time(now)
         timestamps = [_local_time(datetime.fromisoformat(value)) for value in self._state["collected"].values()]
         today = sum(value.date() == local.date() for value in timestamps)
+        today += sum(record["published_date"] == local.date().isoformat()
+                     for key, record in self._state.get("manual", {}).items() if key not in self._state["collected"])
         shift_count = (sum(_local_time(shift.start) <= value < _local_time(shift.end) for value in timestamps)
                        if shift is not None else 0)
         return shift_count, today
