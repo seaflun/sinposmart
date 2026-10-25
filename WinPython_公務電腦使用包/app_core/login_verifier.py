@@ -316,6 +316,19 @@ def capture_login_diagnostic(
     return diagnostic
 
 
+OA_LOGIN_FAILURE_MESSAGES = {
+    "oa_ocr_unavailable": "通報驗證碼辨識元件未就緒，請確認公務電腦執行環境。",
+    "oa_captcha_not_ready": "通報驗證碼圖片尚未完整載入，未送出登入。",
+    "oa_captcha_unrecognized": "通報驗證碼未能辨識，未送出登入。",
+    "oa_captcha_ocr_failed": "通報驗證碼辨識元件執行失敗，未送出登入。",
+    "oa_captcha_rejected": "通報網站判定驗證碼不正確，請稍後重試。",
+    "oa_credentials_rejected": "通報網站拒絕帳號密碼，請確認已儲存的通報帳密。",
+    "oa_login_page_failed": "通報登入頁載入失敗，請確認網站與連線。",
+    "oa_login_form_timeout": "通報登入表單載入逾時，未完成登入。",
+    "oa_login_verification_timeout": "通報登入送出後驗證逾時，尚未確認登入成功。",
+}
+
+
 class OASessionExpiredError(LoginVerificationError):
     """The OA portal returned its session-timeout page after a login attempt."""
 
@@ -420,7 +433,7 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
 
             recognizer = ddddocr.DdddOcr(show_ad=False)
         except Exception:
-            raise LoginVerificationError("入口網自動登入所需 OCR 未就緒，請確認使用包依賴。") from None
+            raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES["oa_ocr_unavailable"], reason_code="oa_ocr_unavailable") from None
 
     def assert_login_target() -> None:
         target = urlsplit(str(driver.current_url or ""))
@@ -442,34 +455,57 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
             raise LoginVerificationError("入口網登入後來源不符，已停止操作。")
         if target.path == "/sess_exceed.php":
             raise OASessionExpiredError("入口網作業逾時，請重新登入。")
+        rejection = current.execute_script("""
+            const text = Array.from(document.querySelectorAll('.swal2-popup,.sweet-alert,.alert,[role="alert"]'))
+              .map(node => node.innerText || '').join(' ');
+            if (/驗證碼/.test(text) && /錯誤|不正確|失敗/.test(text)) return 'oa_captcha_rejected';
+            if (/帳號|密碼/.test(text) && /錯誤|不正確|失敗/.test(text)) return 'oa_credentials_rejected';
+            return '';
+        """)
+        if isinstance(rejection, str) and rejection in OA_LOGIN_FAILURE_MESSAGES:
+            raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[rejection], reason_code=rejection)
         return (target.path not in {"/login.php", "/login_main.php"}
                 and not current.find_elements(By.CSS_SELECTOR, "#login_name, #verify_code, #loginBtn"))
 
+    last_code = "oa_login_page_failed"
     for _attempt in range(max(1, min(int(attempts), 3))):
         try:
+            last_code = "oa_login_page_failed"
             driver.get("https://oa.tyfd.gov.tw/login.php")
             assert_login_target()
             wait = WebDriverWait(driver, 15)
+            last_code = "oa_login_form_timeout"
             set_input(wait, "#login_name", user_id)
             set_input(wait, "#password", password)
+            last_code = "oa_captcha_not_ready"
             captcha = wait.until(EC.visibility_of_element_located((By.ID, "checkcodeImg")))
             wait.until(lambda current: captcha.get_attribute("src") and captcha.size.get("width", 0) > 0)
+            wait.until(lambda current: current.execute_script(
+                "return arguments[0].complete === true && arguments[0].naturalWidth > 0 && arguments[0].naturalHeight > 0;",
+                captcha) is True)
             assert_login_target()
             # CAPTCHA pixels stay in memory; never persist a login screenshot.
+            last_code = "oa_captcha_ocr_failed"
             text = "".join(c for c in str(recognizer.classification(captcha.screenshot_as_png)) if c.isalnum())
             if not text:
+                last_code = "oa_captcha_unrecognized"
                 continue
+            last_code = "oa_login_form_timeout"
             set_input(wait, "#verify_code", text)
             button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#loginBtn")))
             assert_login_target()
+            last_code = "oa_login_verification_timeout"
             button.click()
             wait.until(logged_in)
             return
-        except LoginVerificationError:
+        except LoginVerificationError as exc:
+            if exc.reason_code == "oa_captcha_rejected":
+                last_code = exc.reason_code
+                continue
             raise
         except Exception:
             continue
-    raise LoginVerificationError("入口網自動登入未成功，請確認已儲存的帳密與網站狀態。") from None
+    raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[last_code], reason_code=last_code) from None
 
 
 AUTHENTICATED_DUTY_PAGE_SCRIPT = """

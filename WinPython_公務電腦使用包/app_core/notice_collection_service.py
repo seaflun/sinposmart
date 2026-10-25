@@ -26,7 +26,10 @@ NOTICE_ERROR_CODES = frozenset({
     "origin_mismatch", "account_mismatch", "login_target_mismatch", "login_page_failed",
     "list_navigation_failed", "list_wait_timeout", "page_limit", "list_changed", "duplicate_notice_id",
     "next_page_ambiguous", "count_mismatch", "notice_url_invalid", "scan_unexpected",
-    "session_expired", "login_failed", "credentials_missing", "cancelled",
+    "session_expired", "login_failed", "credentials_missing", "cancelled", "publication_invalid",
+    "oa_ocr_unavailable", "oa_captcha_not_ready", "oa_captcha_unrecognized", "oa_captcha_ocr_failed",
+    "oa_captcha_rejected", "oa_credentials_rejected", "oa_login_page_failed", "oa_login_form_timeout",
+    "oa_login_verification_timeout",
 })
 
 
@@ -71,6 +74,10 @@ class NoticeCollectionResult:
     pending_read_count: int | None = None
     error_stage: str = ""
     error_code: str = ""
+    scan_scope: str = "unread"
+    scan_from: str = ""
+    scan_to: str = ""
+    scan_verified_at: str = ""
 
 
 def _local_time(value: datetime) -> datetime:
@@ -140,7 +147,7 @@ class NoticeCollectionService:
         self._collection_stage = "scan"
         self._confirmed_for_read: set[str] = set()
         self._marked_for_read: set[str] = set()
-        self._state = {"schema_version": 1, "collected": {}, "pending": [], "confirmed": {}}
+        self._state = {"schema_version": 1, "collected": {}, "pending": [], "confirmed": {}, "manual": {}}
         if self.state_path.exists():
             try:
                 state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -171,6 +178,18 @@ class NoticeCollectionService:
                             or not isinstance(record.get("subject", ""), str)
                             or record.get("read_state", "unknown") not in {"confirmed", "pending", "unknown"}):
                         raise ValueError("invalid confirmed record")
+                manual = state.setdefault("manual", {})
+                if not isinstance(manual, dict):
+                    raise ValueError("invalid manual observations")
+                for key, record in manual.items():
+                    if (not isinstance(key, str) or not isinstance(record, dict)
+                            or not isinstance(record.get("subject"), str)
+                            or record.get("read_state") != "confirmed"):
+                        raise ValueError("invalid manual observation")
+                    for field in ("published_at", "observed_at"):
+                        _local_time(datetime.fromisoformat(record[field]))
+                    if record.get("published_date") != _local_time(datetime.fromisoformat(record["published_at"])).date().isoformat():
+                        raise ValueError("invalid manual publication date")
                 self._state = state
             except (OSError, ValueError, KeyError, TypeError, AttributeError, NoticeCollectionError):
                 self._state_error = True
@@ -208,7 +227,10 @@ class NoticeCollectionService:
         self._confirmed_for_read, self._marked_for_read = set(), set()
         self._collection_stage = "scan"
         try:
-            return self._collect(password, received_at, cancel)
+            result = self._collect(password, received_at, cancel)
+            self._collection_stage = "scan"
+            self._reconcile_recent(password, received_at, cancel)
+            return result
         except Exception as exc:
             result = self.last_result
             result.written_keys = sorted(set(result.written_keys) | (set(self._state["collected"]) - before))
@@ -222,6 +244,44 @@ class NoticeCollectionService:
                 result.pending_write_count = self._pending_write_count()
                 result.pending_read_count = len((self._confirmed_for_read | set(result.written_keys)) - self._marked_for_read)
             raise
+
+    def _reconcile_recent(self, password: str, now: datetime, cancel) -> None:
+        """Keep already-read publications separate from automatic write receipts."""
+        start, end = (now - timedelta(days=2)).date(), now.date()
+        recent = self._browser.scan_recent(password, start, end, cancel=cancel)
+        state = copy.deepcopy(self._state)
+        manual = state.setdefault("manual", {})
+        for row in recent:
+            self._check_cancel(cancel)
+            key = self._record_key(row)
+            if row.get("isUnread") is not False:
+                continue
+            try:
+                published = datetime.fromisoformat(row["publishedAt"])
+                year, month, day = map(int, row["date"].split("-"))
+                valid = (published.tzinfo is not None and start <= published.astimezone(TAIPEI).date() <= end
+                    and published.astimezone(TAIPEI).strftime("%Y-%m-%d") == f"{year + 1911:04d}-{month:02d}-{day:02d}"
+                    and published <= now + timedelta(minutes=5))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                valid = False
+            if not valid:
+                raise NoticeCollectionError("通報公布日期時間無法確認，已停止本輪補查。", code="publication_invalid")
+            published_at = published.astimezone(TAIPEI).isoformat(timespec="seconds")
+            if key in state["collected"]:
+                state.setdefault("confirmed", {}).setdefault(key, {}).update(published_at=published_at)
+                manual.pop(key, None)
+                continue
+            if any(key in {str(item.get("key")) for item in intent["records"]} for intent in state["pending"]):
+                continue
+            old = manual.get(key, {})
+            manual[key] = {"subject": str(row.get("subject", ""))[:240], "published_at": published_at,
+                "published_date": published.astimezone(TAIPEI).date().isoformat(),
+                "observed_at": old.get("observed_at") or now.isoformat(timespec="seconds"), "read_state": "confirmed"}
+        if state != self._state:
+            self._persist(state)
+        result = self.last_result
+        result.scan_scope, result.scan_from, result.scan_to = "publication_window", start.isoformat(), end.isoformat()
+        result.scan_verified_at = _local_time(self._now()).isoformat(timespec="seconds")
 
     def _collect(self, password: str, received_at: datetime, cancel=None) -> NoticeCollectionResult:
         self._check_cancel(cancel)
@@ -521,7 +581,8 @@ class NoticeCollectionService:
             metadata = self._state.get("confirmed", {}).get(key, {})
             records.append({"key": hashlib.sha256(key.encode("utf-8")).hexdigest(),
                 "subject": str(metadata.get("subject", ""))[:240], "received_at": received_at.isoformat(),
-                "read_state": metadata.get("read_state", "unknown")})
+                "read_state": metadata.get("read_state", "unknown"),
+                **({"published_at": metadata["published_at"]} if metadata.get("published_at") else {})})
         records.sort(key=lambda row: (row["received_at"], row["key"]))
         new_keys = {hashlib.sha256(key.encode("utf-8")).hexdigest() for key in raw_new}
         messages = {
@@ -531,7 +592,13 @@ class NoticeCollectionService:
             "uncertain": "通報寫入收據仍待確認，未確認的通報保留未讀。",
             "failed": "通報檢查未完成，請確認網站、登入或本機紀錄狀態。",
         }
-        count = max(1, (len(records) + MAX_RECORDS - 1) // MAX_RECORDS)
+        oldest_manual_day = (result.scan_from if result is not None and result.scan_scope == "publication_window"
+                             else (now.date() - timedelta(days=2)).isoformat())
+        manual_records = [{"key": hashlib.sha256(key.encode("utf-8")).hexdigest(), **record}
+            for key, record in sorted(self._state.get("manual", {}).items())
+            if not self._state_error and key not in self._state["collected"]
+            and oldest_manual_day <= record["published_date"] <= now.date().isoformat()]
+        count = max(1, (max(len(records), len(manual_records)) + MAX_RECORDS - 1) // MAX_RECORDS)
         report = {"schema_version": 1, "run_id": run_id, "part_count": count, "state": state,
             "started_at": _local_time(started_at).isoformat() if started_at is not None else "",
             "completed_at": now.isoformat() if terminal else "", "reported_at": now.isoformat(),
@@ -545,11 +612,16 @@ class NoticeCollectionService:
             "pending_read_count": result.pending_read_count if result is not None else None,
             "error_stage": error_stage or (result.error_stage if result is not None else ""),
             "message": messages[state]}
+        if result is not None and result.scan_scope == "publication_window":
+            report.update(scan_scope=result.scan_scope, scan_from=result.scan_from, scan_to=result.scan_to,
+                          scan_verified_at=now.isoformat(timespec="seconds"))
         error_code = _safe_notice_error_code(getattr(result, "error_code", ""))
         if state in {"failed", "partial", "uncertain"} and error_code:
             report["error_code"] = error_code
         return [{**report, "part_index": index,
                  "records": records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS],
+                  **({"manual_records": manual_records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS]}
+                     if manual_records or result is not None and result.scan_scope == "publication_window" else {}),
                  "new_keys": sorted(new_keys & {row["key"] for row in records[index * MAX_RECORDS:(index + 1) * MAX_RECORDS]})}
                 for index in range(count)]
 

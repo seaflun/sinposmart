@@ -48,8 +48,11 @@ return (function (operation, payload, done) {
     let sender = senderMatch ? senderMatch[1].trim() : '未標示';
     if (sender.includes('/')) sender = sender.split('/').pop();
     sender = sender.replace(/^(.*?(?:科|室|隊|組|局|中心|所))/, '$1 ');
+    const weight = links[0].style?.fontWeight || '';
+    const isUnread = weight === 'bold' || Number(weight) >= 600 ? true
+      : weight === 'normal' || (weight !== '' && Number(weight) > 0 && Number(weight) <= 400) ? false : null;
     return { key: noticeId, noticeId, date: date.innerText.trim(), subject, sender,
-      isUnread: true, contentUrl: iframe.src || iframe.getAttribute('src') || '' };
+      isUnread, contentUrl: iframe.src || iframe.getAttribute('src') || '' };
   }
 
   if (operation === 'snapshot') {
@@ -58,9 +61,19 @@ return (function (operation, payload, done) {
       .map(text => text.match(/^第\s*(\d+)\s*\/\s*(\d+)\s*頁\s*共\s*(\d+)\s*筆$/)).find(Boolean);
     const rows = Array.from(document.querySelectorAll('tr')).filter(row => dateCell(row));
     const pagers = Array.from(document.querySelectorAll('a[title="第一頁"],a[title="上一頁"],a[title="下一頁"],a[title="最末頁"]'));
-    const filterConfirmed = pagers.length > 0 && pagers.every(link =>
-      /(?:[&?])is_read=0(?:[&'";)]|$)/.test(link.getAttribute('onclick') || link.getAttribute('href') || ''));
-    return { ...state, filtered: /[&?]is_read=0(?:&|$)/.test(location.hash) && filterConfirmed,
+    const query = new URLSearchParams(location.hash.split('?').slice(1).join('?'));
+    const readFilter = Number(query.get('is_read'));
+    const pagerText = pagers.map(link => link.getAttribute('onclick') || link.getAttribute('href') || '');
+    const filterConfirmed = query.has('is_read') && [0, 2].includes(readFilter) && pagers.length > 0
+      && pagerText.every(text => new RegExp('(?:[&?])is_read=' + readFilter + '(?:[&\'";)]|$)').test(text));
+    const dateConfirmed = ['start_date', 'end_date'].every(name => {
+      const value = query.get(name);
+      return value && /^\d{3}-\d{2}-\d{2}$/.test(value)
+        && document.querySelector('input#' + name)?.value === value
+        && pagerText.every(text => text.includes(name + '=' + value));
+    });
+    return { ...state, filtered: filterConfirmed, readFilter,
+      dateFrom: dateConfirmed ? query.get('start_date') : '', dateTo: dateConfirmed ? query.get('end_date') : '',
       page: summary ? Number(summary[1]) : null, pages: summary ? Number(summary[2]) : null,
       total: summary ? Number(summary[3]) : null, dateRows: rows.length,
       records: rows.map(recordFromRow).filter(Boolean),
@@ -92,6 +105,15 @@ return (function (operation, payload, done) {
       const requested = new URL(payload);
       if (finalUrl.pathname !== requested.pathname || finalUrl.searchParams.get('id') !== requested.searchParams.get('id')) {
         done({ ok: false });
+        return;
+      }
+      if (operation === 'publication') {
+        const frame = parsed.querySelector('.knowledgeContent iframe#content');
+        const id = frame && new URL(frame.getAttribute('src'), expectedOrigin).searchParams.get('id');
+        const times = Array.from(parsed.querySelectorAll('.knowledge span.time'))
+          .map(node => node.textContent.trim().match(/^(\d{3}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*~/)).filter(Boolean);
+        done(times.length === 1 && id === requested.searchParams.get('id')
+          ? { ok: true, noticeId: id, publishedAt: times[0][1] } : { ok: false });
         return;
       }
       const target = parsed.querySelector('div[style*="word-break"]');

@@ -7,17 +7,19 @@ import os
 import re
 import time
 from pathlib import Path
+from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 from selenium.webdriver.common.by import By
 
-from app_core.login_verifier import OASessionExpiredError
+from app_core.login_verifier import OASessionExpiredError, OA_LOGIN_FAILURE_MESSAGES
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
     NoticeCollectionError,
     NoticeLoginRequired,
+    TAIPEI,
 )
 
 
@@ -45,6 +47,7 @@ class NoticeBrowser:
         self._wait_seconds = wait_seconds
         self._poll_seconds = poll_seconds
         self._max_pages = max_pages
+        self._publication_cache = {}
 
     def _create_driver(self):
         from duty_rehearsal import build_driver
@@ -117,12 +120,25 @@ class NoticeBrowser:
             raise NoticeCollectionError("登入頁來源或路徑不符，未填入任何帳號密碼。", code="login_target_mismatch")
 
     def scan_unread(self, password: str, cancel=None) -> list[dict]:
+        return self._scan_with_login(password, cancel)
+
+    def scan_recent(self, password: str, start_date, end_date, cancel=None) -> list[dict]:
+        if start_date > end_date or (end_date - start_date).days > 7:
+            raise NoticeCollectionError("通報補查日期範圍無法確認。", code="publication_invalid")
+        roc = lambda day: f"{day.year - 1911:03d}-{day.month:02d}-{day.day:02d}"
+        rows = self._scan_with_login(password, cancel, read_filter=2, date_range=(roc(start_date), roc(end_date)))
+        for row in rows:
+            if row.get("isUnread") is False:
+                row["publishedAt"] = self.read_publication(row, cancel)
+        return rows
+
+    def _scan_with_login(self, password: str, cancel=None, **filters) -> list[dict]:
         self._check_cancel(cancel)
         if not password:
             raise NoticeLoginRequired("請先在值班台儲存 tyfd01214 的帳號密碼。", code="credentials_missing")
         self._get_driver()
         try:
-            return self._scan_pages(cancel)
+            return self._scan_pages(cancel, **filters)
         except NoticeLoginRequired:
             self._check_cancel(cancel)
             if self._is_session_exceeded_page():
@@ -136,16 +152,19 @@ class NoticeBrowser:
                 self._login_runner(self._driver, FIXED_NOTICE_ACCOUNT, password, attempts=3)
             except OASessionExpiredError:
                 raise NoticeLoginRequired("入口網作業逾時，將於下輪重新登入。", code="session_expired") from None
-            except Exception:
+            except Exception as exc:
+                code = getattr(exc, "reason_code", "")
+                if isinstance(code, str) and code in OA_LOGIN_FAILURE_MESSAGES:
+                    raise NoticeLoginRequired(OA_LOGIN_FAILURE_MESSAGES[code], code=code) from None
                 raise NoticeLoginRequired("通報背景登入未成功，請確認已儲存的密碼與網站狀態。", code="login_failed") from None
             self._check_cancel(cancel)
-            return self._scan_pages(cancel)
+            return self._scan_pages(cancel, **filters)
         except NoticeCollectionError:
             raise
         except Exception:
             raise NoticeCollectionError("通報列表載入未完成，已保留原有未讀狀態。", code="scan_unexpected") from None
 
-    def _wait_page(self, expected_page: int, previous_keys, cancel) -> dict:
+    def _wait_page(self, expected_page: int, previous_keys, cancel, *, read_filter=0, date_range=None) -> dict:
         deadline = time.monotonic() + self._wait_seconds
         while True:
             self._check_cancel(cancel)
@@ -158,6 +177,8 @@ class NoticeBrowser:
             total = state.get("total")
             ready = (
                 state.get("filtered") is True and not state.get("loading")
+                and state.get("readFilter", 0) == read_filter
+                and (date_range is None or (state.get("dateFrom"), state.get("dateTo")) == date_range)
                 and not state.get("ajaxActive") and page == expected_page
                 and isinstance(pages, int) and pages >= page
                 and isinstance(total, int) and total >= len(rows)
@@ -175,10 +196,15 @@ class NoticeBrowser:
                 raise NoticeCollectionError("未讀列表尚未完成載入或資料不完整，已停止本輪收取。", code="list_wait_timeout")
             time.sleep(self._poll_seconds)
 
-    def _scan_pages(self, cancel) -> list[dict]:
+    def _scan_pages(self, cancel, *, read_filter=0, date_range=None) -> list[dict]:
         self._check_cancel(cancel)
+        url = UNREAD_URL
+        if read_filter == 2 and date_range:
+            query = {"action": "bulletin_list", "is_read": 2, "list_condition": "all",
+                     "start_date": date_range[0], "end_date": date_range[1], "orderby": "start_date"}
+            url = OA_ORIGIN + "/module_page.php?module=bulletin#bulletin/bulletin.php?" + urlencode(query)
         try:
-            self._driver.get(UNREAD_URL)
+            self._driver.get(url)
             # The fragment route can retain an earlier document, including an
             # empty unread list. Reload before accepting metadata or readback.
             self._driver.refresh()
@@ -187,7 +213,7 @@ class NoticeBrowser:
             raise NoticeCollectionError("通報專用視窗已關閉，下輪將重新開啟。", code="browser_window_closed") from None
         except Exception:
             raise NoticeCollectionError("通報列表重新整理失敗，請確認連線。", code="list_navigation_failed") from None
-        state = self._wait_page(1, None, cancel)
+        state = self._wait_page(1, None, cancel, read_filter=read_filter, date_range=date_range)
         pages, total = state["pages"], state["total"]
         if pages > self._max_pages:
             raise NoticeCollectionError("未讀通報頁數過多，請先人工確認收取範圍。", code="page_limit")
@@ -202,17 +228,41 @@ class NoticeBrowser:
                 if key in seen:
                     raise NoticeCollectionError("通報分頁出現重複識別碼，已停止本輪收取。", code="duplicate_notice_id")
                 seen.add(key)
-                rows.append(dict(row, isUnread=True))
+                if read_filter == 2 and type(row.get("isUnread")) is not bool:
+                    raise NoticeCollectionError("通報已讀狀態無法確認。", code="publication_invalid")
+                rows.append(dict(row, isUnread=True if read_filter == 0 else row["isUnread"]))
             if page < pages:
                 previous_keys = tuple(str(row["key"]) for row in state["records"])
                 links = self._driver.find_elements(By.CSS_SELECTOR, "a[title='下一頁']")
                 if len(links) != 1:
                     raise NoticeCollectionError("無法唯一確認通報下一頁按鈕。", code="next_page_ambiguous")
                 links[0].click()
-                state = self._wait_page(page + 1, previous_keys, cancel)
+                state = self._wait_page(page + 1, previous_keys, cancel, read_filter=read_filter, date_range=date_range)
         if len(rows) != total:
             raise NoticeCollectionError("未讀通報筆數與網站總數不一致，已停止本輪收取。", code="count_mismatch")
         return rows
+
+    def read_publication(self, record: dict, cancel=None) -> str:
+        self._validated_content_url(record)
+        if record.get("isUnread") is not False:
+            raise NoticeCollectionError("未讀通報尚未入表，不開啟會標記已讀的詳頁。", code="publication_invalid")
+        cache_key = (record["key"], record["date"], record.get("subject", ""))
+        if cache_key in self._publication_cache:
+            return self._publication_cache[cache_key]
+        url = OA_ORIGIN + "/bulletin/bulletin.php?" + urlencode({"action": "bulletin_read", "id": record["noticeId"]})
+        result = self._fetch("publication", url, cancel)
+        try:
+            raw = str(result["publishedAt"])
+            year = int(raw[:3]) + 1911
+            published = datetime.strptime(str(year) + raw[3:], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TAIPEI)
+            valid = result.get("ok") and str(result.get("noticeId")) == str(record["noticeId"]) and raw[:9] == record["date"]
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise NoticeCollectionError("通報公布日期時間無法確認。", code="publication_invalid")
+        value = published.isoformat(timespec="seconds")
+        self._publication_cache[cache_key] = value
+        return value
 
     @staticmethod
     def _validated_content_url(record: dict) -> str:

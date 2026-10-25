@@ -21,10 +21,31 @@ MEMBER = {"member_id": "m1", "name": "測試義消", "title": "隊員", "unit": 
 
 
 class OALoginTests(unittest.TestCase):
+    def test_oa_login_waits_for_captcha_pixels_before_ocr_and_preserves_failure_stage(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, elements, wait = self.make_login()
+        driver.execute_script.return_value = False
+        recognizer = Mock()
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaises(LoginVerificationError) as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        self.assertEqual(caught.exception.reason_code, "oa_captcha_not_ready")
+        recognizer.classification.assert_not_called()
+        elements["loginBtn"].click.assert_not_called()
+
+    def test_oa_empty_ocr_is_reported_as_captcha_failure_instead_of_unknown_login(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, _elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.return_value = ""
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaises(LoginVerificationError) as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        self.assertEqual(caught.exception.reason_code, "oa_captcha_unrecognized")
+
     def make_login(self):
         from selenium.common.exceptions import TimeoutException
 
         driver = Mock(current_url="https://oa.tyfd.gov.tw/login.php")
+        driver.execute_script.return_value = True
         elements = {key: Mock() for key in
                     ("login_name", "password", "checkcodeImg", "verify_code", "loginBtn")}
         for element in elements.values():

@@ -21,11 +21,15 @@ if str(PACKAGE_ROOT) not in sys.path:
 class FakeBrowser:
     def __init__(self, rows=()):
         self.rows = list(rows)
+        self.recent_rows = []
         self.events = []
 
     def scan_unread(self, password, cancel=None):
         self.events.append("scan")
         return self.rows
+
+    def scan_recent(self, password, start_date, end_date, cancel=None):
+        return self.recent_rows
 
     def begin_login_verification(self, password):
         self.events.append("begin_login_verification")
@@ -54,6 +58,61 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_already_read_notice_is_reported_by_publication_day_without_an_automatic_write(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+
+        now = datetime(2026, 10, 25, 8, 45)
+        browser = FakeBrowser()
+        browser.recent_rows = [{**notice("7427992", "115-10-24"), "isUnread": False,
+            "publishedAt": "2026-10-24T22:30:00+08:00"}]
+        poster = Mock(side_effect=AssertionError("Manual observations must not write or mark a notice"))
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            result = service.collect("synthetic", now)
+            report = service.report_parts("manual-audit", "success", now,
+                next_check=now + timedelta(minutes=3), result=result)[0]
+            manual = report["manual_records"][0]
+            self.assertEqual(manual["published_at"], "2026-10-24T22:30:00+08:00")
+            self.assertEqual(manual["published_date"], "2026-10-24")
+            self.assertEqual(manual["read_state"], "confirmed")
+            self.assertEqual((report["unread_count"], report["new_count"]), (0, 0))
+            self.assertEqual(report["records"], [])
+            self.assertEqual(report["scan_scope"], "publication_window")
+            self.assertEqual(service.counts(now), (0, 0))
+            poster.assert_not_called()
+            self.assertEqual(browser.events, ["scan"])
+            restored = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            repeated = restored.collect("synthetic", now + timedelta(minutes=3))
+            again = restored.report_parts("again", "success", now + timedelta(minutes=3),
+                next_check=now + timedelta(minutes=6), result=repeated)[0]
+            self.assertEqual(again["manual_records"], report["manual_records"])
+
+    def test_failed_publication_scan_cannot_report_a_complete_success(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError
+
+        browser = FakeBrowser()
+        browser.scan_recent = Mock(side_effect=NoticeCollectionError("safe failure", code="list_wait_timeout"))
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            with self.assertRaises(NoticeCollectionError):
+                service.collect("synthetic", datetime(2026, 10, 25, 9))
+            self.assertEqual(service.last_result.status, "failed")
+            self.assertEqual(service.last_result.error_stage, "scan")
+
+    def test_manual_history_spanning_multiple_parts_keeps_every_notice_without_automatic_counts(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        now = datetime(2026, 10, 25, 9)
+        browser = FakeBrowser()
+        browser.recent_rows = [{**notice(str(index), "115-10-24"), "isUnread": False,
+            "publishedAt": "2026-10-24T22:30:00+08:00"} for index in range(201)]
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            result = service.collect("synthetic", now)
+            parts = service.report_parts("multipart", "success", now, next_check=now + timedelta(minutes=3), result=result)
+            self.assertEqual([len(part["manual_records"]) for part in parts], [200, 1])
+            self.assertEqual([part["part_count"] for part in parts], [2, 2])
+            self.assertTrue(all(part["new_count"] == 0 and not part["records"] for part in parts))
+
     def test_failure_report_exports_only_allowlisted_error_code(self):
         from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
 

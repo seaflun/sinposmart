@@ -98,6 +98,30 @@ class NoticeBrowserTests(unittest.TestCase):
         return NoticeBrowser(PACKAGE, driver_factory=lambda: driver,
                              wait_seconds=0.03, poll_seconds=0.001, **kwargs)
 
+    def test_publication_window_includes_already_read_notices_and_checks_server_filter(self):
+        from datetime import date
+        record = {**notice("7427992"), "date": "115-10-24", "isUnread": False}
+        driver = FakeDriver([snapshot([record], readFilter=2, dateFrom="115-10-23", dateTo="115-10-25")])
+        driver.fetch_result = {"ok": True, "noticeId": "7427992", "publishedAt": "115-10-24 22:30:00"}
+        result = self.browser(driver).scan_recent("synthetic", date(2026, 10, 23), date(2026, 10, 25))
+        self.assertEqual(result[0]["publishedAt"], "2026-10-24T22:30:00+08:00")
+        self.assertFalse(result[0]["isUnread"])
+        self.assertIn("start_date=115-10-23", driver.gets[-1])
+        self.assertIn("is_read=2", driver.gets[-1])
+        self.assertEqual([args[0] for _script, args in driver.async_calls], ["publication"])
+
+    def test_recent_scan_rejects_stale_unread_grid_and_never_reads_an_unread_detail(self):
+        from datetime import date
+        from app_core.notice_collection_service import NoticeCollectionError
+        driver = FakeDriver([snapshot()])
+        with self.assertRaises(NoticeCollectionError):
+            self.browser(driver).scan_recent("synthetic", date(2026, 10, 23), date(2026, 10, 25))
+        self.assertEqual(driver.async_calls, [])
+        driver = FakeDriver([snapshot([notice()], readFilter=2, dateFrom="115-10-21", dateTo="115-10-25")])
+        result = self.browser(driver).scan_recent("synthetic", date(2026, 10, 21), date(2026, 10, 25))
+        self.assertTrue(result[0]["isUnread"])
+        self.assertEqual(driver.async_calls, [])
+
     def test_empty_unread_filter_returns_without_content_requests(self):
         driver = FakeDriver()
         self.assertEqual(self.browser(driver).scan_unread("synthetic"), [])
@@ -661,9 +685,9 @@ class NoticeBrowserTests(unittest.TestCase):
         script = r"""
 const fs = require('fs');
 const run = new Function(fs.readFileSync(process.argv[1], 'utf8'));
-const state = {filter:0, empty:false};
+const state = {filter:0, empty:false, dated:false};
 const date = {innerText:'115-10-21',getAttribute:name=>name==='rowspan'?'2':null};
-const link = {getAttribute:()=>"javascript:changeForm('bulletin_read&id=100');"};
+const link = {style:{fontWeight:'bold'},getAttribute:()=>"javascript:changeForm('bulletin_read&id=100');"};
 const frame = {src:'https://oa.tyfd.gov.tw/bulletin/bulletin_content.php?id=100'};
 const detail = {tagName:'TR',innerText:'',querySelector:s=>s==='iframe'?frame:null,
   querySelectorAll:s=>s==='td'?[]:[]};
@@ -671,10 +695,10 @@ const row = {nextElementSibling:detail,innerText:'公告人員：測試隊/測�
   querySelectorAll:s=>s==='td'?[{innerText:'',getAttribute:()=>null},date,
     {innerText:'電子通報 download\n 測試主旨\n公告對象全體',getAttribute:()=>null}]:[link]};
 const account = {childNodes:[{nodeType:3,textContent:' 新坡分隊/新坡分隊公務信箱(公務信箱) '}]};
-const pager = {getAttribute:()=>`changeForm('bulletin_list&is_read=${state.filter}&list_condition=all');`};
+const pager = {getAttribute:()=>`changeForm('bulletin_list&is_read=${state.filter}&list_condition=all${state.dated?'&start_date=115-10-21&end_date=115-10-25':''}');`};
 global.location={origin:'https://oa.tyfd.gov.tw',pathname:'/module_page.php',hash:'#bulletin/bulletin.php?action=bulletin_list&is_read=0&list_condition=all'};
 global.window={location:global.location,jQuery:{active:0}};
-global.document={body:{innerText:''},querySelector:()=>null,querySelectorAll:s=>{
+global.document={body:{innerText:''},querySelector:s=>state.dated&&s==='input#start_date'?{value:'115-10-21'}:state.dated&&s==='input#end_date'?{value:'115-10-25'}:null,querySelectorAll:s=>{
   if(s==='.user-menu .user-details')return [account];
   if(s==='p')return [{innerText:`第1/1頁 共${state.empty?0:1}筆`}];
   if(s==='tr')return state.empty?[]:[row,detail];
@@ -688,13 +712,23 @@ state.filter=0;state.empty=true;
 const empty=run('snapshot',null);
 global.location.pathname='/sess_exceed.php';
 const sessionExpired=run('snapshot',null).sessionExpired;
-console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty,sessionExpired}));
+global.location.pathname='/module_page.php';
+global.location.hash='#bulletin/bulletin.php?action=bulletin_list&is_read=2&start_date=115-10-21&end_date=115-10-25';
+state.filter=2;state.empty=false;state.dated=true;link.style.fontWeight='100';
+const recent=run('snapshot',null);
+state.dated=false;
+const missingDate=run('snapshot',null);
+console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty,sessionExpired,recent,missingDate}));
 """
         asset = PACKAGE / "app_core" / "notice_collection_dom.js"
         completed = subprocess.run([shutil.which("node"), "-e", script, str(asset)],
                                    capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
+        self.assertEqual((result["recent"]["readFilter"], result["recent"]["dateFrom"], result["recent"]["dateTo"]),
+                         (2, "115-10-21", "115-10-25"))
+        self.assertFalse(result["recent"]["records"][0]["isUnread"])
+        self.assertEqual(result["missingDate"]["dateFrom"], "")
         self.assertTrue(result["result"]["filtered"])
         self.assertEqual(result["result"]["records"], [{**notice(), "subject": "測試主旨"}])
         self.assertFalse(result["staleFiltered"])
