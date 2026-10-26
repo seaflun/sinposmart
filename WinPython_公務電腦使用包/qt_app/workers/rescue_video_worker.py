@@ -30,6 +30,7 @@ class RescueVideoWorker(QObject):
         defaults_source: str = "",
         defaults_date: str = "",
         defaults_vehicle: str = "",
+        expected_source_identity: str = "",
     ) -> None:
         super().__init__()
         self.request_id = request_id
@@ -39,6 +40,7 @@ class RescueVideoWorker(QObject):
         self.defaults_source = defaults_source
         self.defaults_date = defaults_date
         self.defaults_vehicle = defaults_vehicle
+        self.expected_source_identity = expected_source_identity
 
     @Slot()
     def run(self) -> None:
@@ -55,9 +57,16 @@ class RescueVideoWorker(QObject):
                         self.defaults_date or None,
                         source_path=self.defaults_source,
                         vehicle=self.defaults_vehicle,
+                        inspect_videos=False,
+                        expected_source_identity=self.expected_source_identity,
+                        status_callback=lambda message: self.progress.emit(self.request_id, message),
                     )
                 else:
-                    defaults = self.service.load_defaults()
+                    defaults = self.service.load_defaults(
+                        inspect_videos=False,
+                        expected_source_identity=self.expected_source_identity,
+                        status_callback=lambda message: self.progress.emit(self.request_id, message),
+                    )
                 self.defaultsLoaded.emit(self.request_id, defaults)
             elif self.operation == "execute" and self.request is not None:
                 try:
@@ -92,9 +101,10 @@ class RescueVideoWorker(QObject):
                 self.runSucceeded.emit(self.request_id, result)
             else:
                 raise RescueVideoExecutionError("救護影片背景工作參數不正確。")
-        except (RescueVideoExecutionError, RescueVideoValidationError) as exc:
+        except (RescueVideoExecutionError, RescueVideoValidationError, SystemExit) as exc:
             self.failure_stage = getattr(exc, "failure_stage", stage)
-            self.failed.emit(self.request_id, str(exc))
+            message = str(exc) if not isinstance(getattr(exc, "code", None), int) else ""
+            self.failed.emit(self.request_id, message or "作業已停止，請重新讀取記憶卡。")
         except Exception:
             self.failure_stage = stage
             self.failed.emit(self.request_id, "救護影片分類失敗，請檢查記憶卡與目的地。")

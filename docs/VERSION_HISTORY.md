@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.27.0148` | 2026-10-27 01:48（台北時間） | 簡化救護影片備份，依卡內日期選擇車號，阻擋換卡沿用預覽，補齊檢查原因及部分完成狀態。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.0148) |
 | `2026.10.26.2212` | 2026-10-26 22:12（台北時間） | 勤務表新增救護2車，依兩表規則補足人員，維持訓練名單、到點排程與完成紀錄。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.26.2212) |
 | `2026.10.24.1734` | 2026-10-24 17:34（台北時間） | 修正同址出入紀錄因二級火警等前綴而誤判未返隊，保留人員、時間、門牌與梯次安全檢查。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1734) |
 | `2026.10.24.1216` | 2026-10-24 12:16（台北時間） | 通報接回既有 Chrome 啟動失敗重試，以專用新 profile 復原，保留舊資料及收據／已讀守門。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.24.1216) |

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -41,6 +42,9 @@ class RescueVideoDefaults:
     is_ready: bool = True
     status_text: str = "檢查結果通過"
     check_cards: tuple["RescueVideoCheckCard", ...] = ()
+    source_identity: str = ""
+    available_dates: tuple[str, ...] = ()
+    source_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class RescueVideoCheckCard:
     title: str
     detail: str
     level: str
+    code: str = ""
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class RescueVideoRequest:
     offset_text: str
     repair_mismatch: bool
     mode: str
+    source_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,18 @@ class RescueVideoService:
     ) -> None:
         self.package_root = Path(package_root)
         self.module_loader = module_loader
+        self._card_selections: dict[str, tuple[str, str]] = {}
+
+    def remember_selection(self, identity: str, target_date: str, vehicle: str) -> None:
+        if not identity:
+            return
+        try:
+            datetime.strptime(target_date, "%Y-%m-%d")
+        except ValueError:
+            return
+        self._card_selections[identity] = (target_date, vehicle)
+        while len(self._card_selections) > 16:
+            self._card_selections.pop(next(iter(self._card_selections)))
 
     def load_defaults(
         self,
@@ -120,76 +138,93 @@ class RescueVideoService:
         *,
         source_path: str = "",
         vehicle: str = "",
+        inspect_videos: bool = False,
+        expected_source_identity: str = "",
+        status_callback: Callable[[str], None] | None = None,
     ) -> RescueVideoDefaults:
         core = self.module_loader(self.package_root)
-        if isinstance(today, str):
-            date_text = today.strip() or date.today().strftime("%Y-%m-%d")
-        else:
-            date_text = (today or date.today()).strftime("%Y-%m-%d")
+        if status_callback is not None:
+            status_callback("讀取記憶卡")
         destination = Path(core.DEFAULT_DESTINATION)
-        source = str(source_path or "").strip()
-        manual_source_error = ""
-        if source and not core.is_memory_card_source(Path(source)):
-            source = ""
-            manual_source_error = "請選擇記憶卡內的 DCIM\\100CAREC 資料夾。"
-        if not source and not manual_source_error:
+        source = ""
+        source_error = ""
+        source_code = ""
+        videos: list[Path] = []
+        try:
+            source = str(core.normalize_memory_card_source(Path(source_path))) if source_path else str(core.classifier.resolve_source(None))
+            videos = core.classifier.discover_sources(Path(source), ".TS")
+        except FileExistsError:
+            source_error = "偵測到多張記憶卡，請按「選擇記憶卡」。"
+            source_code = "source_multiple"
+        except (OSError, ValueError, SystemExit) as exc:
+            source_error = f"記憶卡讀取失敗：{exc}" if source else str(exc) if source_path else "請插入記憶卡，或按「選擇記憶卡」。"
+            source_code = "source_unreadable" if source else "source_invalid" if source_path else "source_missing"
+        identity = core.card_identity(Path(source)) if source else ""
+        counts: Counter[str] = Counter()
+        for video in videos:
             try:
-                source = str(core.classifier.resolve_source(None))
+                counts[datetime.fromtimestamp(video.stat().st_mtime).strftime("%Y-%m-%d")] += 1
             except OSError:
-                pass
+                continue
+        dates = tuple(sorted(counts, reverse=True))
+        remembered_date, remembered_vehicle = self._card_selections.get(identity, ("", ""))
+        changed_card = bool(expected_source_identity and identity != expected_source_identity)
+        provided_date = today.strip() if isinstance(today, str) else today.strftime("%Y-%m-%d") if today else ""
+        if changed_card:
+            provided_date = ""
+        suggested_date = max(counts, key=lambda value: (counts[value], value)) if counts else date.today().strftime("%Y-%m-%d")
+        date_text = provided_date or (remembered_date if remembered_date and (not dates or remembered_date in dates) else suggested_date)
+        selected_vehicle = "" if changed_card else str(vehicle or "").strip()
+        if not selected_vehicle and not changed_card and date_text == remembered_date:
+            selected_vehicle = remembered_vehicle
         values: dict[str, object] = {
             "source": source,
+            "source_error": source_error,
+            "source_error_code": source_code,
             "destination": str(destination),
             "date": date_text,
-            "vehicle": str(vehicle or "").strip(),
+            "vehicle": selected_vehicle,
             "offset_minutes": "0",
             "work_log_root": str(core.DEFAULT_WORK_LOG_ROOT),
             "report": str(core.DEFAULT_REPORT),
             "repair_mismatch": False,
         }
         try:
-            state = core.evaluate_preflight(values)
-        except (OSError, ValueError):
-            state = None
-        vehicles = tuple(state.vehicles) if state is not None else ()
-        selected_vehicle = str(vehicle or "").strip()
-        if selected_vehicle not in vehicles:
-            selected_vehicle = vehicles[0] if vehicles else ""
-        values["vehicle"] = selected_vehicle
-        if selected_vehicle:
-            values["report"] = str(core.build_public_duty_report_path(date_text, selected_vehicle))
-
-        offset_text = "0"
-        is_ready = False
-        check_state = None
-        check_lines: list[str] = [manual_source_error] if manual_source_error else []
-        try:
-            check_state = core.evaluate_preflight(values)
-            check_lines.extend(str(check.detail) for check in check_state.checks.values())
-            if check_state.ready:
-                check_lines.append("影片時間會採用同張記憶卡範例影片的實際長度自動判定。")
-                is_ready = True
+            check_state = core.evaluate_preflight(
+                values, inspect_videos=inspect_videos, video_sources=videos, stage_callback=status_callback
+            )
         except (OSError, ValueError, SystemExit) as exc:
-            check_lines.append(f"無法檢查記憶卡影片長度：{exc}")
+            check_state = core.PreflightState(
+                {"destination": core.PreflightCheck("destination", "error", f"案件清單讀取失敗：{exc}", "case_lookup_failed")},
+                [],
+            )
+        vehicles = tuple(check_state.vehicles)
+        if selected_vehicle not in vehicles:
+            selected_vehicle = ""
+        is_ready = check_state.ready and bool(selected_vehicle)
+        check_lines = [str(check.detail) for check in check_state.checks.values()]
 
         card_titles = (
-            ("source", "記憶卡來源"),
-            ("destination", "案件目的地"),
-            ("work_log", "工作／返隊紀錄"),
-            ("vehicle_date", "車號與日期"),
-            ("report", "報告輸出"),
-            ("videos", "影片檢查"),
+            ("source", "記憶卡"),
+            ("destination", "備份位置"),
+            ("work_log", "勤務紀錄"),
+            ("vehicle_date", "日期／車號"),
+            ("report", "備份報告"),
+            ("videos", "影片"),
         )
         checks = getattr(check_state, "checks", {})
         check_cards: list[RescueVideoCheckCard] = []
         for key, title in card_titles:
             check = checks.get(key)
-            detail = str(getattr(check, "detail", "尚未取得檢查結果"))
-            level = str(getattr(check, "level", "error"))
-            if key == "source" and manual_source_error:
-                detail = manual_source_error
-                level = "error"
-            check_cards.append(RescueVideoCheckCard(key, title, detail, level))
+            detail = str(getattr(check, "detail", "尚未檢查"))
+            level = str(getattr(check, "level", "pending"))
+            check_cards.append(RescueVideoCheckCard(key, title, detail, level, str(getattr(check, "code", ""))))
+        if identity:
+            self.remember_selection(identity, date_text, selected_vehicle)
+        date_hint = dates[-1] if len(dates) == 1 else f"{dates[-1]}～{dates[0]}" if dates else ""
+        source_hint = f"{len(videos)} 段" + (f"｜{date_hint}" if date_hint else "") if source else "尚未讀到記憶卡"
+        if changed_card:
+            source_hint = "記憶卡已變更，請確認日期與車號。"
 
         return RescueVideoDefaults(
             source_path=source,
@@ -197,11 +232,14 @@ class RescueVideoService:
             target_date=date_text,
             vehicle_options=vehicles,
             selected_vehicle=selected_vehicle,
-            offset_text=offset_text,
+            offset_text="0",
             check_text="\n".join(check_lines),
             is_ready=is_ready,
-            status_text="檢查結果通過" if is_ready else "等待必要資料",
+            status_text="可以預覽" if is_ready else "請補齊資料",
             check_cards=tuple(check_cards),
+            source_identity=identity,
+            available_dates=dates,
+            source_hint=source_hint,
         )
 
     def validate(self, request: RescueVideoRequest) -> tuple[RescueVideoRequest, list[str], dict[str, object]]:
@@ -215,6 +253,8 @@ class RescueVideoService:
             raise RescueVideoValidationError("日期格式必須是 YYYY-MM-DD。") from exc
         if not str(request.vehicle or "").strip():
             raise RescueVideoValidationError("請選擇救護車號。")
+        if request.source_identity and core.card_identity(Path(request.source_path)) != request.source_identity:
+            raise RescueVideoValidationError("記憶卡已變更，請重新讀取並預覽。")
 
         report = core.build_public_duty_report_path(request.target_date, request.vehicle)
         values: dict[str, object] = {
@@ -238,6 +278,7 @@ class RescueVideoService:
             offset_text=str(request.offset_text or "").strip(),
             repair_mismatch=bool(request.repair_mismatch),
             mode=mode,
+            source_identity=request.source_identity,
         )
         return normalized, [str(warning) for warning in warnings], values
 
@@ -248,15 +289,14 @@ class RescueVideoService:
             return (
                 f"日期：{normalized.target_date}\n車號：{normalized.vehicle}\n"
                 f"來源：{normalized.source_path or '自動偵測記憶卡'}\n\n"
-                "影片會複製到對應案件資料夾並逐檔驗證。\n"
-                "只有複製及驗證成功的記憶卡檔案會刪除；失敗檔案會保留。\n\n"
-                "確定要啟動分類嗎？"
+                "備份並逐檔驗證後，清理成功的來源影片。\n"
+                "待確認及失敗影片會保留。"
                 f"{warning_text}"
             )
         action_text = (
-            "確認後會複製影片並驗證目的地；記憶卡內檔案會保留，不會刪除。"
+            "備份並逐檔驗證，來源影片保留。"
             if normalized.mode == "copy"
-            else "確認後會先複製並核對檔案，只有核對成功的來源影片才會刪除。"
+            else "僅清理備份及驗證成功的來源影片。"
         )
         return (
             f"日期：{normalized.target_date}\n車號：{normalized.vehicle}\n"
@@ -313,8 +353,8 @@ class RescueVideoService:
                     if "unexpected keyword argument" not in str(fallback_exc):
                         raise
                     results = core.run_classification(args)
-        except (OSError, ValueError) as exc:
-            raise RescueVideoExecutionError(str(exc) or "救護影片分類失敗。") from exc
+        except (OSError, ValueError, SystemExit) as exc:
+            raise RescueVideoExecutionError(str(exc) or "影片讀取失敗。", failure_stage=stage) from exc
 
         rows = tuple(self._result_row(core, result) for result in results)
         summary = core.format_summary(core.summarize_results(results))

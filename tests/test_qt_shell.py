@@ -7414,8 +7414,12 @@ class RescueVideoServiceTests(unittest.TestCase):
             DEFAULT_DESTINATION=Path("Z:/救護行車影片"),
             DEFAULT_WORK_LOG_ROOT=Path("runtime_outputs/comparison"),
             DEFAULT_REPORT=Path("分類結果.csv"),
-            classifier=SimpleNamespace(resolve_source=lambda _source: Path("X:/DCIM/100CAREC")),
-            evaluate_preflight=lambda _values: state,
+            classifier=SimpleNamespace(
+                resolve_source=lambda _source: Path("X:/DCIM/100CAREC"),
+                discover_sources=lambda *_args: [],
+            ),
+            card_identity=lambda _source: "card-1",
+            evaluate_preflight=lambda _values, **_kwargs: state,
             build_public_duty_report_path=lambda _date, _vehicle: Path("report.csv"),
             build_args=lambda values, _mode: argparse.Namespace(**values),
         )
@@ -7428,14 +7432,13 @@ class RescueVideoServiceTests(unittest.TestCase):
         self.assertEqual(defaults.selected_vehicle, "93")
         self.assertEqual(defaults.offset_text, "0")
         self.assertTrue(defaults.is_ready)
-        self.assertEqual(defaults.status_text, "檢查結果通過")
+        self.assertEqual(defaults.status_text, "可以預覽")
         self.assertIn("工作／返隊紀錄可存取", defaults.check_text)
-        self.assertIn("影片時間會採用同張記憶卡範例影片的實際長度自動判定。", defaults.check_text)
         self.assertEqual(
             [card.key for card in defaults.check_cards],
             ["source", "destination", "work_log", "vehicle_date", "report", "videos"],
         )
-        self.assertEqual(defaults.check_cards[0].title, "記憶卡來源")
+        self.assertEqual(defaults.check_cards[0].title, "記憶卡")
 
     def test_copy_reuses_existing_classifier_without_deleting_source(self) -> None:
         import argparse
@@ -7506,10 +7509,9 @@ class RescueVideoServiceTests(unittest.TestCase):
         copy_summary = service.confirmation_summary(request("copy"))
         delete_summary = service.confirmation_summary(request("delete"))
 
-        self.assertIn("記憶卡內檔案會保留，不會刪除", copy_summary)
-        self.assertIn("影片會複製到對應案件資料夾並逐檔驗證", delete_summary)
-        self.assertIn("只有複製及驗證成功的記憶卡檔案會刪除；失敗檔案會保留", delete_summary)
-        self.assertIn("確定要啟動分類嗎？", delete_summary)
+        self.assertIn("逐檔驗證，來源影片保留", copy_summary)
+        self.assertIn("逐檔驗證後，清理成功的來源影片", delete_summary)
+        self.assertIn("待確認及失敗影片會保留", delete_summary)
 
     def test_result_model_has_stable_qml_roles(self) -> None:
         from qt_app.models.rescue_video_result_model import RescueVideoResultModel
@@ -13146,12 +13148,12 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("Design.dutyQuickToolLightInset", apple_button + design)
         self.assertIn('objectName: "rescueVideoCheckButton"', rescue_video)
         self.assertIn('text: "檢查結果"', rescue_video)
-        self.assertIn('text: "檢查及預覽分類"', rescue_video)
+        self.assertIn('text: "預覽"', rescue_video)
         self.assertIn('objectName: "rescueVideoCopyOnlyButton"', rescue_video)
-        self.assertIn('text: "啟動分類(只複製檔案不刪除)"', rescue_video)
+        self.assertIn('text: "備份"', rescue_video)
         self.assertIn('objectName: "rescueVideoCopyStartButton"', rescue_video)
-        self.assertIn('text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"', rescue_video)
-        self.assertIn('title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"', rescue_video)
+        self.assertIn('text: "備份後清理記憶卡"', rescue_video)
+        self.assertIn('title: "確認備份後清理"', rescue_video)
         self.assertIn('id: rescueVideoCopyConfirmation', rescue_video)
         self.assertIn("UpdateProgressWindow {", source)
         self.assertIn("controller: window.backend.updateController", source)
@@ -13741,7 +13743,7 @@ class QtShellTests(unittest.TestCase):
             'text: "檢查結果"',
             'model: rescueVideoWindow.controller.checkCards',
             'objectName: "rescueVideoCheckCard_" + rescueVideoCheckCard.modelData.key',
-            'text: "選擇 DCIM\\\\100CAREC"',
+            'text: "選擇記憶卡"',
             'objectName: "rescueVideoFlowGuideText"',
             'objectName: "rescueVideoErrorText"',
             'objectName: "rescueVideoResultEmptyText"',
@@ -13751,13 +13753,13 @@ class QtShellTests(unittest.TestCase):
             'objectName: "rescueVideoDateCalendarButton"',
             'objectName: "rescueVideoCheckButton"',
             'dateFormat: "iso"',
-            'text: "檢查及預覽分類"',
+            'text: "預覽"',
             "rescueVideoWindow.controller.checkAndPreview(",
             'objectName: "rescueVideoCopyOnlyButton"',
-            'text: "啟動分類(只複製檔案不刪除)"',
+            'text: "備份"',
             'objectName: "rescueVideoCopyStartButton"',
             'objectName: "rescueVideoCloseButton"',
-            'text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"',
+            'text: "備份後清理記憶卡"',
             "emphasizedBorder: true",
             "readonly property bool interactionsLocked",
             "if (rescueVideoWindow.interactionsLocked)",
@@ -13842,11 +13844,11 @@ class QtShellTests(unittest.TestCase):
         self.assertNotIn("section: true", panel)
         self.assertNotIn('objectName: "rescueVideoFlowGuideCard"', panel)
         self.assertNotIn('objectName: "rescueVideoFlowGuideTitle"', panel)
-        self.assertIn(': "尚未產生分類結果，請先執行檢查及預覽分類。"', source)
+        self.assertIn(': "請先選車號並預覽。"', source)
         self.assertNotIn('text: "刪除模式只會刪除複製及驗證成功的記憶卡檔案；失敗檔案會保留。"', source)
-        self.assertIn('title: "選擇記憶卡 DCIM\\\\100CAREC 資料夾"', source)
-        self.assertIn('title: "確認啟動分類(只複製檔案不刪除)"', source)
-        self.assertIn('title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"', source)
+        self.assertIn('title: "選擇記憶卡或 DCIM 資料夾"', source)
+        self.assertIn('title: "確認備份"', source)
+        self.assertIn('title: "確認備份後清理"', source)
         self.assertNotIn("CheckBox", source)
 
     def test_qml_rest_time_panel_preserves_finalized_legacy_contract(self) -> None:
@@ -17000,11 +17002,9 @@ if return_code != 0 or loaded:
                 is_ready=False,
             ),
         )
-        self.assertEqual(controller.statusText, "檢查未通過：記憶卡來源、車號與日期")
-        self.assertEqual(
-            controller.summaryText,
-            "請先處理：記憶卡來源、車號與日期，再按「檢查及預覽分類」。",
-        )
+        self.assertEqual(controller.statusText, "請補齊資料")
+        self.assertEqual(controller.summaryText, "來源不可用")
+        self.assertEqual([card["detail"] for card in controller.checkCards], ["來源不可用", "日期不可用"])
 
         controller._defaults_loaded(
             0,
@@ -17020,8 +17020,8 @@ if return_code != 0 or loaded:
                 is_ready=False,
             ),
         )
-        self.assertEqual(controller.statusText, "尚未選擇車號或日期")
-        self.assertEqual(controller.summaryText, "請先選擇日期與車號，再按「檢查及預覽分類」。")
+        self.assertEqual(controller.statusText, "請補齊資料")
+        self.assertEqual(controller.summaryText, "日期不可用")
 
 
     def test_rescue_video_result_model_tracks_each_video_transfer_progress(self) -> None:
@@ -17070,11 +17070,9 @@ if return_code != 0 or loaded:
                 is_ready=False,
             ),
         )
-        self.assertEqual(controller.statusText, "檢查未通過：記憶卡來源、車號與日期")
-        self.assertEqual(
-            controller.summaryText,
-            "請先處理：記憶卡來源、車號與日期，再按「檢查及預覽分類」。",
-        )
+        self.assertEqual(controller.statusText, "請補齊資料")
+        self.assertEqual(controller.summaryText, "來源不可用")
+        self.assertEqual([card["detail"] for card in controller.checkCards], ["來源不可用", "日期不可用"])
 
         controller._defaults_loaded(
             0,
@@ -17090,8 +17088,8 @@ if return_code != 0 or loaded:
                 is_ready=False,
             ),
         )
-        self.assertEqual(controller.statusText, "尚未選擇車號或日期")
-        self.assertEqual(controller.summaryText, "請先選擇日期與車號，再按「檢查及預覽分類」。")
+        self.assertEqual(controller.statusText, "請補齊資料")
+        self.assertEqual(controller.summaryText, "日期不可用")
 
     def test_rescue_video_controller_runs_preview_and_confirms_delete(self) -> None:
         from dataclasses import replace
@@ -17183,10 +17181,10 @@ if return_code != 0 or loaded:
         self.assertEqual(success_spy.count(), first_success_count + 1)
         self.assertEqual(controller.resultModel.rowCount(), 1)
         self.assertTrue(controller.hasPreview)
-        self.assertIn("啟動分類(只複製檔案不刪除)", controller.summaryText)
+        self.assertIn("可備份 1 段", controller.summaryText)
         self.assertEqual(controller.reportPath, "report.csv")
         self.assertTrue(controller.hasPreview)
-        self.assertIn("啟動分類(複製及驗證成功後刪除記憶卡檔案)", controller.summaryText)
+        self.assertIn("待確認 0 段；失敗 0 段", controller.summaryText)
 
         controller.prepareCopy("source", "destination", "2026-07-29", "92", "", False)
         self.assertTrue(controller.isAwaitingConfirmation)
@@ -17195,7 +17193,7 @@ if return_code != 0 or loaded:
         controller.cancelCopy()
         self.assertEqual(controller.confirmationSummary, "")
         self.assertFalse(controller.isAwaitingConfirmation)
-        self.assertEqual(controller.statusText, "已完成預覽，請選擇分類方式。")
+        self.assertEqual(controller.statusText, "預覽完成")
 
         controller.prepareDelete("source", "destination", "2026-07-29", "92", "", False)
         self.assertTrue(controller.isAwaitingConfirmation)
@@ -17205,7 +17203,7 @@ if return_code != 0 or loaded:
         controller.cancelDelete()
         self.assertEqual(controller.confirmationSummary, "")
         self.assertFalse(controller.isAwaitingConfirmation)
-        self.assertEqual(controller.statusText, "已完成預覽，請選擇分類方式。")
+        self.assertEqual(controller.statusText, "預覽完成")
 
     def _create_rescue_video_test_window(self, controller):
         # Match the runtime DLL search path before loading the real QML controls.
@@ -17250,6 +17248,63 @@ if return_code != 0 or loaded:
         with patch.object(controller, "_start_worker") as start_worker:
             window.findChild(QObject, "rescueVideoCheckButton").clicked.emit()
         self.assertEqual(start_worker.call_args.kwargs["defaults_date"], "2026-09-13")
+
+    def test_rescue_video_mouse_flow_requires_vehicle_and_offers_date_shortcuts(self) -> None:
+        from PySide6.QtCore import QObject, QPointF, Qt
+        from PySide6.QtTest import QTest
+        from app_core.rescue_video_service import RescueVideoDefaults, RescueVideoCheckCard
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+        from qt_app.main import configure_application_font
+
+        configure_application_font(self.app)
+        controller = RescueVideoController(object())
+        engine, host, window = self._create_rescue_video_test_window(controller)
+        window.setVisible(True)
+        self.addCleanup(lambda _engine=engine, _host=host, _window=window: _window.hide())
+
+        def control(name):
+            item = window.findChild(QObject, name)
+            self.assertIsNotNone(item)
+            return item
+
+        def click(item):
+            point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+            QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+            QTest.qWait(30)
+
+        preview = control("rescueVideoCheckButton")
+        self.assertFalse(preview.property("enabled"))
+        QTest.qWait(60)
+        with patch.object(controller, "_start_worker") as start:
+            click(control("rescueVideoReadCardButton"))
+        start.assert_called_once_with("defaults")
+        cards = tuple(RescueVideoCheckCard(key, key, "請選車號。" if key == "vehicle_date" else "可用",
+                      "error" if key == "vehicle_date" else "ok")
+                      for key in ("source", "destination", "work_log", "vehicle_date", "report", "videos"))
+        controller._defaults_loaded(0, RescueVideoDefaults("card", "destination", "2026-10-26", ("92", "95"), "",
+            is_ready=False, check_cards=cards, source_identity="card-A", available_dates=("2026-10-26",), source_hint="44 段"))
+        combo = control("rescueVideoVehicleCombo")
+        self.assertEqual(combo.property("currentIndex"), -1)
+        self.assertEqual(combo.property("displayText"), "選車號")
+        self.assertFalse(preview.property("enabled"))
+        combo.forceActiveFocus()
+        QTest.keyClick(window, Qt.Key_Down)
+        QTest.qWait(30)
+        self.assertEqual(controller.selectedVehicle, "92")
+        self.assertTrue(preview.property("enabled"))
+        self.assertFalse(control("rescueVideoCopyOnlyButton").property("enabled"))
+        qa_dir = os.environ.get("SINPOSMART_RESCUE_QA_DIR")
+        if qa_dir:
+            QTest.qWait(60)
+            self.assertTrue(window.grabWindow().save(str(Path(qa_dir) / "rescue-video-ready.png")))
+        with patch.object(controller, "_start_worker") as start:
+            click(preview)
+        self.assertEqual(start.call_args.kwargs["defaults_vehicle"], "92")
+        self.assertEqual(start.call_args.kwargs["defaults_date"], "2026-10-26")
+        with patch.object(controller, "_start_worker") as start:
+            click(control("rescueVideoYesterdayButton"))
+        self.assertEqual(start.call_args.kwargs["defaults_date"], controller.yesterdayDate)
+        self.assertEqual(controller.selectedVehicle, "")
 
     def test_rescue_video_reopening_visible_tool_preserves_preview_and_confirmation(self) -> None:
         from PySide6.QtCore import QObject, QUrl
@@ -21411,9 +21466,12 @@ if return_code != 0 or loaded:
                 check_start, check_end, preview_start, preview_end = [fields for _, fields in sync.events]
                 self.assertEqual(check_start["snapshot"]["run_id"], check_end["snapshot"]["run_id"])
                 self.assertEqual(check_end["status"], "completed")
+                self.assertEqual(check_end["snapshot"]["rescue_video_state"], "checked")
+                self.assertEqual(check_end["snapshot"]["preflight_checks"][0]["key"], "work_log")
                 self.assertEqual(preview_start["snapshot"]["tool_name"], "rescue_video")
                 self.assertEqual(preview_start["snapshot"]["run_id"], preview_end["snapshot"]["run_id"])
                 self.assertNotEqual(check_start["snapshot"]["run_id"], preview_start["snapshot"]["run_id"])
+                self.assertEqual(preview_end["snapshot"]["rescue_video_state"], "previewed")
                 for outcome in ("blocked", "exception"):
                     with self.subTest(outcome=outcome):
                         sync.events.clear()
@@ -21424,9 +21482,13 @@ if return_code != 0 or loaded:
                         self.assertEqual(len(sync.events), 2)
                         start, end = [fields for _, fields in sync.events]
                         self.assertEqual(start["snapshot"]["run_id"], end["snapshot"]["run_id"])
-                        self.assertEqual(end["status"], "failed")
-                        self.assertEqual(end["snapshot"]["failure_stage"], "preflight")
-                        self.assertTrue(end["error"])
+                        self.assertEqual(end["status"], "waiting" if outcome == "blocked" else "failed")
+                        self.assertEqual(end["snapshot"]["rescue_video_state"], "needs_input" if outcome == "blocked" else "failed")
+                        if outcome == "exception":
+                            self.assertEqual(end["snapshot"]["failure_stage"], "preflight")
+                            self.assertTrue(end["error"])
+                        else:
+                            self.assertFalse(end.get("error"))
                         self.assertFalse(rescue.hasPreview)
             finally:
                 service.release.set()
@@ -27580,19 +27642,19 @@ if return_code != 0 or loaded:
                 self.assertEqual(rescue_date_field.width(), 140)
                 self.assertEqual(rescue_title_label.property("font").pixelSize(), 24)
                 self.assertEqual(rescue_window_title.property("text"), "SinpoSmart - 救護行車紀錄器")
-                self.assertIn("只支援單張記憶卡", rescue_flow_text.property("text"))
+                self.assertIn("確認日期與車號", rescue_flow_text.property("text"))
                 self.assertEqual(
                     rescue_result_empty_text.property("text"),
-                    "尚未產生分類結果，請先執行檢查及預覽分類。",
+                    "請先選車號並預覽。",
                 )
                 self.assertEqual(rescue_result_title.property("font").pixelSize(), 16)
                 self.assertGreater(rescue_source_card.width(), 0)
                 self.assertGreater(rescue_videos_card.width(), 0)
                 self.assertTrue(rescue_date_field.property("enabled"))
-                self.assertEqual(rescue_check_button.property("text"), "檢查及預覽分類")
+                self.assertEqual(rescue_check_button.property("text"), "預覽")
                 self.assertEqual(rescue_bottom_close_button.property("text"), "關閉")
-                self.assertEqual(rescue_copy_only_button.property("text"), "啟動分類(只複製檔案不刪除)")
-                self.assertEqual(rescue_copy_button.property("text"), "啟動分類(複製及驗證成功後刪除記憶卡檔案)")
+                self.assertEqual(rescue_copy_only_button.property("text"), "備份")
+                self.assertEqual(rescue_copy_button.property("text"), "備份後清理記憶卡")
                 self.assertTrue(rescue_copy_button.property("emphasizedBorder"))
                 self.assertGreater(rescue_copy_button.property("contentItem").width(), 0)
                 self.assertGreater(
@@ -27605,7 +27667,7 @@ if return_code != 0 or loaded:
                 )
                 self.assertFalse(rescue_copy_only_button.property("enabled"))
                 self.assertFalse(rescue_copy_button.property("enabled"))
-                self.assertIn("尚未開始", wait_for("rescueVideoStatusBadge").property("text"))
+                self.assertIn("已讀取", wait_for("rescueVideoStatusBadge").property("text"))
                 click(rescue_check_button, rescue_window)
                 wait_until(
                     lambda: len(rescue_video_service.requests) == 1
@@ -27638,7 +27700,7 @@ if return_code != 0 or loaded:
                 self.assertTrue(rescue_copy_confirmation.property("visible"))
                 self.assertEqual(
                     controller.rescueVideoController.confirmationSummary,
-                    "確認救護影片 copy",
+                    "確認救護影片 copy\n可備份 1 段；待確認 0 段；失敗 0 段。",
                 )
                 self.assertTrue(
                     QMetaObject.invokeMethod(rescue_copy_confirmation, "reject", Qt.DirectConnection)
@@ -27670,10 +27732,8 @@ if return_code != 0 or loaded:
                         self.assertEqual(control.property("enabled"), expected_enabled)
                 self.assertTrue(QMetaObject.invokeMethod(rescue_window, "close", Qt.DirectConnection))
                 self.assertTrue(rescue_window.property("visible"))
-                self.assertEqual(
-                    controller.rescueVideoController.confirmationSummary,
-                    "只有複製及驗證成功的記憶卡檔案會刪除；失敗檔案會保留。確定要啟動分類嗎？",
-                )
+                self.assertIn("只有複製及驗證成功的記憶卡檔案會刪除", controller.rescueVideoController.confirmationSummary)
+                self.assertIn("可備份 1 段", controller.rescueVideoController.confirmationSummary)
                 self.assertTrue(
                     QMetaObject.invokeMethod(rescue_delete_confirmation, "accept", Qt.DirectConnection)
                 )
@@ -27748,7 +27808,7 @@ if return_code != 0 or loaded:
                 self.assertEqual([kind for kind, _ in preflight_events],
                                  ["tool_action_started", "tool_action_finished"] * 3)
                 self.assertEqual([fields["status"] for _, fields in preflight_events],
-                                 ["started", "completed"] * 3)
+                                 ["started", "loaded", "started", "loaded", "started", "completed"])
                 for index in range(0, len(preflight_events), 2):
                     self.assertEqual(preflight_events[index][1]["snapshot"]["run_id"],
                                      preflight_events[index + 1][1]["snapshot"]["run_id"])

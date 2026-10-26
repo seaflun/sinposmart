@@ -17,6 +17,13 @@ from app_core.schedule_repository import business_roc_date
 from qt_app.models.tool_model import ToolListModel, ToolUsageListModel
 
 
+USAGE_STATUS_LABELS = {
+    "completed": "已完成", "failed": "失敗", "loaded": "已讀取",
+    "needs_input": "待補資料", "checked": "檢查完成", "previewed": "預覽完成",
+    "backed_up": "備份完成", "partial": "部分完成",
+}
+
+
 TOOL_CATALOG = (
     {
         "toolId": "duty_sheet",
@@ -185,7 +192,7 @@ class ToolController(QObject):
             (
                 entry
                 for entry in reversed(self._usage_history)
-                if entry.get("tool_name") == tool_id and entry.get("report") in ("已完成", "失敗")
+                if entry.get("tool_name") == tool_id and entry.get("report") in USAGE_STATUS_LABELS.values()
             ),
             {},
         )
@@ -202,7 +209,7 @@ class ToolController(QObject):
             "time": str(latest.get("time", "尚無紀錄") or "尚無紀錄"),
             "people": people or "舊紀錄未保存操作人員",
             "report": self._result_text(tool_id, latest, report, include_failure_context=True),
-            "tone": "error" if report == "失敗" else "success",
+            "tone": self._report_tone(report),
         }
 
     @Slot(str, str, str, str, bool, result=QObject)
@@ -289,7 +296,7 @@ class ToolController(QObject):
             return
         tool_id = str(tool_id or "").strip()
         entry_id = self._active_usage_ids.pop(tool_id, "")
-        report = {"completed": "已完成", "failed": "失敗"}.get(str(status or ""), str(status or ""))
+        report = USAGE_STATUS_LABELS.get(str(status or ""), str(status or ""))
         for entry in reversed(self._usage_history):
             if entry.get("id") != entry_id:
                 continue
@@ -482,7 +489,7 @@ class ToolController(QObject):
             if entry.get("tool_name") != tool_id:
                 continue
             report = str(entry.get("report", "") or "").strip()
-            if report not in ("已完成", "失敗"):
+            if report not in USAGE_STATUS_LABELS.values():
                 continue
             if current_operator_only and not self._matches_operator(
                 entry,
@@ -500,7 +507,7 @@ class ToolController(QObject):
                     "timeText": str(entry.get("time", "") or "—"),
                     "peopleText": self._usage_people_text(entry),
                     "resultText": self._result_text(tool_id, entry, report),
-                    "tone": "error" if report == "失敗" else "success",
+                    "tone": self._report_tone(report),
                 }
             )
             break
@@ -518,6 +525,14 @@ class ToolController(QObject):
             " ",
             text,
         )
+
+    @staticmethod
+    def _report_tone(report: str) -> str:
+        if report == "失敗":
+            return "error"
+        if report in {"待補資料", "部分完成", "已讀取", "檢查完成", "預覽完成"}:
+            return "neutral"
+        return "success"
 
     def _result_text(
         self,

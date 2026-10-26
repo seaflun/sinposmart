@@ -161,7 +161,7 @@ Window {
 
     FolderDialog {
         id: rescueVideoSourceDialog
-        title: "選擇記憶卡 DCIM\\100CAREC 資料夾"
+        title: "選擇記憶卡或 DCIM 資料夾"
         onAccepted: {
             if (!rescueVideoWindow.readOnlyAcceptance) {
                 rescueVideoWindow.controller.updateInputs(
@@ -185,7 +185,7 @@ Window {
                  && !rescueVideoWindow.controller.isAwaitingConfirmation
                  && !rescueVideoWindow.readOnlyAcceptance
         onDateSelected: function(value) {
-            if (rescueVideoWindow.readOnlyAcceptance)
+            if (rescueVideoWindow.readOnlyAcceptance || value === rescueVideoWindow.controller.targetDate)
                 return
             rescueVideoWindow.controller.refreshVehicleOptions(
                 rescueVideoWindow.controller.sourcePath,
@@ -383,7 +383,7 @@ Window {
                     Label {
                         objectName: "rescueVideoFlowGuideText"
                         Layout.fillWidth: true
-                        text: "只支援單張記憶卡：插卡後自動尋找 DCIM\\100CAREC → 確認日期與車號 → 檢查並預覽 → 選擇分類方式（只複製，或複製及驗證成功後刪除）。不同案件資料夾會分別傳送並逐檔驗證。"
+                        text: "讀取記憶卡 → 確認日期與車號 → 預覽 → 備份。作業時請勿拔卡。"
                         color: Design.strongHeaderStatus
                         font.pixelSize: Design.captionSize
                         wrapMode: Text.Wrap
@@ -410,6 +410,35 @@ Window {
             Layout.bottomMargin: 14
             spacing: 8
 
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                AppleButton {
+                    objectName: "rescueVideoReadCardButton"
+                    text: "讀取記憶卡"
+                    tone: "neutralStrong"
+                    enabled: !rescueVideoWindow.interactionsLocked && !rescueVideoWindow.readOnlyAcceptance
+                    onClicked: rescueVideoWindow.controller.loadDefaults()
+                }
+                AppleButton {
+                    objectName: "rescueVideoChooseCardButton"
+                    text: "選擇記憶卡"
+                    tone: "neutralStrong"
+                    enabled: !rescueVideoWindow.interactionsLocked && !rescueVideoWindow.readOnlyAcceptance
+                    onClicked: rescueVideoSourceDialog.open()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: rescueVideoWindow.controller.sourcePath || "請插入一張記憶卡。"
+                    color: Design.secondaryText
+                    elide: Text.ElideMiddle
+                }
+                Label {
+                    text: rescueVideoWindow.controller.sourceHint
+                    color: Design.secondaryText
+                }
+            }
+
             ToolFormCard {
                 Layout.fillWidth: true
                 contentItem: RowLayout {
@@ -424,7 +453,7 @@ Window {
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
                                  && !rescueVideoWindow.readOnlyAcceptance
                         onEditingFinished: {
-                            if (!rescueVideoWindow.readOnlyAcceptance) {
+                            if (!rescueVideoWindow.readOnlyAcceptance && text !== rescueVideoWindow.controller.targetDate) {
                                 rescueVideoWindow.controller.refreshVehicleOptions(
                                     rescueVideoWindow.controller.sourcePath,
                                     text
@@ -435,6 +464,22 @@ Window {
                             rescueVideoDateCalendar.openForCurrentDate()
                         }
                     }
+                    AppleButton {
+                        objectName: "rescueVideoYesterdayButton"
+                        text: "昨天"
+                        tone: "neutralStrong"
+                        enabled: !rescueVideoWindow.interactionsLocked && !rescueVideoWindow.readOnlyAcceptance
+                        onClicked: rescueVideoWindow.controller.refreshVehicleOptions(
+                            rescueVideoWindow.controller.sourcePath, rescueVideoWindow.controller.yesterdayDate)
+                    }
+                    AppleButton {
+                        objectName: "rescueVideoTodayButton"
+                        text: "今天"
+                        tone: "neutralStrong"
+                        enabled: !rescueVideoWindow.interactionsLocked && !rescueVideoWindow.readOnlyAcceptance
+                        onClicked: rescueVideoWindow.controller.refreshVehicleOptions(
+                            rescueVideoWindow.controller.sourcePath, rescueVideoWindow.controller.todayDate)
+                    }
                     FormFieldTitle { text: "車號" }
                     AppleComboBox {
                         id: rescueVideoVehicleCombo
@@ -442,6 +487,7 @@ Window {
                         Layout.preferredWidth: Design.rescueVehicleWidth
                         model: rescueVideoWindow.controller.vehicleOptions
                         currentIndex: model.indexOf(rescueVideoWindow.controller.selectedVehicle)
+                        displayText: currentIndex < 0 ? "選車號" : currentText
                         enabled: model.length > 0
                                  && !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
@@ -458,9 +504,10 @@ Window {
                     }
                     AppleButton {
                         objectName: "rescueVideoCheckButton"
-                        text: "檢查及預覽分類"
+                        text: "預覽"
                         tone: "neutralStrong"
-                        enabled: !rescueVideoWindow.controller.isRunning
+                        enabled: rescueVideoWindow.controller.canPreview
+                                 && !rescueVideoWindow.controller.isRunning
                                  && !rescueVideoWindow.controller.isAwaitingConfirmation
                                  && !rescueVideoWindow.readOnlyAcceptance
                         onClicked: {
@@ -483,6 +530,24 @@ Window {
                         elide: Text.ElideRight
                     }
                 }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: rescueVideoWindow.controller.availableDates.length > 0
+                Label { text: "卡內日期"; color: Design.secondaryText }
+                Repeater {
+                    model: rescueVideoWindow.controller.availableDates.slice(0, 3)
+                    AppleButton {
+                        required property string modelData
+                        text: modelData.slice(5)
+                        tone: "neutralStrong"
+                        enabled: !rescueVideoWindow.interactionsLocked && !rescueVideoWindow.readOnlyAcceptance
+                        onClicked: rescueVideoWindow.controller.refreshVehicleOptions(
+                            rescueVideoWindow.controller.sourcePath, modelData)
+                    }
+                }
+                Item { Layout.fillWidth: true }
             }
 
             ToolFormCard {
@@ -586,12 +651,12 @@ Window {
                                     Label {
                                         text: rescueVideoCheckCard.modelData.level === "ok" ? "可用"
                                               : rescueVideoCheckCard.modelData.level === "pending" ? (rescueVideoCheckCard.modelData.stateText || "待重新檢查")
-                                              : "需處理"
+                                              : "待處理"
                                         color: rescueVideoCheckCard.modelData.level === "ok"
                                                ? Design.successText
                                                : rescueVideoCheckCard.modelData.level === "pending"
                                                  ? Design.warningText
-                                               : Design.dangerStrong
+                                                : Design.warningText
                                         font.pixelSize: Design.captionSize
                                         font.bold: true
                                     }
@@ -608,22 +673,6 @@ Window {
                                         verticalAlignment: Text.AlignTop
                                     }
 
-                                    AppleButton {
-                                        visible: rescueVideoCheckCard.modelData.key === "source"
-                                                 && rescueVideoWindow.controller.sourcePath.length === 0
-                                        Layout.fillWidth: true
-                                        implicitHeight: Design.toolBrowseButtonHeight
-                                        text: "選擇 DCIM\\100CAREC"
-                                        tone: "neutralStrong"
-                                        enabled: !rescueVideoWindow.controller.isRunning
-                                                 && !rescueVideoWindow.controller.isAwaitingConfirmation
-                                                 && !rescueVideoWindow.readOnlyAcceptance
-                                        onClicked: {
-                                            if (!rescueVideoWindow.readOnlyAcceptance) {
-                                                rescueVideoSourceDialog.open()
-                                            }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -787,8 +836,8 @@ Window {
                             anchors.centerIn: parent
                             width: Math.min(parent.width - 48, 520)
                             text: rescueVideoWindow.controller.hasPreview
-                                  ? "預覽完成，但目前沒有可分送的影片。請檢查記憶卡影片時間與案件資料。"
-                                  : "尚未產生分類結果，請先執行檢查及預覽分類。"
+                                  ? "沒有可備份的影片，請確認日期與案件。"
+                                  : "請先選車號並預覽。"
                             color: Design.secondaryText
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.Wrap
@@ -802,7 +851,7 @@ Window {
                 spacing: 8
                 AppleButton {
                     objectName: "rescueVideoCopyOnlyButton"
-                    text: "啟動分類(只複製檔案不刪除)"
+                    text: "備份"
                     tone: "primary"
                     emphasizedBorder: true
                     enabled: rescueVideoWindow.controller.isReady
@@ -825,7 +874,7 @@ Window {
                 }
                 AppleButton {
                     objectName: "rescueVideoCopyStartButton"
-                    text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"
+                    text: "備份後清理記憶卡"
                     tone: "dangerFilled"
                     emphasizedBorder: true
                     enabled: rescueVideoWindow.controller.isReady
@@ -868,9 +917,9 @@ Window {
         anchors.centerIn: parent
         width: Math.min(rescueVideoWindow.width - 72, 500)
         modal: true
-        title: "確認啟動分類(只複製檔案不刪除)"
+        title: "確認備份"
         standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "開始分類"
+        acceptText: "開始備份"
         rejectText: "取消"
         acceptTone: "primary"
         onAccepted: {
@@ -894,9 +943,9 @@ Window {
         anchors.centerIn: parent
         width: Math.min(rescueVideoWindow.width - 72, 500)
         modal: true
-        title: "確認啟動分類(複製及驗證成功後刪除記憶卡檔案)"
+        title: "確認備份後清理"
         standardButtons: Dialog.Yes | Dialog.No
-        acceptText: "開始分類並刪除"
+        acceptText: "備份並清理"
         rejectText: "取消"
         acceptTone: "dangerFilled"
         onAccepted: {

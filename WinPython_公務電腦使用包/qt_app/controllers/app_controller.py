@@ -390,13 +390,15 @@ class AppController(QObject):
         )
         self._rescue_video_controller.preflightSucceeded.connect(
             lambda message: self._tool_run_finished(
-                "rescue_video_preflight", "救護行車紀錄器前置檢查", message, notify=False
+                "rescue_video_preflight", "救護行車紀錄器前置檢查", message, notify=False,
+                snapshot_extra=self._rescue_video_controller.completed_preflight_details(),
             )
         )
         self._rescue_video_controller.preflightFailed.connect(
             lambda message: self._tool_run_failed(
                 "rescue_video_preflight", "救護行車紀錄器前置檢查", message,
                 mode="preflight", notify=False,
+                snapshot_extra=self._rescue_video_controller.completed_preflight_details(),
             )
         )
         self._rescue_video_controller.runStarted.connect(
@@ -412,6 +414,7 @@ class AppController(QObject):
                 message,
                 mode=mode,
                 notify=False,
+                snapshot_extra=self._rescue_video_controller.completed_preflight_details(),
             )
         )
         self._duty_execution_controller.submissionQueued.connect(self._submission_queued)
@@ -2728,7 +2731,9 @@ class AppController(QObject):
         run_context = self._tool_run_contexts.pop(tool_name, {})
         if tool_name == "daily_vehicle" and not run_context:
             run_context = self._daily_vehicle_controller.run_context
-        self._tool_controller.record_finished(tool_name, "completed", message)
+        rescue_state = str((snapshot_extra or {}).get("rescue_video_state") or "") if tool_name.startswith("rescue_video") else ""
+        status = {"loaded": "loaded", "needs_input": "waiting", "partial": "partial"}.get(rescue_state, "completed")
+        self._tool_controller.record_finished(tool_name, rescue_state or status, message)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         snapshot.update(run_context)
@@ -2741,7 +2746,7 @@ class AppController(QObject):
             snapshot.update(snapshot_extra)
         self._send_operational_event(
             "tool_action_finished",
-            status="completed",
+            status=status,
             trigger_type="tool_finish",
             content=message,
             snapshot=snapshot,
@@ -2760,10 +2765,17 @@ class AppController(QObject):
         notify: bool = True,
         force: bool = False,
         allow_during_shutdown: bool = False,
+        snapshot_extra: Mapping[str, object] | None = None,
     ) -> None:
         if self._operational_sync_shutting_down and not allow_during_shutdown:
             return
         if tool_name in self._shutdown_terminal_tool_runs and not force:
+            return
+        if tool_name.startswith("rescue_video") and (snapshot_extra or {}).get("rescue_video_state") == "needs_input":
+            self._tool_run_finished(
+                tool_name, tool_label, message, notify=notify,
+                snapshot_extra=snapshot_extra, allow_during_shutdown=allow_during_shutdown,
+            )
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
@@ -2794,6 +2806,8 @@ class AppController(QObject):
             snapshot["failure_detail"] = failure_detail
         if mode:
             snapshot["mode"] = mode
+        if snapshot_extra:
+            snapshot.update(snapshot_extra)
         self._send_operational_event(
             "tool_action_finished",
             status="failed",

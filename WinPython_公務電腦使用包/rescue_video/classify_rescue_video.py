@@ -240,33 +240,37 @@ def discover_vehicles(
     selected_key = (str(selected_date.year), selected_date.month, selected_date.strftime("%m%d"))
     previous_key = (str(previous_date.year), previous_date.month, previous_date.strftime("%m%d"))
     previous_vehicles: set[str] = set()
+    previous_folders: dict[str, list[CaseFolder]] = {}
+    wanted_months = {(selected_key[0], selected_key[1]), (previous_key[0], previous_key[1])}
     for year_dir in destination.iterdir():
-        if not year_dir.is_dir() or not YEAR_RE.match(year_dir.name):
+        if year_dir.name not in {selected_key[0], previous_key[0]} or not year_dir.is_dir():
             continue
         for month_dir in year_dir.iterdir():
             folder_month = month_from_name(month_dir.name)
-            if not month_dir.is_dir() or folder_month is None:
+            if (year_dir.name, folder_month) not in wanted_months or not month_dir.is_dir():
                 continue
             for case_dir in month_dir.iterdir():
-                if not case_dir.is_dir():
-                    continue
                 match = CASE_RE.match(case_dir.name)
                 if not match:
                     continue
                 case_key = (year_dir.name, folder_month, match.group("md"))
+                if case_key not in {selected_key, previous_key} or not case_dir.is_dir():
+                    continue
                 if case_key == selected_key:
                     vehicles.add(match.group("vehicle"))
                 elif case_key == previous_key:
-                    previous_vehicles.add(match.group("vehicle"))
+                    vehicle = match.group("vehicle")
+                    try:
+                        start = datetime.strptime(year_dir.name + match.group("md") + match.group("hm"), "%Y%m%d%H%M")
+                    except ValueError:
+                        continue
+                    previous_vehicles.add(vehicle)
+                    previous_folders.setdefault(vehicle, []).append(CaseFolder(case_dir, case_dir.name, vehicle, start))
 
     selected_day_start = datetime.combine(selected_date, datetime.min.time())
     effective_work_log_root = Path(work_log_root or DEFAULT_WORK_LOG_ROOT)
     for vehicle in previous_vehicles:
-        previous_cases = [
-            case
-            for case in discover_cases(destination, vehicle)
-            if case.start.date() == previous_date
-        ]
+        previous_cases = previous_folders.get(vehicle, [])
         attached_cases = attach_case_work(
             previous_cases,
             discover_case_work(effective_work_log_root, vehicle),

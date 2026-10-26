@@ -90,11 +90,14 @@ class RescueVideoPackageTests(unittest.TestCase):
 
         self.assertLess(source.index('FormFieldTitle { text: "日期" }'), source.index('FormFieldTitle { text: "車號" }'))
         self.assertIn("refreshVehicleOptions(", source)
-        self.assertIn('text: "檢查及預覽分類"', source)
+        self.assertIn('text: "預覽"', source)
+        self.assertIn("controller.canPreview", source)
+        self.assertIn('objectName: "rescueVideoReadCardButton"', source)
+        self.assertIn('objectName: "rescueVideoChooseCardButton"', source)
         self.assertIn("controller.checkAndPreview(", source)
         self.assertNotIn('objectName: "rescueVideoFlowGuideTitle"', source)
         self.assertNotIn('objectName: "rescueVideoFlowGuideCard"', source)
-        self.assertIn(': "尚未產生分類結果，請先執行檢查及預覽分類。"', source)
+        self.assertIn(': "請先選車號並預覽。"', source)
         self.assertNotIn('text: "刪除模式只會刪除複製及驗證成功的記憶卡檔案；失敗檔案會保留。"', source)
         self.assertNotIn('objectName: "rescueVideoPreviewButton"', source)
         self.assertIn('text: "矯正影片時間"', source)
@@ -117,12 +120,12 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertIn("controller.resetForNextSession()", source)
 
         controller_source = (PACKAGE_ROOT / "qt_app" / "controllers" / "rescue_video_controller.py").read_text(encoding="utf-8")
-        self.assertIn("本工具只支援單張記憶卡", controller_source)
+        self.assertIn("插入單張記憶卡", controller_source)
         self.assertIn("errorText", controller_source)
         self.assertNotIn("請先完成預覽分類", controller_source)
         self.assertIn('objectName: "rescueVideoCopyOnlyButton"', source)
-        self.assertIn('text: "啟動分類(只複製檔案不刪除)"', source)
-        self.assertIn('text: "啟動分類(複製及驗證成功後刪除記憶卡檔案)"', source)
+        self.assertIn('text: "備份"', source)
+        self.assertIn('text: "備份後清理記憶卡"', source)
         self.assertIn('id: rescueVideoCopyConfirmation', source)
         self.assertNotIn("CheckBox", source)
         self.assertIn('objectName: "rescueVideoResultEmptyText"', source)
@@ -550,12 +553,11 @@ class RescueVideoPackageTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(controller.statusText, "尚未開始")
-        self.assertIn("單張記憶卡", controller.summaryText)
-        self.assertEqual(controller.checkCards[0]["stateText"], "尚未開始")
-        self.assertTrue(controller.checkCards[0]["nextStep"])
-        self.assertFalse(controller.checkCards[1]["nextStep"])
-        self.assertIn("自動尋找 DCIM", controller.checkCards[0]["detail"])
+        self.assertEqual(controller.statusText, "請補齊資料")
+        self.assertIn("來源尚未檢查", controller.summaryText)
+        self.assertFalse(controller.canPreview)
+        self.assertEqual(controller.checkCards[0]["level"], "error")
+        self.assertEqual(controller.completed_preflight_details()["rescue_video_state"], "needs_input")
 
         controller._set_error("請插入單張記憶卡後再檢查。")
         self.assertEqual(controller.errorText, "請插入單張記憶卡後再檢查。")
@@ -624,6 +626,10 @@ class RescueVideoPackageTests(unittest.TestCase):
                 "case_count": 2,
                 "total_count": 5,
                 "usage_seconds": 65,
+                "ready_count": 3,
+                "pending_count": 1,
+                "failed_count": 1,
+                "rescue_video_state": "partial",
                 "classification_rows": [
                     {
                         "video_time": "08/24 08:01:00",
@@ -763,7 +769,7 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertEqual(model.data(index, model.StatusTextRole), "傳輸中")
         self.assertEqual(model.data(index, model.TransferPercentRole), 51)
 
-    def test_date_or_vehicle_change_marks_check_cards_pending(self) -> None:
+    def test_changed_source_reloads_metadata_and_invalidates_preview(self) -> None:
         if str(PACKAGE_ROOT) not in sys.path:
             sys.path.insert(0, str(PACKAGE_ROOT))
         from qt_app.controllers.rescue_video_controller import RescueVideoController
@@ -774,10 +780,16 @@ class RescueVideoPackageTests(unittest.TestCase):
             {"key": "vehicle_date", "title": "車號與日期", "detail": "案件可用", "level": "ok"},
         ]
 
-        controller.updateInputs("F:/DCIM/100CAREC", "2026-08-08", "93")
+        controller._has_preview = True
+        controller._source_identity = "old-card"
+        with mock.patch.object(controller, "_start_worker") as start:
+            controller.updateInputs("F:/DCIM/100CAREC", "2026-08-08", "93")
 
-        self.assertEqual([card["level"] for card in controller.checkCards], ["pending", "pending"])
-        self.assertTrue(all("重新檢查" in card["detail"] for card in controller.checkCards))
+        start.assert_called_once_with("defaults", defaults_source="F:/DCIM/100CAREC")
+        self.assertFalse(controller.hasPreview)
+        self.assertFalse(controller.canPreview)
+        self.assertEqual(controller.selectedVehicle, "")
+        self.assertEqual(controller._source_identity, "")
 
     def test_closing_rescue_video_clears_prior_session(self) -> None:
         if str(PACKAGE_ROOT) not in sys.path:
@@ -806,6 +818,165 @@ class RescueVideoPackageTests(unittest.TestCase):
         self.assertFalse(controller.hasPreview)
         self.assertEqual(controller.statusText, "尚未開始")
         self.assertEqual(controller.resultModel.rowCount(), 0)
+
+    def test_unreadable_sample_returns_a_specific_preflight_error(self) -> None:
+        service_module = self._service_module()
+        core = service_module.load_rescue_video_core(PACKAGE_ROOT)
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(
+            core.os, "access", return_value=True
+        ), mock.patch.object(core.classifier, "discover_vehicles", return_value=["95"]), mock.patch.object(
+            core.classifier, "discover_sources", return_value=[Path("damaged.TS")]
+        ), mock.patch.object(core.classifier, "read_card_duration", side_effect=ValueError("damaged.TS cannot be read")):
+            state = core.evaluate_preflight({"source": "card", "date": "2026-10-26", "vehicle": "95"})
+        self.assertFalse(state.ready)
+        self.assertEqual(state.checks["videos"].level, "error")
+        self.assertIn("damaged.TS", state.checks["videos"].detail)
+
+    def test_missing_media_system_exit_reports_failure_and_finishes_once(self) -> None:
+        service_module = self._service_module()
+        from qt_app.workers.rescue_video_worker import RescueVideoWorker
+
+        service = SimpleNamespace(execute=mock.Mock(side_effect=SystemExit("記憶卡已移除")))
+        request = service_module.RescueVideoRequest("card", "destination", "2026-10-26", "95", "0", False, "preview")
+        worker = RescueVideoWorker(1, service, "execute", request)
+        failed = []
+        finished = []
+        worker.failed.connect(lambda request_id, message: failed.append((request_id, message)))
+        worker.finished.connect(lambda request_id: finished.append(request_id))
+        worker.run()
+        self.assertEqual(finished, [1])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("記憶卡已移除", failed[0][1])
+
+    def test_metadata_load_accepts_card_root_and_does_not_probe_video_duration(self) -> None:
+        service_module = self._service_module()
+        core = service_module.load_rescue_video_core(PACKAGE_ROOT)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "DCIM" / "100CAREC"
+            source.mkdir(parents=True)
+            (source / "video.TS").write_bytes(b"metadata only")
+            service = service_module.RescueVideoService(PACKAGE_ROOT, module_loader=lambda _: core)
+            with mock.patch.object(core, "DEFAULT_DESTINATION", root), mock.patch.object(
+                core, "DEFAULT_WORK_LOG_ROOT", root
+            ), mock.patch.object(core, "DEFAULT_RUNTIME_OUTPUT_ROOT", root), mock.patch.object(
+                core.classifier, "discover_vehicles", return_value=["92", "95"]
+            ), mock.patch.object(core.classifier, "read_card_duration", side_effect=AssertionError("metadata must not read video")), mock.patch.object(
+                core, "evaluate_preflight", wraps=core.evaluate_preflight
+            ) as checks:
+                defaults = service.load_defaults("2026-10-26", source_path=str(root), vehicle="95", inspect_videos=False)
+            self.assertEqual(Path(defaults.source_path), source)
+            self.assertTrue(defaults.source_identity)
+            self.assertTrue(defaults.is_ready)
+            self.assertEqual(checks.call_count, 1)
+
+    def test_vehicle_requires_an_explicit_choice_and_same_card_remembers_it(self) -> None:
+        service_module = self._service_module()
+        core = service_module.load_rescue_video_core(PACKAGE_ROOT)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "DCIM" / "100CAREC"
+            source.mkdir(parents=True)
+            video = source / "video.TS"
+            video.write_bytes(b"metadata only")
+            timestamp = datetime(2026, 10, 26, 23, 50).timestamp()
+            os.utime(video, (timestamp, timestamp))
+            service = service_module.RescueVideoService(PACKAGE_ROOT, module_loader=lambda _: core)
+            with mock.patch.object(core, "DEFAULT_DESTINATION", root), mock.patch.object(
+                core, "DEFAULT_WORK_LOG_ROOT", root
+            ), mock.patch.object(core, "DEFAULT_RUNTIME_OUTPUT_ROOT", root), mock.patch.object(
+                core.classifier, "discover_vehicles", return_value=["92", "95"]
+            ), mock.patch.object(core, "card_identity", return_value="card-A"):
+                defaults = service.load_defaults(source_path=str(source), inspect_videos=False)
+                self.assertEqual(defaults.target_date, "2026-10-26")
+                self.assertEqual(defaults.selected_vehicle, "")
+                self.assertFalse(defaults.is_ready)
+                service.remember_selection("card-A", "2026-10-26", "95")
+                reopened = service.load_defaults(source_path=str(source), inspect_videos=False)
+                self.assertEqual((reopened.target_date, reopened.selected_vehicle), ("2026-10-26", "95"))
+            with mock.patch.object(core, "card_identity", return_value="card-B"), mock.patch.object(
+                core.classifier, "discover_vehicles", return_value=["92", "95"]
+            ):
+                changed = service.load_defaults(source_path=str(source), inspect_videos=False)
+                self.assertEqual(changed.selected_vehicle, "")
+
+    def test_source_check_distinguishes_missing_multiple_invalid_empty_and_unreadable_cards(self) -> None:
+        service_module = self._service_module()
+        core = service_module.load_rescue_video_core(PACKAGE_ROOT)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "DCIM" / "100CAREC"
+            source.mkdir(parents=True)
+            service = service_module.RescueVideoService(PACKAGE_ROOT, module_loader=lambda _: core)
+            with mock.patch.object(core, "DEFAULT_DESTINATION", root), mock.patch.object(
+                core, "DEFAULT_WORK_LOG_ROOT", root
+            ), mock.patch.object(core, "DEFAULT_RUNTIME_OUTPUT_ROOT", root):
+                for error, expected in ((FileNotFoundError("missing"), "source_missing"),
+                                        (FileExistsError("multiple"), "source_multiple")):
+                    with self.subTest(expected=expected), mock.patch.object(core.classifier, "resolve_source", side_effect=error):
+                        defaults = service.load_defaults()
+                        self.assertEqual(defaults.check_cards[0].code, expected)
+                        self.assertFalse(defaults.is_ready)
+                invalid = service.load_defaults(source_path=str(root / "wrong"))
+                self.assertEqual(invalid.check_cards[0].code, "source_invalid")
+                for accepted in (root, root / "DCIM", source):
+                    empty = service.load_defaults(source_path=str(accepted))
+                    self.assertEqual(empty.check_cards[-1].code, "videos_missing")
+                    self.assertFalse(empty.is_ready)
+                with mock.patch.object(core.classifier, "discover_sources", side_effect=OSError("損壞的目錄")):
+                    damaged = service.load_defaults(source_path=str(root))
+                self.assertEqual(damaged.check_cards[0].code, "source_unreadable")
+                self.assertIn("損壞的目錄", damaged.check_cards[0].detail)
+
+    def test_changed_card_cannot_execute_an_old_preview(self) -> None:
+        service_module = self._service_module()
+        core = service_module.load_rescue_video_core(PACKAGE_ROOT)
+        service = service_module.RescueVideoService(PACKAGE_ROOT, module_loader=lambda _: core)
+        request = service_module.RescueVideoRequest("card", "destination", "2026-10-26", "95", "0", False,
+            "copy", source_identity="old-card")
+        with mock.patch.object(core, "card_identity", return_value="new-card"):
+            with self.assertRaisesRegex(service_module.RescueVideoValidationError, "記憶卡.*變更"):
+                service.validate(request)
+
+    def test_vehicle_lookup_does_not_scan_unrelated_years_or_months(self) -> None:
+        classifier = self._classifier_module()
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in ("2025/10月/10260800-92", "2026/09月/09260800-93", "2026/10月/10260800-95"):
+                (root / relative).mkdir(parents=True)
+            original = Path.iterdir
+            def list_directory(path):
+                self.assertNotIn(path, {root / "2025", root / "2026" / "09月"})
+                return original(path)
+            with mock.patch.object(Path, "iterdir", list_directory):
+                self.assertEqual(classifier.discover_vehicles(root, date(2026, 10, 26)), ["95"])
+
+    def test_input_readiness_is_separate_from_a_verified_preview(self) -> None:
+        service_module = self._service_module()
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+        service = SimpleNamespace(remember_selection=mock.Mock())
+        controller = RescueVideoController(service)
+        cards = tuple(service_module.RescueVideoCheckCard(key, key, "請選車號" if key == "vehicle_date" else "可用",
+            "error" if key == "vehicle_date" else "ok", "vehicle_required" if key == "vehicle_date" else "")
+            for key in ("source", "destination", "work_log", "vehicle_date", "report", "videos"))
+        controller._defaults_loaded(0, service_module.RescueVideoDefaults("card", "destination", "2026-10-26",
+            ("92", "95"), "", is_ready=False, check_cards=cards, source_identity="card-A"))
+        self.assertFalse(controller.canPreview)
+        self.assertEqual(controller.completed_preflight_details()["rescue_video_state"], "needs_input")
+        controller.updateInputs("card", "2026-10-26", "95")
+        self.assertTrue(controller.canPreview)
+        self.assertFalse(controller.isReady)
+        self.assertFalse(controller.hasPreview)
+        service.remember_selection.assert_called_with("card-A", "2026-10-26", "95")
+
+    def test_controller_freezes_card_identity_in_the_copy_request(self) -> None:
+        self._service_module()
+        from qt_app.controllers.rescue_video_controller import RescueVideoController
+        service = SimpleNamespace(validate=lambda request: (request, [], {}))
+        controller = RescueVideoController(service)
+        controller._source_identity = "card-A"
+        request = controller._request("card", "destination", "2026-10-26", "95", "0", False, "copy")
+        self.assertEqual(request.source_identity, "card-A")
 
     def test_windows_notification_is_limited_to_completed_rescue_video_copy(self) -> None:
         source = (PACKAGE_ROOT / "qt_app" / "controllers" / "app_controller.py").read_text(
