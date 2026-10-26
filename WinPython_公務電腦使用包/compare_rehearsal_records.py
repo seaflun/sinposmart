@@ -425,8 +425,9 @@ def find_incomplete_training_work_matches(
 
 
 def _case_location_without_incident_note(value: str) -> str:
-    """Keep the full house number while ignoring an appended incident note."""
+    """Keep the full address while ignoring explicit alarm levels and appended notes."""
 
+    value = re.sub(r"^[一二三四五1-5]級火警[-－—–:：]", "", value, count=1)
     match = re.fullmatch(r"(.+\d+(?:-\d+)?號(?:之\d+)?)[-－—–（(，,](.+)", value)
     if match is None:
         return value

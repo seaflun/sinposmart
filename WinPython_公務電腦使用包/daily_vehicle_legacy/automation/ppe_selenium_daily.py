@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -412,12 +412,42 @@ def wait_for_login_site(url: str, timeout_seconds: int) -> None:
 
 
 def login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password: str) -> None:
+    def require_authorized_page(*, login_page: bool = True) -> None:
+        try:
+            target = urlsplit(str(driver.current_url or ""))
+            authorized = (
+                target.scheme == "https"
+                and target.hostname == "ppe.tyfd.gov.tw"
+                and target.port in (None, 443)
+                and target.username is None
+                and target.password is None
+                and (not login_page or target.path == "/")
+            )
+        except ValueError:
+            authorized = False
+        if not authorized:
+            raise RuntimeError("車輛保養登入已離開授權頁面，已停止操作。")
+
     print("[login] opening login page")
     driver.get(LOGIN_URL)
-    wait.until(EC.presence_of_element_located((By.ID, "Account"))).send_keys(username)
-    wait.until(EC.presence_of_element_located((By.ID, "Password"))).send_keys(password)
-    wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit"))).click()
-    wait.until(EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{TEXT_LOGOUT}')]")))
+    for field_id, value in (("Account", username), ("Password", password)):
+        require_authorized_page()
+        field = wait.until(EC.presence_of_element_located((By.ID, field_id)))
+        require_authorized_page()
+        field.send_keys(value)
+    require_authorized_page()
+    button = wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit")))
+    require_authorized_page()
+    button.click()
+
+    def logged_in(current_driver):
+        require_authorized_page(login_page=False)
+        return EC.presence_of_element_located(
+            (By.XPATH, f"//*[contains(text(), '{TEXT_LOGOUT}')]"),
+        )(current_driver)
+
+    wait.until(logged_in)
+    require_authorized_page(login_page=False)
     print("[login] success")
 
 

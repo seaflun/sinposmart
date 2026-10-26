@@ -5,20 +5,116 @@ from __future__ import annotations
 
 import json
 import os
+import ipaddress
+import subprocess
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 
 CredentialPoster = Callable[[dict[str, Any]], dict[str, Any]]
 ACCOUNT_FIELDS = ("actor_no", "user_id", "password", "display_name", "name", "id_number", "duty_pc_save_status")
+_OVERLAY_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_NAS_API_PATHS = {"/api/credential-sync", "/api/sinposmart/events", "/api/sinposmart/civilpower-roster",
+                  "/api/sinposmart/identity", "/api/sinposmart/heartbeat"}
 
 
 class CredentialSyncError(RuntimeError):
     """Safe credential-sync failure without secret values."""
+
+
+class SyncTransportError(RuntimeError):
+    """A safe transport-policy failure containing no endpoint or credentials."""
+
+
+def _tailscale_peer_verified(address: str) -> bool:
+    candidates = (
+        (Path("C:/Program Files/Tailscale/tailscale.exe"), Path("C:/Program Files (x86)/Tailscale/tailscale.exe"))
+        if os.name == "nt" else (Path("/usr/bin/tailscale"), Path("/usr/local/bin/tailscale"))
+    )
+    executable = next((path for path in candidates if path.is_file()), None)
+    if executable is None:
+        return False
+    try:
+        completed = subprocess.run(
+            [str(executable), "status", "--json"], capture_output=True, text=True, encoding="utf-8",
+            timeout=3, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        state = json.loads(completed.stdout) if completed.returncode == 0 else {}
+        own = state.get("Self", {})
+        peers = state.get("Peer", {})
+        return (
+            state.get("BackendState") == "Running" and own.get("Online") is True
+            and any(ipaddress.ip_address(ip) in _OVERLAY_NETWORK for ip in own.get("TailscaleIPs", []))
+            and isinstance(peers, dict)
+            and any(isinstance(peer, dict) and peer.get("Online") is True
+                    and address in peer.get("TailscaleIPs", []) for peer in peers.values())
+        )
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        return False
+
+
+def _sync_target(url: str) -> tuple[str, bool]:
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None or parsed.fragment
+                or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
+            raise ValueError()
+        if parsed.scheme == "https":
+            return url, False
+        if (parsed.hostname == "10.30.65.30" and parsed.port == 8080
+                and parsed.path in _NAS_API_PATHS and not parsed.query):
+            return url, True  # Preserve the fixed NAS LAN route without using proxies.
+        address = ipaddress.ip_address(parsed.hostname)
+        if address not in _OVERLAY_NETWORK:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise SyncTransportError("同步位址必須使用 HTTPS 或已驗證的 Tailscale 加密連線。") from None
+    if not _tailscale_peer_verified(str(address)):
+        raise SyncTransportError("尚未確認 Tailscale 加密連線與 NAS 節點，已停止傳送同步資料。")
+    return url, True
+
+
+class SyncRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allow_google_redirects: bool = False) -> None:
+        super().__init__()
+        self._allow_google_redirects = allow_google_redirects
+
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        try:
+            source, target = urlsplit(request.full_url), urlsplit(new_url)
+            same_origin = (source.scheme, source.hostname, source.port or 443) == (
+                target.scheme, target.hostname, target.port or 443)
+            google_redirect = (source.hostname in {"script.google.com", "script.googleusercontent.com"}
+                               and target.hostname == "script.googleusercontent.com")
+            allowed = (self._allow_google_redirects and code in {301, 302, 303}
+                       and source.scheme == target.scheme == "https"
+                       and target.hostname and target.username is None and target.password is None
+                       and target.port in (None, 443) and not target.fragment
+                       and (same_origin or google_redirect))
+        except (ValueError, TypeError):
+            allowed = False
+        if not allowed:
+            raise SyncTransportError("同步服務發生未授權轉址，已停止傳送資料。") from None
+        return urllib.request.Request(new_url, headers={"Accept": "application/json"}, method="GET")
+
+
+def open_sync_request(request: urllib.request.Request, *, timeout: int,
+                      allow_google_redirects: bool = False):
+    url, direct = _sync_target(request.full_url)
+    if url != request.full_url:
+        request = urllib.request.Request(url, data=request.data, headers=dict(request.header_items()),
+                                         method=request.get_method())
+    handlers = [SyncRedirectHandler(allow_google_redirects=allow_google_redirects)]
+    if direct:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
 
 
 class CredentialSyncService:
@@ -86,12 +182,14 @@ class CredentialSyncService:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds()) as response:
+            with open_sync_request(request, timeout=self._timeout_seconds()) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
+        except SyncTransportError as exc:
+            raise CredentialSyncError(str(exc)) from None
         except urllib.error.HTTPError as exc:
-            raise CredentialSyncError(f"NAS 帳密同步被拒絕或失敗：HTTP {exc.code}") from exc
+            raise CredentialSyncError(f"NAS 帳密同步被拒絕或失敗：HTTP {exc.code}") from None
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-            raise CredentialSyncError("NAS 帳密同步連線失敗。") from exc
+            raise CredentialSyncError("NAS 帳密同步連線失敗。") from None
 
     @staticmethod
     def _timeout_seconds() -> int:

@@ -21,10 +21,31 @@ MEMBER = {"member_id": "m1", "name": "測試義消", "title": "隊員", "unit": 
 
 
 class OALoginTests(unittest.TestCase):
+    def test_oa_login_waits_for_captcha_pixels_before_ocr_and_preserves_failure_stage(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, elements, wait = self.make_login()
+        driver.execute_script.return_value = False
+        recognizer = Mock()
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaises(LoginVerificationError) as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        self.assertEqual(caught.exception.reason_code, "oa_captcha_not_ready")
+        recognizer.classification.assert_not_called()
+        elements["loginBtn"].click.assert_not_called()
+
+    def test_oa_empty_ocr_is_reported_as_captcha_failure_instead_of_unknown_login(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, _elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.return_value = ""
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaises(LoginVerificationError) as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        self.assertEqual(caught.exception.reason_code, "oa_captcha_unrecognized")
+
     def make_login(self):
         from selenium.common.exceptions import TimeoutException
 
         driver = Mock(current_url="https://oa.tyfd.gov.tw/login.php")
+        driver.execute_script.return_value = True
         elements = {key: Mock() for key in
                     ("login_name", "password", "checkcodeImg", "verify_code", "loginBtn")}
         for element in elements.values():
@@ -226,6 +247,24 @@ class AttendanceTests(unittest.TestCase):
             automation._select_jqx_combobox(
                 driver, WebDriverWait(driver, 0.1, poll_frequency=0.001), "#txt_AddServeUnit", "新坡分隊")
         self.assertEqual(element.get_attribute.call_count, 2)
+
+    def test_slow_unit_options_can_become_ready_after_twenty_seconds(self):
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        elapsed = [0.0]
+        clock = Mock()
+        clock.monotonic.side_effect = lambda: elapsed[0]
+        clock.sleep.side_effect = lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds)
+        driver, element = Mock(), Mock()
+        driver.find_element.return_value = element
+        element.is_displayed.return_value = element.is_enabled.return_value = True
+        driver.execute_script.side_effect = lambda *_args: elapsed[0] >= 20
+        plan = CivilpowerService(PACKAGE).validate(self.request())
+        with patch("selenium.webdriver.support.wait.time", clock):
+            automation._wait_for_io_form_dependencies(
+                driver, WebDriverWait(driver, automation.DEFAULT_WAIT_SECONDS), plan)
+        self.assertEqual(elapsed[0], 20)
 
     def test_persistently_replaced_person_dialog_never_saves(self):
         from selenium.common.exceptions import StaleElementReferenceException, TimeoutException

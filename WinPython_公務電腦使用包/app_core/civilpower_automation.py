@@ -25,7 +25,7 @@ OA_LOGIN_URL = "https://oa.tyfd.gov.tw/login.php"
 CIVILPOWER_SSO_LOGIN_URL = "https://civilpower.tyfd.gov.tw/TYCC/Home/SSOLogin"
 IO_WORK_LOG_URL = "https://civilpower.tyfd.gov.tw/TYCC/Home/IOWorkLog"
 OUT_STATUS = "出"
-DEFAULT_WAIT_SECONDS = 15
+DEFAULT_WAIT_SECONDS = 30
 IO_QUERY_SETTLE_SECONDS = 5
 CIVILPOWER_STAGE_LABELS = {
     "io_query": "查詢既有出入紀錄…", "io_add": "填寫出入登記…",

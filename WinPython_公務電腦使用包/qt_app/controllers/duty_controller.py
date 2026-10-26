@@ -127,6 +127,8 @@ class DutyController(QObject):
         self._schedule_data: dict[str, Any] = {}
         self._staff: dict[str, dict[str, Any]] = {}
         self._comparisons: dict[int, dict[str, Any]] = {}
+        self._notice_live_comparisons = False
+        self._notice_last_responsibility = None
         self._audit_kind_filter = "全部"
         self._audit_status_filter = "需處理"
         self._audit_only_actor = False
@@ -1176,6 +1178,16 @@ class DutyController(QObject):
             self._login_started_at = None
             self._cancel_auto_logout()
         self._refresh_projection()
+
+    def notice_responsibility(self, now: datetime) -> dict:
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+
+        proof = confirmed_notice_responsibility(
+            {} if self._preview_loaded else self._schedule_data,
+            self._comparisons, self._executed_indices, now, live=self._notice_live_comparisons,
+            previous=self._notice_last_responsibility)
+        self._notice_last_responsibility = proof if proof.get("status") == "confirmed" else None
+        return proof
 
     def _capture_context_is_current(
         self,
@@ -2394,6 +2406,7 @@ class DutyController(QObject):
         comparisons: Mapping[int, Mapping[str, Any]] | None = None,
         comparison_data: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
+        self._notice_live_comparisons = False
         next_target_date = str(data.get("target_date", "") or "")
         same_schedule_date = bool(next_target_date) and next_target_date == self._target_date_text
         target_date_changed = bool(self._target_date_text) and next_target_date != self._target_date_text
@@ -3694,6 +3707,7 @@ class DutyController(QObject):
             comparisons=snapshot.comparisons,
             comparison_data=snapshot.comparison_data,
         )
+        self._notice_live_comparisons = True
         publish_events = self._capture_publish_events.get(request_id, True)
         if not schedule_was_ready and publish_events:
             captured_data = dict(snapshot.data)
@@ -3753,6 +3767,7 @@ class DutyController(QObject):
             }
         )
         self._comparisons = comparisons
+        self._notice_live_comparisons = True
         self._schedule_status = "已更新已登打比對資料。"
         self._refresh_projection()
 
@@ -3766,6 +3781,7 @@ class DutyController(QObject):
     ) -> None:
         if not self._capture_context_is_current(self._comparison_contexts, request_id):
             return
+        self._notice_live_comparisons = False
         self._schedule_status = message
         self.scheduleChanged.emit()
         if error_code in {"login_failed", "comparison_login_failed"}:
@@ -3815,6 +3831,7 @@ class DutyController(QObject):
             request_id in self._capture_schedule_ready_ids
             and error_code.startswith("comparison_")
         )
+        self._notice_live_comparisons = False
         if not comparison_failure:
             self.disable_auto_execution()
         self._schedule_status = message

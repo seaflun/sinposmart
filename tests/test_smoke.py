@@ -28,22 +28,36 @@ def package_dir() -> Path:
 
 
 def run_powershell_contract(source: str) -> subprocess.CompletedProcess[str]:
+    system_powershell = (
+        Path(os.environ.get("SystemRoot", "C:/Windows"))
+        / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+    process_env = os.environ.copy()
+    if system_powershell.is_file():
+        process_env["PSModulePath"] = os.pathsep.join(
+            [str(system_powershell.parent / "Modules"), process_env.get("PSModulePath", "")]
+        )
     with tempfile.TemporaryDirectory() as temp_dir:
         contract_path = Path(temp_dir) / "contract.ps1"
         contract_path.write_text(source, encoding="utf-8-sig")
+        contract_literal = str(contract_path).replace("'", "''")
         return subprocess.run(
             [
-                "powershell",
+                str(system_powershell) if system_powershell.is_file() else "powershell",
                 "-NoProfile",
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-File",
-                str(contract_path),
+                "-Command",
+                "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+                "$OutputEncoding = [Console]::OutputEncoding; "
+                f"& '{contract_literal}'",
             ],
             cwd=package_dir(),
+            env=process_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
             check=False,
         )
@@ -4044,6 +4058,32 @@ try {
         self.assertNotEqual(profiles[0], profiles[1])
         self.assertEqual(getattr(driver, "_sinposmart_duty_browser_profile"), str(profiles[1]))
 
+    def test_build_driver_passes_only_explicit_preferences_as_a_copy(self) -> None:
+        module = duty_rehearsal_module()
+        preferences = {"credentials_enable_service": False, "profile.password_manager_enabled": False}
+        for supplied in (False, True):
+            with self.subTest(supplied=supplied):
+                driver = mock.Mock()
+                with mock.patch.object(module, "chrome_start_attempts", return_value=1), mock.patch.object(
+                    module, "duty_browser_profile_dir", return_value=Path("C:/Temp/duty_gui_preferences")
+                ), mock.patch.object(
+                    module, "create_webdriver_chrome_with_timeout", return_value=driver
+                ) as start_chrome:
+                    result = module.build_driver(
+                        headless=True,
+                        prune_profiles=False,
+                        write_diagnostics=False,
+                        **({"preferences": preferences} if supplied else {}),
+                    )
+
+                self.assertIs(result, driver)
+                options = start_chrome.call_args.args[0]
+                if supplied:
+                    self.assertEqual(options.experimental_options["prefs"], preferences)
+                    self.assertIsNot(options.experimental_options["prefs"], preferences)
+                else:
+                    self.assertNotIn("prefs", options.experimental_options)
+
     def test_prewrite_session_open_retries_with_a_fresh_driver_only(self) -> None:
         module = duty_rehearsal_module()
         first_driver = object()
@@ -5727,6 +5767,181 @@ try {
         self.assertEqual(cases[0].return_time, "")
         self.assertEqual(sum(item["count"] for item in items), 1)
 
+    def test_visible_table_rejects_missing_query_controls(self) -> None:
+        module = duty_rehearsal_module()
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "wait_for_any_form_control", return_value=False
+        ), mock.patch.object(module, "js_set") as set_value, mock.patch.object(
+            module, "wait_for_query_completion"
+        ):
+            with self.assertRaisesRegex(module.TimeoutException, "查詢按鈕"):
+                driver = mock.Mock(execute_script=mock.Mock(return_value=[]))
+                module.query_visible_table(driver, module.ENTRY_LOG_AP, "1151024")
+
+        set_value.assert_not_called()
+
+    def test_visible_table_rejects_missing_date_fields(self) -> None:
+        module = duty_rehearsal_module()
+        date_fields = {
+            "_txtSDATE", "_txtSdate", "_txtSDate", "_txtEDATE", "_txtEDate",
+            "_txtEndDate", "_txtDate", "_txtTaskDate",
+        }
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "wait_for_any_form_control", return_value=True
+        ), mock.patch.object(module, "suppress_window_open_for_background_query"), mock.patch.object(
+            module, "js_set", side_effect=lambda _driver, field_id, _value: field_id not in date_fields
+        ), mock.patch.object(module, "wait_for_query_completion"):
+            with self.assertRaisesRegex(module.NoSuchElementException, "日期欄位"):
+                driver = mock.Mock(execute_script=mock.Mock(return_value=[]))
+                module.query_visible_table(driver, module.ENTRY_LOG_AP, "1151024")
+
+    def test_visible_table_rejects_missing_query_button(self) -> None:
+        module = duty_rehearsal_module()
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "wait_for_any_form_control", return_value=True
+        ), mock.patch.object(module, "suppress_window_open_for_background_query"), mock.patch.object(
+            module, "js_set", return_value=True
+        ), mock.patch.object(module, "js_click", return_value=False), mock.patch.object(
+            module, "wait_for_query_completion"
+        ) as wait_for_completion:
+            with self.assertRaisesRegex(module.NoSuchElementException, "查詢按鈕"):
+                driver = mock.Mock(execute_script=mock.Mock(return_value=[]))
+                module.query_visible_table(driver, module.ENTRY_LOG_AP, "1151024")
+
+        wait_for_completion.assert_not_called()
+
+    def test_visible_table_accepts_search_button_with_date_range_fields(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock(execute_script=mock.Mock(return_value=[]))
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "wait_for_any_form_control", return_value=True
+        ), mock.patch.object(module, "suppress_window_open_for_background_query"), mock.patch.object(
+            module, "js_set", return_value=True
+        ), mock.patch.object(
+            module, "js_click", side_effect=lambda _driver, field_id: field_id == "_btnSearch"
+        ), mock.patch.object(module, "wait_for_query_completion"):
+            rows = module.query_visible_table(driver, module.ENTRY_LOG_AP, "1151024")
+
+        self.assertEqual(rows, [])
+
+    def test_duty_login_rejects_redirect_before_entering_credentials(self) -> None:
+        module = duty_rehearsal_module()
+
+        for redirected_url in (
+            "https://untrusted.example/tyfd119/login119",
+            "http://dutymgt.tyfd.gov.tw/tyfd119/login119",
+            "https://dutymgt.tyfd.gov.tw/unexpected-login",
+        ):
+            with self.subTest(url=redirected_url):
+                driver = mock.Mock(current_url=redirected_url)
+                with mock.patch.object(module, "WebDriverWait") as wait, mock.patch.object(
+                    module, "detect_login_error", return_value=""
+                ), mock.patch.object(module.time, "sleep"):
+                    with self.assertRaisesRegex(RuntimeError, "授權.*登入頁面"):
+                        module.login(driver, "test-user", "test-password")
+                wait.return_value.until.return_value.send_keys.assert_not_called()
+                driver.find_element.return_value.send_keys.assert_not_called()
+
+    def test_visible_table_reads_all_pages_without_joining_page_headers(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def __init__(self, ap_name):
+                self.ap_name = ap_name
+                self.page = "1"
+
+            def execute_script(self, script, *_args):
+                if "Array.from(pageSelect.options" in script:
+                    return ["1", "2"]
+                indices = range(200) if self.page == "1" else range(200, 201)
+                if self.ap_name == module.WORK_LOG_AP:
+                    return [
+                        ["115/10/24 08:00", "class", "unit", "duty", "", f"work-{i}", "status", "person", "1", "", "", "", ""]
+                        for i in indices
+                    ]
+                rows = [["115/10/24 08:00", "unit", f"person-{i}", "role", "入", "值班"] for i in indices]
+                return [["日期", "單位", "人員", "職稱", "出入", "事由"], *rows]
+
+        for ap_name in (module.WORK_LOG_AP, module.ENTRY_LOG_AP):
+            with self.subTest(ap_name=ap_name):
+                driver = Driver(ap_name)
+                with mock.patch.object(module, "open_ap"), mock.patch.object(
+                    module, "wait_for_any_form_control", return_value=True
+                ), mock.patch.object(module, "suppress_window_open_for_background_query"), mock.patch.object(
+                    module, "js_set", return_value=True
+                ), mock.patch.object(module, "js_click", return_value=True), mock.patch.object(
+                    module, "arm_query_completion_tracking", return_value=100.0
+                ), mock.patch.object(module, "wait_for_query_completion"), mock.patch.object(
+                    module, "select_case_query_page", side_effect=lambda current, page: setattr(current, "page", page)
+                ):
+                    rows = module.query_visible_table(driver, ap_name, "1151024")
+
+                self.assertEqual(len(rows), 201)
+                if ap_name == module.ENTRY_LOG_AP:
+                    self.assertEqual(len(rows[199]), 6)
+                    self.assertEqual(rows[200][2], "person-200")
+                else:
+                    self.assertEqual(rows[200][5], "work-200")
+                    self.assertEqual(rows[200][4], "")
+
+    def test_duty_sheet_waits_for_fresh_rows_before_labelling_target_date(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def __init__(self):
+                self.result_checks = 0
+
+            def execute_script(self, script, *_args):
+                if "return Array.from(document.querySelectorAll('table')).some" in script:
+                    self.result_checks += 1
+                    return "const tracker" not in script or self.result_checks >= 2
+                if "function cellText(cell)" in script:
+                    return {
+                        "rows": [{"slot": "8-9", "columns": {"值班": "20" if self.result_checks >= 2 else "10"}}],
+                        "captured_date": "1151024", "staff": {}, "summary": {}, "checkNums": [],
+                    }
+                return True
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency):
+                self.driver = driver
+
+            def until(self, condition):
+                if condition(self.driver) or condition(self.driver):
+                    return True
+                raise module.TimeoutException()
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "WebDriverWait", ImmediateWait
+        ), mock.patch.object(module, "suppress_window_open_for_background_query"), mock.patch.object(
+            module, "js_set", return_value=True
+        ), mock.patch.object(module, "js_click", return_value=True), mock.patch.object(
+            module, "arm_query_completion_tracking", return_value=100.0
+        ):
+            sheet = module.query_duty_sheet(Driver(), "1151024")
+
+        self.assertEqual(sheet.rows[0].columns["值班"], ["20"])
+
+    def test_duty_sheet_rejects_captured_date_mismatch(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock()
+        driver.execute_script.side_effect = lambda script, *_args: {
+            "rows": [{"slot": "8-9", "columns": {"值班": "10"}}],
+            "captured_date": "1151023", "staff": {}, "summary": {}, "checkNums": [],
+        } if "function cellText(cell)" in script else True
+
+        with mock.patch.object(module, "open_ap"), mock.patch.object(
+            module, "suppress_window_open_for_background_query"
+        ), mock.patch.object(module, "js_set", return_value=True), mock.patch.object(
+            module, "js_click", return_value=True
+        ), mock.patch.object(module, "arm_query_completion_tracking", return_value=100.0):
+            with self.assertRaisesRegex(RuntimeError, "日期"):
+                module.query_duty_sheet(driver, "1151024")
+
     def test_visible_table_waits_for_completion_and_requests_200_rows(self) -> None:
         module = duty_rehearsal_module()
 
@@ -5881,6 +6096,72 @@ try {
                         {"27": {"name": "林宏為"}}, {"target": "27"},
                         current_at=datetime(2026, 10, 21, 14, 0),
                     ))
+
+    def test_same_minute_case_return_accepts_explicit_fire_alarm_level_prefix(self) -> None:
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        for prefix in ("一級火警-", "二級火警-", "三級火警-", "四級火警-", "五級火警-",
+                       "1級火警-", "2級火警-", "3級火警-", "4級火警-", "5級火警-",
+                       "二級火警－", "二級火警—", "二級火警–", "二級火警:", "二級火警："):
+            ranked = reason.replace("案發地點：", "案發地點：" + prefix)
+            for outgoing, incoming in ((reason, ranked), (ranked, reason),
+                                       (reason + "-電線冒煙", ranked + "（屋內冒煙）")):
+                records = [
+                    ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", outgoing],
+                    ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", incoming],
+                ]
+                for raw_rows in (records, list(reversed(records)), records + records):
+                    with self.subTest(prefix=prefix, outgoing=outgoing, rows=raw_rows):
+                        self.assertIsNone(module.find_open_external_assignment(
+                            module.flatten_rows(raw_rows, "1151021"), "1151021",
+                            {"15": {"name": "測試15番"}}, {"target": "15"},
+                            current_at=datetime(2026, 10, 21, 14, 0),
+                        ))
+
+    def test_fire_alarm_level_prefix_preserves_address_identity_time_and_pairing_boundaries(self) -> None:
+        from itertools import permutations
+
+        module = package_module("compare_rehearsal_records")
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        ranked = reason.replace("案發地點：", "案發地點：二級火警-")
+        for stamp, name, direction, incoming in (
+            ("115/10/21 12:41", "另一人", "入", ranked),
+            ("115/10/20 12:41", "測試15番", "入", ranked),
+            ("115/10/21 12:40", "測試15番", "入", ranked),
+            ("115/10/21 14:01", "測試15番", "入", ranked),
+            ("115/10/21 12:41", "測試15番", "出", ranked),
+            *(("115/10/21 12:41", "測試15番", "入", value) for value in (
+                ranked.replace("1227巷", "1228巷"), ranked.replace("1227巷", "1227巷1弄"),
+                ranked.replace("123號", "1230號"), ranked.replace("123號", "123-1號"),
+                ranked + "之1", ranked + "-二樓", ranked + "-第一梯", ranked + " 梯次：2",
+                ranked.replace("火災-一般(集合)住宅", "火災-其他"),
+                *(ranked.replace("二級火警-", value) for value in (
+                    "六級火警-", "6級火警-", "第二級火警-", "二級火災-", "重大火警-",
+                    "二級火警", "備註二級火警-", "二級火警-二級火警-")),
+            )),
+        ):
+            records = [
+                ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", reason],
+                [stamp, "新坡分隊", name, "隊員", direction, incoming],
+            ]
+            for raw_rows in (records, list(reversed(records))):
+                with self.subTest(stamp=stamp, name=name, direction=direction, incoming=incoming):
+                    self.assertEqual(module.find_open_external_assignment(
+                        module.flatten_rows(raw_rows, "1151021", start_date="1151020"), "1151021",
+                        {"15": {"name": "測試15番"}}, {"target": "15"},
+                        current_at=datetime(2026, 10, 21, 14, 0),
+                    ), "2026-10-21T12:41")
+        records = [
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", reason],
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", ranked],
+            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", ranked.replace("二級火警", "三級火警")],
+        ]
+        for raw_rows in permutations(records):
+            self.assertEqual(module.find_open_external_assignment(
+                module.flatten_rows(list(raw_rows), "1151021"), "1151021",
+                {"15": {"name": "測試15番"}}, {"target": "15"},
+                current_at=datetime(2026, 10, 21, 14, 0),
+            ), "2026-10-21T12:41")
 
     def test_same_minute_incident_notes_preserve_address_and_identity_boundaries(self) -> None:
         module = package_module("compare_rehearsal_records")
@@ -6159,6 +6440,154 @@ try {
             cases = module.query_cases(Driver(), "1150809")
 
         self.assertEqual(cases, [])
+
+    @unittest.skipUnless(os.environ.get("SINPOSMART_TEST_BROWSER") == "1", "opt-in local Chrome DOM regression")
+    def test_page_refresh_ignores_loading_changes_in_control_rows(self) -> None:
+        from urllib.parse import quote
+
+        module = duty_rehearsal_module()
+        html = """<html><body><p>QUY-000 : 查詢完成</p>
+        <table><tr><td id="spinner">ready</td><td>query</td><td>controls</td></tr></table>
+        <select name="pageSelect" onchange="document.getElementById('spinner').textContent='loading';
+          setTimeout(()=>{const old=document.querySelector('[data-id]').closest('tr');const fresh=old.cloneNode(true);
+          fresh.querySelector('[data-id]').textContent='second';old.replaceWith(fresh);},600)">
+        <option value="1">1</option><option value="2">2</option></select>
+        <table><tr><th>返隊時間</th><th>id</th><th>time</th></tr>
+        <tr><td></td><td data-id>first</td><td>12:00:00</td></tr></table></body></html>"""
+
+        with tempfile.TemporaryDirectory(prefix="sinposmart-query-dom-") as temp_dir:
+            driver = module.build_driver(
+                headless=True,
+                profile_root=Path(temp_dir).resolve(),
+                prune_profiles=False,
+                write_diagnostics=False,
+            )
+            try:
+                driver.get("data:text/html;charset=utf-8," + quote(html))
+                previous_origin = module.arm_query_completion_tracking(driver)
+                module.select_case_query_page(driver, "2")
+                module.wait_for_query_completion(driver, expected_page="2", previous_time_origin=previous_origin)
+                self.assertEqual(
+                    driver.execute_script("return document.querySelector('[data-id]').textContent"),
+                    "second",
+                )
+            finally:
+                module.quit_driver(driver)
+
+    @unittest.skipUnless(os.environ.get("SINPOSMART_TEST_BROWSER") == "1", "opt-in local Chrome DOM regression")
+    def test_page_refresh_ignores_loading_changes_inside_existing_record(self) -> None:
+        from urllib.parse import quote
+
+        module = duty_rehearsal_module()
+        with tempfile.TemporaryDirectory(prefix="sinposmart-record-query-dom-") as temp_dir:
+            driver = module.build_driver(
+                headless=True, profile_root=Path(temp_dir).resolve(),
+                prune_profiles=False, write_diagnostics=False,
+            )
+            try:
+                for identical in (False, True):
+                    with self.subTest(identical=identical):
+                        update = "" if identical else "fresh.querySelector('[data-id]').textContent='second';"
+                        html = """<html><body><p>QUY-000 : 查詢完成</p>
+                        <select name="pageSelect" onchange="document.getElementById('spinner').firstChild.data='loading';
+                          setTimeout(()=>{const old=document.getElementById('record');const fresh=old.cloneNode(true);
+                          fresh.setAttribute('data-page','2');UPDATE old.replaceWith(fresh);},600)">
+                        <option value="1">1</option><option value="2">2</option></select>
+                        <table><tr><th>返隊時間</th><th>id</th><th>time</th><th>status</th></tr>
+                        <tr id="record" data-page="1"><td></td><td data-id>first</td><td>12:00:00</td>
+                        <td><span id="spinner">ready</span></td></tr></table></body></html>""".replace("UPDATE", update)
+                        driver.get("data:text/html;charset=utf-8," + quote(html))
+                        previous_origin = module.arm_query_completion_tracking(driver)
+                        module.select_case_query_page(driver, "2")
+                        module.wait_for_query_completion(driver, expected_page="2", previous_time_origin=previous_origin)
+                        self.assertEqual(
+                            driver.execute_script("return document.getElementById('record').getAttribute('data-page')"),
+                            "2",
+                        )
+            finally:
+                module.quit_driver(driver)
+
+    def test_page_completion_rejects_old_rows_until_refresh_finishes(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def __init__(self):
+                self.checks = 0
+
+            def execute_script(self, _script: str, *_args) -> dict[str, object]:
+                self.checks += 1
+                return {
+                    "completed": True, "page": "2", "hasRows": True,
+                    "freshRows": self.checks >= 2, "timeOrigin": 100.0,
+                    "readyState": "complete" if self.checks >= 3 else "loading",
+                }
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency):
+                self.driver = driver
+
+            def until(self, condition):
+                for _ in range(3):
+                    if condition(self.driver):
+                        return True
+                raise AssertionError("the refreshed result did not become ready")
+
+        driver = Driver()
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(driver, expected_page="2", previous_time_origin=100.0)
+
+        self.assertEqual(driver.checks, 3)
+
+    def test_page_completion_accepts_identical_rows_after_ajax_refresh(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def __init__(self):
+                self.checks = 0
+
+            def execute_script(self, _script: str, *_args) -> dict[str, object]:
+                self.checks += 1
+                return {
+                    "completed": False, "page": "2", "hasRows": True,
+                    "freshRows": self.checks >= 2, "timeOrigin": 100.0, "readyState": "complete",
+                }
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency):
+                self.driver = driver
+
+            def until(self, condition):
+                if condition(self.driver) or condition(self.driver):
+                    return True
+                raise AssertionError("the identical refreshed rows were rejected")
+
+        driver = Driver()
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(driver, expected_page="2", previous_time_origin=100.0)
+
+        self.assertEqual(driver.checks, 2)
+
+    def test_page_completion_accepts_a_fresh_no_records_result(self) -> None:
+        module = duty_rehearsal_module()
+
+        class Driver:
+            def execute_script(self, _script: str, *_args) -> dict[str, object]:
+                return {
+                    "completed": True, "page": "", "hasRows": False,
+                    "freshCompletion": True, "noRecords": True, "readyState": "complete",
+                }
+
+        class ImmediateWait:
+            def __init__(self, driver, _timeout, *, poll_frequency):
+                self.driver = driver
+
+            def until(self, condition):
+                if not condition(self.driver):
+                    raise AssertionError("a fresh QUY-500 result must finish the query")
+                return True
+
+        with mock.patch.object(module, "WebDriverWait", ImmediateWait):
+            module.wait_for_query_completion(Driver(), expected_page="2")
 
     def test_page_completion_accepts_loaded_second_page_without_query_banner(self) -> None:
         module = duty_rehearsal_module()
@@ -7448,6 +7877,26 @@ if ($record.close_failure) {{ throw 'Stale failure contaminated a successful upd
             script.index("$runningDutyGuiProcesses"),
         )
 
+    def test_update_package_requires_notice_and_civilpower_runtime_files(self) -> None:
+        import re
+
+        script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        required_block = script.split("$requiredQtPackageFiles = @(", 1)[1].split("\n    )", 1)[0]
+        required_paths = {value.replace("\\", "/") for value in re.findall(r'"([^"\n]+)"', required_block)}
+
+        for relative in (
+            "app_core/notice_collection_service.py",
+            "app_core/notice_collection_browser.py",
+            "app_core/notice_collection_dom.js",
+            "qt_app/controllers/notice_collection_controller.py",
+            "app_core/civilpower_service.py",
+            "app_core/civilpower_automation.py",
+            "qt_app/controllers/civilpower_controller.py",
+            "qt_app/qml/pages/CivilpowerToolPanel.qml",
+        ):
+            with self.subTest(relative=relative):
+                self.assertIn(relative, required_paths)
+
     def test_powershell_scripts_parse(self) -> None:
         root = package_dir()
         scripts = [
@@ -7794,7 +8243,8 @@ if (cell.value !== '' || count !== 1) throw new Error('Unstaffed ambulance cell 
                     harness = """
 const trs = MATRIX.map(values => ({children:values.map(value => ({innerText:value, querySelectorAll(){return [];}}))}));
 const table = {className:'report_list1', querySelectorAll(){return trs;}};
-global.document = {body:{innerText:''}, querySelectorAll(){return [table];}, getElementById(){return null;}};
+global.document = {body:{innerText:''}, querySelectorAll(){return [table];},
+  getElementById(id){return id === '_txtTaskDate' ? {value:'1151024'} : null;}};
 global.window = {getComputedStyle(){return {display:'block'};}};
 console.log(JSON.stringify(new Function(SCRIPT)(TARGET)));
 """.replace("MATRIX", json.dumps(matrix)).replace("SCRIPT", json.dumps(script)).replace("TARGET", json.dumps(args[0]))
@@ -7807,7 +8257,9 @@ console.log(JSON.stringify(new Function(SCRIPT)(TARGET)));
                 driver.execute_script.side_effect = execute
                 with mock.patch.object(module, "open_ap"), mock.patch.object(module, "WebDriverWait"), mock.patch.object(
                     module, "suppress_window_open_for_background_query"
-                ), mock.patch.object(module, "js_set", return_value=True), mock.patch.object(module, "js_click", return_value=True):
+                ), mock.patch.object(module, "js_set", return_value=True), mock.patch.object(
+                    module, "arm_query_completion_tracking", return_value=100.0
+                ), mock.patch.object(module, "js_click", return_value=True):
                     if missing_header:
                         with self.assertRaisesRegex(JavascriptException, "勤務表缺少.*標題"):
                             module.query_duty_sheet(driver, "1151024")

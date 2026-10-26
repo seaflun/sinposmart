@@ -4955,19 +4955,23 @@ class DutySubmissionServiceTests(unittest.TestCase):
         from datetime import datetime
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
 
-        reason = "案件類別：火災-其他 案發地點：桃園市觀音區一心路89號"
+        reason = "案件類別：火災-一般(集合)住宅 案發地點：桃園市新屋區新文路1227巷123號"
+        ranked = reason.replace("案發地點：", "案發地點：二級火警-")
         for trigger in ("due", "recovery"):
             for reverse_rows in (False, True):
                 for case, departure_reason, return_reason, expected_status in (
                     ("incident_description", reason, reason + "-電桿起火", "handoff_preflight_ready"),
-                    ("different_house", reason, reason.replace("89號", "90號") + "-電桿起火", "paused_external"),
+                    ("fire_alarm_prefix", reason, ranked, "handoff_preflight_ready"),
+                    ("fire_alarm_prefix_on_departure", ranked, reason, "handoff_preflight_ready"),
+                    ("different_house", reason, reason.replace("123號", "124號") + "-電桿起火", "paused_external"),
+                    ("different_lane_with_prefix", reason, ranked.replace("1227巷", "1228巷"), "paused_external"),
                     ("different_dispatch", reason + " 梯次：1", reason + "-電桿起火 梯次：2", "paused_external"),
                 ):
                     with self.subTest(trigger=trigger, reverse_rows=reverse_rows, case=case), \
                             tempfile.TemporaryDirectory() as directory:
                         records = [
-                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "出", departure_reason],
-                            ["115/10/21 12:41", "新坡分隊", "林宏為", "隊員", "入", return_reason],
+                            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "出", departure_reason],
+                            ["115/10/21 12:41", "新坡分隊", "測試15番", "隊員", "入", return_reason],
                         ]
                         if reverse_rows:
                             records.reverse()
@@ -4985,10 +4989,10 @@ class DutySubmissionServiceTests(unittest.TestCase):
                         )
                         data = {
                             "target_date": "1151021",
-                            "today": {"staff": {"25": {"name": "值班員"}, "27": {"name": "林宏為"}}},
+                            "today": {"staff": {"25": {"name": "值班員"}, "15": {"name": "測試15番"}}},
                             "actions": [{
                                 "kind": "handoff_preflight", "time": "14:00", "actor": "25",
-                                "target": "27", "source": "值班交接",
+                                "target": "15", "source": "值班交接",
                                 "fields": {"出或入": "值班", "領用事由及地點": "值班"},
                             }],
                         }
@@ -6357,6 +6361,100 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
 
 class DailyVehicleServiceTests(unittest.TestCase):
+    def test_ppe_login_rejects_untrusted_initial_page_without_filling_credentials(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for target in (
+            "https://outside.example/",
+            "http://ppe.tyfd.gov.tw/",
+            "https://ppe.tyfd.gov.tw.outside.example/",
+            "https://ppe.tyfd.gov.tw:444/",
+            "https://ppe.tyfd.gov.tw:invalid/",
+            "https://user:synthetic-secret@ppe.tyfd.gov.tw/",
+            "https://ppe.tyfd.gov.tw/unknown-login",
+        ):
+            with self.subTest(target=target):
+                driver = SimpleNamespace(current_url=target, get=Mock())
+                field = Mock()
+                wait = Mock()
+                wait.until.return_value = field
+
+                with self.assertRaisesRegex(RuntimeError, "授權") as raised:
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+
+                field.send_keys.assert_not_called()
+                field.click.assert_not_called()
+                self.assertNotIn("synthetic-secret", str(raised.exception))
+
+
+    def test_ppe_login_rechecks_target_after_field_and_button_lookups(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for redirect_at in (1, 2, 3):
+            with self.subTest(redirect_at=redirect_at):
+                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock())
+                sent = []
+                fields = [Mock() for _ in range(3)]
+                for field in fields[:2]:
+                    field.send_keys.side_effect = lambda value: sent.append((driver.current_url, value))
+                lookup_count = 0
+
+                def locate(_condition):
+                    nonlocal lookup_count
+                    lookup_count += 1
+                    if lookup_count == redirect_at:
+                        driver.current_url = "https://outside.example/"
+                    return fields[min(lookup_count - 1, 2)]
+
+                wait = SimpleNamespace(until=locate)
+                with self.assertRaisesRegex(RuntimeError, "授權"):
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+
+                self.assertTrue(all(target == automation.LOGIN_URL for target, _value in sent))
+                self.assertEqual(len(sent), redirect_at - 1)
+                fields[2].click.assert_not_called()
+
+
+    def test_ppe_login_checks_post_login_origin_and_allows_authorized_routes(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        for destination, allowed, redirect_after_wait in (
+            ("https://ppe.tyfd.gov.tw/CarMaintainCheck/Index", True, False),
+            ("https://ppe.tyfd.gov.tw:443/Home/Index", True, False),
+            ("https://outside.example/Home/Index", False, False),
+            ("http://ppe.tyfd.gov.tw/Home/Index", False, False),
+            ("https://outside.example/Home/Index", False, True),
+        ):
+            with self.subTest(destination=destination, redirect_after_wait=redirect_after_wait):
+                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock())
+                fields = [Mock() for _ in range(4)]
+                fields[2].click.side_effect = lambda: setattr(
+                    driver, "current_url", automation.LOGIN_URL if redirect_after_wait else destination,
+                )
+                driver.find_element = Mock(return_value=fields[3])
+                lookup_count = 0
+
+                def locate(condition):
+                    nonlocal lookup_count
+                    lookup_count += 1
+                    if lookup_count < 4:
+                        return fields[lookup_count - 1]
+                    result = condition(driver)
+                    if redirect_after_wait:
+                        driver.current_url = destination
+                    return result
+
+                wait = SimpleNamespace(until=locate)
+                if allowed:
+                    automation.login(driver, wait, "synthetic-user", "synthetic-password")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "授權"):
+                        automation.login(driver, wait, "synthetic-user", "synthetic-password")
+                fields[0].send_keys.assert_called_once_with("synthetic-user")
+                fields[1].send_keys.assert_called_once_with("synthetic-password")
+                fields[2].click.assert_called_once_with()
+
+
     @staticmethod
     def _verified_report():
         from datetime import date
@@ -8098,7 +8196,7 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertIs(result, False)
 
-    def _parse_captioned_official_staff_cases(self) -> dict:
+    def _parse_captioned_official_staff_cases(self, *, live_unassigned_members: bool = False) -> dict:
         import ast
         import shutil
         import duty_rehearsal
@@ -8116,7 +8214,12 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         names = ["人員甲"] + [f"人員{chr(0x7533 + index)}" for index in range(24)]
         groups = [["", str(actor), "分隊長" if actor == 1 else "小隊長" if actor <= 5 else "隊員", name]
                   for actor, name in zip(actors, names)]
-        groups.extend([["", "", "實習生", "人員畋"], ["", "", "實習生", "人員界"]])
+        if live_unassigned_members:
+            # The 2026-10-23/24 table also has two unnumbered members outside the formal numbered roster.
+            groups.extend([["", "", "隊員", "人員增"], ["", "", "實習生", "人員畋"],
+                           ["", "", "實習生", "人員界"], ["", "", "隊員", "人員補"]])
+        else:
+            groups.extend([["", "", "實習生", "人員畋"], ["", "", "實習生", "人員界"]])
         groups.extend([["", "", "", ""] for _ in range(32 - len(groups))])
         rows = [[{"text": "當日勤務輪流順序與值勤人員對照表(替代役人數:0人)", "colSpan": 32, "rowSpan": 1}]]
         rows.extend([[{"text": text, "colSpan": 1, "rowSpan": 1} for group in groups[start:start + 8] for text in group]
@@ -8138,10 +8241,16 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'extra-column') rows[2].push({text:'未知欄', colSpan:1, rowSpan:1});
           if (change === 'separator') rows[1][4].text = '未知欄';
           if (change === 'blank-actor') rows[1][5].text = '';
+          if (change === 'blank-last-actor') rows[4][1].text = '';
           if (change === 'bad-actor') rows[1][5].text = 'X2';
           if (change === 'duplicate') rows[1][5].text = '1';
           if (change === 'canonical-duplicate') rows[1][5].text = '01';
           if (change === 'duplicate-name') rows[1][7].text = rows[1][3].text;
+          if (change === 'unnumbered-duplicate-name') rows[4][7].text = rows[1][3].text;
+          if (change === 'unnumbered-duplicate-extra-name') rows[4][19].text = rows[4][7].text;
+          if (change === 'supplemental-wrong-column') [rows[4][22].text, rows[4][23].text] = ['隊員', '人員補'];
+          if (change === 'supplemental-wrong-row') [rows[3][5].text, rows[3][6].text] = ['', '隊員'];
+          if (change === 'supplemental-control') {rows[4][6].text = '隊員'; rows[4][5].hasControl = true;}
           if (change === 'header-in-captioned') [rows[1][5].text, rows[1][6].text, rows[1][7].text] = ['番號','職稱','姓名'];
           if (change === 'unknown-role') rows[1][6].text = '其他人員';
           if (change === 'empty-name') rows[1][7].text = '';
@@ -8149,7 +8258,8 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'unknown-unnumbered') rows[4][6].text = '其他人員';
           if (change === 'numbered-trainee') rows[4][5].text = '29';
           if (change === 'unnamed-trainee') rows[4][7].text = '';
-          const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan, querySelectorAll:()=>[]});
+          const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan,
+            querySelectorAll:()=>value.hasControl?[{tagName:'INPUT', type:'text', value:''}]:[]});
           const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
           const schedule = table([['時段', '值班', '救護'].map(text=>({text})),
             ...Array.from({length:24}, (_,i)=>[
@@ -8159,14 +8269,16 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'two-tables') tables.push(table(rows));
           if (change === 'headered-and-captioned') tables.push(table([
             ['番號','職稱','姓名'].map(text=>({text})), ['1','分隊長','人員甲'].map(text=>({text}))]));
-          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}};
+          global.window = {jQuery:{active:change === 'ajax' ? 1 : 0}, getComputedStyle:()=>({display:'block'})};
           global.document = {readyState:change === 'loading' ? 'loading' : 'complete', body:{innerText:''},
             querySelectorAll:()=>tables, getElementById:()=>({value:change === 'wrong-date' ? '1151018' : '1151019'})};
           return new Function(source)('1151019');
         }
         const cases = ['ready','bad-caption','missing-caption','caption-span','cell-span','row-span',
           'missing-first-row','missing-middle-row','missing-last-row','extra-row','partial-row',
-          'extra-column','separator','blank-actor','bad-actor','duplicate','canonical-duplicate','duplicate-name',
+          'extra-column','separator','blank-actor','blank-last-actor','bad-actor','duplicate','canonical-duplicate','duplicate-name',
+          'unnumbered-duplicate-name','unnumbered-duplicate-extra-name',
+          'supplemental-wrong-column','supplemental-wrong-row','supplemental-control',
           'header-in-captioned','unknown-role','empty-name',
           'unsafe-name','unknown-unnumbered','numbered-trainee','unnamed-trainee','class','two-tables',
           'headered-and-captioned','ajax','loading','wrong-date'];
@@ -8203,6 +8315,24 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
                 snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
                 self.assertIs(snapshot["complete"], False)
                 self.assertEqual(snapshot["members"], [])
+
+    def test_official_captioned_staff_keeps_titles_when_live_table_has_unnumbered_supplemental_members(self) -> None:
+        from qt_app.controllers.app_controller import official_personnel_title_snapshot
+
+        results = self._parse_captioned_official_staff_cases(live_unassigned_members=True)
+        parsed = results["ready"]
+        self.assertTrue(parsed["staff_complete"])
+        self.assertEqual(len(parsed["staff"]), 25)
+        snapshot = official_personnel_title_snapshot("1151019", {"today": {"roc_date": "1151019", **parsed}})
+        self.assertIs(snapshot["complete"], True)
+        self.assertEqual(len(snapshot["members"]), 25)
+        self.assertFalse(any(member["name"] in {"人員增", "人員補", "人員畋", "人員界"}
+                             for member in snapshot["members"]))
+        for change in ("blank-actor", "blank-last-actor", "unknown-role", "unknown-unnumbered", "empty-name",
+                       "duplicate", "duplicate-name", "unnumbered-duplicate-name", "unnumbered-duplicate-extra-name",
+                       "supplemental-wrong-column", "supplemental-wrong-row", "supplemental-control", "unnamed-trainee"):
+            with self.subTest(change=change):
+                self.assertIs(results[change]["staff_complete"], False)
 
     def test_control_wait_returns_immediately_when_form_is_ready(self) -> None:
         import duty_rehearsal
@@ -9196,6 +9326,17 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertTrue(release["title"].strip())
             self.assertTrue(release["items"])
             self.assertTrue(all(str(item).strip() for item in release["items"]))
+
+    def test_current_update_archive_excludes_runtime_issue_reports(self) -> None:
+        import zipfile
+
+        archive_path = PACKAGE_ROOT.parent / "UPDATE" / "WinPython_公務電腦使用包.zip"
+        if not archive_path.exists():
+            self.skipTest("尚未建立公務電腦更新包。")
+        with zipfile.ZipFile(archive_path) as archive:
+            forbidden = {"issue_reports", "logs", "runtime_outputs", "snapshots", "__pycache__"}
+            leaked = [name for name in archive.namelist() if forbidden.intersection(Path(name).parts)]
+        self.assertEqual(leaked, [], "更新包不可包含執行期回報或診斷檔案。")
 
     def test_update_history_and_pending_notice_are_cleared_only_after_dismissal(self) -> None:
         from app_core.update_repository import UpdateRepository
@@ -10903,9 +11044,9 @@ class OperationalSyncServiceTests(unittest.TestCase):
                 "SINPOSMART_BACKEND_EVENT_URL": f"http://127.0.0.1:{server.server_port}/api/sinposmart/events",
                 "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-only-token",
                 "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
-            }):
+            }), patch("app_core.credential_sync_service._sync_target", side_effect=lambda url: (url, True)):
                 service = OperationalSyncService(Path(directory))
-                with self.assertRaisesRegex(RuntimeError, "心跳無法確認連線"):
+                with self.assertRaisesRegex(RuntimeError, "未授權轉址"):
                     service.send_heartbeat(captured[0])
                 self.assertFalse(service.pending_path.exists())
             self.assertEqual(origin, [True])
@@ -10936,7 +11077,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             return handle
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
-            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid:8080/api/sinposmart/events?discard=1#discard",
+            "SINPOSMART_BACKEND_EVENT_URL": "https://nas.invalid:8080/api/sinposmart/events?discard=1#discard",
             "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
         }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
             service = OperationalSyncService(Path(directory))
@@ -10946,8 +11087,8 @@ class OperationalSyncServiceTests(unittest.TestCase):
             self.assertFalse(service.pending_path.exists())
 
         self.assertEqual([request.method for request in requests], ["GET", "POST"])
-        self.assertEqual(requests[0].full_url, "http://nas.invalid:8080/api/sinposmart/identity")
-        self.assertEqual(requests[1].full_url, "http://nas.invalid:8080/api/sinposmart/heartbeat")
+        self.assertEqual(requests[0].full_url, "https://nas.invalid:8080/api/sinposmart/identity")
+        self.assertEqual(requests[1].full_url, "https://nas.invalid:8080/api/sinposmart/heartbeat")
         payload = json.loads(requests[1].data)
         self.assertEqual(payload["route"], {"name": "configured", "identity_status": "verified", "instance_id": server_id})
         self.assertEqual(payload["app_version"], "2026.10.18.1350")
@@ -11010,7 +11151,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             return handle
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
-            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.invalid/api/sinposmart/events",
+            "SINPOSMART_BACKEND_EVENT_URL": "https://nas.invalid/api/sinposmart/events",
             "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-only-token",
         }), patch("urllib.request.OpenerDirector.open", side_effect=open_request):
             service = OperationalSyncService(Path(directory))
@@ -11024,7 +11165,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
             self.assertNotIn("nas.invalid", status)
             self.assertNotIn("test-only-token", status)
             self.assertEqual(len([row for row in requests if row.method == "GET"]), 1)
-            self.assertTrue(all(row.full_url.startswith("http://nas.invalid/") for row in requests))
+            self.assertTrue(all(row.full_url.startswith("https://nas.invalid/") for row in requests))
             self.assertTrue(all(json.loads(row.data)["route"]["instance_id"] == original_id
                                 for row in requests if row.method == "POST"))
             with patch("urllib.request.OpenerDirector.open") as network:
@@ -11329,7 +11470,7 @@ class OperationalSyncServiceTests(unittest.TestCase):
         self.assertEqual(posted, [payload])
         self.assertEqual(pending, "")
 
-    def test_event_uses_legacy_default_url_when_only_token_is_configured(self) -> None:
+    def test_event_preserves_legacy_lan_default_url_when_only_token_is_configured(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11345,6 +11486,27 @@ class OperationalSyncServiceTests(unittest.TestCase):
                     service.event_url,
                     "http://10.30.65.30:8080/api/sinposmart/events",
                 )
+
+    def test_remote_update_callback_preserves_legacy_lan_default_when_only_token_is_configured(self) -> None:
+        from qt_app.controllers.update_controller import _remote_update_endpoint
+        from qt_app.workers.update_check_worker import RemoteUpdateWorker
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok":true}'
+        request_id = "44444444-4444-4444-8444-444444444444"
+        with patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token"}, clear=True), \
+                patch("urllib.request.urlopen", return_value=response) as open_request:
+            endpoint = _remote_update_endpoint()
+            self.assertEqual(endpoint, "http://10.30.65.30:8080/api/sinposmart/remote-update")
+            worker = RemoteUpdateWorker(1, endpoint, "synthetic-token", "synthetic-worker", "2026.10.24.0209",
+                status_request={"request_id": request_id, "status": "completed", "installed_version": "2026.10.24.0209"})
+            self.assertTrue(worker._request()["ok"])
+            sent = open_request.call_args.args[0]
+            self.assertEqual(sent.full_url, endpoint + "/" + request_id + "/status")
+            self.assertEqual(sent.get_method(), "POST")
+            self.assertEqual(json.loads(sent.data)["status"], "completed")
 
     def test_event_failure_is_safely_recorded_and_kept_for_retry(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
@@ -11388,6 +11550,209 @@ class OperationalSyncServiceTests(unittest.TestCase):
 
         self.assertEqual(status["board"]["state"], "failed")
         self.assertIn("同步失敗", status["board"]["detail"])
+
+
+class SecureSyncTransportTests(unittest.TestCase):
+    def test_plain_http_cannot_send_credentials_before_transport_is_verified(self) -> None:
+        from app_core.credential_sync_service import CredentialSyncError, CredentialSyncService
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok":true}'
+        with patch.dict(os.environ, {
+            "SINPOSMART_CREDENTIAL_SYNC_URL": "http://192.168.1.10/api/credential-sync",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+        }), patch("urllib.request.urlopen", return_value=response) as unguarded:
+            with self.assertRaises(CredentialSyncError):
+                CredentialSyncService().sync([{"user_id": "synthetic-user", "password": "synthetic-password"}])
+            unguarded.assert_not_called()
+
+    def test_invalid_http_targets_are_rejected_without_opening_a_connection(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        for url in ("http://example.invalid/api", "http://127.0.0.1/api",
+                    "http://10.30.65.30:8080/unknown", "http://100.114.126.58:invalid/api",
+                    "http://10.30.65.31:8080/api/credential-sync",
+                    "http://10.30.65.30:8081/api/credential-sync",
+                    "http://10.30.65.30:8080/api/credential-sync?extra=1",
+                    "http://10.30.65.30:8080/api/credential-sync#fragment",
+                    "http://user:synthetic-secret@10.30.65.30:8080/api/credential-sync",
+                    "http://user:synthetic-secret@100.114.126.58/api", "file:///tmp/example"):
+            with self.subTest(url=url), patch.object(transport.urllib.request, "build_opener") as build:
+                with self.assertRaises(transport.SyncTransportError) as caught:
+                    transport.open_sync_request(transport.urllib.request.Request(url), timeout=1)
+                build.assert_not_called()
+                self.assertNotIn("synthetic-secret", str(caught.exception))
+
+    def test_overlay_http_requires_verified_peer_and_bypasses_proxies(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        request = transport.urllib.request.Request(
+            "http://100.114.126.58:8080/api/credential-sync", data=b"synthetic-body",
+            headers={"X-Credential-Sync-Token": "synthetic-token"}, method="POST",
+        )
+        with patch.object(transport, "_tailscale_peer_verified", return_value=False), \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            with self.assertRaises(transport.SyncTransportError):
+                transport.open_sync_request(request, timeout=1)
+            build.assert_not_called()
+        with patch.object(transport, "_tailscale_peer_verified", return_value=True) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            transport.open_sync_request(request, timeout=2)
+            verify.assert_called_once_with("100.114.126.58")
+            sent = build.return_value.open.call_args.args[0]
+            self.assertEqual(sent.full_url, "http://100.114.126.58:8080/api/credential-sync")
+            self.assertEqual(sent.data, b"synthetic-body")
+            proxies = [handler for handler in build.call_args.args
+                       if isinstance(handler, transport.urllib.request.ProxyHandler)]
+            self.assertEqual([handler.proxies for handler in proxies], [{}])
+
+    def test_token_only_legacy_lan_heartbeat_reaches_identity_and_heartbeat_without_tailscale(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.operational_sync_service import GuiHeartbeatReporter, OperationalSyncService
+
+        server = {"instance_id": "366be866-51b0-49df-8712-a6d4f56f592d", "version": "fixture", "deployment": "fixture"}
+        requests = []
+
+        def open_request(request, **_kwargs):
+            requests.append(request)
+            response = {"ok": True, "server": server}
+            if request.get_method() == "POST":
+                response.update(accepted=True, received_at="2026-10-24T10:30:00+08:00")
+            handle = Mock()
+            handle.__enter__ = Mock(return_value=handle)
+            handle.__exit__ = Mock(return_value=False)
+            handle.read.return_value = json.dumps(response).encode()
+            return handle
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token"}, clear=True), \
+                patch.object(transport, "_tailscale_peer_verified", return_value=False) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = open_request
+            service = OperationalSyncService(Path(directory))
+            reporter = GuiHeartbeatReporter(service, component="gui", app_version="2026.10.24.0209")
+            payload = {**reporter._base, "sequence": 1, "state": "idle", "login_state": "logged_out", "phase": "idle",
+                       "result_code": "", "exit_code": None, "progress_percent": None}
+            self.assertTrue(service.send_heartbeat(payload)["accepted"])
+            verify.assert_not_called()
+            self.assertEqual([request.full_url for request in requests], [
+                "http://10.30.65.30:8080/api/sinposmart/identity",
+                "http://10.30.65.30:8080/api/sinposmart/heartbeat",
+            ])
+            self.assertEqual(json.loads(requests[1].data)["route"]["identity_status"], "verified")
+            self.assertEqual(json.loads(service.status_path.read_text(encoding="utf-8"))["heartbeat"]["state"], "ok")
+
+    def test_tailscale_verification_uses_installed_cli_and_authenticated_live_peer(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        state = {"BackendState": "Running", "Self": {"Online": True, "TailscaleIPs": ["100.80.1.2"]},
+                 "Peer": {"node": {"Online": True, "TailscaleIPs": ["100.114.126.58"]}}}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(state))
+        with patch.object(Path, "is_file", return_value=True), \
+                patch.object(transport.subprocess, "run", return_value=completed) as run:
+            self.assertTrue(transport._tailscale_peer_verified("100.114.126.58"))
+            command = run.call_args.args[0]
+            self.assertTrue(Path(command[0]).is_absolute())
+            self.assertEqual(command[1:], ["status", "--json"])
+            self.assertFalse(run.call_args.kwargs.get("shell", False))
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        for invalid in (
+            {**state, "BackendState": "NeedsLogin"},
+            {**state, "Self": {"Online": False, "TailscaleIPs": ["100.80.1.2"]}},
+            {**state, "Peer": {}},
+            {**state, "Peer": {"node": {"Online": False, "TailscaleIPs": ["100.114.126.58"]}}},
+        ):
+            with self.subTest(state=invalid), patch.object(Path, "is_file", return_value=True), \
+                    patch.object(transport.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(invalid))):
+                self.assertFalse(transport._tailscale_peer_verified("100.114.126.58"))
+
+    def test_nas_redirects_are_blocked_and_google_get_redirects_drop_secrets(self) -> None:
+        import app_core.credential_sync_service as transport
+
+        request = transport.urllib.request.Request(
+            "https://script.google.com/macros/s/example/exec", data=b"synthetic-secret",
+            headers={"X-Credential-Sync-Token": "synthetic-token", "Authorization": "synthetic-auth"},
+            method="POST",
+        )
+        destination = "https://script.googleusercontent.com/macros/echo?opaque=synthetic"
+        with self.assertRaises(transport.SyncTransportError):
+            transport.SyncRedirectHandler().redirect_request(request, None, 302, "", {}, destination)
+        handler = transport.SyncRedirectHandler(allow_google_redirects=True)
+        redirected = handler.redirect_request(request, None, 302, "", {}, destination)
+        self.assertEqual(redirected.get_method(), "GET")
+        self.assertIsNone(redirected.data)
+        self.assertFalse(redirected.has_header("Authorization"))
+        self.assertFalse(redirected.has_header("X-credential-sync-token"))
+        for destination in ("http://script.googleusercontent.com/macros/echo", "https://outside.example/echo"):
+            with self.subTest(destination=destination), self.assertRaises(transport.SyncTransportError):
+                handler.redirect_request(request, None, 302, "", {}, destination)
+
+    def test_https_and_all_nas_callers_use_the_guarded_transport(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.civilpower_service import CivilpowerService
+        from app_core.operational_sync_service import OperationalSyncService
+
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"ok": True, "server": {
+            "instance_id": "366be866-51b0-49df-8712-a6d4f56f592d", "version": "fixture", "deployment": "fixture",
+        }, "received_at": "2026-10-24T10:30:00+08:00"}).encode()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_CREDENTIAL_SYNC_URL": "http://10.30.65.30:8080/api/credential-sync",
+            "SINPOSMART_BACKEND_EVENT_URL": "http://10.30.65.30:8080/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+            "SINPOSMART_DUTY_BOARD_SYNC_URL": "https://script.google.com/macros/s/example/exec",
+            "SINPOSMART_DUTY_BOARD_SYNC_KEY": "synthetic-key",
+        }), patch.object(transport, "_tailscale_peer_verified", return_value=False) as verify, \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = response
+            transport.CredentialSyncService().sync([{"user_id": "synthetic-user", "password": "synthetic-password"}])
+            operational = OperationalSyncService(Path(directory))
+            operational._post_event({"event_id": "synthetic-event"})
+            CivilpowerService._fetch_roster()
+            operational._heartbeat_request("/identity")
+            operational._heartbeat_request("/heartbeat", {"synthetic": True})
+            operational._post_board({"content_hash": "synthetic-hash"})
+            sent = [call.args[0].full_url for call in build.return_value.open.call_args_list]
+            self.assertEqual(sent, [
+                "http://10.30.65.30:8080/api/credential-sync",
+                "http://10.30.65.30:8080/api/sinposmart/events",
+                "http://10.30.65.30:8080/api/sinposmart/civilpower-roster",
+                "http://10.30.65.30:8080/api/sinposmart/identity",
+                "http://10.30.65.30:8080/api/sinposmart/heartbeat",
+                "https://script.google.com/macros/s/example/exec",
+            ])
+            verify.assert_not_called()
+            for call in build.call_args_list[:5]:
+                proxies = [handler for handler in call.args
+                           if isinstance(handler, transport.urllib.request.ProxyHandler)]
+                self.assertEqual([handler.proxies for handler in proxies], [{}])
+
+    def test_unverified_overlay_preserves_pending_event_without_sending_token(self) -> None:
+        import app_core.credential_sync_service as transport
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_BACKEND_EVENT_URL": "http://100.114.126.58:8080/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "synthetic-token",
+        }), patch.object(transport, "_tailscale_peer_verified", return_value=False), \
+                patch.object(transport.urllib.request, "build_opener") as build:
+            service = OperationalSyncService(Path(directory))
+            payload = service.build_event_payload("login", actor_no="synthetic-actor")
+            service.send_event_payload(payload)
+            pending = service.pending_path.read_text(encoding="utf-8")
+            status = json.loads(service.status_path.read_text(encoding="utf-8"))
+            self.assertIn(payload["event_id"], pending)
+            self.assertEqual(status["event"]["state"], "failed")
+            self.assertIn("Tailscale", status["event"]["detail"])
+            self.assertNotIn("synthetic-token", pending + json.dumps(status))
+            with self.assertRaises(transport.SyncTransportError):
+                service._heartbeat_request("/identity")
+            build.assert_not_called()
 
 
 class CredentialSyncServiceTests(unittest.TestCase):
@@ -11560,6 +11925,42 @@ class QtShellTests(unittest.TestCase):
             QTest.qWait(30)
             self.assertTrue(card.property("visible"))
             self.assertTrue(row.property("visible"))
+            indicator = root.findChild(QObject, "noticeCollectionStatusDot")
+            self.assertIsNotNone(indicator)
+            self.assertIsNone(root.findChild(QObject, "noticeCollectionActivityPill"))
+            self.assertTrue(indicator.property("visible"))
+            idle_color = indicator.property("color")
+            original_height = card.property("height")
+            notice = controller.noticeCollectionController
+            notice._read_only = False
+            notice._job = SimpleNamespace(verify_only=False)
+            self.addCleanup(setattr, notice, "_job", None)
+            notice.stateChanged.emit()
+            QTest.qWait(30)
+            running_color = indicator.property("color")
+            self.assertNotEqual(running_color, idle_color)
+            self.assertEqual(indicator.property("statusDescription"), "執行中")
+            notice._has_shift_notices = True
+            notice.stateChanged.emit()
+            QTest.qWait(30)
+            received_color = indicator.property("color")
+            self.assertNotIn(received_color, (idle_color, running_color))
+            self.assertIn("本班已收到通報", indicator.property("statusDescription"))
+            self.assertEqual(card.property("height"), original_height)
+            notice._job = None
+            notice.stateChanged.emit()
+            QTest.qWait(30)
+            self.assertEqual(indicator.property("color"), received_color)
+            notice._has_shift_notices = False
+            notice._read_only = True
+            notice.stateChanged.emit()
+            QTest.qWait(30)
+            self.assertEqual(indicator.property("color"), idle_color)
+            self.assertEqual(indicator.property("statusDescription"), "已停止")
+            notice._set_notice("測試：網站登入失敗", "error")
+            QTest.qWait(30)
+            self.assertIn("網站登入失敗", row.property("text"))
+            self.assertEqual(indicator.property("color"), idle_color)
             self.assertGreaterEqual(card.property("y"), tools.property("y") + tools.property("height"))
             self.assertGreaterEqual(tasks.property("y"), card.property("y") + card.property("height"))
             self.assertGreater(tasks.property("height"), 0)

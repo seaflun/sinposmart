@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app_core.duty_task_projection import action_summary
+from app_core.credential_sync_service import SyncTransportError, open_sync_request
 
 
 JsonPoster = Callable[[dict[str, Any]], dict[str, Any]]
@@ -34,11 +35,6 @@ HEARTBEAT_PHASES = frozenset({
     "waiting_gui", "completed", "failed", "stopping", "unknown",
 })
 HEARTBEAT_RESULTS = frozenset({"", "installer_failed", "gui_start_failed", "gui_ready_timeout", "update_completed", "closed"})
-
-
-class _HeartbeatRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None  # Never forward the existing credential-sync token to another endpoint.
 
 
 def _heartbeat_uuid(value: Any, *, empty: bool = False) -> bool:
@@ -266,7 +262,6 @@ class OperationalSyncService:
         self._heartbeat_server_id = ""
         self._heartbeat_endpoint = self._heartbeat_base_url()
         self._heartbeat_token = os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
-        self._heartbeat_opener = urllib.request.build_opener(_HeartbeatRedirectHandler())
 
     def _heartbeat_base_url(self) -> str:
         try:
@@ -295,7 +290,7 @@ class OperationalSyncService:
         request = urllib.request.Request(self._heartbeat_endpoint + suffix, data=body, headers=headers,
                                          method="GET" if body is None else "POST")
         try:
-            with self._heartbeat_opener.open(request, timeout=3) as response:
+            with open_sync_request(request, timeout=3) as response:
                 raw = response.read(8193)
         except urllib.error.HTTPError as error:
             error.close()
@@ -336,6 +331,9 @@ class OperationalSyncService:
             self._record_sync_status("heartbeat", "ok" if response["accepted"] else "failed",
                                      "值班台心跳已同步。" if response["accepted"] else "值班台心跳未被採用。")
             return response
+        except SyncTransportError as error:
+            self._record_sync_status("heartbeat", "failed", str(error))
+            raise RuntimeError(str(error)) from None
         except Exception:
             self._record_sync_status("heartbeat", "failed", "值班台心跳無法確認連線。")
             raise RuntimeError("值班台心跳無法確認連線。") from None
@@ -585,7 +583,7 @@ class OperationalSyncService:
             headers={"Content-Type": "application/json", "X-Credential-Sync-Token": token},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self._timeout("SINPOSMART_BACKEND_EVENT_TIMEOUT_SECONDS", 5)) as response:
+        with open_sync_request(request, timeout=self._timeout("SINPOSMART_BACKEND_EVENT_TIMEOUT_SECONDS", 5)) as response:
             result = json.loads(response.read().decode("utf-8") or "{}")
         if not isinstance(result, dict) or not result.get("ok"):
             raise RuntimeError("SinpoSmart 後台事件未回報成功。")
@@ -603,7 +601,8 @@ class OperationalSyncService:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self._timeout("SINPOSMART_DUTY_BOARD_SYNC_TIMEOUT_SECONDS", 8)) as response:
+        with open_sync_request(request, timeout=self._timeout("SINPOSMART_DUTY_BOARD_SYNC_TIMEOUT_SECONDS", 8),
+                               allow_google_redirects=True) as response:
             result = json.loads(response.read().decode("utf-8") or "{}")
         if not isinstance(result, dict) or not result.get("ok"):
             raise RuntimeError("Google Site 看板同步未回報成功。")
@@ -687,6 +686,8 @@ class OperationalSyncService:
 
     @staticmethod
     def _safe_failure_detail(error: BaseException, label: str) -> str:
+        if isinstance(error, SyncTransportError):
+            return f"{label}同步失敗：{error}"
         if isinstance(error, urllib.error.HTTPError):
             return f"{label}同步失敗：HTTP {error.code}。"
         if isinstance(error, (urllib.error.URLError, TimeoutError, OSError)):

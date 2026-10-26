@@ -1,12 +1,11 @@
 var WRITE_RECEIPT_CACHE_PREFIX = "noticeWriteReceipt:";
 var WRITE_RECEIPT_TTL_SECONDS = 10 * 60;
 var MAX_RECORDS_PER_REQUEST = 200;
-var DUTY_RECIPIENT_CACHE_PREFIX = "noticeDutyRecipient:v2:";
 
 function doPost(e) {
   var startedAt = Date.now();
   var res = createWriteResult();
-  var ctx = newContext();
+  var ctx = null;
   var lock = null;
   var locked = false;
   var requestId = "";
@@ -14,7 +13,17 @@ function doPost(e) {
   var writeMayHaveStarted = false;
   var retryable = false;
   try {
-    var data = JSON.parse(e.postData.contents);
+    var data;
+    try {
+      data = JSON.parse(e.postData.contents);
+    } catch (_parseError) {
+      throw new Error("Invalid request payload");
+    }
+    authorizeNoticeCollection_(data);
+    if (data && data.action === "getMonthlySpreadsheetLink") {
+      return out(getMonthlySpreadsheetLink(data));
+    }
+    ctx = newContext();
     if (data && data.action === "checkExisting") {
       return checkExisting(validateRecords(data.records || []), ctx);
     }
@@ -28,10 +37,6 @@ function doPost(e) {
       logWriteTiming(requestId, receipt.result, timing, true);
       return out(receiptResponse(receipt, requestId));
     }
-
-    var dutyStartedAt = Date.now();
-    var dutyState = getCurrentDutyRecipient();
-    timing.dutyRecipientMs = Date.now() - dutyStartedAt;
 
     lock = LockService.getScriptLock();
     var lockStartedAt = Date.now();
@@ -51,19 +56,13 @@ function doPost(e) {
       return out(receiptResponse(receipt, requestId));
     }
 
-    if (dutyState.slotKey !== getDutyRecipientContext().slotKey) {
-      var refreshStartedAt = Date.now();
-      dutyState = getCurrentDutyRecipient();
-      timing.dutyRecipientRefreshMs = Date.now() - refreshStartedAt;
-    }
-
     var groupingStartedAt = Date.now();
     writeMayHaveStarted = true;
     ctx.allowCreate = true;
     var batch = groupRecords(request.records, ctx, res);
     timing.groupRecordsMs = Date.now() - groupingStartedAt;
     var writeStartedAt = Date.now();
-    writeGroups(batch, ctx, res, dutyState.recipient);
+    writeGroups(batch, ctx, res);
     writeContentUpdates(batch, res);
     timing.writeGroupsMs = Date.now() - writeStartedAt;
     resolvePendingRecords(batch, res);
@@ -95,6 +94,33 @@ function doPost(e) {
   } finally {
     if (locked) lock.releaseLock();
   }
+}
+
+function authorizeNoticeCollection_(data) {
+  var key = data && typeof data.sync_key === "string" ? data.sync_key : "";
+  var verifier = String(PropertiesService.getScriptProperties()
+    .getProperty("NOTICE_COLLECTION_SYNC_KEY_SHA256") || "").toLowerCase();
+  if (!key || !/^[a-f0-9]{64}$/.test(verifier)) {
+    throw new Error("Unauthorized notice request");
+  }
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, key, Utilities.Charset.UTF_8)
+    .map(function(value) { return ("0" + ((value + 256) % 256).toString(16)).slice(-2); }).join("");
+  var difference = 0;
+  for (var index = 0; index < 64; index++) {
+    difference |= verifier.charCodeAt(index) ^ digest.charCodeAt(index);
+  }
+  if (difference !== 0) throw new Error("Unauthorized notice request");
+}
+
+function configureNoticeCollectionAuthorization(verifierSha256) {
+  var email = String(Session.getEffectiveUser().getEmail() || "").toLowerCase();
+  if (email !== "sinpo666@gmail.com") throw new Error("Unauthorized configuration");
+  if (typeof verifierSha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(verifierSha256)) {
+    throw new Error("Invalid authorization verifier");
+  }
+  PropertiesService.getScriptProperties().setProperty(
+    "NOTICE_COLLECTION_SYNC_KEY_SHA256", verifierSha256.toLowerCase());
+  return { configured: true };
 }
 
 function createWriteResult() {
@@ -352,17 +378,19 @@ function shouldRewriteNotice(existingEntry, record) {
     !isNoticeContentUnavailable(record.content);
 }
 
-function writeGroups(batch, ctx, res, dutyRecipient) {
+function writeGroups(batch, ctx, res) {
   Object.keys(batch.groups).forEach(function(key) {
     var group = batch.groups[key];
     var entries = group.entries;
     if (entries.length === 0) return;
     var outcomes;
     try {
-      var recipient = getValidDutyRecipient(group.target.sheet, dutyRecipient);
       var rows = getWritableRows(group.target, entries.length, ctx);
       var values = entries.map(function(entry) {
         var record = entry.record;
+        var recipient = getValidDutyRecipient(group.target.sheet, getCurrentDutyRecipient(record).recipient,
+          record.responsibility && record.responsibility.role);
+        entry.signingRecipient = recipient;
         return [record.sender, record.subject, record.content, recipient];
       });
       outcomes = writeRows(group.target.sheet, rows, values, entries);
@@ -375,6 +403,9 @@ function writeGroups(batch, ctx, res, dutyRecipient) {
       var outcome = outcomes[index];
       batch.tokenResults[entry.token] = Boolean(outcome && outcome.success);
       if (outcome && outcome.success) {
+        if (!res.signingResults) res.signingResults = [];
+        res.signingResults.push({ key: entry.key, recipient: entry.signingRecipient || "",
+          status: entry.signingRecipient ? "confirmed" : "unknown" });
         res.success++;
         pushKey(res.writtenKeys, entry.key);
         pushKey(res.handledKeys, entry.key);
@@ -427,77 +458,34 @@ function pushKey(keys, key) {
   if (keys.indexOf(key) === -1) keys.push(key);
 }
 
-function getCurrentDutyRecipient() {
-  var context = getDutyRecipientContext();
-  var cache = null;
-  try {
-    cache = CacheService.getScriptCache();
-    var cachedRecipient = cache.get(DUTY_RECIPIENT_CACHE_PREFIX + context.slotKey);
-    if (cachedRecipient) {
-      return { slotKey: context.slotKey, recipient: cachedRecipient };
-    }
-  } catch (err) {
-    console.log("Duty recipient cache read failed: " + err.toString());
-  }
-
-  try {
-    var raw = DriveApp.getFileById("1QHTnDgmrk779hU7lQXbdB6myKisbPXcP")
-      .getBlob()
-      .getDataAsString("UTF-8");
-    var board = JSON.parse(raw);
-    var recipient = findDutyRecipient(board, context.rocDate, context.hour);
-    if (recipient && cache) {
-      try {
-        cache.put(DUTY_RECIPIENT_CACHE_PREFIX + context.slotKey, recipient, 300);
-      } catch (cacheErr) {
-        console.log("Duty recipient cache save failed: " + cacheErr.toString());
-      }
-    }
-    return { slotKey: context.slotKey, recipient: recipient };
-  } catch (err) {
-    return { slotKey: context.slotKey, recipient: "" };
-  }
+function getCurrentDutyRecipient(record) {
+  var empty = { recipient: "" };
+  var proof = record && record.responsibility;
+  if (!proof || proof.schema_version !== 1 || proof.status !== "confirmed"
+      || typeof proof.actorNo !== "string"
+      || !/^[1-9]\d{0,2}$/.test(String(proof.actorNo || ""))
+      || !/^[0-9a-f]{64}$/.test(String(proof.evidenceKey || ""))
+      || typeof proof.name !== "string" || proof.name.length < 2 || proof.name.length > 40
+      || typeof proof.role !== "string" || proof.role.length > 20
+      || /[\x00-\x1f]/.test(proof.name + proof.role)) return empty;
+  var iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+  if (typeof proof.capturedAt !== "string" || !iso.test(proof.capturedAt)
+      || typeof proof.handoffSlotAt !== "string" || !iso.test(proof.handoffSlotAt)) return empty;
+  var captured = new Date(proof.capturedAt), effective = new Date(proof.handoffSlotAt);
+  if (!isFinite(captured.getTime()) || !isFinite(effective.getTime())
+      || effective > captured || captured - effective > 24 * 60 * 60 * 1000) return empty;
+  // Compare against this record's original receipt minute, never the retry clock or roster cache.
+  var local = new Date(captured.getTime() + 8 * 60 * 60 * 1000);
+  var pad = function(number) { return ("0" + number).slice(-2); };
+  var minute = local.getUTCFullYear() + "." + pad(local.getUTCMonth() + 1) + "." + pad(local.getUTCDate())
+    + "." + pad(local.getUTCHours()) + pad(local.getUTCMinutes());
+  if (record.receivedAt !== minute) return empty;
+  var name = norm(proof.name);
+  return { recipient: proof.role === "小隊長" ? name.charAt(0) + "小"
+    : proof.role === "分隊長" ? name.charAt(0) + "分" : name };
 }
 
-function getDutyRecipientContext() {
-  var timeZone = "Asia/Taipei";
-  var now = new Date();
-  var hour = parseInt(Utilities.formatDate(now, timeZone, "H"), 10);
-  var fireDay = new Date(now.getTime() - (hour < 8 ? 24 * 60 * 60 * 1000 : 0));
-  var dateKey = Utilities.formatDate(fireDay, timeZone, "yyyyMMdd");
-  var rocDate = String(parseInt(dateKey.slice(0, 4), 10) - 1911) + dateKey.slice(4);
-  return {
-    hour: hour,
-    rocDate: rocDate,
-    slotKey: rocDate + "|" + hour
-  };
-}
-
-function findDutyRecipient(board, rocDate, hour) {
-  var days = Array.isArray(board.days) ? board.days : [];
-  for (var dayIndex = 0; dayIndex < days.length; dayIndex++) {
-    var day = days[dayIndex];
-    if (String(day.roc_date) !== rocDate) continue;
-    var slots = Array.isArray(day.slots) ? day.slots : [];
-    for (var slotIndex = 0; slotIndex < slots.length; slotIndex++) {
-      var slot = slots[slotIndex];
-      if (Number(slot.start_hour) !== hour) continue;
-      var names = Array.isArray(slot.names) ? slot.names : [];
-      var dutyNos = Array.isArray(slot.duty_nos) ? slot.duty_nos : [];
-      if (names.length !== 1 || dutyNos.length !== 1) return "";
-      var fullName = norm(names[0]);
-      if (fullName.length < 2) return "";
-      var roles = Array.isArray(slot.roles) && slot.roles.length === names.length ? slot.roles : [];
-      var role = norm(roles[0]);
-      if (role === "小隊長") return fullName.charAt(0) + "小";
-      if (role === "分隊長") return fullName.charAt(0) + "分";
-      return fullName;
-    }
-  }
-  return "";
-}
-
-function getValidDutyRecipient(sheet, recipient) {
+function getValidDutyRecipient(sheet, recipient, role) {
   recipient = norm(recipient);
   if (!recipient) return "";
   try {
@@ -506,7 +494,7 @@ function getValidDutyRecipient(sheet, recipient) {
     var sourceRange = criteria[0];
     if (!sourceRange || typeof sourceRange.getDisplayValues !== "function") return "";
     var names = sourceRange.getDisplayValues();
-    var candidates = [recipient, recipient.slice(1)];
+    var candidates = role === "小隊長" || role === "分隊長" ? [recipient] : [recipient, recipient.slice(1)];
     for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
       if (!candidates[candidateIndex]) continue;
       for (var index = 0; index < names.length; index++) {
@@ -528,6 +516,40 @@ function newContext() {
     noticeCache: {},
     rowCache: {}
   };
+}
+
+function getMonthlySpreadsheetLink(data) {
+  var year = data.year;
+  var month = data.month;
+  if (typeof year !== "number" || year !== Math.floor(year) || year < 2011 || year > 2910
+      || typeof month !== "number" || month !== Math.floor(month) || month < 1 || month > 12) {
+    return { status: "error", error: "invalid_month" };
+  }
+  try {
+    var rocYear = year - 1911;
+    var root = DriveApp.getFolderById(NOTICE_WORKBOOK_ROOT_FOLDER_ID);
+    var folders = root.getFoldersByName(rocYear + "年");
+    var folder = folders.hasNext() ? folders.next() : null;
+    if (folders.hasNext()) return { status: "error", error: "ambiguous_spreadsheet" };
+    if (!folder) return { status: "error", error: "spreadsheet_not_found" };
+    var files = folder.getFilesByName(rocYear + "年" + month + "月電子通報");
+    var file = files.hasNext() ? files.next() : null;
+    if (files.hasNext()) return { status: "error", error: "ambiguous_spreadsheet" };
+    if (!file || file.isTrashed()) return { status: "error", error: "spreadsheet_not_found" };
+    if (file.getMimeType() !== MimeType.GOOGLE_SHEETS) {
+      return { status: "error", error: "invalid_spreadsheet" };
+    }
+    var id = file.getId();
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{20,128}$/.test(id)) {
+      return { status: "error", error: "invalid_spreadsheet" };
+    }
+    return {
+      status: "success", year: year, month: month, spreadsheetId: id,
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/" + id + "/edit"
+    };
+  } catch (_lookupError) {
+    return { status: "error", error: "lookup_failed" };
+  }
 }
 
 function getTarget(dateText, ctx) {

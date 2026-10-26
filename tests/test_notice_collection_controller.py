@@ -23,6 +23,71 @@ TAIPEI = timezone(timedelta(hours=8))
 
 
 class NoticeCollectionControllerTests(unittest.TestCase):
+    def test_shift_reminder_clears_only_after_a_confirmed_handoff(self):
+        self.controller.shutdown()
+        proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",
+                 "role": "隊員", "capturedAt": self.now.isoformat(),
+                 "handoffSlotAt": "2026-10-21T08:00:00+08:00", "evidenceKey": "a" * 64}
+        provider = Mock(return_value=proof)
+        self.service.has_notices_for_responsibility.return_value = False
+        self.controller = NoticeCollectionController(self.service, self.lookup, self.busy,
+            responsibility_provider=provider, now_factory=lambda: self.now, timer_start=False)
+        self.controller.set_schedule_data(self.schedule())
+        self.assertFalse(self.controller.hasShiftNotices)
+        self.service.has_notices_for_responsibility.return_value = True
+        self.controller.check_due()
+        self.assertTrue(self.controller.hasShiftNotices)
+        self.now = self.now.replace(hour=10, minute=5)
+        provider.return_value = {**proof, "capturedAt": self.now.isoformat()}
+        self.service.has_notices_for_responsibility.return_value = False
+        self.controller._set_notice("檢查失敗", "error")
+        self.assertTrue(self.controller.hasShiftNotices)
+        provider.side_effect = RuntimeError("暫時無法比對")
+        self.controller.check_due()
+        self.assertTrue(self.controller.hasShiftNotices)
+        provider.side_effect = None
+        provider.return_value = {**proof, "status": "unknown"}
+        self.controller.check_due()
+        self.assertTrue(self.controller.hasShiftNotices)
+        provider.return_value = {**proof, "capturedAt": self.now.isoformat(), "actorNo": "2", "evidenceKey": "b" * 64}
+        self.controller.check_due()
+        self.assertFalse(self.controller.hasShiftNotices)
+
+    def test_activity_capsule_tracks_waiting_running_failure_and_shutdown(self):
+        self.assertEqual(self.controller.activityLabel, "等待排程")
+        self.busy.return_value = "勤務登打"
+        self.controller.check_due()
+        self.assertEqual(self.controller.activityLabel, "等待作業")
+        self.busy.return_value = ""
+        self.enable_saved_account()
+        release = threading.Event()
+        def collect(*_args, **_kwargs):
+            release.wait(2)
+            raise NoticeCollectionError("測試讀取失敗")
+        self.service.collect.side_effect = collect
+        self.controller.check_due()
+        self.assertEqual(self.controller.activityLabel, "執行中")
+        release.set()
+        self.wait_for(lambda: not self.controller.isRunning)
+        self.assertEqual(self.controller.activityLabel, "失敗")
+        self.controller.shutdown()
+        self.assertEqual(self.controller.activityLabel, "已停止")
+
+    def test_job_receives_an_immutable_responsibility_snapshot_from_the_main_thread(self):
+        self.controller.shutdown()
+        proof = {"status": "confirmed", "actorNo": "1"}
+        provider_threads = []
+        provider = Mock(side_effect=lambda _now: provider_threads.append(threading.get_ident()) or proof)
+        self.controller = NoticeCollectionController(self.service, self.lookup, self.busy,
+            responsibility_provider=provider, now_factory=lambda: self.now, timer_start=False)
+        self.enable_saved_account()
+        self.controller.check_due()
+        self.wait_for(lambda: not self.controller.isRunning)
+        self.assertTrue(provider.call_args_list)
+        self.assertTrue(all(call.args == (self.now,) for call in provider.call_args_list))
+        self.assertTrue(all(thread == threading.get_ident() for thread in provider_threads))
+        self.assertEqual(self.service.collect.call_args.kwargs["responsibility"], proof)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["notice-controller-tests"])
@@ -106,7 +171,7 @@ class NoticeCollectionControllerTests(unittest.TestCase):
                 service.last_result = result
                 service.report_parts.side_effect = lambda run_id, state, *_args, **_kwargs: [
                     {"run_id": run_id, "state": state}]
-                def collect(_password, _received_at, cancel):
+                def collect(_password, _received_at, cancel, **_kwargs):
                     while not cancel():
                         time.sleep(0.001)
                     if state == "failed":
@@ -270,7 +335,7 @@ class NoticeCollectionControllerTests(unittest.TestCase):
     def test_verification_waits_for_collection_and_uses_latest_saved_password(self):
         self.enable_saved_account()
         release = threading.Event()
-        def collect(_password, received_at, cancel):
+        def collect(_password, received_at, cancel, **_kwargs):
             while not release.wait(0.01) and not cancel():
                 pass
             return NoticeCollectionResult(received_at)
@@ -387,7 +452,7 @@ class NoticeCollectionControllerTests(unittest.TestCase):
     def test_running_collection_is_single_flight_even_when_manual_checks_arrive(self):
         self.enable_saved_account()
         release = threading.Event()
-        def collect(_password, received_at, cancel):
+        def collect(_password, received_at, cancel, **_kwargs):
             while not release.wait(0.01):
                 if cancel():
                     break
@@ -533,7 +598,7 @@ class NoticeCollectionControllerTests(unittest.TestCase):
 
     def test_shutdown_cancels_safely_then_closes_browser_and_rejects_further_runs(self):
         self.enable_saved_account()
-        def collect(_password, received_at, cancel):
+        def collect(_password, received_at, cancel, **_kwargs):
             while not cancel():
                 time.sleep(0.005)
             return NoticeCollectionResult(received_at)

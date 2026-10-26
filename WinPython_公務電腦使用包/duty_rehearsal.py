@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from compare_rehearsal_records import work_log_reason_variants
@@ -1661,10 +1662,31 @@ def inspect_entry_log_format(
 # Login and query readers
 
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
+    def require_authorized_login_page() -> None:
+        try:
+            current = urlsplit(str(driver.current_url or ""))
+            authorized = (
+                current.scheme == "https"
+                and current.hostname == "dutymgt.tyfd.gov.tw"
+                and current.port in (None, 443)
+                and current.username is None
+                and current.password is None
+                and current.path == "/tyfd119/login119"
+            )
+        except ValueError:
+            authorized = False
+        if not authorized:
+            raise RuntimeError("勤務登入已離開授權的登入頁面，已停止輸入帳密。")
+
     wait = WebDriverWait(driver, 20)
     driver.get(f"{BASE_URL}/login119")
-    wait.until(EC.presence_of_element_located((By.ID, "_txtUsername"))).send_keys(user_id)
-    driver.find_element(By.ID, "_txtPassword").send_keys(password)
+    require_authorized_login_page()
+    username_field = wait.until(EC.presence_of_element_located((By.ID, "_txtUsername")))
+    require_authorized_login_page()
+    username_field.send_keys(user_id)
+    password_field = driver.find_element(By.ID, "_txtPassword")
+    require_authorized_login_page()
+    password_field.send_keys(password)
     driver.execute_script(
         """
         if (document.getElementById('hidFlag')) {
@@ -1782,6 +1804,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
     suppress_window_open_for_background_query(driver)
     if not js_set(driver, "_txtTaskDate", target_roc_date):
         raise RuntimeError("勤務表查詢失敗：找不到查詢日期欄位。")
+    query_time_origin = arm_query_completion_tracking(driver)
     if not js_click(driver, "_btnQuery") and not js_click(driver, "_btnSearch"):
         raise RuntimeError("勤務表查詢失敗：找不到查詢按鈕。")
     try:
@@ -1789,6 +1812,13 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
             lambda current_driver: bool(
                 current_driver.execute_script(
                     """
+                    const tracker = window.__sinpoDutyQueryTracker;
+                    const previousOrigin = Number(arguments[0] || 0);
+                    const navigated = previousOrigin > 0 && Number(performance.timeOrigin || 0) !== previousOrigin;
+                    const fresh = navigated || tracker?.freshRows || tracker?.freshCompletion;
+                    const capturedDate = String(document.getElementById('_txtTaskDate')?.value || '').replace(/\\D/g, '');
+                    if (!fresh || document.readyState !== 'complete' ||
+                        (window.jQuery && window.jQuery.active !== 0) || capturedDate !== arguments[1]) return false;
                     return Array.from(document.querySelectorAll('table')).some(table => {
                       if (!String(table.className || '').includes('report_list1')) return false;
                       const slots = Array.from(table.querySelectorAll('tr')).map(row =>
@@ -1797,7 +1827,9 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
                       return slots.some(slot => /^8[~～-]9$/.test(slot)) &&
                         slots.some(slot => /^7[~～-]8$/.test(slot));
                     });
-                    """
+                    """,
+                    query_time_origin,
+                    target_roc_date,
                 )
             )
         )
@@ -1902,6 +1934,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
           }
         }
         const capturedDateField = document.getElementById('_txtTaskDate');
+        result.captured_date = String(capturedDateField?.value || '').replace(/\\D/g, '');
         let complete = staffTables.length === 1 && document.readyState === 'complete' &&
           (!window.jQuery || window.jQuery.active === 0) &&
           String(capturedDateField?.value || '').replace(/\\D/g, '') === arguments[0];
@@ -1936,9 +1969,16 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
               const name = (row[i + 2] || '').trim();
               if ((!no && !role && !name) || (!captioned && isHeader([no, role, name]))) continue;
               if (captioned) {
-                if (!no && role === '實習生' && validName(name)) continue;
-                const actor = String(Number(no));
                 const key = name.replace(/\\s+/g, '').toLocaleLowerCase();
+                // The observed final row has two unnumbered supplemental members outside the numbered roster.
+                const supplemental = role === '隊員' && row === matrix[4] && [5, 17].includes(i) &&
+                  Array.from(trs[4].children).slice(i, i + 3).every(cell => cell.querySelectorAll('input,select,textarea').length === 0);
+                if (!no && (role === '實習生' || supplemental) && validName(name)) {
+                  if (names.has(key)) complete = false;
+                  names.add(key);
+                  continue;
+                }
+                const actor = String(Number(no));
                 if (!['分隊長', '小隊長', '隊員'].includes(role) || !validName(name) || actors.has(actor) || names.has(key)) complete = false;
                 actors.add(actor);
                 names.add(key);
@@ -1956,6 +1996,8 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
         """,
         target_roc_date,
     )
+    if "captured_date" in data and data["captured_date"] != target_roc_date:
+        raise RuntimeError("勤務表讀取失敗：查詢結果日期與要求日期不一致，已停止讀取。")
     if not data.get("rows"):
         page_text = driver.execute_script(
             """
@@ -2010,11 +2052,18 @@ def arm_query_completion_tracking(driver: webdriver.Chrome) -> float | None:
           const element = node?.nodeType === Node.ELEMENT_NODE
             ? node
             : node?.parentElement;
-          return element?.closest?.('tr') || null;
+          const row = element?.closest?.('tr');
+          if (!row || row.querySelector('table')) return null;
+          const cells = Array.from(row.children).map(cell => String(cell.innerText || '').trim());
+          const slot = /^\d{1,2}[~～-]\d{1,2}$/.test((cells[0] || '').replace(/\s+/g, ''));
+          const datedRow = /^\d{3,4}[/-]?\d{2}[/-]?\d{2}\s+\d{1,2}:\d{2}/.test(cells[0] || '');
+          return slot || datedRow || cells.some(text => /\d{1,2}:\d{2}:\d{2}/.test(text)) ? row : null;
         };
         const isCompletionNode = (element) => {
+          if (element?.matches?.('html,body,form,table,thead,tbody,tfoot,tr')) return false;
           const text = textOf(element);
-          return text.length <= 240 && completionPattern.test(text);
+          return text.length <= 240 && completionPattern.test(text) &&
+            !Array.from(element?.children || []).some(child => completionPattern.test(textOf(child)));
         };
         const oldTracker = window.__sinpoDutyQueryTracker;
         oldTracker?.observer?.disconnect();
@@ -2040,13 +2089,17 @@ def arm_query_completion_tracking(driver: webdriver.Chrome) -> float | None:
             const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
               ? mutation.target
               : mutation.target?.parentElement;
-            if (rowRoot(targetElement)) tracker.freshRows = true;
+            const cellsOf = nodes => Array.from(nodes || []).filter(node =>
+              node.nodeType === Node.ELEMENT_NODE && /^(TD|TH)$/.test(node.tagName));
+            // Child text may be a loading indicator inside an old record. Only
+            // structural result-row replacement proves a fresh row response.
+            if (targetElement?.tagName === 'TR' && rowRoot(targetElement) &&
+                cellsOf(mutation.addedNodes).length === targetElement.children.length &&
+                cellsOf(mutation.removedNodes).length >= 3) tracker.freshRows = true;
             for (const addedNode of Array.from(mutation.addedNodes || [])) {
-              if (addedNode.nodeType === Node.ELEMENT_NODE
-                && (addedNode.matches?.('tr, tr *') || addedNode.querySelector?.('tr'))
-              ) {
-                tracker.freshRows = true;
-              } else if (rowRoot(addedNode)) {
+              if (addedNode.nodeType === Node.ELEMENT_NODE &&
+                  ((addedNode.tagName === 'TR' && rowRoot(addedNode)) ||
+                   Array.from(addedNode.querySelectorAll('tr')).some(row => rowRoot(row)))) {
                 tracker.freshRows = true;
               }
             }
@@ -2104,8 +2157,11 @@ def wait_for_query_completion(
             const pageSelect = document.querySelector("select[name='pageSelect']");
             const tracker = window.__sinpoDutyQueryTracker;
             return {
+              readyState: document.readyState,
+              pendingQueries: Number(window.jQuery?.active || 0),
               completed: /QUY-000\s*[:：]\s*查詢完成/.test(text)
                 || /QUY-500\s*[:：]\s*查無資料/.test(text),
+              noRecords: /QUY-500\s*[:：]\s*查無資料/.test(text),
               page: pageSelect?.value || '',
               hasRows: Array.from(document.querySelectorAll('tr')).some(row => row.children.length >= 3),
               freshCompletion: Boolean(tracker?.freshCompletion),
@@ -2115,6 +2171,8 @@ def wait_for_query_completion(
             """
         )
         if not isinstance(state, dict):
+            return False
+        if state.get("readyState", "complete") != "complete" or state.get("pendingQueries", 0):
             return False
         try:
             current_time_origin = float(state.get("timeOrigin") or 0)
@@ -2126,6 +2184,8 @@ def wait_for_query_completion(
             and current_time_origin != previous_time_origin
         )
         if expected_page:
+            if state.get("noRecords"):
+                return bool(state.get("freshCompletion")) or navigated
             return (
                 str(state.get("page", "")) == expected_page
                 and bool(state.get("hasRows"))
@@ -2223,26 +2283,37 @@ def query_visible_table(
     if query_started_callback is not None:
         query_started_callback()
     wait_for_query_completion(driver, previous_time_origin=query_time_origin)
-    if ap_name == WORK_LOG_AP:
-        raw_rows = driver.execute_script(
-            r"""
-            const rows = Array.from(document.querySelectorAll('tr'));
-            const labels = ['日期時間', '單位分類', '單位名稱', '勤務項目', '事由',
-              '工作概述', '處理情形', '服勤人員', '服勤人數', '被宣導人數', '附件', '建檔者', '簽核者'];
-            const header = rows.find(tr => {
-              const texts = Array.from(tr.children).map(td => (td.innerText || '').replace(/\s/g, ''));
-              return labels.slice(0, 8).every(label => texts.includes(label));
-            });
-            if (!header) throw new Error('工作紀錄查詢欄位不完整，停止比對。');
-            const headers = Array.from(header.children).map(td => (td.innerText || '').replace(/\s/g, ''));
-            const indices = labels.map(label => headers.indexOf(label));
-            return rows.map(tr => {
-              const cells = Array.from(tr.children).map(td => (td.innerText || td.value || '').trim());
-              return indices.map(index => index >= 0 ? (cells[index] || '') : '');
-            }).filter(row => /^\d{3}\/?\d{2}\/?\d{2}\s+\d{1,2}:\d{2}$/.test(row[0]));
-            """
-        )
-    else:
+    def row_in_query_range(row: list[str]) -> bool:
+        if not row or start_at is None or end_at is None:
+            return False
+        row_at = _row_query_datetime(str(row[0]))
+        return row_at is not None and start_at <= row_at <= end_at
+
+    def capture_visible_page() -> list[list[str]]:
+        if ap_name == WORK_LOG_AP:
+            raw_rows = driver.execute_script(
+                r"""
+                const rows = Array.from(document.querySelectorAll('tr'));
+                const labels = ['日期時間', '單位分類', '單位名稱', '勤務項目', '事由',
+                  '工作概述', '處理情形', '服勤人員', '服勤人數', '被宣導人數', '附件', '建檔者', '簽核者'];
+                const header = rows.find(tr => {
+                  const texts = Array.from(tr.children).map(td => (td.innerText || '').replace(/\s/g, ''));
+                  return labels.slice(0, 8).every(label => texts.includes(label));
+                });
+                if (!header) {
+                  if (/QUY-500\s*[:：]\s*查無資料/.test(document.body?.innerText || '')) return [];
+                  throw new Error('工作紀錄查詢欄位不完整，停止比對。');
+                }
+                const headers = Array.from(header.children).map(td => (td.innerText || '').replace(/\s/g, ''));
+                const indices = labels.map(label => headers.indexOf(label));
+                return rows.map(tr => {
+                  const cells = Array.from(tr.children).map(td => (td.innerText || td.value || '').trim());
+                  return indices.map(index => index >= 0 ? (cells[index] || '') : '');
+                }).filter(row => /^\d{3}\/?\d{2}\/?\d{2}\s+\d{1,2}:\d{2}$/.test(row[0]));
+                """
+            )
+            return [row for row in raw_rows if len(row) >= 8 and row_in_query_range(row)]
+
         raw_rows = driver.execute_script(
             """
             return Array.from(document.querySelectorAll('tr')).map(tr =>
@@ -2250,28 +2321,28 @@ def query_visible_table(
             ).filter(row => row.length);
             """
         )
-    def row_in_query_range(row: list[str]) -> bool:
-        if not row or start_at is None or end_at is None:
-            return False
-        row_at = _row_query_datetime(str(row[0]))
-        return row_at is not None and start_at <= row_at <= end_at
+        page_rows: list[list[str]] = []
+        index = 0
+        while index < len(raw_rows):
+            row = raw_rows[index]
+            if len(row) >= 6 and row_in_query_range(row):
+                combined = list(row)
+                if index + 1 < len(raw_rows):
+                    next_row = raw_rows[index + 1]
+                    if next_row and not row_in_query_range(next_row):
+                        combined.extend(next_row)
+                        index += 1
+                page_rows.append(combined)
+            index += 1
+        return page_rows
 
-    if ap_name == WORK_LOG_AP:
-        return [row for row in raw_rows if len(row) >= 8 and row_in_query_range(row)]
-
-    rows: list[list[str]] = []
-    index = 0
-    while index < len(raw_rows):
-        row = raw_rows[index]
-        if len(row) >= 6 and row_in_query_range(row):
-            combined = list(row)
-            if index + 1 < len(raw_rows):
-                next_row = raw_rows[index + 1]
-                if next_row and not row_in_query_range(next_row):
-                    combined.extend(next_row)
-                    index += 1
-            rows.append(combined)
-        index += 1
+    rows = capture_visible_page()
+    pages = case_query_pages(driver)
+    for page in pages[1:]:
+        page_time_origin = arm_query_completion_tracking(driver)
+        select_case_query_page(driver, page)
+        wait_for_query_completion(driver, expected_page=page, previous_time_origin=page_time_origin)
+        rows.extend(capture_visible_page())
     return rows
 
 
@@ -2285,7 +2356,7 @@ def case_query_pages(driver: webdriver.Chrome) -> list[str]:
           .filter(Boolean);
         """
     )
-    return [str(page) for page in pages] if isinstance(pages, list) else []
+    return [str(page) for page in pages if isinstance(page, (str, int)) and str(page).isdigit()] if isinstance(pages, list) else []
 
 
 def select_case_query_page(driver: webdriver.Chrome, page: str) -> None:
@@ -3885,6 +3956,7 @@ def build_driver(
     profile_root: Path | None = None,
     prune_profiles: bool = True,
     write_diagnostics: bool = True,
+    preferences: dict[str, object] | None = None,
 ) -> webdriver.Chrome:
     attempts = chrome_start_attempts()
     selected_profile_root = Path(profile_root) if profile_root is not None else None
@@ -3904,6 +3976,8 @@ def build_driver(
             else duty_browser_profile_dir()
         )
         options = Options()
+        if preferences is not None:
+            options.add_experimental_option("prefs", dict(preferences))
         options.add_argument(f"--user-data-dir={profile_dir}")
         if headless:
             options.add_argument("--headless=new")

@@ -274,6 +274,7 @@ class AppController(QObject):
             schedule_repository or ScheduleRepository(package_root / "runtime_outputs"),
             self,
             read_only_acceptance=self._read_only_acceptance,
+            responsibility_provider=getattr(self._duty_controller, "notice_responsibility", None),
         )
         self._session_controller.noticePasswordSaved.connect(self._notice_collection_controller.verifyLogin)
         self._notice_collection_controller.reportReady.connect(self._notice_collection_report_ready)
