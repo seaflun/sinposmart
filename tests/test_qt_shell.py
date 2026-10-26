@@ -9325,6 +9325,17 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertTrue(release["items"])
             self.assertTrue(all(str(item).strip() for item in release["items"]))
 
+    def test_current_update_archive_excludes_runtime_issue_reports(self) -> None:
+        import zipfile
+
+        archive_path = PACKAGE_ROOT.parent / "UPDATE" / "WinPython_公務電腦使用包.zip"
+        if not archive_path.exists():
+            self.skipTest("尚未建立公務電腦更新包。")
+        with zipfile.ZipFile(archive_path) as archive:
+            forbidden = {"issue_reports", "logs", "runtime_outputs", "snapshots", "__pycache__"}
+            leaked = [name for name in archive.namelist() if forbidden.intersection(Path(name).parts)]
+        self.assertEqual(leaked, [], "更新包不可包含執行期回報或診斷檔案。")
+
     def test_update_history_and_pending_notice_are_cleared_only_after_dismissal(self) -> None:
         from app_core.update_repository import UpdateRepository
         from qt_app.controllers.update_controller import UpdateController

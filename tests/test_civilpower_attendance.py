@@ -248,6 +248,24 @@ class AttendanceTests(unittest.TestCase):
                 driver, WebDriverWait(driver, 0.1, poll_frequency=0.001), "#txt_AddServeUnit", "新坡分隊")
         self.assertEqual(element.get_attribute.call_count, 2)
 
+    def test_slow_unit_options_can_become_ready_after_twenty_seconds(self):
+        from selenium.webdriver.support.ui import WebDriverWait
+        from app_core import civilpower_automation as automation
+
+        elapsed = [0.0]
+        clock = Mock()
+        clock.monotonic.side_effect = lambda: elapsed[0]
+        clock.sleep.side_effect = lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds)
+        driver, element = Mock(), Mock()
+        driver.find_element.return_value = element
+        element.is_displayed.return_value = element.is_enabled.return_value = True
+        driver.execute_script.side_effect = lambda *_args: elapsed[0] >= 20
+        plan = CivilpowerService(PACKAGE).validate(self.request())
+        with patch("selenium.webdriver.support.wait.time", clock):
+            automation._wait_for_io_form_dependencies(
+                driver, WebDriverWait(driver, automation.DEFAULT_WAIT_SECONDS), plan)
+        self.assertEqual(elapsed[0], 20)
+
     def test_persistently_replaced_person_dialog_never_saves(self):
         from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
         from selenium.webdriver.support.ui import WebDriverWait

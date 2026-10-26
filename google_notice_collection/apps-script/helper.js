@@ -205,9 +205,9 @@ function withNoticeMetadataNote(note, noticeId, receivedAt, entry) {
   if (entry && typeof entry.signingRecipient === "string") {
     lines = lines.filter(function(line) { return !/^SinpoSmart signing:/.test(line); });
     var proof = entry.record.responsibility;
-    var signing = "SinpoSmart signing: unconfirmed; manual confirmation required";
+    var signing = "SinpoSmart signing: 待人工確認";
     if (entry.signingRecipient) signing = "SinpoSmart signing: " + proof.actorNo + "番 " + proof.name
-      + " (" + entry.signingRecipient + "); capturedAt=" + proof.capturedAt + "; evidence=" + proof.evidenceKey;
+      + " (" + entry.signingRecipient + ")";
     lines.push(signing);
   }
   return lines.join("\n");

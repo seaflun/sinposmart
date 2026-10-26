@@ -480,19 +480,26 @@ test('unknown malformed or mismatched responsibility never signs a notice', () =
   }
 });
 
-test('new-row notes retain the full actor and frozen proof without erasing human notes', () => {
+test('compact notes retain notice identity receipt and full signer without erasing human notes', () => {
   const s = fixture().sandbox;
   const entry = { record: confirmedRecipientRecord(), signingRecipient: '莊小' };
   const note = s.withNoticeMetadataNote('人工備註', '123', '2026.10.21.1005', entry);
   assert.match(note, /人工備註/);
   assert.match(note, /1番 莊勝斌/);
-  assert.match(note, /2026-10-21T10:05:00\+08:00/);
-  assert.match(note, /evidence=aaaaaaaa/);
+  assert.equal(s.readNoticeIdFromNote(note), '123');
+  assert.match(note, /SinpoSmart receivedAt: 2026\.10\.21\.1005/);
+  assert.match(note, /1番 莊勝斌 \(莊小\)/);
+  assert.doesNotMatch(note, /capturedAt=|evidence=/);
+  assert.ok(note.length < 110);
+  assert.equal(entry.record.responsibility.evidenceKey, 'a'.repeat(64));
   const again = s.withNoticeMetadataNote(note, '123', '2026.10.21.1005', entry);
   assert.equal(again, note);
+  const old = '人工備註\nSinpoSmart noticeId: 123\nSinpoSmart receivedAt: 2026.10.21.1005\n'
+    + 'SinpoSmart signing: 1番 莊勝斌 (莊小); capturedAt=2026-10-21T10:05:00+08:00; evidence=' + 'a'.repeat(64);
+  assert.equal(s.withNoticeMetadataNote(old, '123', '2026.10.21.1005', entry), note);
   entry.signingRecipient = '';
   const unknown = s.withNoticeMetadataNote('人工備註', '123', '2026.10.21.1005', entry);
-  assert.match(unknown, /signing: unconfirmed/);
+  assert.match(unknown, /signing: 待人工確認/);
   assert.doesNotMatch(unknown, /莊勝斌/);
 });
 
