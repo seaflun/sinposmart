@@ -9,6 +9,9 @@ import tempfile
 import threading
 import unittest
 import os
+import shutil
+from contextlib import ExitStack
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -4635,9 +4638,9 @@ try {
 
         driver.find_element.assert_not_called()
 
-    def test_external_popup_sets_eighth_rescue_item_and_clears_unused_fields(self) -> None:
+    def test_external_popup_sets_two_rescue_items_and_clears_unused_fields(self) -> None:
         module = legacy_duty_sheet_module()
-        for names in (["勤務一", "勤務二", "勤務三", "勤務四", "勤務五", "勤務六"], ["勤務一"]):
+        for names in (["勤務一", "勤務二", "勤務三", "勤務四", "勤務五"], ["勤務一"], []):
             with self.subTest(items=len(names)):
                 driver = mock.Mock()
                 driver.window_handles = ["main", "popup"]
@@ -4658,11 +4661,13 @@ try {
                 for index, name in enumerate(names, start=2):
                     fields[f"_txtNAME{index}"].clear.assert_called_once()
                     fields[f"_txtNAME{index}"].send_keys.assert_called_once_with(name)
-                for index in range(2 + len(names), 8):
+                for index in range(2 + len(names), 7):
                     fields[f"_txtNAME{index}"].clear.assert_called_once()
                     fields[f"_txtNAME{index}"].send_keys.assert_not_called()
+                fields["_txtNAME7"].clear.assert_called_once()
+                fields["_txtNAME7"].send_keys.assert_called_once_with("救護")
                 fields["_txtNAME8"].clear.assert_called_once()
-                fields["_txtNAME8"].send_keys.assert_called_once_with("救護")
+                fields["_txtNAME8"].send_keys.assert_called_once_with("救護2車")
 
     def test_external_popup_missing_eighth_field_stops_before_any_write(self) -> None:
         from selenium.common.exceptions import NoSuchElementException
@@ -4683,7 +4688,7 @@ try {
             module, "wait_for_popup_close_and_return_to_main"
         ), mock.patch.object(module, "accept_pending_alerts"), mock.patch.object(module.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "外勤設定儲存失敗"):
-                module.step_config_popups(driver, wait, ["勤務一"] * 6, "2", "main")
+                module.step_config_popups(driver, wait, ["勤務一"] * 5, "2", "main")
         for field in fields.values():
             field.clear.assert_not_called()
             field.send_keys.assert_not_called()
@@ -4695,7 +4700,7 @@ try {
         sheet = workbook.active
         sheet.title = "3號"
         sheet.cell(5, 3, "值班")
-        for column in range(4, 11):
+        for column in range(4, 10):
             sheet.cell(5, column, f"外勤{column - 3}")
         for column, label in ((11, "休息"), (12, "備勤緊急救護"), (14, "備勤救災"), (16, "指揮官")):
             sheet.cell(5, column, label)
@@ -4711,7 +4716,7 @@ try {
             result = module.start_automation("test-user", "test-password", "1151003", "test.xlsm", {},
                 error_callback=error, show_dialogs=False)
         self.assertFalse(result)
-        self.assertIn("外勤項目超過 6 項", error.call_args.args[0])
+        self.assertIn("外勤項目超過 5 項", error.call_args.args[0])
         build_driver.assert_not_called()
 
     def test_duty_sheet_matches_main_rest_header_and_keeps_extra_staff_on_standby(self) -> None:
@@ -4763,9 +4768,9 @@ try {
                 self.assertEqual({key: duty_map[key] for key in ("_pln_8_2", "_pln_8_3", "_pln_8_4")},
                     {"_pln_8_2": "17", "_pln_8_3": "18", "_pln_8_4": "19"})
                 self.assertEqual(duty_map["_pln_8_5"], "6,7")
-                self.assertEqual(duty_map["_pln_8_6"], "10,11,12,99,3")
-                self.assertEqual(duty_map["_pln_8_7"], "30")
-                self.assertNotIn("_pln_8_8", duty_map)
+                self.assertEqual(duty_map["_pln_8_6"], "10,11")
+                self.assertEqual(duty_map["_pln_8_7"], "12,99,3")
+                self.assertEqual(duty_map["_pln_8_8"], "30")
                 mission_map = fill_mission.call_args.args[1]
                 fire_members = set((mission_map["_pln_8_1"] + "," + mission_map["_pln_8_2"]).split(","))
                 self.assertEqual(fire_members, {"10", "11", "12", "99", "3"})
@@ -4833,8 +4838,8 @@ try {
                 duty_map = fill_duty.call_args.args[1]
                 mission_map = fill_mission.call_args.args[1]
                 for hour in range(24):
-                    self.assertEqual([duty_map[f"_pln_{hour}_{column}"] for column in range(1, 6)],
-                        ["20", "31", "16,28,24", "8,9,10,11,12,2", "30"])
+                    self.assertEqual([duty_map[f"_pln_{hour}_{column}"] for column in range(1, 7)],
+                        ["20", "31", "16,28,24", "8,9", "10,11,12,2", "30"])
                     self.assertEqual(mission_map[f"_pln_{hour}_6"], "16,28,24")
                 for payload in (duty_map, mission_map):
                     assigned = {number for key, value in payload.items() if key.startswith("_pln_")
@@ -7549,6 +7554,270 @@ if ($record.close_failure) {{ throw 'Stale failure contaminated a successful upd
         self.assertEqual(len(refreshes), 1)
         self.assertEqual(refreshes[0][0], "1150716")
         self.assertEqual(len(scheduled), 2)
+
+
+class DutyAmbulanceSplitTests(unittest.TestCase):
+    def _payloads(self, standby, commander, external, ambulance=None):
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "24號"
+        ambulance = ambulance if ambulance is not None else ["16", "28", "1"]
+        for column, label in {3: "值班", 4: "外勤", 5: "休息", 6: "備勤緊急救護", 10: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 14, "指揮官")
+        for row in range(10, 34):
+            hour = (row - 2) % 24
+            values = {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20", 4: ",".join(external),
+                5: "30", 6: ambulance[0], 7: ",".join(ambulance[1:]),
+                11: ",".join(standby), 14: ",".join(commander)}
+            for column, value in values.items():
+                sheet.cell(row, column, value)
+        normal_staff = list(dict.fromkeys(["20", "30"] + ambulance + standby + commander + external))
+        driver = mock.Mock()
+        driver.execute_script.return_value = False
+        error = mock.Mock()
+        def use_mock_browser(_open_browser, verify, **_kwargs):
+            verify(driver)
+            return driver
+        with ExitStack() as stack:
+            for name, options in {
+                "ThreadPoolExecutor": {}, "log_status": {},
+                "retry_duty_number_popup_preflight": {"side_effect": use_mock_browser},
+                "preflight_duty_number_popup": {"return_value": "main"},
+                "step_config_popups": {}, "wait_for_duty_result_grid": {"return_value": True},
+                "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
+                "trainee_numbers_from_workbook": {"return_value": set()},
+                "expected_on_duty_numbers_from_daily_sheet": {"return_value": normal_staff},
+                "build_driver": {"side_effect": AssertionError("測試不得啟動真實瀏覽器")},
+            }.items():
+                stack.enter_context(mock.patch.object(module, name, **options))
+            stack.enter_context(mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook))
+            stack.enter_context(mock.patch.object(module.time, "sleep"))
+            fill_duty = stack.enter_context(mock.patch.object(module, "step_batch_fill_duty"))
+            fill_mission = stack.enter_context(mock.patch.object(module, "step_fill_mission_cells",
+                side_effect=RuntimeError("offline-stop-before-save")))
+            result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                error_callback=error, show_dialogs=False)
+        self.assertFalse(result)
+        error.assert_called_once_with("offline-stop-before-save")
+        return fill_duty.call_args.args[1], fill_mission.call_args.args[1], sheet
+
+    def test_duty_and_mission_use_distinct_ambulance2_fallbacks(self):
+        for standby, commander, external, expected_duty, expected_mission, remaining in (
+            (["9", "8", "10"], ["2"], ["31"], "9,8", "9,8", "10,2"),
+            (["8"], ["2"], ["31"], "8,2", "8,2", ""),
+            ([], ["2"], ["31", "32"], "", "2,31", "2"),
+        ):
+            with self.subTest(standby=standby):
+                duty, mission, sheet = self._payloads(standby, commander, external)
+                for hour in range(24):
+                    self.assertEqual(duty[f"_pln_{hour}_3"], "16,28,1")
+                    self.assertEqual(duty[f"_pln_{hour}_4"], expected_duty)
+                    self.assertEqual(duty[f"_pln_{hour}_5"], remaining)
+                    self.assertEqual(duty[f"_pln_{hour}_6"], "30")
+                    self.assertEqual(mission[f"_pln_{hour}_6"], "16,28,1")
+                    self.assertEqual(mission[f"_pln_{hour}_7"], expected_mission)
+                    all_duty_members = [no for column in range(1, 7)
+                        for no in duty[f"_pln_{hour}_{column}"].split(",") if no]
+                    self.assertEqual(len(all_duty_members), len(set(all_duty_members)))
+                    self.assertTrue(set(mission[f"_pln_{hour}_6"].split(",")).isdisjoint(
+                        mission[f"_pln_{hour}_7"].split(",")))
+                    self.assertTrue(set(mission[f"_pln_{hour}_1"].split(",")).isdisjoint(
+                        mission[f"_pln_{hour}_2"].split(",")))
+                self.assertEqual(sheet.cell(10, 11).value, ",".join(standby))
+                self.assertEqual(sheet.cell(10, 14).value, ",".join(commander))
+
+    def test_duty_single_candidate_returns_to_standby_without_external_staff(self):
+        module = legacy_duty_sheet_module()
+        self.assertEqual(module.select_duty_ambulance2_members(["16"], ["2"], ["16", "28", "1"]), [])
+        self.assertEqual(module.select_duty_ambulance2_members(["8", "8"], ["8"], ["16", "28", "1"]), [])
+        self.assertEqual(module.select_duty_ambulance2_members(["9", "8"], ["2"], ["16", "28", "1"]), ["9", "8"])
+
+    def test_mission_shortage_after_external_candidates_stops_before_writes(self):
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "24號"
+        for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 13, "指揮官")
+        for row in range(10, 34):
+            hour = (row - 2) % 24
+            for column, value in {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20", 4: "30",
+                5: "16", 6: "28", 13: "2"}.items():
+                sheet.cell(row, column, value)
+        error = mock.Mock()
+        with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+            module, "expected_on_duty_numbers_from_daily_sheet", return_value=["20", "30", "16", "28", "2"]
+        ), mock.patch.object(module, "ThreadPoolExecutor", side_effect=AssertionError("不得啟動截圖")) as capture, mock.patch.object(
+            module, "build_driver", side_effect=AssertionError("不得啟動瀏覽器")
+        ) as browser, mock.patch.object(module, "log_status"):
+            result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                error_callback=error, show_dialogs=False)
+        self.assertFalse(result)
+        self.assertIn("救災任務編組表救護2車", error.call_args.args[0])
+        self.assertIn("外勤", error.call_args.args[0])
+        capture.assert_not_called()
+        browser.assert_not_called()
+
+    def _schedule(self, split):
+        module = duty_rehearsal_module()
+        rows = []
+        for offset in range(24):
+            hour = (8 + offset) % 24
+            columns = {"值班": ["10" if hour in (8, 9) else "11"], "救護": ["6", "7", "8"],
+                "備勤": ["2", "3", "4"], "休息": [], "防溺車巡": []}
+            if hour in (12, 13):
+                columns["備勤"].remove("2")
+                columns["休息"] = ["2"]
+            if hour in (16, 17):
+                columns["備勤"].remove("4")
+                columns["防溺車巡"] = ["4"]
+            if split:
+                selected = columns["備勤"][:2] if len(columns["備勤"]) >= 2 else []
+                columns["救護2車"] = selected
+                columns["備勤"] = [no for no in columns["備勤"] if no not in selected]
+            rows.append(module.DutyRow(f"{hour:02d}-{(hour + 1) % 24:02d}", columns))
+        return module.DutySheet(roc_date="1151024", rows=rows,
+            summary={"在勤": ["2", "3", "4", "6", "7", "8", "10", "11"]})
+
+    def test_rescue_split_preserves_all_scheduled_actions(self):
+        module = duty_rehearsal_module()
+        with mock.patch.object(module, "load_work_log_defaults", return_value=dict(module.DEFAULT_WORK_LOG_DEFAULTS)):
+            before = module.planned_actions(self._schedule(False), None, [], module.parse_roc_date("1151024"))
+            after = module.planned_actions(self._schedule(True), None, [], module.parse_roc_date("1151024"))
+        self.assertEqual([vars(action) for action in after], [vars(action) for action in before])
+        self.assertFalse(any(action.source.startswith("外勤") and
+            "救護2車" in action.duplicate_key for action in after))
+        self.assertTrue(any(action.source == "外勤簽出" and action.target == "4" for action in after))
+        training = [action for action in after if action.source == "在隊訓練"]
+        self.assertEqual(len(training), 3)
+        for action in training:
+            expected = {"2", "3", "4", "6", "7", "8"}
+            if action.time == "17:00":
+                expected.remove("4")
+            self.assertEqual(set(action.fields["服勤人員"]), expected)
+
+    def test_rescue2_before_rest_is_not_an_external_route(self):
+        module = duty_rehearsal_module()
+        self.assertFalse(module.rest_is_external_route(self._schedule(True), "2", 12, 14))
+
+    def _stale_ambulance_cache(self):
+        module = duty_rehearsal_module()
+        sheet = self._schedule(True)
+        with mock.patch.object(module, "load_work_log_defaults", return_value=dict(module.DEFAULT_WORK_LOG_DEFAULTS)):
+            actions = [asdict(action) for action in module.planned_actions(
+                sheet, None, [], module.parse_roc_date(sheet.roc_date))]
+        completed_key = next(action["duplicate_key"] for action in actions if action["source"] == "在隊訓練")
+        for action in actions:
+            if action["source"] == "在隊訓練":
+                action["target"] = "6,7,8"
+                action["fields"]["服勤人員"] = ["6", "7", "8"]
+                action["audit_note"] = "保留既有紀錄"
+        actions.append({"kind": "entry_log", "time": "08:00", "actor": "10", "target": "2",
+            "fields": {"出或入": "出", "領用事由及地點": "救護2車"}, "source": "外勤簽出",
+            "duplicate_key": "entry:2026-10-24:8:out:2:救護2車", "date_offset": 0})
+        return {"target_date": sheet.roc_date, "today": asdict(sheet), "actions": actions,
+            "completed_keys": [completed_key]}, completed_key
+
+    def _assert_refreshed_cache(self, payload, completed_key):
+        actions = payload["actions"]
+        self.assertFalse(any(action.get("source", "").startswith("外勤") and
+            "救護2車" in action.get("duplicate_key", "") for action in actions))
+        training = next(action for action in actions if action.get("duplicate_key") == completed_key)
+        self.assertEqual(set(training["fields"]["服勤人員"]), {"2", "3", "4", "6", "7", "8"})
+        self.assertEqual(training["audit_note"], "保留既有紀錄")
+        self.assertEqual(payload["completed_keys"], [completed_key])
+        self.assertEqual(len({action["duplicate_key"] for action in actions}), len(actions))
+
+    def test_repository_rebuilds_stale_rescue2_actions_without_overwriting_cache(self):
+        duty_rehearsal_module()
+        from app_core.schedule_repository import ScheduleRepository
+        payload, completed_key = self._stale_ambulance_cache()
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScheduleRepository(Path(directory))
+            path = repository.schedule_path(payload["target_date"])
+            path.parent.mkdir(parents=True)
+            original = json.dumps(payload, ensure_ascii=False)
+            path.write_text(original, encoding="utf-8")
+            snapshot = repository.load_for_date(payload["target_date"])
+            self._assert_refreshed_cache(snapshot.data, completed_key)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            legacy_payload = {"target_date": payload["target_date"],
+                "today": asdict(self._schedule(False)), "actions": []}
+            path.write_text(json.dumps(legacy_payload, ensure_ascii=False), encoding="utf-8")
+            with mock.patch("builtins.__import__", wraps=__import__) as imports:
+                legacy_snapshot = repository.load_for_date(payload["target_date"])
+            self.assertEqual(legacy_snapshot.data["actions"], [])
+            self.assertFalse(any(call.args[0] == "duty_rehearsal" for call in imports.call_args_list))
+
+    def test_legacy_cache_refresh_removes_false_departures_and_keeps_completion_keys(self):
+        module = duty_gui_module()
+        payload, completed_key = self._stale_ambulance_cache()
+        module.DutyGui.ensure_schedule_actions(object(), payload)
+        self._assert_refreshed_cache(payload, completed_key)
+
+    def test_duty_fill_explicitly_clears_an_unstaffed_rescue2_cell(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the isolated browser-script contract")
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        module.step_batch_fill_duty(driver, {"_pln_8_4": ""})
+        script, payload = driver.execute_script.call_args.args
+        harness = """
+const cell = {value:'2', focus(){}, dispatchEvent(){}};
+global.window = {top:{document:{getElementById(){return cell;}}, frames:[], alert(){}, confirm(){}}};
+global.Event = class Event {};
+const count = new Function(SCRIPT)(PAYLOAD);
+if (cell.value !== '' || count !== 1) throw new Error('Unstaffed ambulance cell was not cleared');
+""".replace("SCRIPT", json.dumps(script)).replace("PAYLOAD", json.dumps(payload))
+        result = subprocess.run([node, "-e", harness], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_query_reads_old_and_split_headers_and_rejects_missing_header(self):
+        from selenium.common.exceptions import JavascriptException
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the isolated browser-script contract")
+        module = duty_rehearsal_module()
+        for split, missing_header in ((False, False), (True, False), (True, True)):
+            with self.subTest(split=split, missing_header=missing_header):
+                header = ["時段", "值班", "外勤1", "救護"] + (["救護2車"] if split else []) + ["備勤", "休息", "檢核欄"]
+                matrix = [] if missing_header else [header]
+                for offset in range(24):
+                    hour = (8 + offset) % 24
+                    matrix.append([f"{hour}-{(hour + 1) % 24}", "10", "11", "6,7"]
+                        + (["2,3"] if split else []) + ["4" if split else "2,3,4", "12", ""])
+                def execute(script, *args):
+                    harness = """
+const trs = MATRIX.map(values => ({children:values.map(value => ({innerText:value, querySelectorAll(){return [];}}))}));
+const table = {className:'report_list1', querySelectorAll(){return trs;}};
+global.document = {body:{innerText:''}, querySelectorAll(){return [table];}, getElementById(){return null;}};
+global.window = {getComputedStyle(){return {display:'block'};}};
+console.log(JSON.stringify(new Function(SCRIPT)(TARGET)));
+""".replace("MATRIX", json.dumps(matrix)).replace("SCRIPT", json.dumps(script)).replace("TARGET", json.dumps(args[0]))
+                    result = subprocess.run([node, "-e", harness], capture_output=True, text=True,
+                        encoding="utf-8", check=False)
+                    if result.returncode:
+                        raise JavascriptException(result.stderr)
+                    return json.loads(result.stdout)
+                driver = mock.Mock()
+                driver.execute_script.side_effect = execute
+                with mock.patch.object(module, "open_ap"), mock.patch.object(module, "WebDriverWait"), mock.patch.object(
+                    module, "suppress_window_open_for_background_query"
+                ), mock.patch.object(module, "js_set", return_value=True), mock.patch.object(module, "js_click", return_value=True):
+                    if missing_header:
+                        with self.assertRaisesRegex(JavascriptException, "勤務表缺少.*標題"):
+                            module.query_duty_sheet(driver, "1151024")
+                    else:
+                        sheet = module.query_duty_sheet(driver, "1151024")
+                        self.assertEqual(len(sheet.rows), 24)
+                        self.assertEqual(sheet.rows[0].columns["救護"], ["6", "7"])
+                        self.assertEqual(sheet.rows[0].columns["休息"], ["12"])
+                        if split:
+                            self.assertEqual(sheet.rows[0].columns["救護2車"], ["2", "3"])
 
 
 if __name__ == "__main__":

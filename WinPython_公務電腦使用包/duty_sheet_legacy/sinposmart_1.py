@@ -838,6 +838,28 @@ def unique_member_ids(member_ids):
     return list(dict.fromkeys(str(member).strip() for member in member_ids if str(member).strip()))
 
 
+def read_duty_row_crews(sheet, row, ex_map, excluded_numbers):
+    """保留 Excel 原順序，分別讀取救護、備勤救災與同時段指揮官。"""
+    ambulance1 = []
+    for col in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
+        ambulance1.extend(clean_to_list_excluding(get_merged_val(sheet, row, col), excluded_numbers))
+    standby = []
+    for col in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"]):
+        standby.extend(clean_to_list_excluding(get_merged_val(sheet, row, col), excluded_numbers))
+    commander = clean_to_list_excluding(
+        get_merged_val(sheet, row, ex_map["指揮官"]), excluded_numbers
+    )
+    return unique_member_ids(ambulance1), unique_member_ids(standby), unique_member_ids(commander)
+
+
+def select_duty_ambulance2_members(standby_ids, commander_ids, ambulance1_ids):
+    """勤務表只用備勤與指揮官湊足兩人，不足時整組退回備勤。"""
+    ambulance1 = set(unique_member_ids(ambulance1_ids))
+    candidates = unique_member_ids(list(standby_ids) + list(commander_ids))
+    selected = [member for member in candidates if member not in ambulance1][:2]
+    return selected if len(selected) == 2 else []
+
+
 def select_ambulance2_members(standby_ids, out_ids, ambulance1_ids):
     """救護車 2 優先取備勤，不足時取同時段外勤，且不得與救護車 1 重複。"""
     ambulance1 = set(unique_member_ids(ambulance1_ids))
@@ -1547,6 +1569,8 @@ def save_duty_number_popup(driver, wait, daily_commander, main_window):
 
 
 def step_config_popups(driver, wait, out_duty_names, daily_commander, main_window):
+    if len(out_duty_names) > 5:
+        raise RuntimeError("外勤項目超過 5 項，無法對應勤務設定第 2–6 欄，已停止登打。")
     # --- 1. 設定勤務番號 ---
     log_status("➡️ 正在設定勤務番號...")
     save_duty_number_popup(driver, wait, daily_commander, main_window)
@@ -1574,7 +1598,7 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
                     i: wait.until(EC.presence_of_element_located((By.ID, f"_txtNAME{i}")))
                     for i in range(2, 9)
                 }
-                for i in range(2, 8):
+                for i in range(2, 7):
                     inp = item_inputs[i]
                     inp.clear()
                     if (i-2) < len(out_duty_names):
@@ -1584,8 +1608,10 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
                             log_status(f"外勤項目超過 12 個中文字限制，已截短：{task_name}")
                         inp.send_keys(task_name)
 
+                item_inputs[7].clear()
+                item_inputs[7].send_keys("救護")
                 item_inputs[8].clear()
-                item_inputs[8].send_keys("救護")
+                item_inputs[8].send_keys("救護2車")
 
                 time.sleep(0.5)
                 driver.find_element(By.ID, "_btnSave").click()
@@ -1669,7 +1695,7 @@ def step_batch_fill_duty(driver, duty_map):
         var count = 0;
         for (var id in data) {
             var el = win.document.getElementById(id);
-            if (el && data[id] !== "") {
+            if (el) {
                 el.focus(); el.value = data[id];
                 el.dispatchEvent(new Event('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
@@ -1864,16 +1890,30 @@ def start_automation(
     num_out = len(out_names)
     web_idx = {
         "值班": 1, "外勤開始": 2, 
-        "救護": 2 + num_out, "備勤": 2 + num_out + 1, "休息": 2 + num_out + 2
+        "救護": 2 + num_out, "救護2車": 3 + num_out,
+        "備勤": 4 + num_out, "休息": 5 + num_out
     }
 
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
     report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
-    if num_out > 6:
-        preflight_issues.append(f"{sheet.title}：外勤項目超過 6 項，無法對應勤務設定第 2–7 欄，已停止登打。")
+    if num_out > 5:
+        preflight_issues.append(f"{sheet.title}：外勤項目超過 5 項，無法對應勤務設定第 2–6 欄，已停止登打。")
     if not daily_standby_numbers:
         preflight_issues.append(f"{sheet.title}：找不到輪休基準表或每日備勤名單的正常上班人員，無法比對勤務番號維護休假別。")
+    for row in range(10, 34):
+        time_cell = str(sheet.cell(row=row, column=ex_map["時間"]).value or "").strip()
+        if "-" not in time_cell:
+            continue
+        ambulance1, standby, commanders = read_duty_row_crews(sheet, row, ex_map, excluded_numbers)
+        external = []
+        for col in out_excel_cols:
+            external.extend(clean_to_list_excluding(get_merged_val(sheet, row, col), excluded_numbers))
+        mission_ambulance2 = select_ambulance2_members(standby + commanders, external, ambulance1)
+        if len(mission_ambulance2) < 2:
+            preflight_issues.append(
+                f"{sheet.title} {time_cell}：救災任務編組表救護2車的合格備勤與同時段外勤不足2人，已停止登打。"
+            )
     if preflight_issues:
         preflight_message = format_daily_sheet_preflight_message(preflight_issues)
         log_status(f"❌ 勤務表檢查未通過，共 {len(preflight_issues)} 項，已停止登打")
@@ -1988,14 +2028,13 @@ def start_automation(
                 for i, col_idx in enumerate(out_excel_cols):
                     duty_map[f"_pln_{hour}_{web_idx['外勤開始'] + i}"] = clean_v_excluding(get_merged_val(sheet, r, col_idx), excluded_numbers)
                 
-                med_v = clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]), excluded_numbers) + "," + clean_v_excluding(get_merged_val(sheet, r, ex_map["救護_Excel"]+1), excluded_numbers)
-                duty_map[f"_pln_{hour}_{web_idx['救護']}"] = med_v.strip(',')
-                
-                dis_v = ""
-                for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
-                    val = clean_v_excluding(get_merged_val(sheet, r, c), excluded_numbers)
-                    if val: dis_v += str(val) + ","
-                duty_map[f"_pln_{hour}_{web_idx['備勤']}"] = dis_v.strip(',')
+                amb1_members, standby_ids, commander_ids = read_duty_row_crews(sheet, r, ex_map, excluded_numbers)
+                amb2_members = select_duty_ambulance2_members(standby_ids, commander_ids, amb1_members)
+                remaining_standby = [member for member in unique_member_ids(standby_ids + commander_ids)
+                    if member not in amb2_members]
+                duty_map[f"_pln_{hour}_{web_idx['救護']}"] = ",".join(amb1_members)
+                duty_map[f"_pln_{hour}_{web_idx['救護2車']}"] = ",".join(amb2_members)
+                duty_map[f"_pln_{hour}_{web_idx['備勤']}"] = ",".join(remaining_standby)
                 duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["休息_Excel"]), excluded_numbers)
 
             team_tra_val = str(sheet["C35"].value or "").strip()
@@ -2066,18 +2105,8 @@ def start_automation(
                 if "-" not in time_cell: continue
                 hour = str(int(time_cell.split("-")[0].strip()))
                 
-                amb1_members = []
-                for c in range(ex_map["救護_Excel"], ex_map["備勤_Excel"]):
-                    amb1_members.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
-                amb1_members = unique_member_ids(amb1_members)
-                
-                disaster_ids = []
-                for c in range(ex_map["備勤_Excel"] + 1, ex_map["指揮官"] + 1):
-                    disaster_ids.extend(clean_to_list_excluding(get_merged_val(sheet, r, c), excluded_numbers))
-                disaster_ids = unique_member_ids(disaster_ids)
-                commander_ids = clean_to_list_excluding(
-                    get_merged_val(sheet, r, ex_map["指揮官"]), excluded_numbers
-                )
+                amb1_members, standby_ids, commander_ids = read_duty_row_crews(sheet, r, ex_map, excluded_numbers)
+                disaster_ids = unique_member_ids(standby_ids + commander_ids)
                 row_commander = commander_ids[0] if commander_ids else ""
                 out_ids = []
                 for col_idx in out_excel_cols:

@@ -154,6 +154,7 @@ from duty_rehearsal import (
     login,
     parse_roc_date,
     planned_actions,
+    refresh_ambulance_schedule_actions,
     query_cases,
     query_duty_sheet,
     query_visible_table,
@@ -1832,6 +1833,7 @@ class DutyGui(ctk.CTk):
             target_date = parse_roc_date(target_roc_date)
         except ValueError:
             return
+        refresh_ambulance_schedule_actions(data)
 
         def sheet_from_payload(key: str) -> DutySheet:
             payload = data.get(key, {}) or {}

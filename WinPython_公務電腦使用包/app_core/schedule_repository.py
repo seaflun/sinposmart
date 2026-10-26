@@ -130,6 +130,19 @@ class ScheduleRepository:
         if expected_target_date and payload_target and payload_target != expected_target_date:
             raise ScheduleLoadError(f"排程日期不一致：{path.name}")
         payload["target_date"] = target_roc_date
+        if any(
+            isinstance(sheet, dict) and any(
+                isinstance(row, dict) and "救護2車" in (row.get("columns") or {})
+                for row in sheet.get("rows", [])
+            )
+            for sheet in (payload.get("today"), payload.get("yesterday"), payload.get("tomorrow"))
+        ):
+            from duty_rehearsal import refresh_ambulance_schedule_actions
+            try:
+                refresh_ambulance_schedule_actions(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ScheduleLoadError(f"救護勤務排程無法重建：{path.name}") from exc
+        actions = payload["actions"]
         comparison_data = {
             action_date: self._load_comparison_data(action_date)
             for action_date in comparison_dates(actions, payload["target_date"])

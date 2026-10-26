@@ -8078,7 +8078,8 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           }
           const cell = text => ({innerText:text, querySelectorAll:()=>[]});
           const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
-          const schedule = table(Array.from({length:24}, (_,i)=>[`${(i+8)%24}~${(i+9)%24}`, '1', '']));
+          const schedule = table([['時段', '值班', '救護'],
+            ...Array.from({length:24}, (_,i)=>[`${(i+8)%24}~${(i+9)%24}`, '1', ''])]);
           const staff = table(rows);
           const tables = [schedule, staff];
           if (change === 'two-tables') tables.push(table(rows));
@@ -8150,8 +8151,9 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
           if (change === 'unnamed-trainee') rows[4][7].text = '';
           const cell = value => ({innerText:value.text, colSpan:value.colSpan, rowSpan:value.rowSpan, querySelectorAll:()=>[]});
           const table = matrix => ({className:'report_list1', querySelectorAll:()=>matrix.map(row=>({children:row.map(cell)}))});
-          const schedule = table(Array.from({length:24}, (_,i)=>[
-            {text:`${(i+8)%24}~${(i+9)%24}`}, {text:'1'}, {text:''}]));
+          const schedule = table([['時段', '值班', '救護'].map(text=>({text})),
+            ...Array.from({length:24}, (_,i)=>[
+              {text:`${(i+8)%24}~${(i+9)%24}`}, {text:'1'}, {text:''}])]);
           const staff = table(rows), tables = [schedule, staff];
           if (change === 'class') staff.className = 'other';
           if (change === 'two-tables') tables.push(table(rows));
@@ -22028,6 +22030,41 @@ if return_code != 0 or loaded:
             self.assertNotIn(1, controller._executed_indices)
         finally:
             controller.shutdown()
+
+    def test_rescue2_cache_rebuild_preserves_completed_training(self) -> None:
+        from dataclasses import asdict
+        from unittest.mock import patch
+        import duty_rehearsal as planner
+        from qt_app.controllers.duty_controller import DutyController
+
+        columns = {"值班": ["10"], "救護": ["6", "7"], "救護2車": ["2", "3"], "備勤": ["4"]}
+        today = planner.DutySheet(roc_date="1151024",
+            rows=[planner.DutyRow("08-24", columns), planner.DutyRow("00-08", columns)],
+            summary={"在勤": ["2", "3", "4", "6", "7", "10"]})
+        with patch.object(planner, "load_work_log_defaults", return_value=dict(planner.DEFAULT_WORK_LOG_DEFAULTS)):
+            actions = [asdict(action) for action in planner.planned_actions(
+                today, None, [], planner.parse_roc_date(today.roc_date))]
+            completed_index = next(index for index, action in enumerate(actions)
+                if action["source"] == "在隊訓練" and action["time"] == "12:00")
+            completed_key = actions[completed_index]["duplicate_key"]
+            actions[completed_index]["fields"]["服勤人員"] = ["6", "7"]
+            actions[completed_index]["target"] = "6,7"
+            data = {"target_date": today.roc_date, "today": asdict(today), "actions": actions}
+            controller = DutyController()
+            controller.set_actor_no("10")
+            try:
+                controller.replace_schedule_data(data)
+                controller.handle_submission_result(completed_index, "submitted", "完成", "result.json")
+                planner.refresh_ambulance_schedule_actions(data)
+                controller.replace_schedule_data(data)
+                new_index = next(index for index, action in enumerate(controller._actions)
+                    if action["duplicate_key"] == completed_key)
+                self.assertEqual(set(controller._actions[new_index]["fields"]["服勤人員"]),
+                    {"2", "3", "4", "6", "7"})
+                self.assertIn(new_index, controller._executed_indices)
+                self.assertEqual(controller._comparisons[new_index]["group"], "done")
+            finally:
+                controller.shutdown()
 
     def test_manual_submission_includes_external_review_task(self) -> None:
         from PySide6.QtTest import QSignalSpy

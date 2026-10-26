@@ -112,6 +112,8 @@ TRAINING_REASON = {
     "器材車、化學(處理)車": "裝備器材保養",
 }
 
+NON_EXTERNAL_DUTY_COLUMNS = {"值班", "救護", "救護2車", "備勤", "休息", "檢核欄"}
+
 
 # Data models
 
@@ -1851,7 +1853,7 @@ def query_duty_sheet(driver: webdriver.Chrome, target_roc_date: str) -> DutyShee
               }
             }
             if (!header.length) {
-              header = ['時段', '值班', '外勤1', '救護', '備勤', '休息', '檢核欄'];
+              throw new Error('勤務表缺少時段欄位標題，無法安全對應救護與救護2車。');
             }
             for (const row of matrix) {
               if (row.length < 3) continue;
@@ -2642,8 +2644,7 @@ def rest_blocks(sheet: DutySheet, next_sheet: DutySheet | None = None) -> list[t
 
 
 def external_columns(row: DutyRow) -> dict[str, list[str]]:
-    ignore = {"值班", "救護", "備勤", "休息", "檢核欄"}
-    return {column: values for column, values in row.columns.items() if column not in ignore}
+    return {column: values for column, values in row.columns.items() if column not in NON_EXTERNAL_DUTY_COLUMNS}
 
 
 def has_external_duty(row: DutyRow | None, no: str) -> bool:
@@ -3355,11 +3356,12 @@ def planned_actions(
         actor = duty_actor_at(today, yesterday, actor_hour)
         end_hour = int(work_time[:2])
         probe_hour = end_hour - 1 if end_hour != 12 else 11
-        attendees = set(people_at(today, probe_hour, "救護")) | set(people_at(today, probe_hour, "備勤"))
+        attendees = (set(people_at(today, probe_hour, "救護"))
+            | set(people_at(today, probe_hour, "救護2車")) | set(people_at(today, probe_hour, "備勤")))
         attendees -= set(people_at(today, probe_hour, "值班"))
         attendees -= set(people_at(today, probe_hour, "休息"))
         for key in today.rows[0].columns.keys() if today.rows else []:
-            if key not in ("值班", "救護", "備勤", "休息", "檢核欄") and key:
+            if key not in NON_EXTERNAL_DUTY_COLUMNS and key:
                 attendees -= set(people_at(today, probe_hour, key))
         description, status = training_template(topic, time_range, instructor)
         if actor:
@@ -3414,6 +3416,63 @@ def planned_actions(
     # Keep insertion order inside the same minute after applying the required
     # entry sequence: 外勤入, 休息入, 值退, 值班, 到勤, 外勤出, 休息出.
     return [action for _, action in sorted(enumerate(actions), key=sort_key)]
+
+
+def refresh_ambulance_schedule_actions(data: dict[str, Any]) -> None:
+    """重建含救護2車的快取分類，保留完成識別與其他獨立任務。"""
+    if not any(
+        isinstance(sheet, dict) and any(
+            isinstance(row, dict) and "救護2車" in (row.get("columns") or {})
+            for row in sheet.get("rows", [])
+        )
+        for sheet in (data.get("today"), data.get("yesterday"), data.get("tomorrow"))
+    ):
+        return
+    target = parse_roc_date(str(data.get("target_date", "") or ""))
+
+    def sheet_from_payload(key: str) -> DutySheet:
+        payload = data.get(key) or {}
+        return DutySheet(
+            roc_date=str(payload.get("roc_date", "") or ""),
+            unit=str(payload.get("unit", "") or ""),
+            rows=[DutyRow(str(row.get("slot", "") or ""), {
+                str(name): [str(value) for value in values]
+                for name, values in (row.get("columns") or {}).items() if isinstance(values, list)
+            }) for row in payload.get("rows", [])],
+            summary={str(name): [str(value) for value in values]
+                for name, values in (payload.get("summary") or {}).items() if isinstance(values, list)},
+            staff=payload.get("staff") or {},
+            staff_complete=bool(payload.get("staff_complete", False)),
+        )
+
+    def cases_from_payload(key: str) -> list[CaseRecord]:
+        return [CaseRecord(
+            report_time=str(item.get("report_time", "") or ""),
+            return_time=str(item.get("return_time", "") or ""),
+            category=str(item.get("category", "") or ""),
+            raw=[str(value) for value in item.get("raw", [])],
+            personnel_count=int(item.get("personnel_count", 0) or 0),
+        ) for item in data.get(key, []) or [] if isinstance(item, dict)]
+
+    generated = planned_actions(
+        sheet_from_payload("today"), sheet_from_payload("yesterday"), cases_from_payload("cases"),
+        target, cases_from_payload("yesterday_cases"),
+        sheet_from_payload("tomorrow") if data.get("tomorrow") else None,
+    )
+    existing = [action for action in data.get("actions", []) if isinstance(action, dict)]
+    by_key = {str(action.get("duplicate_key", "")): action for action in existing
+        if action.get("duplicate_key")}
+    refreshed_sources = {"外勤簽出", "外勤簽入", "休息簽出", "休息結束", "休息後退勤", "在隊訓練"}
+    actions = []
+    generated_keys = set()
+    for action in generated:
+        payload = asdict(action)
+        previous = by_key.get(action.duplicate_key, {})
+        actions.append({**previous, **payload} if action.source in refreshed_sources else previous or payload)
+        generated_keys.add(action.duplicate_key)
+    actions.extend(action for action in existing if action.get("source") not in refreshed_sources
+        and action.get("duplicate_key") not in generated_keys)
+    data["actions"] = actions
 
 
 # CLI helpers
