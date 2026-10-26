@@ -16,6 +16,7 @@ from app_core.notice_collection_service import (
     NoticeLoginRequired,
     current_shift,
     next_check_at,
+    notice_responsibility_key,
 )
 from app_core.schedule_repository import business_roc_date
 
@@ -93,6 +94,8 @@ class NoticeCollectionController(QObject):
         self._status_text = ""
         self._status_tone = "muted"
         self._shift_text = "值班時段待取得"
+        self._reminder_duty_key = ""
+        self._has_shift_notices = False
         self._notice = ""
         self._verification_status = "尚未驗證通報帳號。"
         self._verification_state = "configured"
@@ -120,6 +123,10 @@ class NoticeCollectionController(QObject):
     @Property(bool, notify=stateChanged)
     def isRunning(self) -> bool:
         return self._job is not None
+
+    @Property(bool, notify=stateChanged)
+    def hasShiftNotices(self) -> bool:
+        return self._has_shift_notices
 
     @Property(str, notify=stateChanged)
     def activityLabel(self) -> str:
@@ -187,6 +194,21 @@ class NoticeCollectionController(QObject):
 
     def _refresh_status(self) -> None:
         now = self._now()
+        had_notices = self._has_shift_notices
+        try:
+            responsibility = self._responsibility_provider(now) if self._responsibility_provider else None
+        except Exception:
+            responsibility = None
+        duty_key = notice_responsibility_key(responsibility)
+        if duty_key:
+            if duty_key != self._reminder_duty_key:
+                self._reminder_duty_key = duty_key
+                self._has_shift_notices = False
+            try:
+                if self._service.has_notices_for_responsibility(responsibility) is True:
+                    self._has_shift_notices = True
+            except NoticeCollectionError:
+                pass  # A read failure cannot clear a reminder within the same confirmed duty.
         shift = current_shift(self._schedule_data, now)
         shift_text = shift.label if shift is not None else "值班時段待取得"
         try:
@@ -199,7 +221,8 @@ class NoticeCollectionController(QObject):
             text = "當班時段通報收取紀錄暫時無法讀取。"
         if self._notice and self._status_tone in {"warning", "error"}:
             text += f" {self._notice}"
-        changed = text != self._status_text or shift_text != self._shift_text
+        changed = (text != self._status_text or shift_text != self._shift_text
+                   or had_notices != self._has_shift_notices)
         self._status_text, self._shift_text = text, shift_text
         if changed:
             self.stateChanged.emit()

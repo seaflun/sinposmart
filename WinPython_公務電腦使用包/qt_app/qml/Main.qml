@@ -760,12 +760,38 @@ ApplicationWindow {
                 spacing: 8
 
                 Label {
+                    id: noticeCollectionTitle
                     Layout.preferredWidth: 58
                     Layout.minimumWidth: 58
                     Layout.alignment: Qt.AlignVCenter
                     text: "通報收取"
                     color: Design.blueHover
                     font.bold: true
+                    ToolTip.visible: noticeStatusHover.hovered
+                    ToolTip.text: noticeCollectionIndicator.statusDescription
+                    ToolTip.delay: 350
+
+                    HoverHandler {
+                        id: noticeStatusHover
+                    }
+
+                    Rectangle {
+                        id: noticeCollectionIndicator
+                        objectName: "noticeCollectionStatusDot"
+                        property string statusDescription: (window.backend.noticeCollectionController.hasShiftNotices
+                                                            ? "本班已收到通報；" : "")
+                                                           + window.backend.noticeCollectionController.activityLabel
+                        x: noticeCollectionTitle.implicitWidth + 1
+                        y: -1
+                        width: Design.statusDotSize
+                        height: width
+                        radius: width / 2
+                        color: window.backend.noticeCollectionController.hasShiftNotices ? Design.dangerFill
+                             : window.backend.noticeCollectionController.activityTone === "running" ? Design.successText
+                             : Design.blue
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: statusDescription
+                    }
                 }
 
                 Label {
@@ -783,12 +809,6 @@ ApplicationWindow {
                              ? Design.warningText : Design.text
                 }
 
-                DutyTaskStatusPill {
-                    objectName: "noticeCollectionActivityPill"
-                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    tone: window.backend.noticeCollectionController.activityTone
-                    statusText: window.backend.noticeCollectionController.activityLabel
-                }
             }
         }
 

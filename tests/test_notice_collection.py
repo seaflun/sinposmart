@@ -63,6 +63,49 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_shift_reminder_uses_confirmed_receipts_and_survives_restart(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",
+                 "role": "隊員", "capturedAt": "2026-10-21T09:00:00+08:00",
+                 "handoffSlotAt": "2026-10-21T08:00:00+08:00", "evidenceKey": "a" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser([notice(1)]),
+                poster=lambda payload: ({"status": "success", "existingKeys": [], "retryKeys": []}
+                    if payload["action"] == "checkExisting" else write_response(payload, ["1"])))
+            self.assertFalse(service.has_notices_for_responsibility(proof))
+            service.collect("synthetic", datetime(2026, 10, 21, 9), responsibility=proof)
+            restarted = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            self.assertTrue(restarted.has_notices_for_responsibility(proof))
+            self.assertFalse(restarted.has_notices_for_responsibility({**proof, "evidenceKey": "b" * 64}))
+            self.assertFalse(restarted.has_notices_for_responsibility({**proof, "status": "unknown"}))
+            restarted._state_error = True
+            with self.assertRaises(NoticeCollectionError):
+                restarted.has_notices_for_responsibility(proof)
+
+    def test_manual_reminder_belongs_to_first_observed_duty_and_excludes_older_publications(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",
+                 "role": "隊員", "capturedAt": "2026-10-21T09:00:00+08:00",
+                 "handoffSlotAt": "2026-10-21T08:00:00+08:00", "evidenceKey": "a" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            browser.recent_rows = [{**notice(1), "isUnread": False, "publishedAt": "2026-10-21T08:30:00+08:00"}]
+            service = NoticeCollectionService(Path(directory), browser=browser,
+                poster=lambda _payload: self.fail("manual observation must not write to Sheets"))
+            service.collect("synthetic", datetime(2026, 10, 21, 9), responsibility=proof)
+            self.assertTrue(service.has_notices_for_responsibility(proof))
+            following = {**proof, "capturedAt": "2026-10-21T10:00:00+08:00", "evidenceKey": "b" * 64}
+            service.collect("synthetic", datetime(2026, 10, 21, 10), responsibility=following)
+            restarted = NoticeCollectionService(Path(directory), browser=browser)
+            self.assertTrue(restarted.has_notices_for_responsibility(proof))
+            self.assertFalse(restarted.has_notices_for_responsibility(following))
+            browser.recent_rows = [{**notice(2), "isUnread": False, "publishedAt": "2026-10-21T07:00:00+08:00"}]
+            restarted.collect("synthetic", datetime(2026, 10, 21, 10), responsibility=following)
+            self.assertFalse(restarted.has_notices_for_responsibility(following))
+            report = restarted.report_parts("reminder-fixture", "success", datetime(2026, 10, 21, 10),
+                                            next_check=datetime(2026, 10, 21, 10, 3))[0]
+            self.assertNotIn("observed_duty_key", str(report))
+
     def test_responsibility_follows_confirmed_handoff_instead_of_the_clock(self):
         from app_core.notice_collection_service import confirmed_notice_responsibility
         actions = []

@@ -114,6 +114,7 @@ QtObject {
     readonly property int dutyTaskPeopleWidth: 84
     readonly property int taskStatusWidth: 96
     readonly property int taskStatusHeight: 28
+    readonly property int statusDotSize: 6
     readonly property int auditTaskComparisonWidth: 104
     readonly property int auditTaskTimeWidth: 82
     readonly property int auditTaskActorWidth: 70

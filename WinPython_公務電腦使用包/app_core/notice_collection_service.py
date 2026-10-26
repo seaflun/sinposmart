@@ -188,6 +188,18 @@ def _frozen_responsibility(value, received_at: datetime) -> dict:
                                       "capturedAt", "handoffSlotAt", "evidenceKey")}
 
 
+def notice_responsibility_key(value) -> str:
+    """Stable identity for a display reminder; it never authorizes signing."""
+    try:
+        proof = _frozen_responsibility(value, datetime.fromisoformat(value["capturedAt"]))
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if proof["status"] != "confirmed":
+        return ""
+    return "|".join((proof["actorNo"], _local_time(datetime.fromisoformat(proof["handoffSlotAt"])).isoformat(),
+                     proof["evidenceKey"]))
+
+
 def next_check_at(now: datetime) -> datetime:
     """Use clock-aligned periods; never schedule beyond the 08/22 boundary."""
     local = _local_time(now)
@@ -393,6 +405,12 @@ class NoticeCollectionService:
             manual[key] = {"subject": str(row.get("subject", ""))[:240], "published_at": published_at,
                 "published_date": published.astimezone(TAIPEI).date().isoformat(),
                 "observed_at": old.get("observed_at") or now.isoformat(timespec="seconds"), "read_state": "confirmed"}
+            duty_key = old.get("observed_duty_key", "")
+            if not old and notice_responsibility_key(self._responsibility):
+                if published >= datetime.fromisoformat(self._responsibility["handoffSlotAt"]):
+                    duty_key = notice_responsibility_key(self._responsibility)
+            if duty_key:
+                manual[key]["observed_duty_key"] = duty_key
         if state != self._state:
             self._persist(state)
         result = self.last_result
@@ -734,7 +752,8 @@ class NoticeCollectionService:
         }
         oldest_manual_day = (result.scan_from if result is not None and result.scan_scope == "publication_window"
                              else (now.date() - timedelta(days=2)).isoformat())
-        manual_records = [{"key": hashlib.sha256(key.encode("utf-8")).hexdigest(), **record}
+        manual_records = [{"key": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                           **{field: value for field, value in record.items() if field != "observed_duty_key"}}
             for key, record in sorted(self._state.get("manual", {}).items())
             if not self._state_error and key not in self._state["collected"]
             and oldest_manual_day <= record["published_date"] <= now.date().isoformat()]
@@ -834,6 +853,19 @@ class NoticeCollectionService:
         shift_count = (sum(_local_time(shift.start) <= value < _local_time(shift.end) for value in timestamps)
                        if shift is not None else 0)
         return shift_count, today
+
+    def has_notices_for_responsibility(self, responsibility) -> bool:
+        if self._state_error:
+            raise NoticeCollectionError("通報收取紀錄無法讀取，提醒暫時無法確認。")
+        duty_key = notice_responsibility_key(responsibility)
+        if not duty_key:
+            return False
+        return (any(key in self._state["collected"] and
+                    notice_responsibility_key(record.get("responsibility")) == duty_key
+                    for key, record in self._state.get("confirmed", {}).items())
+                or any(record.get("observed_duty_key") == duty_key
+                       for key, record in self._state.get("manual", {}).items()
+                       if key not in self._state["collected"]))
 
     def close(self) -> None:
         if self._browser is not None:

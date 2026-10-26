@@ -488,7 +488,7 @@ test('compact notes retain notice identity receipt and full signer without erasi
   assert.match(note, /1番 莊勝斌/);
   assert.equal(s.readNoticeIdFromNote(note), '123');
   assert.match(note, /SinpoSmart receivedAt: 2026\.10\.21\.1005/);
-  assert.match(note, /^SinpoSmart signing: 1番 莊勝斌$/m);
+  assert.match(note, /^SinpoSmart signing:\n1番 莊勝斌$/m);
   assert.doesNotMatch(note, /\(莊小\)/);
   assert.doesNotMatch(note, /capturedAt=|evidence=/);
   assert.ok(note.length < 110);
@@ -498,8 +498,9 @@ test('compact notes retain notice identity receipt and full signer without erasi
   const old = '人工備註\nSinpoSmart noticeId: 123\nSinpoSmart receivedAt: 2026.10.21.1005\n'
     + 'SinpoSmart signing: 1番 莊勝斌 (莊小); capturedAt=2026-10-21T10:05:00+08:00; evidence=' + 'a'.repeat(64);
   assert.equal(s.withNoticeMetadataNote(old, '123', '2026.10.21.1005', entry), note);
+  assert.equal(s.withNoticeMetadataNote(note.replace('signing:\n', 'signing: '), '123', '2026.10.21.1005', entry), note);
   entry.signingRecipient = '';
-  const unknown = s.withNoticeMetadataNote('人工備註', '123', '2026.10.21.1005', entry);
+  const unknown = s.withNoticeMetadataNote(note, '123', '2026.10.21.1005', entry);
   assert.match(unknown, /signing: 待人工確認/);
   assert.doesNotMatch(unknown, /莊勝斌/);
 });

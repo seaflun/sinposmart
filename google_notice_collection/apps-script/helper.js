@@ -203,10 +203,13 @@ function withNoticeMetadataNote(note, noticeId, receivedAt, entry) {
   }
 
   if (entry && typeof entry.signingRecipient === "string") {
-    lines = lines.filter(function(line) { return !/^SinpoSmart signing:/.test(line); });
+    lines = lines.filter(function(line, index, original) {
+      return !/^SinpoSmart signing:/.test(line)
+        && !(index > 0 && /^SinpoSmart signing:\s*$/.test(original[index - 1]) && /^[1-9]\d{0,2}番 .+$/.test(line));
+    });
     var proof = entry.record.responsibility;
     var signing = "SinpoSmart signing: 待人工確認";
-    if (entry.signingRecipient) signing = "SinpoSmart signing: " + proof.actorNo + "番 " + proof.name;
+    if (entry.signingRecipient) signing = "SinpoSmart signing:\n" + proof.actorNo + "番 " + proof.name;
     lines.push(signing);
   }
   return lines.join("\n");
