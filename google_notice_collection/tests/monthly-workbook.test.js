@@ -488,7 +488,8 @@ test('compact notes retain notice identity receipt and full signer without erasi
   assert.match(note, /1番 莊勝斌/);
   assert.equal(s.readNoticeIdFromNote(note), '123');
   assert.match(note, /SinpoSmart receivedAt: 2026\.10\.21\.1005/);
-  assert.match(note, /1番 莊勝斌 \(莊小\)/);
+  assert.match(note, /^SinpoSmart signing: 1番 莊勝斌$/m);
+  assert.doesNotMatch(note, /\(莊小\)/);
   assert.doesNotMatch(note, /capturedAt=|evidence=/);
   assert.ok(note.length < 110);
   assert.equal(entry.record.responsibility.evidenceKey, 'a'.repeat(64));
