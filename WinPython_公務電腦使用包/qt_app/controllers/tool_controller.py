@@ -75,6 +75,7 @@ TOOL_CATALOG = (
     },
 )
 DAILY_TOOL_IDS = ("duty_sheet", "daily_vehicle")
+DAILY_AUTOMATIC_TIMES = {"daily_vehicle": (9, 0), "duty_sheet": (10, 30)}
 MONTHLY_TOOL_IDS = {"rest_time", "monthly_base"}
 TOOL_USAGE_RESULT_LABELS = {
     "civilpower": "民力系統",
@@ -354,10 +355,11 @@ class ToolController(QObject):
                 row["state"] = "expired"
                 notices.append(f'{row["target_date"]} {row["label"]}已超過補跑期限，請人工確認。')
                 changed = True
-        for tool_id, label, hour, minute in (
-            ("daily_vehicle", "每日點車", 9, 0),
-            ("duty_sheet", "勤務表", 16, 25),
+        for tool_id, label in (
+            ("daily_vehicle", "每日點車"),
+            ("duty_sheet", "勤務表"),
         ):
+            hour, minute = DAILY_AUTOMATIC_TIMES[tool_id]
             due = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute)
             expiry = due.replace(hour=0, minute=0) + timedelta(
                 days=1, hours=8 if tool_id == "duty_sheet" else 0
@@ -421,6 +423,7 @@ class ToolController(QObject):
         except (OSError, ValueError) as exc:
             self._automatic_storage_failed = True
             raise RuntimeError("每日自動執行紀錄無法讀取，已停止自動執行，未覆寫原檔。") from exc
+        rescheduled = []
         try:
             if payload["schema"] != 1 or not isinstance(payload["records"], dict):
                 raise ValueError("schema")
@@ -437,15 +440,24 @@ class ToolController(QObject):
                 business = row["business_date"]
                 day = datetime(int(business[:3]) + 1911, int(business[3:5]), int(business[5:7]))
                 is_sheet = row["tool_id"] == "duty_sheet"
-                due = day.replace(hour=16 if is_sheet else 9, minute=25 if is_sheet else 0)
+                hour, minute = DAILY_AUTOMATIC_TIMES[row["tool_id"]]
+                due = day.replace(hour=hour, minute=minute)
+                legacy_due = day.replace(hour=16, minute=25) if is_sheet else due
                 expiry = day + timedelta(days=1, hours=8 if is_sheet else 0)
-                if (datetime.fromisoformat(row["due_at"]) != due
+                stored_due = datetime.fromisoformat(row["due_at"])
+                if (stored_due not in {due, legacy_due}
                         or datetime.fromisoformat(row["expires_at"]) != expiry):
                     raise ValueError("schedule dates")
+                if is_sheet and stored_due != due and row["state"] == "pending":
+                    rescheduled.append((row, due.isoformat()))
         except (KeyError, TypeError, ValueError) as exc:
             self._automatic_storage_failed = True
             raise RuntimeError("每日自動執行紀錄格式不正確，請人工確認，未覆寫原檔。") from exc
         self._automatic_records = payload["records"]
+        if rescheduled:
+            for row, due_at in rescheduled:
+                row["due_at"] = due_at
+            self._save_automatic_records()
         for row in self._automatic_records.values():
             if row["state"] == "claimed":
                 self.automaticNotice.emit(f'{row["target_date"]} {row["label"]}上次執行結果未確認，不會重複自動執行。')

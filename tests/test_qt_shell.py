@@ -48,12 +48,59 @@ def run_isolated_python(
 
 
 class DailyAutomaticScheduleTests(unittest.TestCase):
+    def test_duty_sheet_starts_at_1030_once_for_the_next_fire_day(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = ToolController(Path(directory))
+            vehicle = controller.next_daily_automatic(datetime(2026, 9, 20, 9))
+            controller.claim_daily_automatic(vehicle["key"], datetime(2026, 9, 20, 9))
+            controller.finish_daily_automatic(vehicle["key"], True)
+            self.assertIsNone(controller.next_daily_automatic(datetime(2026, 9, 20, 10, 29, 59)))
+            row = controller.next_daily_automatic(datetime(2026, 9, 20, 10, 30))
+            self.assertIsNotNone(row)
+            self.assertEqual((row["tool_id"], row["target_date"], row["due_at"]),
+                             ("duty_sheet", "1150921", "2026-09-20T10:30:00"))
+            self.assertTrue(controller.claim_daily_automatic(row["key"], datetime(2026, 9, 20, 10, 30)))
+            restarted = ToolController(Path(directory))
+            self.assertIsNone(restarted.next_daily_automatic(datetime(2026, 9, 20, 16, 25)))
+
+    def test_legacy_1625_schedule_migrates_pending_only_and_preserves_other_states(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        for state in ("pending", "claimed", "completed", "completed_manually", "failed", "expired"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "runtime_outputs/daily_tool_schedule.json"
+                path.parent.mkdir()
+                key = "1150920:duty_sheet"
+                legacy = {"key": key, "tool_id": "duty_sheet", "label": "勤務表", "business_date": "1150920",
+                          "target_date": "1150921", "due_at": "2026-09-20T16:25:00",
+                          "expires_at": "2026-09-21T08:00:00", "state": state}
+                path.write_text(json.dumps({"schema": 1, "records": {key: legacy}}), encoding="utf-8")
+                controller = ToolController(root)
+                vehicle = controller.next_daily_automatic(datetime(2026, 9, 20, 10, 29))
+                controller.claim_daily_automatic(vehicle["key"], datetime(2026, 9, 20, 10, 29))
+                controller.finish_daily_automatic(vehicle["key"], True)
+                restarted = ToolController(root)
+                candidate = restarted.next_daily_automatic(datetime(2026, 9, 20, 10, 30))
+                saved = json.loads(path.read_text(encoding="utf-8"))["records"][key]
+                if state == "pending":
+                    self.assertEqual(candidate["key"], key)
+                    self.assertEqual(saved["due_at"], "2026-09-20T10:30:00")
+                    self.assertEqual(saved["state"], "pending")
+                else:
+                    self.assertIsNone(candidate)
+                    self.assertEqual(saved, legacy)
+
     def test_due_order_claim_survives_restart_and_manual_success_cancels(self) -> None:
         from datetime import datetime
         from qt_app.controllers.tool_controller import ToolController
 
         with tempfile.TemporaryDirectory() as directory:
-            clock = lambda: datetime(2026, 9, 20, 16, 25)
+            clock = lambda: datetime(2026, 9, 20, 10, 30)
             controller = ToolController(Path(directory), now_factory=clock)
             first = controller.next_daily_automatic()
             self.assertEqual((first["tool_id"], first["target_date"]), ("daily_vehicle", "1150920"))
@@ -96,6 +143,33 @@ class DailyAutomaticScheduleTests(unittest.TestCase):
             with patch("qt_app.controllers.tool_controller.os.replace", side_effect=OSError("disk")):
                 with self.assertRaises(RuntimeError):
                     controller.next_daily_automatic(datetime(2026, 9, 20, 9))
+
+    def test_rescheduling_does_not_repair_other_invalid_records_or_run_after_save_failure(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        for failure in ("invalid_record", "save_failed"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "runtime_outputs/daily_tool_schedule.json"
+                path.parent.mkdir()
+                key = "1150920:duty_sheet"
+                records = {key: {"key": key, "tool_id": "duty_sheet", "label": "勤務表",
+                    "business_date": "1150920", "target_date": "1150921",
+                    "due_at": "2026-09-20T16:25:00", "expires_at": "2026-09-21T08:00:00", "state": "pending"}}
+                if failure == "invalid_record":
+                    records["1150920:daily_vehicle"] = {**records[key], "key": "1150920:daily_vehicle",
+                        "tool_id": "daily_vehicle", "target_date": "1150920",
+                        "due_at": "2026-09-20T00:00:00", "expires_at": "2026-09-21T00:00:00"}
+                original = json.dumps({"schema": 1, "records": records})
+                path.write_text(original, encoding="utf-8")
+                controller = ToolController(root)
+                with patch("qt_app.controllers.tool_controller.os.replace", side_effect=OSError("disk")):
+                    with self.assertRaises(RuntimeError):
+                        controller.next_daily_automatic(datetime(2026, 9, 20, 10, 30))
+                self.assertEqual(path.read_text(encoding="utf-8"), original)
+                with self.assertRaises(RuntimeError):
+                    controller.next_daily_automatic(datetime(2026, 9, 20, 10, 30))
 
     def test_clock_rollback_does_not_run_before_due_time(self) -> None:
         from datetime import datetime
@@ -334,7 +408,7 @@ class DailyAutomaticAdmissionTests(unittest.TestCase):
         from qt_app.controllers.tool_controller import ToolController
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.now = datetime(2026, 9, 20, 16, 25)
+        self.now = datetime(2026, 9, 20, 10, 30)
         self.controller = AppController(
             tool_controller=ToolController(Path(self.directory.name), now_factory=lambda: self.now),
             schedule_repository=ScheduleRepository(Path(self.directory.name)),
