@@ -11867,6 +11867,124 @@ class QtShellTests(unittest.TestCase):
         self.enterContext(patch("qt_app.controllers.app_controller.NoticeCollectionController",
             side_effect=notice_controller_without_background_poll))
 
+    def test_notice_responsibility_recovers_delayed_handoff_from_existing_durable_time(self) -> None:
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+        from tests.test_notice_collection import NoticeCollectionTests
+
+        class ScenarioDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 10, 27, 9, 33)
+                return value if tz is None else value.replace(tzinfo=tz)
+
+        data = NoticeCollectionTests._handoff_responsibility_fixture()
+        visible = [["115/10/27 08:10", "新坡分隊", "值班(宿)", name, "隊員", kind]
+                   for name, kind in (("原班甲", "值退"), ("接班乙", "值班"))]
+        with tempfile.TemporaryDirectory() as temporary, patch(
+                "qt_app.controllers.duty_controller.datetime", ScenarioDateTime):
+            root = Path(temporary)
+            for stamp in ("2026-10-27T08:10:00", "2026-10-27T00:10:00+00:00"):
+                with self.subTest(stamp=stamp):
+                    (root / "duty_return_policy.json").write_text(json.dumps({"schema_version": 1,
+                        "actual_handoff_times": {data["actions"][2]["duplicate_key"]: stamp}}), encoding="utf-8")
+                    controller = DutyController(repository=ScheduleRepository(root))
+                    self.addCleanup(controller.shutdown)
+                    controller.replace_schedule_data(data, comparison_data={"1151027": {"visible_entry_rows": visible}})
+                    controller._notice_live_comparisons = True
+                    proof = controller.notice_responsibility(ScenarioDateTime.now())
+                    self.assertEqual(proof.get("actorNo"), "25")
+                    saved = json.loads((root / "duty_return_policy.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["notice_responsibility"]["actorNo"], "25")
+
+    def test_notice_checkpoint_survives_restart_and_transient_failure_but_not_cancellation(self) -> None:
+        from datetime import datetime, timedelta
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+        from tests.test_notice_collection import NoticeCollectionTests
+
+        data = NoticeCollectionTests._handoff_responsibility_fixture()
+        now = datetime(2026, 10, 27, 9, 33)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = DutyController(repository=ScheduleRepository(root))
+            self.addCleanup(original.shutdown)
+            original.replace_schedule_data(data, comparisons={0: {"group": "done"}, 1: {"group": "done"}})
+            original._notice_live_comparisons = True
+            proof = original.notice_responsibility(now)
+            self.assertEqual(proof["actorNo"], "25")
+
+            restarted = DutyController(repository=ScheduleRepository(root))
+            self.addCleanup(restarted.shutdown)
+            restarted.replace_schedule_data(data, comparisons={0: {"group": "done"}, 1: {"group": "done"}})
+            self.assertEqual(restarted.notice_responsibility(now)["status"], "unknown")
+            self.assertEqual(restarted._notice_last_responsibility["actorNo"], "25")
+            restarted._notice_live_comparisons = True
+            self.assertEqual(restarted.notice_responsibility(now)["actorNo"], "25")
+            with patch.object(restarted, "_save_manual_departure_pair_keys") as save:
+                restarted.notice_responsibility(now + timedelta(seconds=5))
+                save.assert_not_called()
+
+            restarted._comparisons[1]["cancelled"] = True
+            self.assertEqual(restarted.notice_responsibility(now)["status"], "unknown")
+            again = DutyController(repository=ScheduleRepository(root))
+            self.addCleanup(again.shutdown)
+            self.assertIsNone(again._notice_last_responsibility)
+
+    def test_notice_checkpoint_crosses_fire_day_only_until_a_new_verified_handoff(self) -> None:
+        import copy
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+        from tests.test_notice_collection import NoticeCollectionTests
+
+        old = NoticeCollectionTests._handoff_responsibility_fixture()
+        for action in old["actions"]:
+            action["time"] = "22:00"
+        fresh = copy.deepcopy(old)
+        fresh["target_date"] = "1151028"
+        for action in fresh["actions"]:
+            action["time"] = "08:00"
+            action["duplicate_key"] = action["duplicate_key"].replace("2026-10-27:8", "2026-10-28:8")
+            action["actor"] = "25"
+            if action["kind"] == "entry_log":
+                action["target"] = "25" if action["fields"]["出或入"] == "值退" else "14"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = DutyController(repository=ScheduleRepository(root))
+            self.addCleanup(original.shutdown)
+            original.replace_schedule_data(old, comparisons={0: {"group": "done"}, 1: {"group": "done"}})
+            original._notice_live_comparisons = True
+            self.assertEqual(original.notice_responsibility(datetime(2026, 10, 27, 23))["actorNo"], "25")
+            restarted = DutyController(repository=ScheduleRepository(root))
+            self.addCleanup(restarted.shutdown)
+            restarted.replace_schedule_data(fresh, comparisons={0: {"group": "paused"}, 1: {"group": "paused"}})
+            restarted._notice_live_comparisons = True
+            self.assertEqual(restarted.notice_responsibility(datetime(2026, 10, 28, 8, 5))["actorNo"], "25")
+            restarted._comparisons = {0: {"group": "done"}, 1: {"group": "paused"}}
+            self.assertEqual(restarted.notice_responsibility(datetime(2026, 10, 28, 8, 5))["status"], "unknown")
+            restarted._comparisons[1] = {"group": "done"}
+            self.assertEqual(restarted.notice_responsibility(datetime(2026, 10, 28, 8, 5))["actorNo"], "14")
+
+    def test_notice_checkpoint_is_not_trusted_from_corrupt_or_expired_state(self) -> None:
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+        from tests.test_notice_collection import NoticeCollectionTests
+
+        data = NoticeCollectionTests._handoff_responsibility_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for content in ("{bad", "[]", json.dumps({"schema_version": 1, "notice_responsibility": {"status": "confirmed"}})):
+                (root / "duty_return_policy.json").write_text(content, encoding="utf-8")
+                controller = DutyController(repository=ScheduleRepository(root), read_only_acceptance=True)
+                self.addCleanup(controller.shutdown)
+                self.assertIsNone(controller._notice_last_responsibility)
+                controller.replace_schedule_data(data, comparisons={0: {"group": "near"}, 1: {"group": "near"}})
+                controller._notice_live_comparisons = True
+                self.assertEqual(controller.notice_responsibility(datetime(2026, 10, 28, 9))["status"], "unknown")
+
     def test_notice_fixed_account_lookup_survives_logout_without_changing_selection(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from app_core.session import LoginSession

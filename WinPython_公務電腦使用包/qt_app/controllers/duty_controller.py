@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -128,7 +128,7 @@ class DutyController(QObject):
         self._staff: dict[str, dict[str, Any]] = {}
         self._comparisons: dict[int, dict[str, Any]] = {}
         self._notice_live_comparisons = False
-        self._notice_last_responsibility = None
+        self._notice_last_responsibility = self._load_notice_responsibility()
         self._audit_kind_filter = "全部"
         self._audit_status_filter = "需處理"
         self._audit_only_actor = False
@@ -790,7 +790,7 @@ class DutyController(QObject):
         except (TypeError, ValueError):
             return None
         if parsed.tzinfo is not None:
-            parsed = parsed.replace(tzinfo=None)
+            parsed = parsed.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
         return parsed
 
     def _load_actual_handoff_times(self) -> dict[str, str]:
@@ -817,6 +817,18 @@ class DutyController(QObject):
             retained[normalized_key] = actual_at.isoformat(timespec="seconds")
         return retained
 
+    def _load_notice_responsibility(self) -> dict | None:
+        from app_core.notice_collection_service import NOTICE_RESPONSIBILITY_FIELDS, notice_responsibility_key
+
+        try:
+            payload = json.loads(self._return_policy_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+            return None
+        proof = payload.get("notice_responsibility")
+        return {key: proof[key] for key in NOTICE_RESPONSIBILITY_FIELDS} if notice_responsibility_key(proof) else None
+
     def _prune_actual_handoff_times(self, now: datetime | None = None) -> None:
         current = now or datetime.now()
         self._actual_handoff_times = {
@@ -838,6 +850,7 @@ class DutyController(QObject):
             ),
             "completed_return_pair_keys": sorted(self._completed_return_pair_keys),
             "actual_handoff_times": dict(sorted(self._actual_handoff_times.items())),
+            "notice_responsibility": getattr(self, "_notice_last_responsibility", None),
         }
         temporary_path = self._return_policy_state_path.with_name(
             f"{self._return_policy_state_path.name}.tmp"
@@ -1182,11 +1195,18 @@ class DutyController(QObject):
     def notice_responsibility(self, now: datetime) -> dict:
         from app_core.notice_collection_service import confirmed_notice_responsibility
 
+        previous = self._notice_last_responsibility
         proof = confirmed_notice_responsibility(
             {} if self._preview_loaded else self._schedule_data,
             self._comparisons, self._executed_indices, now, live=self._notice_live_comparisons,
-            previous=self._notice_last_responsibility)
-        self._notice_last_responsibility = proof if proof.get("status") == "confirmed" else None
+            previous=previous, actual_handoff_times=self._actual_handoff_times)
+        if proof.get("status") == "confirmed":
+            self._notice_last_responsibility = proof
+            if not previous or any(previous.get(key) != value for key, value in proof.items() if key != "capturedAt"):
+                self._save_manual_departure_pair_keys()
+        elif self._notice_live_comparisons and not self._preview_loaded and previous is not None:
+            self._notice_last_responsibility = None
+            self._save_manual_departure_pair_keys()
         return proof
 
     def _capture_context_is_current(
@@ -2386,6 +2406,7 @@ class DutyController(QObject):
     def prepare_session_end(self) -> bool:
         """Stop admitting capture or submission work before logout or update."""
 
+        self.notice_responsibility(datetime.now())
         self._session_closing = True
         self.disable_auto_execution()
         self._pending_manual_indices.clear()
@@ -3708,6 +3729,7 @@ class DutyController(QObject):
             comparison_data=snapshot.comparison_data,
         )
         self._notice_live_comparisons = True
+        self.notice_responsibility(datetime.now())
         publish_events = self._capture_publish_events.get(request_id, True)
         if not schedule_was_ready and publish_events:
             captured_data = dict(snapshot.data)
@@ -3768,6 +3790,7 @@ class DutyController(QObject):
         )
         self._comparisons = comparisons
         self._notice_live_comparisons = True
+        self.notice_responsibility(datetime.now())
         self._schedule_status = "已更新已登打比對資料。"
         self._refresh_projection()
 

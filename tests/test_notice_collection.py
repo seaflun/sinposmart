@@ -63,6 +63,104 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    @staticmethod
+    def _handoff_responsibility_fixture():
+        actions = [
+            {"kind": "entry_log", "source": "值班交接", "actor": "14", "target": target,
+             "time": "08:00", "duplicate_key": f"entry:2026-10-27:8:{kind}:{target}",
+             "fields": {"出或入": kind}}
+            for kind, target in (("值退", "14"), ("值班", "25"))]
+        actions.append({"kind": "work_log", "source": "值班交接", "actor": "14", "time": "08:00",
+                        "duplicate_key": "work:2026-10-27:8:值班交接:14", "fields": {}})
+        return {"target_date": "1151027", "actions": actions, "today": {"staff": {
+            "14": {"name": "原班甲", "role": "隊員"}, "25": {"name": "接班乙", "role": "隊員"}}}}
+
+    def test_delayed_handoff_requires_saved_completion_and_matching_official_pair(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        now = datetime(2026, 10, 27, 9, 33)
+        comparisons = {i: {"group": "near", "matched": [
+            f"115/10/27 08:10 | 新坡分隊 | 值班(宿) | {name} | 隊員 | {kind} | 115/10/27 08:10 | {kind}"]}
+            for i, (name, kind) in enumerate((("原班甲", "值退"), ("接班乙", "值班")))}
+        actual = {data["actions"][2]["duplicate_key"]: "2026-10-27T08:10:00"}
+        resolve = lambda rows, times: confirmed_notice_responsibility(
+            data, rows, set(), now, live=True, actual_handoff_times=times)
+        self.assertEqual(resolve(comparisons, actual)["actorNo"], "25")
+        self.assertEqual(resolve(comparisons, {})["status"], "unknown")
+        for changed in ({0: {"group": "todo", "matched": []}},
+                        {1: {"group": "near", "matched": []}},
+                        {1: {"group": "near", "matched": ["115/10/27 08:10 | 他人 | 值班"]}},
+                        {1: {**comparisons[1], "cancelled": True}},
+                        {1: {**comparisons[1], "group": "review"}}):
+            with self.subTest(changed=changed):
+                self.assertEqual(resolve({**comparisons, **changed}, actual)["status"], "unknown")
+        for stamp in ("bad", "2026-10-27T09:50:00", "2026-10-26T08:10:00", "2026-10-27T08:11:00"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(resolve(comparisons, {next(iter(actual)): stamp})["status"], "unknown")
+        utc_actual = {next(iter(actual)): "2026-10-27T00:10:00+00:00"}
+        self.assertEqual(resolve(comparisons, utc_actual)["actorNo"], "25")
+
+    def test_incomplete_or_conflicting_handoff_never_certifies_a_recipient(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        now = datetime(2026, 10, 27, 9)
+        for entries in ([data["actions"][1]], [data["actions"][0]],
+                        [*data["actions"][:2], data["actions"][1]],
+                        [data["actions"][0], {**data["actions"][1], "target": "14"}]):
+            with self.subTest(entries=entries):
+                altered = {**data, "actions": entries}
+                self.assertEqual(confirmed_notice_responsibility(altered,
+                    {i: {"group": "done"} for i in range(len(entries))}, set(), now, live=True)["status"], "unknown")
+
+    def test_previous_proof_cannot_override_cancelled_or_changed_current_handoff(self):
+        import copy
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        now = datetime(2026, 10, 27, 9)
+        done = {0: {"group": "done"}, 1: {"group": "done"}}
+        previous = confirmed_notice_responsibility(data, done, set(), now, live=True)
+        for change in ("cancelled", "review", "missing_entry", "changed_target", "changed_name", "tampered_proof", "future_proof"):
+            altered, proof = copy.deepcopy(data), dict(previous)
+            rows = {0: {"group": "near"}, 1: {"group": "near"}}
+            if change == "cancelled": rows[1]["cancelled"] = True
+            if change == "review": rows[1]["group"] = "review"
+            if change == "missing_entry": rows[1]["group"] = "todo"
+            if change == "changed_target": altered["actions"][1]["target"] = "14"
+            if change == "changed_name": altered["today"]["staff"]["25"]["name"] = "同番異人"
+            if change == "tampered_proof": proof["evidenceKey"] = "b" * 64
+            if change == "future_proof": proof["capturedAt"] = "2026-10-27T10:00:00+08:00"
+            with self.subTest(change=change):
+                self.assertEqual(confirmed_notice_responsibility(altered, rows, set(), now,
+                    live=True, previous=proof)["status"], "unknown")
+
+    def test_delayed_handoff_can_be_verified_after_midnight_and_rejects_mixed_times(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        for action in data["actions"]:
+            action["time"] = "23:00"
+        comparisons = {i: {"group": "near", "matched": [
+            f"115/10/28 00:10 | 新坡分隊 | 值班(宿) | {name} | 隊員 | {kind}"]}
+            for i, (name, kind) in enumerate((("原班甲", "值退"), ("接班乙", "值班")))}
+        actual = {data["actions"][2]["duplicate_key"]: "2026-10-28T00:10:00+08:00"}
+        now = datetime(2026, 10, 28, 0, 15)
+        self.assertEqual(confirmed_notice_responsibility(data, comparisons, set(), now,
+            live=True, actual_handoff_times=actual).get("actorNo"), "25")
+        comparisons[1]["matched"] = [comparisons[1]["matched"][0].replace("00:10", "00:11")]
+        self.assertEqual(confirmed_notice_responsibility(data, comparisons, set(), now,
+            live=True, actual_handoff_times=actual)["status"], "unknown")
+
+    def test_previous_proof_requires_a_live_schedule_for_the_current_fire_day(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        now = datetime(2026, 10, 27, 9)
+        previous = confirmed_notice_responsibility(data, {0: {"group": "done"}, 1: {"group": "done"}},
+                                                  set(), now, live=True)
+        for context in ({**data, "actions": []}, {**data, "target_date": "1151028"},
+                        {**data, "target_date": "1151025"}):
+            with self.subTest(context=context):
+                self.assertEqual(confirmed_notice_responsibility(context, {}, set(), now,
+                    live=True, previous=previous)["status"], "unknown")
+
     def test_shift_reminder_uses_confirmed_receipts_and_survives_restart(self):
         from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
         proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",

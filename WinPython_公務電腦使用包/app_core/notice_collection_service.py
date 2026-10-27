@@ -21,6 +21,8 @@ FIXED_NOTICE_ACCOUNT = "tyfd01214"
 TAIPEI = timezone(timedelta(hours=8))
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw5yM8234CMi67hkox091wgoubwNIuWC8yxtNsQ024SpbpXhAGWVC5hB-HU4UQQavPO1A/exec"
 MAX_RECORDS = 200
+NOTICE_RESPONSIBILITY_FIELDS = ("schema_version", "status", "actorNo", "name", "role",
+                                "capturedAt", "handoffSlotAt", "evidenceKey")
 NOTICE_ERROR_CODES = frozenset({
     "browser_start_failed", "browser_window_closed", "snapshot_failed", "snapshot_invalid",
     "origin_mismatch", "account_mismatch", "login_target_mismatch", "login_page_failed",
@@ -90,9 +92,11 @@ def _local_time(value: datetime) -> datetime:
     return value.replace(tzinfo=TAIPEI) if value.tzinfo is None else value.astimezone(TAIPEI)
 
 
-def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *, live=False, previous=None) -> dict:
+def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *,
+                                    live=False, previous=None, actual_handoff_times=None) -> dict:
     """Use completed official handoffs; a scheduled boundary never transfers ownership."""
     from app_core.duty_task_projection import action_datetime, action_completion_key, action_staff, action_time_value, parse_roc_date
+    from compare_rehearsal_records import find_entry_matches
 
     now = _local_time(now)
     unknown = {"schema_version": 1, "status": "unknown", "capturedAt": now.isoformat()}
@@ -101,14 +105,21 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
     if not isinstance(data, dict) or not re.fullmatch(r"\d{7}", str(data.get("target_date", ""))):
         return unknown
     try:
-        parse_roc_date(data["target_date"])
+        target = parse_roc_date(data["target_date"])
     except ValueError:
         return unknown
-    groups = {}
+    if (not now.date() - timedelta(days=1) <= target <= now.date()
+            or not isinstance(data.get("actions"), list) or not isinstance(comparisons, dict)
+            or not any(isinstance(action, dict) and action.get("kind") == "entry_log"
+                       and action.get("source") == "值班交接" for action in data["actions"])):
+        return unknown
+    groups, work_keys, action_comparisons = {}, {}, {}
+    actual_handoff_times = actual_handoff_times if isinstance(actual_handoff_times, dict) else {}
     for index, action in enumerate(data.get("actions", [])):
-        if (not isinstance(action, dict) or action.get("kind") != "entry_log"
+        if (not isinstance(action, dict) or action.get("kind") not in {"entry_log", "work_log"}
                 or action.get("source") != "值班交接"
-                or action.get("fields", {}).get("出或入") not in {"值班", "值退"}):
+                or not isinstance(action.get("fields"), dict)
+                or action.get("kind") == "entry_log" and action["fields"].get("出或入") not in {"值班", "值退"}):
             continue
         try:
             if not re.fullmatch(r"(?:[0-2]?\d|3[0-2]):[0-5]\d", action_time_value(action)):
@@ -118,25 +129,90 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
             return unknown
         if not now - timedelta(hours=24) <= at <= now:
             continue
+        group_key = (at, str(action.get("actor", "")))
+        if action["kind"] == "work_log":
+            work_keys.setdefault(group_key, []).append(action_completion_key(action))
+            continue
         comparison = comparisons.get(index, {})
+        action_comparisons[id(action)] = comparison
         cancelled = bool(comparison.get("cancelled")) or comparison.get("group") in {"near", "review"}
         done = not cancelled and (index in executed or live and comparison.get("group") == "done")
-        groups.setdefault((at, str(action.get("actor", ""))), []).append((action, done, cancelled))
-    completed = []
-    for (at, _actor), entries in groups.items():
+        groups.setdefault(group_key, []).append((action, done, cancelled))
+
+    def incoming_pair(actor, entries):
         incoming = [action for action, _done, _cancelled in entries if action["fields"]["出或入"] == "值班"]
-        targets = {str(action.get("target", "")) for action in incoming}
-        if len(targets) == 1 and all(done for _action, done, _cancelled in entries):
-            completed.append((at, incoming[0], entries))
+        outgoing = [action for action, _done, _cancelled in entries if action["fields"]["出或入"] == "值退"]
+        if (len(entries) == 2 and len(incoming) == len(outgoing) == 1
+                and outgoing[0].get("target") == actor and incoming[0].get("target") != actor
+                and len({action_completion_key(action) for action, _done, _cancelled in entries}) == 2):
+            return incoming[0]
+        return None
+
+    def evidence_key(entries):
+        evidence = sorted(action_completion_key(action) for action, _done, _cancelled in entries)
+        return hashlib.sha256(json.dumps(evidence).encode()).hexdigest()
+
+    # A resolved recovery group already records its actual time durably. Require
+    # both live official rows at that exact time; an arbitrary near match is insufficient.
+    for group_key, entries in list(groups.items()):
+        at, actor = group_key
+        keys = work_keys.get(group_key, [])
+        if len(keys) != 1 or incoming_pair(actor, entries) is None:
+            continue
+        try:
+            actual = _local_time(datetime.fromisoformat(actual_handoff_times[keys[0]]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not at <= actual <= now:
+            continue
+        verified = []
+        for action, done, cancelled in entries:
+            comparison = action_comparisons[id(action)]
+            if comparison.get("cancelled") or comparison.get("group") not in {"near", "done"}:
+                break
+            adjusted = {**action, "fields": {**action["fields"], "系統寫入時間": actual.strftime("%H:%M")}}
+            matched = comparison.get("matched", [])
+            if (not isinstance(matched, list) or any(not isinstance(row, str) for row in matched)
+                    or not find_entry_matches(matched, f"{actual.year - 1911:03d}{actual:%m%d}",
+                                              action_staff(data, action), adjusted)):
+                break
+            verified.append((action, True, False))
+        if len(verified) == len(entries):
+            groups[group_key] = verified
+    completed = []
+    for (at, actor), entries in groups.items():
+        incoming = incoming_pair(actor, entries)
+        if incoming is not None and all(done for _action, done, _cancelled in entries):
+            completed.append((at, incoming, entries))
     prior = None
     if live and isinstance(previous, dict):
         try:
             prior = _frozen_responsibility(previous, datetime.fromisoformat(previous["capturedAt"]))
             prior_at = _local_time(datetime.fromisoformat(prior["handoffSlotAt"]))
-            if not now - timedelta(hours=24) <= prior_at <= now:
+            if (prior.get("status") != "confirmed" or datetime.fromisoformat(prior["capturedAt"]) > now
+                    or not now - timedelta(hours=24) <= prior_at <= now):
                 prior = None
         except (ValueError, TypeError, KeyError):
             prior = None
+    if prior:
+        matching = [(actor, entries) for (at, actor), entries in groups.items() if at == prior_at]
+        if matching:
+            actor, entries = matching[0]
+            incoming = incoming_pair(actor, entries)
+            member = action_staff(data, incoming or {}).get(prior["actorNo"], {})
+            if (len(matching) != 1 or incoming is None or incoming.get("target") != prior["actorNo"]
+                    or any(not done or cancelled for _action, done, cancelled in entries)
+                    or evidence_key(entries) != prior["evidenceKey"] or member.get("name") != prior["name"]
+                    or str(member.get("role", "")) != prior["role"]
+                    or any(action_comparisons[id(action)].get("cancelled")
+                           or action_comparisons[id(action)].get("group") == "review"
+                           for action, _done, _cancelled in entries)):
+                prior = None
+        else:
+            member = action_staff(data, {}).get(prior["actorNo"], {})
+            if (groups and prior_at >= min(at for at, _actor in groups)
+                    or member.get("name") != prior["name"] or str(member.get("role", "")) != prior["role"]):
+                prior = None
     if prior and (not completed or prior_at > max(at for at, _action, _entries in completed)):
         if any(at > prior_at and any(done or cancelled for _action, done, cancelled in entries)
                for (at, _actor), entries in groups.items()):
@@ -146,7 +222,7 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
         return unknown
     latest = max(at for at, _action, _entries in completed)
     latest_entries = [entry for entry in completed if entry[0] == latest]
-    if len(latest_entries) != 1:
+    if len(latest_entries) != 1 or sum(at == latest for at, _actor in groups) != 1:
         return unknown
     # Partial submission, cancellation, or competing handoffs cannot certify who owns the desk.
     if any(at > latest and any(done or cancelled for _action, done, cancelled in entries)
@@ -155,13 +231,14 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
     at, incoming, entries = latest_entries[0]
     actor = str(incoming.get("target", ""))
     member = action_staff(data, incoming).get(actor, {})
-    name = str(member.get("name", "")).strip()
-    if not re.fullmatch(r"[1-9]\d{0,2}", actor) or not 2 <= len(name) <= 40:
+    name, role = member.get("name", ""), member.get("role", "")
+    if (not isinstance(name, str) or not isinstance(role, str)
+            or not re.fullmatch(r"[1-9]\d{0,2}", actor) or not 2 <= len(name.strip()) <= 40
+            or len(role.strip()) > 20 or any(ord(char) < 32 for char in name + role)):
         return unknown
-    evidence = sorted(action_completion_key(action) for action, _done, _cancelled in entries)
-    return {"schema_version": 1, "status": "confirmed", "actorNo": actor, "name": name,
-            "role": str(member.get("role", "")).strip()[:20], "capturedAt": now.isoformat(),
-            "handoffSlotAt": at.isoformat(), "evidenceKey": hashlib.sha256(json.dumps(evidence).encode()).hexdigest()}
+    return {"schema_version": 1, "status": "confirmed", "actorNo": actor, "name": name.strip(),
+            "role": role.strip(), "capturedAt": now.isoformat(),
+            "handoffSlotAt": at.isoformat(), "evidenceKey": evidence_key(entries)}
 
 
 def _frozen_responsibility(value, received_at: datetime) -> dict:
@@ -184,8 +261,7 @@ def _frozen_responsibility(value, received_at: datetime) -> dict:
             return unknown
     except (ValueError, TypeError, KeyError):
         return unknown
-    return {key: value[key] for key in ("schema_version", "status", "actorNo", "name", "role",
-                                      "capturedAt", "handoffSlotAt", "evidenceKey")}
+    return {key: value[key] for key in NOTICE_RESPONSIBILITY_FIELDS}
 
 
 def notice_responsibility_key(value) -> str:

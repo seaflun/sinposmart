@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.27.1210` | 2026-10-27 12:10（台北時間） | 修正延後交班與更新重啟後的通報簽收責任恢復，保留跨日、取消與衝突守門，明確區分入表與簽收。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.1210) |
 | `2026.10.27.0850` | 2026-10-27 08:50（台北時間） | 修正通報與民力登入的密碼到期提醒，自動暫不變更並等待導頁；強制換密碼保留人工處理提示。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.0850) |
 | `2026.10.27.0148` | 2026-10-27 01:48（台北時間） | 簡化救護影片備份，依卡內日期選擇車號，阻擋換卡沿用預覽，補齊檢查原因及部分完成狀態。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.0148) |
 | `2026.10.26.2212` | 2026-10-26 22:12（台北時間） | 勤務表新增救護2車，依兩表規則補足人員，維持訓練名單、到點排程與完成紀錄。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.26.2212) |
