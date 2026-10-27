@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import copy
 import hashlib
@@ -50,6 +50,115 @@ class NoticeCollectionError(RuntimeError):
 
 class NoticeLoginRequired(NoticeCollectionError):
     """The dedicated notice browser could not confirm automatic login."""
+
+
+class NoticeLoginGuard:
+    """A credential-free, durable gate for the fixed notice account."""
+
+    REASONS = {"", "oa_login_unconfirmed", "oa_credentials_rejected", "oa_account_locked",
+               "oa_password_change_required", "oa_password_expired"}
+
+    def __init__(self, package_root: Path):
+        self.path = Path(package_root) / "runtime_outputs" / "notice_collection" / "login_guard.json"
+        self._unavailable = False
+
+    def _load(self) -> dict:
+        try:
+            if self._unavailable:
+                raise ValueError("guard unavailable")
+            try:
+                size = self.path.stat().st_size
+            except FileNotFoundError:
+                return {"schema_version": 1, "account": FIXED_NOTICE_ACCOUNT,
+                        "expiry_date": "", "pending_expiry": "", "pause_reason": ""}
+            if size > 16_384:
+                raise ValueError("invalid guard size")
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(value, dict) or set(value) != {"schema_version", "account", "expiry_date", "pending_expiry", "pause_reason"}
+                    or value.get("schema_version") != 1
+                    or value.get("account") != FIXED_NOTICE_ACCOUNT
+                    or value.get("pause_reason") not in self.REASONS):
+                raise ValueError("invalid guard")
+            for field in ("expiry_date", "pending_expiry"):
+                if not isinstance(value.get(field), str):
+                    raise ValueError("invalid expiry")
+                if value[field]:
+                    date.fromisoformat(value[field])
+            return value
+        except (OSError, ValueError, TypeError, KeyError):
+            self._unavailable = True
+            raise NoticeLoginRequired("通報登入保護紀錄無法確認，已停止自動登入。", code="oa_login_guard_unavailable") from None
+
+    def _save(self, state: dict) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name("login-guard-" + uuid4().hex + ".tmp")
+            temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(self.path)
+        except OSError:
+            self._unavailable = True
+            raise NoticeLoginRequired("通報登入保護紀錄無法儲存，未送出登入。", code="oa_login_guard_unavailable") from None
+
+    def status(self, now: datetime) -> dict:
+        try:
+            state = self._load()
+        except NoticeLoginRequired as exc:
+            return {"paused": True, "expired": False, "expiry_date": "", "code": exc.code, "message": str(exc)}
+        expiry = state["pending_expiry"] or state["expiry_date"]
+        stop = datetime.combine(date.fromisoformat(expiry), datetime.min.time(), TAIPEI) - timedelta(minutes=1) if expiry else None
+        expired = state["pause_reason"] == "oa_password_expired" or (stop is not None and _local_time(now) >= stop)
+        code = "oa_password_expired" if expired else state["pause_reason"]
+        message = (f"密碼 {expiry.replace('-', '/')} 到期，{stop:%m/%d %H:%M} 停止自動收取。" if stop else "到期日尚未取得。")
+        if code:
+            message = ((message + " 請儲存新密碼以自動驗證。") if expired else
+                       "通報帳號已鎖定或停用，請人工處理後儲存密碼重新驗證。" if code == "oa_account_locked" else
+                       "通報自動登入已暫停，請確認密碼並儲存以自動驗證。")
+        return {"paused": bool(code), "expired": expired, "expiry_date": expiry, "code": code, "message": message}
+
+    def require_allowed(self, now: datetime, *, verification=False) -> None:
+        status = self.status(now)
+        if status["paused"] and (not verification or status["code"] == "oa_login_guard_unavailable"):
+            if status["expired"]:
+                self.latch_expiry(now)
+            raise NoticeLoginRequired(status["message"], code=status["code"])
+
+    def latch_expiry(self, now: datetime) -> None:
+        status = self.status(now)
+        if status["expired"]:
+            state = self._load()
+            if state["pause_reason"] != "oa_password_expired":
+                state["pause_reason"] = "oa_password_expired"
+                self._save(state)
+
+    def begin_attempt(self, now: datetime, *, verification=False) -> None:
+        self.require_allowed(now, verification=verification)
+        state = self._load()
+        state.update(pause_reason="oa_login_unconfirmed", pending_expiry="")
+        self._save(state)  # Persist before the only permitted login submission.
+
+    def record_expiry(self, value: str, *, pending=False) -> None:
+        try:
+            value = date.fromisoformat(value).isoformat()
+        except (ValueError, TypeError):
+            return
+        state = self._load()
+        field = "pending_expiry" if pending else "expiry_date"
+        if state[field] != value:
+            state[field] = value
+            self._save(state)
+
+    def finish_attempt(self, now: datetime, *, verification=False) -> None:
+        state = self._load()
+        if verification or state["pending_expiry"]:
+            state["expiry_date"] = state["pending_expiry"]
+        state.update(pause_reason="", pending_expiry="")
+        self._save(state)
+        self.require_allowed(now)
+
+    def pause(self, code="oa_login_unconfirmed") -> None:
+        state = self._load()
+        state["pause_reason"] = code if code in self.REASONS and code else "oa_login_unconfirmed"
+        self._save(state)
 
 
 class _NoticeStateError(NoticeCollectionError):
@@ -334,6 +443,7 @@ class NoticeCollectionService:
         self._poster = poster
         self._sync_key_lookup = sync_key_lookup if sync_key_lookup is not None else self._default_sync_key
         self._now = now_factory or (lambda: datetime.now(TAIPEI))
+        self.login_guard = NoticeLoginGuard(self.package_root)
         self.state_path = self.package_root / "runtime_outputs" / "notice_collection" / "state.json"
         self._state_error = False
         self.last_result: NoticeCollectionResult | None = None
@@ -400,31 +510,42 @@ class NoticeCollectionService:
 
     def verify_login(self, password: str, cancel=None) -> NoticeCollectionResult:
         """Verify a fresh fixed-account login without collecting or changing counts."""
-        self._check_cancel(cancel)
+        self._check_cancel(cancel, verification=True)
         if not isinstance(password, str) or not password:
             raise NoticeLoginRequired("請先設定通報帳號 tyfd01214 的密碼。")
         try:
             if self._browser is None:
                 from app_core.notice_collection_browser import NoticeBrowser
-                self._browser = NoticeBrowser(self.package_root)
-            self._check_cancel(cancel)
+                self._browser = NoticeBrowser(self.package_root, login_guard=self.login_guard, now_factory=self._now)
+            self._check_cancel(cancel, verification=True)
             self._browser.begin_login_verification(password)
-            self._check_cancel(cancel)
+            self._check_cancel(cancel, verification=True)
             rows = self._browser.scan_unread(password, cancel=cancel)
-            self._check_cancel(cancel)
+            self._check_cancel(cancel, verification=True)
             if not isinstance(rows, list):
                 raise NoticeCollectionError("通報登入驗證未取得完整的未讀列表。")
             keys = {self._record_key(row) for row in rows}
-        except NoticeCollectionError:
+            self.login_guard.finish_attempt(self._now(), verification=True)
+        except NoticeCollectionError as exc:
+            try:
+                self.login_guard.pause(exc.code)
+            except NoticeCollectionError:
+                pass
             raise
         except Exception:
+            self.login_guard.pause()
             raise NoticeCollectionError("通報登入驗證未完成，請確認帳密、網站與網路狀態。") from None
+        finally:
+            end = getattr(self._browser, "end_login_verification", None)
+            if callable(end):
+                end()
         return NoticeCollectionResult(
             _local_time(self._now()), unread_count=len(keys), status="login_verified",
             message="通報帳號 tyfd01214 登入驗證成功。",
         )
 
     def collect(self, password: str, received_at: datetime, cancel=None, *, responsibility=None) -> NoticeCollectionResult:
+        self.login_guard.require_allowed(self._now())
         received_at = _local_time(received_at)
         self._responsibility = _frozen_responsibility(responsibility, received_at)
         before = set(self._state["collected"])
@@ -510,7 +631,7 @@ class NoticeCollectionService:
             raise NoticeCollectionError("通報收取紀錄無法讀取，請先確認本機紀錄；未送出通報。")
         if self._browser is None:
             from app_core.notice_collection_browser import NoticeBrowser
-            self._browser = NoticeBrowser(self.package_root)
+            self._browser = NoticeBrowser(self.package_root, login_guard=self.login_guard, now_factory=self._now)
         scanned = self._browser.scan_unread(password, cancel=cancel)
         rows = list({self._record_key(row): dict(row) for row in scanned}.values())
         received_at = _local_time(received_at)
@@ -927,10 +1048,16 @@ class NoticeCollectionService:
     def _metadata(row: dict) -> dict:
         return {name: str(row.get(name, "") or "") for name in ("key", "date", "noticeId", "subject", "sender")}
 
-    @staticmethod
-    def _check_cancel(cancel) -> None:
+    def _check_cancel(self, cancel, *, verification=False) -> None:
+        self.login_guard.require_allowed(self._now(), verification=verification)
         if cancel is not None and cancel():
             raise NoticeCollectionError("通報收取已停止，未開始新的寫入或已讀操作。", code="cancelled")
+
+    def login_protection(self, now: datetime) -> dict:
+        return self.login_guard.status(now)
+
+    def pause_expired_login(self, now: datetime) -> None:
+        self.login_guard.latch_expiry(now)
 
     def counts(self, now: datetime, shift: NoticeShift | None = None) -> tuple[int, int]:
         if self._state_error:

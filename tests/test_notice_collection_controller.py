@@ -23,6 +23,36 @@ TAIPEI = timezone(timedelta(hours=8))
 
 
 class NoticeCollectionControllerTests(unittest.TestCase):
+    def test_expiry_pauses_scheduler_and_collect_now_but_password_verification_can_resume(self):
+        from app_core.notice_collection_service import NoticeLoginGuard
+        self.now = datetime(2026, 10, 31, 23, 58, tzinfo=TAIPEI)
+        with tempfile.TemporaryDirectory() as temporary:
+            guard = NoticeLoginGuard(Path(temporary))
+            guard.record_expiry("2026-11-01")
+            self.service.login_protection.side_effect = lambda now: guard.status(now)
+            self.enable_saved_account()
+            self.controller.check_due()
+            self.wait_for(lambda: not self.controller.isRunning)
+            count = self.service.collect.call_count
+            self.now += timedelta(minutes=1)
+            self.controller.check_due()
+            self.controller.collectNow()
+            self.assertEqual(self.service.collect.call_count, count)
+            self.assertEqual(self.controller.activityLabel, "已暫停")
+            self.assertIn("10/31 23:59", self.controller.statusText)
+            def verify(*_args, **_kwargs):
+                guard.begin_attempt(self.now, verification=True)
+                guard.record_expiry("2027-02-01", pending=True)
+                guard.finish_attempt(self.now, verification=True)
+            self.service.verify_login.side_effect = verify
+            self.controller.verifyLogin()
+            self.wait_for(lambda: not self.controller.isRunning)
+            self.service.verify_login.assert_called_once()
+            self.assertFalse(guard.status(self.now)["paused"])
+            self.controller.collectNow()
+            self.wait_for(lambda: not self.controller.isRunning)
+            self.assertEqual(self.service.collect.call_count, count + 1)
+
     def reminder_controller(self, path=None, actor=None):
         self.controller.shutdown()
         self.service.shift_records.return_value = [{"time": "09:12", "unit": "第三救災救護大隊",

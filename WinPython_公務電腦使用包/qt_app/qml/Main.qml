@@ -786,6 +786,8 @@ ApplicationWindow {
                         property string statusDescription: (window.backend.noticeCollectionController.hasShiftNotices
                                                             ? "本班已收到通報；" : "")
                                                            + window.backend.noticeCollectionController.activityLabel
+                                                           + (window.backend.noticeCollectionController.loginProtectionText.length > 0
+                                                              ? "；" + window.backend.noticeCollectionController.loginProtectionText : "")
                         x: noticeCollectionTitle.implicitWidth + 1
                         y: -1
                         width: Design.statusDotSize

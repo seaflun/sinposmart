@@ -123,6 +123,9 @@ class NoticeCollectionController(QObject):
         self._schedule_data = {}
         self._status_text = ""
         self._status_tone = "muted"
+        self._login_paused = False
+        self._login_expired = False
+        self._protection_text = ""
         self._shift_text = "值班時段待取得"
         self._reminder_duty_key = ""
         self._has_shift_notices = False
@@ -150,6 +153,10 @@ class NoticeCollectionController(QObject):
     @Property(str, notify=stateChanged)
     def statusTone(self) -> str:
         return self._status_tone
+
+    @Property(str, notify=stateChanged)
+    def loginProtectionText(self) -> str:
+        return self._protection_text
 
     @Property(bool, notify=stateChanged)
     def isRunning(self) -> bool:
@@ -235,7 +242,8 @@ class NoticeCollectionController(QObject):
                                          + ("翌日" if shift.end.date() != shift.start.date() else "") + f"{shift.end:%H:%M}",
                             "lastCheckedText": "最後檢查 " + checked,
                             "handoffText": f"{shift.end:%H:%M} 交班",
-                            "warning": self._notice if self._status_tone in {"warning", "error"} else ""}
+                            "warning": self._protection_text if self._login_paused else
+                                self._notice if self._status_tone in {"warning", "error"} else ""}
         except Exception:
             if eligible and self._active_reminder == key and self._handoff_view.get("visible"):
                 view = {**self._handoff_view, "warning": "通報資料暫時無法更新，顯示上次已確認的紀錄。"}
@@ -294,6 +302,8 @@ class NoticeCollectionController(QObject):
             return "已停止"
         if self.isRunning:
             return "登入驗證中" if self._job.verify_only else "執行中"
+        if self._login_paused:
+            return "已暫停"
         if self._status_tone == "error":
             return "失敗"
         if self._status_tone == "warning":
@@ -304,7 +314,7 @@ class NoticeCollectionController(QObject):
 
     @Property(str, notify=stateChanged)
     def activityTone(self) -> str:
-        return ("ready" if self._closing else "running" if self.isRunning else "manual" if self.activityLabel in {"失敗", "待確認"}
+        return ("ready" if self._closing else "running" if self.isRunning else "manual" if self.activityLabel in {"失敗", "待確認", "已暫停"}
                 else "triggered" if self._status_tone == "success" and not self._closing else "ready")
 
     @Property(str, notify=stateChanged)
@@ -352,6 +362,15 @@ class NoticeCollectionController(QObject):
 
     def _refresh_status(self) -> None:
         now = self._now()
+        old_protection = (self._login_paused, self._protection_text)
+        try:
+            protection = self._service.login_protection(now)
+        except Exception:
+            protection = {"paused": True, "message": "通報登入保護狀態無法確認，已停止自動登入。"}
+        protection = protection if isinstance(protection, dict) else {}
+        self._login_paused = protection.get("paused") is True
+        self._login_expired = protection.get("expired") is True
+        self._protection_text = str(protection.get("message") or "")
         had_notices = self._has_shift_notices
         try:
             responsibility = self._responsibility_provider(now) if self._responsibility_provider else None
@@ -381,10 +400,14 @@ class NoticeCollectionController(QObject):
             text += " 交班通報提醒紀錄無法確認，請人工查看通報。"
             if self._status_tone != "error":
                 self._status_tone = "warning"
-        if self._notice and self._status_tone in {"warning", "error"}:
+        if self._login_paused and not self.isRunning:
+            text += " " + self._protection_text
+            self._status_tone = "warning"
+        elif self._notice and self._status_tone in {"warning", "error"}:
             text += f" {self._notice}"
         changed = (text != self._status_text or shift_text != self._shift_text
-                   or had_notices != self._has_shift_notices)
+                   or had_notices != self._has_shift_notices
+                   or old_protection != (self._login_paused, self._protection_text))
         self._status_text, self._shift_text = text, shift_text
         self._refresh_reminder(shift, now)
         if changed:
@@ -412,10 +435,19 @@ class NoticeCollectionController(QObject):
         if business_roc_date(self._now()) != self._last_schedule_day:
             self._load_saved_schedule()
         self._refresh_status()
+        if self._login_expired and self.isRunning and not self._job.verify_only:
+            self._job.requestInterruption()
         if self._read_only or self._closing or self.isRunning:
             return
         now = self._now()
         verify_only = self._verification_pending
+        if self._login_expired and not verify_only:
+            try:
+                self._service.pause_expired_login(now)
+            except NoticeCollectionError:
+                self._refresh_status()
+        if self._login_paused and not verify_only:
+            return
         if not verify_only and now < self._next_check:
             return
         reason = self._busy_reason()
@@ -527,7 +559,9 @@ class NoticeCollectionController(QObject):
 
     @Slot()
     def _verified(self) -> None:
-        self._set_verification_status(f"通報帳號 {FIXED_NOTICE_ACCOUNT} 登入驗證成功。", "verified")
+        self._notice, self._status_tone = "", "success"
+        self._refresh_status()
+        self._set_verification_status(f"通報帳號 {FIXED_NOTICE_ACCOUNT} 登入驗證成功。" + self._protection_text, "verified")
 
     @Slot(str, str)
     def _verification_failed(self, message: str, tone: str) -> None:

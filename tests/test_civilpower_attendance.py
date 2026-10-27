@@ -21,6 +21,69 @@ MEMBER = {"member_id": "m1", "name": "測試義消", "title": "隊員", "unit": 
 
 
 class OALoginTests(unittest.TestCase):
+    def test_password_expiry_parser_accepts_only_explicit_valid_unambiguous_dates(self):
+        from app_core.login_verifier import oa_password_expiry_date
+        cases = {
+            "此帳號的密碼即將在2026-11-01到期": "2026-11-01",
+            "密碼到期日：115/11/01": "2026-11-01",
+            "上次變更密碼2026/08/01，密碼有效期限2026年11月01日": "2026-11-01",
+            "密碼到期日2026-11-01；密碼到期日2026-12-01": "",
+            "密碼即將在2026-02-30到期": "",
+            "更新日期2026/11/01": "",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(oa_password_expiry_date(text), expected)
+
+    def test_notice_can_retry_ocr_before_submitting_and_gate_can_stop_the_submit(self):
+        from app_core.login_verifier import run_oa_login, LoginVerificationError
+        driver, elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.side_effect = ["", "", "abcd"]
+        gate = Mock()
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer,
+                         attempts=3, submit_limit=1, before_submit=gate)
+        self.assertEqual(recognizer.classification.call_count, 3)
+        elements["loginBtn"].click.assert_called_once()
+        driver, elements, wait = self.make_login()
+        recognizer.classification.side_effect = None
+        recognizer.classification.return_value = "abcd"
+        gate.side_effect = LoginVerificationError("已到停用時間", reason_code="oa_password_expired")
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaises(LoginVerificationError):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer,
+                         attempts=3, submit_limit=1, before_submit=gate)
+        elements["loginBtn"].click.assert_not_called()
+
+    def test_guarded_notice_login_captures_expiry_and_calls_gate_before_only_submission(self):
+        from app_core.login_verifier import run_oa_login
+        driver, elements, wait = self.make_password_warning_login()
+        gate, expiry = Mock(), Mock()
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer,
+                         attempts=3, submit_limit=1, before_submit=gate, password_expiry_callback=expiry)
+        gate.assert_called_once()
+        self.assertIn(unittest.mock.call("2026-11-01"), expiry.call_args_list)
+        elements["loginBtn"].click.assert_called_once()
+
+    def test_guarded_login_never_resubmits_after_captcha_rejection_or_unknown_result(self):
+        from app_core.login_verifier import run_oa_login, LoginVerificationError
+        for captcha_rejected in (True, False):
+            driver, elements, wait = self.make_login()
+            driver.execute_script.side_effect = lambda script, *args: (
+                "oa_captcha_rejected" if "const text = Array.from" in script and captcha_rejected
+                else {"page_text": "", "password_fields": 0} if "login-diagnostic-probe" in script else True)
+            elements["loginBtn"].click.side_effect = None
+            recognizer = Mock()
+            recognizer.classification.return_value = "abcd"
+            with self.subTest(captcha_rejected=captcha_rejected), patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+                with self.assertRaises(LoginVerificationError):
+                    run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer,
+                                 attempts=3, submit_limit=1, before_submit=Mock())
+                elements["loginBtn"].click.assert_called_once()
+
     def make_password_warning_login(self, *, state="oa_password_expiring", dismisses=True, visible=True):
         driver, elements, wait = self.make_login()
         original_find = driver.find_elements.side_effect

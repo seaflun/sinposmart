@@ -93,8 +93,89 @@ class FakeDriver:
 
 
 class NoticeBrowserTests(unittest.TestCase):
+    def test_guarded_success_saves_date_and_cookie_cannot_bypass_cutoff(self):
+        from datetime import datetime, timezone, timedelta
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired, NoticeCollectionService
+        from app_core.notice_collection_browser import NoticeBrowser, OA_LOGIN_URL
+        now = datetime(2026, 10, 31, 23, 58, tzinfo=timezone(timedelta(hours=8)))
+        driver = FakeDriver([snapshot(login=True)])
+        def navigate(current):
+            if current.pages[0].get("login"):
+                current.current_url = OA_LOGIN_URL
+        driver.on_get = navigate
+        expiry = "2026-11-01"
+        def login(current, account, password, **options):
+            options["before_submit"]()
+            options["password_expiry_callback"](expiry)
+            current.pages = [snapshot()]
+            current.current_url = "https://oa.tyfd.gov.tw/index.php"
+        with tempfile.TemporaryDirectory() as temporary:
+            guard = NoticeLoginGuard(Path(temporary))
+            browser = NoticeBrowser(Path(temporary), driver_factory=lambda: driver, login_runner=login,
+                now_factory=lambda: now)
+            self.assertEqual(browser.scan_unread("synthetic-password"), [])
+            self.assertEqual(guard.status(now)["expiry_date"], expiry)
+            now += timedelta(minutes=1)
+            before = len(driver.gets)
+            with self.assertRaises(NoticeLoginRequired):
+                browser.scan_unread("synthetic-password")
+            self.assertEqual(len(driver.gets), before)
+            expiry = "2027-02-01"
+            driver.pages = [snapshot(login=True)]
+            service = NoticeCollectionService(Path(temporary), browser=browser, now_factory=lambda: now)
+            service.verify_login("synthetic-new-password")
+            self.assertFalse(service.login_protection(now)["paused"])
+            self.assertEqual(service.login_protection(now)["expiry_date"], expiry)
+            self.assertFalse(browser._verifying_password)
+
+    def test_guard_keeps_pre_submit_ocr_failure_retryable_without_an_account_submission(self):
+        from datetime import datetime
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired
+        from app_core.notice_collection_browser import NoticeBrowser, OA_LOGIN_URL
+        from app_core.login_verifier import LoginVerificationError
+        driver = FakeDriver([snapshot(login=True)])
+        driver.on_get = lambda current: setattr(current, "current_url", OA_LOGIN_URL)
+        login = Mock(side_effect=LoginVerificationError("辨識元件失敗", reason_code="oa_captcha_ocr_failed"))
+        with tempfile.TemporaryDirectory() as temporary:
+            guard = NoticeLoginGuard(Path(temporary))
+            browser = NoticeBrowser(Path(temporary), driver_factory=lambda: driver, login_runner=login,
+                login_guard=guard, now_factory=lambda: datetime(2026, 10, 27, 12))
+            with self.assertRaises(NoticeLoginRequired):
+                browser.scan_unread("synthetic-password")
+            self.assertFalse(guard.status(datetime(2026, 10, 27, 12))["paused"])
+            self.assertFalse(guard.path.exists())
+
+    def test_guarded_login_stops_after_one_rejection_across_browser_restart(self):
+        from datetime import datetime, timezone, timedelta
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired
+        from app_core.notice_collection_browser import NoticeBrowser, OA_LOGIN_URL
+        from app_core.login_verifier import LoginVerificationError
+        now = datetime(2026, 10, 27, 12, tzinfo=timezone(timedelta(hours=8)))
+        driver = FakeDriver([snapshot(login=True)])
+        driver.on_get = lambda current: setattr(current, "current_url", OA_LOGIN_URL)
+        def rejected(current, account, password, *, attempts, submit_limit, before_submit, password_expiry_callback):
+            self.assertEqual(submit_limit, 1)
+            before_submit()
+            raise LoginVerificationError("合成帳密錯誤", reason_code="oa_credentials_rejected")
+        login = Mock(side_effect=rejected)
+        with tempfile.TemporaryDirectory() as temporary:
+            guard = NoticeLoginGuard(Path(temporary))
+            browser = NoticeBrowser(Path(temporary), driver_factory=lambda: driver, login_runner=login,
+                login_guard=guard, now_factory=lambda: now)
+            with self.assertRaises(NoticeLoginRequired):
+                browser.scan_unread("synthetic-password")
+            self.assertTrue(guard.status(now)["paused"])
+            factory = Mock(return_value=driver)
+            restarted = NoticeBrowser(Path(temporary), driver_factory=factory, login_runner=login,
+                login_guard=NoticeLoginGuard(Path(temporary)), now_factory=lambda: now)
+            with self.assertRaises(NoticeLoginRequired):
+                restarted.scan_unread("synthetic-password")
+            factory.assert_not_called()
+            login.assert_called_once()
+
     def browser(self, driver, **kwargs):
         from app_core.notice_collection_browser import NoticeBrowser
+        kwargs.setdefault("login_guard", False)
         return NoticeBrowser(PACKAGE, driver_factory=lambda: driver,
                              wait_seconds=0.03, poll_seconds=0.001, **kwargs)
 
@@ -460,7 +541,7 @@ class NoticeBrowserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
                 patch("duty_rehearsal.create_webdriver_chrome_with_timeout") as create, \
                 patch("duty_rehearsal.prune_stale_duty_browser_profiles") as prune:
-            browser = NoticeBrowser(PACKAGE)
+            browser = NoticeBrowser(PACKAGE, login_guard=False)
             browser._create_driver()
         options = create.call_args.args[0]
         self.assertIn("--headless=new", options.arguments)
@@ -476,7 +557,7 @@ class NoticeBrowserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}), \
                 patch("duty_rehearsal.build_driver", return_value=FakeDriver()) as build, \
                 patch("duty_rehearsal.create_webdriver_chrome_with_timeout", side_effect=AssertionError("unexpected direct startup")):
-            browser = NoticeBrowser(PACKAGE)
+            browser = NoticeBrowser(PACKAGE, login_guard=False)
             self.assertIs(browser._create_driver(), build.return_value)
             self.assertEqual(browser._profile_dir, Path(directory) / "SinpoSmart/notice_browser_profiles")
             build.assert_called_once_with(headless=True, profile_root=browser._profile_dir,
@@ -513,7 +594,7 @@ class NoticeBrowserTests(unittest.TestCase):
             for path in (legacy, other):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("keep", encoding="utf-8")
-            browser = NoticeBrowser(PACKAGE)
+            browser = NoticeBrowser(PACKAGE, login_guard=False)
             self.assertEqual(browser.scan_unread("synthetic-password"), [])
             self.assertEqual(browser.scan_unread("synthetic-password"), [])
             self.assertEqual(start.call_count, 2)  # The successful driver is reused by the next scan.
@@ -551,7 +632,7 @@ class NoticeBrowserTests(unittest.TestCase):
                       side_effect=SessionNotCreatedException("synthetic-private-detail")) as start, \
                 patch("duty_rehearsal.time.sleep"), \
                 patch("duty_rehearsal.cleanup_duty_browser_profile", side_effect=safe_cleanup) as cleaned:
-            browser = NoticeBrowser(PACKAGE)
+            browser = NoticeBrowser(PACKAGE, login_guard=False)
             with self.assertRaises(NoticeCollectionError) as caught:
                 browser.scan_unread("synthetic-password")
             self.assertEqual(caught.exception.code, "browser_start_failed")
@@ -572,7 +653,7 @@ class NoticeBrowserTests(unittest.TestCase):
             current.pages = [snapshot()]
             current.on_get = None
         login = Mock(side_effect=complete_login)
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory, login_runner=login)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory, login_runner=login)
         self.assertEqual(browser.scan_unread("old-synthetic"), [])
         previous_profile = browser._profile_dir
         browser.begin_login_verification("new-synthetic")
@@ -598,7 +679,7 @@ class NoticeBrowserTests(unittest.TestCase):
         from app_core.notice_collection_service import NoticeLoginRequired
         factory = Mock()
         from app_core.notice_collection_browser import NoticeBrowser
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory)
         with self.assertRaises(NoticeLoginRequired):
             browser.scan_unread("")
         factory.assert_not_called()
@@ -610,7 +691,7 @@ class NoticeBrowserTests(unittest.TestCase):
         first, second = FakeDriver(), FakeDriver()
         first.get = Mock(side_effect=InvalidSessionIdException())
         factory = Mock(side_effect=[first, second])
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory)
         with self.assertRaises(NoticeCollectionError):
             browser.scan_unread("synthetic")
         self.assertEqual(browser.scan_unread("synthetic"), [])
@@ -624,7 +705,7 @@ class NoticeBrowserTests(unittest.TestCase):
         driver = FakeDriver()
         driver.get = Mock(side_effect=[TimeoutException(), None])
         factory = Mock(return_value=driver)
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory)
         with self.assertRaises(NoticeCollectionError):
             browser.scan_unread("synthetic")
         self.assertEqual(browser.scan_unread("synthetic"), [])
@@ -637,7 +718,7 @@ class NoticeBrowserTests(unittest.TestCase):
         driver = FakeDriver()
         driver.refresh = Mock(side_effect=[TimeoutException(), None])
         factory = Mock(return_value=driver)
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory)
 
         with self.assertRaises(NoticeCollectionError):
             browser.scan_unread("synthetic")
@@ -652,7 +733,7 @@ class NoticeBrowserTests(unittest.TestCase):
         first, second = FakeDriver(), FakeDriver()
         first.refresh = Mock(side_effect=InvalidSessionIdException())
         factory = Mock(side_effect=[first, second])
-        browser = NoticeBrowser(PACKAGE, driver_factory=factory)
+        browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=factory)
 
         with self.assertRaises(NoticeCollectionError):
             browser.scan_unread("synthetic")

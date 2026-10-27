@@ -62,6 +62,95 @@ def write_response(payload, written, *, handled=None, errors=0):
                            for row in payload.get("records", []) if row["key"] in written]}}
 
 
+class NoticeLoginProtectionTests(unittest.TestCase):
+    def test_permission_error_is_not_treated_as_a_missing_guard(self):
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired
+        with tempfile.TemporaryDirectory() as directory:
+            guard = NoticeLoginGuard(Path(directory))
+            with patch.object(Path, "stat", side_effect=PermissionError("synthetic")):
+                self.assertTrue(guard.status(datetime(2026, 10, 27))["paused"])
+                with self.assertRaises(NoticeLoginRequired):
+                    guard.begin_attempt(datetime(2026, 10, 27), verification=True)
+
+    def test_expiry_cutoff_handles_year_boundary_and_utc(self):
+        from app_core.notice_collection_service import NoticeLoginGuard
+        with tempfile.TemporaryDirectory() as directory:
+            guard = NoticeLoginGuard(Path(directory))
+            guard.record_expiry("2027-01-01")
+            self.assertFalse(guard.status(datetime(2026, 12, 31, 15, 58, 59, tzinfo=timezone.utc))["paused"])
+            self.assertTrue(guard.status(datetime(2026, 12, 31, 15, 59, tzinfo=timezone.utc))["paused"])
+
+    def test_saved_new_password_verifies_while_expired_and_failed_verification_stays_paused(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeLoginRequired
+        at = datetime(2026, 11, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            service = NoticeCollectionService(Path(directory), browser=browser, now_factory=lambda: at)
+            service.login_guard.record_expiry("2026-11-01")
+            self.assertTrue(service.login_protection(at)["paused"])
+            service.verify_login("synthetic-new-password")
+            self.assertFalse(service.login_protection(at)["paused"])
+            self.assertEqual(browser.events, ["begin_login_verification", "scan"])
+            service.login_guard.pause()
+            browser.scan_unread = Mock(side_effect=NoticeLoginRequired("合成錯誤", code="oa_credentials_rejected"))
+            with self.assertRaises(NoticeLoginRequired):
+                service.verify_login("synthetic-wrong-password")
+            restarted = NoticeCollectionService(Path(directory), browser=browser, now_factory=lambda: at)
+            self.assertTrue(restarted.login_protection(at)["paused"])
+            self.assertTrue(restarted.login_protection(at - timedelta(hours=1))["paused"])
+            before = browser.scan_unread.call_count
+            with self.assertRaises(NoticeLoginRequired):
+                restarted.collect("synthetic-wrong-password", at)
+            self.assertEqual(browser.scan_unread.call_count, before)
+
+    def test_expiry_cutoff_blocks_collection_even_with_a_live_cookie_and_after_restart(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeLoginRequired
+        at = datetime(2026, 10, 31, 23, 58, 59, tzinfo=timezone(timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            service = NoticeCollectionService(Path(directory), browser=browser, now_factory=lambda: at)
+            service.login_guard.record_expiry("2026-11-01")
+            self.assertFalse(service.login_protection(at)["paused"])
+            at += timedelta(seconds=1)
+            with self.assertRaises(NoticeLoginRequired):
+                service.collect("synthetic-password", at)
+            self.assertEqual(browser.events, [])
+            restarted = NoticeCollectionService(Path(directory), browser=browser, now_factory=lambda: at)
+            self.assertTrue(restarted.login_protection(at)["paused"])
+            self.assertIn("10/31 23:59", restarted.login_protection(at)["message"])
+
+    def test_unconfirmed_submission_is_durable_and_only_verified_new_password_clears_it(self):
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired
+        at = datetime(2026, 10, 31, 23, 58, tzinfo=timezone(timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as directory:
+            guard = NoticeLoginGuard(Path(directory))
+            guard.record_expiry("2026-11-01")
+            guard.begin_attempt(at)
+            guard = NoticeLoginGuard(Path(directory))
+            with self.assertRaises(NoticeLoginRequired):
+                guard.require_allowed(at)
+            guard.begin_attempt(at + timedelta(minutes=2), verification=True)
+            guard.record_expiry("2027-02-01", pending=True)
+            guard.finish_attempt(at + timedelta(minutes=2), verification=True)
+            self.assertFalse(guard.status(at + timedelta(minutes=2))["paused"])
+            self.assertEqual(guard.status(at)["expiry_date"], "2027-02-01")
+            self.assertNotIn("synthetic-password", guard.path.read_text(encoding="utf-8"))
+
+    def test_corrupt_or_unwritable_guard_fails_closed_without_discarding_the_file(self):
+        from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired
+        at = datetime(2026, 10, 31, 12, tzinfo=timezone(timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as directory:
+            guard = NoticeLoginGuard(Path(directory))
+            with patch.object(Path, "replace", side_effect=OSError("synthetic")):
+                with self.assertRaises(NoticeLoginRequired):
+                    guard.begin_attempt(at)
+            guard.path.write_text("{bad", encoding="utf-8")
+            self.assertTrue(guard.status(at)["paused"])
+            with self.assertRaises(NoticeLoginRequired):
+                guard.begin_attempt(at, verification=True)
+            self.assertEqual(guard.path.read_text(encoding="utf-8"), "{bad")
+
+
 class NoticeCollectionTests(unittest.TestCase):
     def test_shift_records_keep_publisher_and_original_receipt_across_restart(self):
         from app_core.notice_collection_service import NoticeCollectionService, NoticeShift
@@ -1263,7 +1352,8 @@ class NoticeLoginVerificationTests(unittest.TestCase):
                 poster=lambda payload: self.fail("登入驗證不得呼叫 Apps Script"))
             self.assertEqual(service.verify_login("synthetic-login-secret").status, "login_verified")
             self.assertFalse(service.state_path.exists())
-            self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertFalse(service.state_path.exists())
+            self.assertEqual(list(service.login_guard.path.parent.iterdir()), [service.login_guard.path])
 
     def test_empty_password_or_pre_cancel_stops_before_browser_actions(self):
         from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError

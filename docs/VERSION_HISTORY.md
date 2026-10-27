@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.27.1833` | 2026-10-27 18:33（台北時間） | 通報於密碼到期前一天23:59停用；登入最多送出一次，失敗持續暫停，儲存新密碼後自動驗證恢復。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.1833) |
 | `2026.10.27.1547` | 2026-10-27 15:47（台北時間） | 交班前兩分鐘顯示當班通報置頂提醒，單位與姓名分行、收取時間排序，保留零則不跳與跨重啟防重複。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.1547) |
 | `2026.10.27.1342` | 2026-10-27 13:42（台北時間） | 勤務表自動登打提前至每日10:30，保留下一消防日目標、舊排程轉換與防重複執行。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.1342) |
 | `2026.10.27.1210` | 2026-10-27 12:10（台北時間） | 修正延後交班與更新重啟後的通報簽收責任恢復，保留跨日、取消與衝突守門，明確區分入表與簽收。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.27.1210) |

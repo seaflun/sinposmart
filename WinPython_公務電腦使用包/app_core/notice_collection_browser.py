@@ -14,11 +14,12 @@ from uuid import uuid4
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 from selenium.webdriver.common.by import By
 
-from app_core.login_verifier import OASessionExpiredError, OA_LOGIN_FAILURE_MESSAGES
+from app_core.login_verifier import LoginVerificationError, OASessionExpiredError, OA_LOGIN_FAILURE_MESSAGES
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
     NoticeCollectionError,
     NoticeLoginRequired,
+    NoticeLoginGuard,
     TAIPEI,
 )
 
@@ -36,7 +37,7 @@ _SCRIPT = Path(__file__).with_name("notice_collection_dom.js").read_text(encodin
 class NoticeBrowser:
     def __init__(self, package_root: Path, *, driver_factory=None, login_runner=None,
                  wait_seconds: float = 25, poll_seconds: float = 0.2,
-                 max_pages: int = 100) -> None:
+                 max_pages: int = 100, login_guard=None, now_factory=None) -> None:
         self.package_root = Path(package_root)
         self._driver_factory = driver_factory or self._create_driver
         self._login_runner = login_runner or self._run_oa_login
@@ -48,6 +49,10 @@ class NoticeBrowser:
         self._poll_seconds = poll_seconds
         self._max_pages = max_pages
         self._publication_cache = {}
+        self._login_guard = None if login_guard is False else login_guard or NoticeLoginGuard(self.package_root)
+        self._now = now_factory or (lambda: datetime.now(TAIPEI))
+        self._verifying_password = False
+        self._attempt_started = False
 
     def _create_driver(self):
         from duty_rehearsal import build_driver
@@ -57,10 +62,10 @@ class NoticeBrowser:
             preferences={"credentials_enable_service": False, "profile.password_manager_enabled": False})
 
     @staticmethod
-    def _run_oa_login(driver, account: str, password: str, *, attempts: int) -> None:
+    def _run_oa_login(driver, account: str, password: str, *, attempts: int, **options) -> None:
         from app_core.login_verifier import run_oa_login
 
-        run_oa_login(driver, account, password, attempts=attempts)
+        run_oa_login(driver, account, password, attempts=attempts, **options)
 
     def begin_login_verification(self, password: str) -> None:
         if not password:
@@ -69,9 +74,16 @@ class NoticeBrowser:
         # A fresh owned profile cannot reuse an earlier authenticated session to
         # falsely validate a newly saved password. No cookie jar is exported.
         self._profile_dir = self._profile_root / "notice_verification_profiles" / uuid4().hex
+        self._verifying_password = True
 
-    @staticmethod
-    def _check_cancel(cancel) -> None:
+    def end_login_verification(self) -> None:
+        self._verifying_password = False
+
+    def _check_cancel(self, cancel) -> None:
+        if self._login_guard and not self._verifying_password:
+            status = self._login_guard.status(self._now())
+            if status["expired"]:
+                raise NoticeLoginRequired(status["message"], code=status["code"])
         if cancel is not None and cancel():
             raise NoticeCollectionError("通報收取已停止。", code="cancelled")
 
@@ -133,6 +145,8 @@ class NoticeBrowser:
         return rows
 
     def _scan_with_login(self, password: str, cancel=None, **filters) -> list[dict]:
+        if self._login_guard:
+            self._login_guard.require_allowed(self._now(), verification=self._verifying_password)
         self._check_cancel(cancel)
         if not password:
             raise NoticeLoginRequired("請先在值班台儲存 tyfd01214 的帳號密碼。", code="credentials_missing")
@@ -148,21 +162,54 @@ class NoticeBrowser:
                     raise NoticeCollectionError("通報登入頁重新整理失敗，請確認連線。", code="login_page_failed") from None
             self._assert_login_target()
             self._check_cancel(cancel)
+            self._attempt_started = False
             try:
-                self._login_runner(self._driver, FIXED_NOTICE_ACCOUNT, password, attempts=3)
+                options = ({"submit_limit": 1, "before_submit": self._before_login_submit,
+                            "password_expiry_callback": self._record_password_expiry} if self._login_guard else {})
+                self._login_runner(self._driver, FIXED_NOTICE_ACCOUNT, password, attempts=3, **options)
+                self._check_cancel(cancel)
+                rows = self._scan_pages(cancel, **filters)
+                if self._login_guard and not self._verifying_password:
+                    self._login_guard.finish_attempt(self._now())
+                return rows
             except OASessionExpiredError:
-                raise NoticeLoginRequired("入口網作業逾時，將於下輪重新登入。", code="session_expired") from None
+                self._pause_failed_attempt("oa_login_unconfirmed")
+                message = ("入口網登入尚未確認，已暫停自動登入，請儲存通報密碼重新驗證。" if self._login_guard
+                           else "入口網作業逾時，將於下輪重新登入。")
+                raise NoticeLoginRequired(message, code="session_expired") from None
             except Exception as exc:
-                code = getattr(exc, "reason_code", "")
+                code = getattr(exc, "reason_code", "") or getattr(exc, "code", "")
+                self._pause_failed_attempt(code)
+                if isinstance(exc, NoticeCollectionError):
+                    raise
                 if isinstance(code, str) and code in OA_LOGIN_FAILURE_MESSAGES:
                     raise NoticeLoginRequired(OA_LOGIN_FAILURE_MESSAGES[code], code=code) from None
                 raise NoticeLoginRequired("通報背景登入未成功，請確認已儲存的密碼與網站狀態。", code="login_failed") from None
-            self._check_cancel(cancel)
-            return self._scan_pages(cancel, **filters)
         except NoticeCollectionError:
             raise
         except Exception:
             raise NoticeCollectionError("通報列表載入未完成，已保留原有未讀狀態。", code="scan_unexpected") from None
+
+    def _before_login_submit(self) -> None:
+        try:
+            self._login_guard.begin_attempt(self._now(), verification=self._verifying_password)
+            self._attempt_started = True
+        except NoticeLoginRequired as exc:
+            raise LoginVerificationError(str(exc), reason_code=exc.code) from None
+
+    def _record_password_expiry(self, value: str) -> None:
+        try:
+            self._login_guard.record_expiry(value, pending=True)
+            if not self._verifying_password:
+                status = self._login_guard.status(self._now())
+                if status["expired"]:
+                    raise NoticeLoginRequired(status["message"], code=status["code"])
+        except NoticeLoginRequired as exc:
+            raise LoginVerificationError(str(exc), reason_code=exc.code) from None
+
+    def _pause_failed_attempt(self, code: str) -> None:
+        if self._login_guard and (self._attempt_started or code in self._login_guard.REASONS - {""}):
+            self._login_guard.pause(code)
 
     def _wait_page(self, expected_page: int, previous_keys, cancel, *, read_filter=0, date_range=None) -> dict:
         deadline = time.monotonic() + self._wait_seconds

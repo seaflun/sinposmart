@@ -328,6 +328,10 @@ OA_LOGIN_FAILURE_MESSAGES = {
     "oa_login_verification_timeout": "通報登入送出後驗證逾時，尚未確認登入成功。",
     "oa_password_warning_blocked": "入口網密碼到期提醒未能關閉，尚未確認登入成功，請稍後重試。",
     "oa_password_change_required": "入口網密碼須更新，請手動變更密碼後重新登入。",
+    "oa_account_locked": "入口網帳號已鎖定或停用，請人工確認後再更新通報密碼。",
+    "oa_login_unconfirmed": "通報自動登入已暫停，請確認密碼並儲存以自動驗證。",
+    "oa_password_expired": "已達通報密碼停用時間，請儲存新密碼以自動驗證。",
+    "oa_login_guard_unavailable": "通報登入保護紀錄無法確認，未送出登入。",
 }
 
 
@@ -420,8 +424,27 @@ def run_duty_login(driver: Any, user_id: str, password: str) -> None:
     login(driver, user_id, password)
 
 
+def oa_password_expiry_date(page_text: str) -> str:
+    """Read only an explicit, unambiguous password-expiry label or warning."""
+    text = re.sub(r"\s+", "", str(page_text or ""))
+    pattern = (r"密碼(?:即將(?:在|於)?|將(?:在|於)|到期(?:日期|日)?[:：]?|"
+               r"有效(?:期限|日期)(?:為|至)?[:：]?)[^\d]{0,6}"
+               r"(\d{3,4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?!\d)(?:日)?")
+    values = set()
+    for year, month, day in re.findall(pattern, text):
+        try:
+            year = int(year) + (1911 if len(year) == 3 else 0)
+            if not 2011 <= year <= 2910:
+                return ""
+            values.add(datetime(year, int(month), int(day)).date().isoformat())
+        except ValueError:
+            return ""
+    return values.pop() if len(values) == 1 else ""
+
+
 def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = None,
-                 *, attempts: int = 3) -> None:
+                 *, attempts: int = 3, submit_limit: int | None = None,
+                 before_submit=None, password_expiry_callback=None) -> None:
     """Log into the OA portal with the existing in-memory CAPTCHA recognizer."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
@@ -461,6 +484,7 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
         rejection = current.execute_script("""
             const text = Array.from(document.querySelectorAll('.swal2-popup,.sweet-alert,.alert,[role="alert"]'))
               .map(node => node.innerText || '').join(' ');
+            if (/帳號/.test(text) && /鎖定|停用|停權/.test(text)) return 'oa_account_locked';
             if (/驗證碼/.test(text) && /錯誤|不正確|失敗/.test(text)) return 'oa_captcha_rejected';
             if (/帳號|密碼/.test(text) && /錯誤|不正確|失敗/.test(text)) return 'oa_credentials_rejected';
             return '';
@@ -469,6 +493,9 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
             raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[rejection], reason_code=rejection)
         probe = _login_page_probe(current)
         page_text = str(probe.get("page_text") or "")
+        expiry = oa_password_expiry_date(page_text)
+        if expiry and callable(password_expiry_callback):
+            password_expiry_callback(expiry)
         if warning_dismissed and not page_text:
             return False
         if _password_change_required(page_text, probe.get("password_fields", 0)):
@@ -493,6 +520,8 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
                 and not current.find_elements(By.CSS_SELECTOR, "#login_name, #verify_code, #loginBtn"))
 
     last_code = "oa_login_page_failed"
+    submissions = 0
+    maximum_submissions = max(1, min(int(submit_limit or attempts), 3))
     for _attempt in range(max(1, min(int(attempts), 3))):
         warning_dismissed = False
         try:
@@ -521,15 +550,22 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
             button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#loginBtn")))
             assert_login_target()
             last_code = "oa_login_verification_timeout"
+            if callable(before_submit):
+                before_submit()
+            submissions += 1
             button.click()
             wait.until(logged_in)
             return
         except LoginVerificationError as exc:
             if exc.reason_code == "oa_captcha_rejected":
                 last_code = exc.reason_code
+                if submissions >= maximum_submissions:
+                    raise
                 continue
             raise
         except Exception:
+            if submissions >= maximum_submissions:
+                break
             continue
     raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[last_code], reason_code=last_code) from None
 
