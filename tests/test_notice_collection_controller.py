@@ -8,7 +8,7 @@ import unittest
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -23,6 +23,174 @@ TAIPEI = timezone(timedelta(hours=8))
 
 
 class NoticeCollectionControllerTests(unittest.TestCase):
+    def reminder_controller(self, path=None, actor=None):
+        self.controller.shutdown()
+        self.service.shift_records.return_value = [{"time": "09:12", "unit": "第三救災救護大隊",
+            "name": "測試員", "subject": "測試主旨"}]
+        self.actor = actor or Mock(return_value="1")
+        self.controller = NoticeCollectionController(self.service, self.lookup, self.busy,
+            now_factory=lambda: self.now, timer_start=False, reminder_actor_provider=self.actor,
+            reminder_state_path=path)
+        self.controller._next_check = self.now + timedelta(hours=3)
+        self.controller.set_schedule_data(self.schedule())
+
+    def test_handoff_popup_uses_two_minute_boundary_updates_and_dismisses_once(self):
+        self.now = self.now.replace(hour=9, minute=57, second=59)
+        self.reminder_controller()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+        self.now += timedelta(seconds=1)
+        self.controller.check_due()
+        self.assertTrue(self.controller.handoffReminder["visible"])
+        self.assertEqual(self.controller.handoffReminder["count"], 1)
+        self.assertEqual(self.controller.handoffReminder["handoffText"], "10:00 交班")
+        self.service.shift_records.return_value.append({"time": "09:58", "unit": "救災救護指揮中心",
+            "name": "測試乙", "subject": "新增通報"})
+        self.controller.check_due()
+        self.assertEqual(self.controller.handoffReminder["count"], 2)
+        self.controller.dismissHandoffReminder()
+        self.controller.check_due()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+
+    def test_zero_records_wrong_actor_logout_and_shift_end_never_show_popup(self):
+        self.now = self.now.replace(hour=9, minute=58)
+        self.reminder_controller(actor=Mock(return_value="2"))
+        self.assertFalse(self.controller.handoffReminder["visible"])
+        self.actor.return_value = "1"
+        self.service.shift_records.return_value = []
+        self.controller.check_due()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+        self.service.shift_records.return_value = [{"time": "09:12", "unit": "救護科", "name": "甲", "subject": "通報"}]
+        self.controller.check_due()
+        self.assertTrue(self.controller.handoffReminder["visible"])
+        self.actor.return_value = ""
+        self.controller.check_due()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+        self.actor.return_value = "1"
+        self.now = self.now.replace(hour=10)
+        self.controller.check_due()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+
+    def test_reminder_checkpoint_prevents_repeat_after_restart_and_corruption(self):
+        self.now = self.now.replace(hour=9, minute=58)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reminder.json"
+            self.reminder_controller(path)
+            self.assertTrue(self.controller.handoffReminder["visible"])
+            self.reminder_controller(path)
+            self.assertFalse(self.controller.handoffReminder["visible"])
+            path.write_text("{bad", encoding="utf-8")
+            self.reminder_controller(path)
+            self.assertFalse(self.controller.handoffReminder["visible"])
+
+    def test_popup_uses_true_handoff_across_midnight(self):
+        self.now = self.now.replace(hour=23, minute=58)
+        self.reminder_controller()
+        schedule = self.schedule()
+        schedule["today"]["rows"] = [{"slot": "22~0", "columns": {"值班": ["1"]}}]
+        self.controller.set_schedule_data(schedule)
+        self.assertTrue(self.controller.handoffReminder["visible"])
+        self.assertEqual(self.controller.handoffReminder["handoffText"], "00:00 交班")
+
+    def test_popup_is_read_only_during_ledger_failure_and_journal_write_failure(self):
+        self.now = self.now.replace(hour=9, minute=58)
+        with tempfile.TemporaryDirectory() as temporary:
+            self.reminder_controller(Path(temporary) / "reminder.json", actor=Mock(return_value="2"))
+            self.actor.return_value = "1"
+            with patch.object(Path, "replace", side_effect=OSError("test")):
+                self.controller.check_due()
+            self.assertFalse(self.controller.handoffReminder["visible"])
+            self.service.collect.assert_not_called()
+
+    def test_live_popup_keeps_confirmed_rows_when_refresh_fails(self):
+        self.now = self.now.replace(hour=9, minute=58)
+        self.reminder_controller()
+        self.service.shift_records.side_effect = NoticeCollectionError("暫時失敗")
+        self.controller.refreshReminder()
+        self.assertTrue(self.controller.handoffReminder["visible"])
+        self.assertEqual(self.controller.handoffReminder["count"], 1)
+        self.assertIn("上次已確認", self.controller.handoffReminder["warning"])
+        self.actor.return_value = ""
+        self.controller.refreshReminder()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+
+    def test_last_check_checkpoint_survives_restart_without_triggering_collection(self):
+        self.now = self.now.replace(hour=9, minute=57)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reminder.json"
+            self.reminder_controller(path)
+            self.controller._poll_run_id = "fixture-run"
+            self.controller._collected(NoticeCollectionResult(self.now))
+            self.now = self.now.replace(minute=58)
+            self.reminder_controller(path)
+            self.assertIn("09:57:00", self.controller.handoffReminder["lastCheckedText"])
+            self.service.collect.assert_not_called()
+
+    def test_refresh_failure_after_sleep_does_not_expose_the_previous_shift(self):
+        self.now = self.now.replace(hour=9, minute=58)
+        self.reminder_controller()
+        self.assertTrue(self.controller.handoffReminder["visible"])
+        self.now = self.now.replace(hour=11)
+        self.actor.return_value = "2"
+        self.service.shift_records.side_effect = NoticeCollectionError("暫時失敗")
+        self.controller.refreshReminder()
+        self.assertFalse(self.controller.handoffReminder["visible"])
+
+    def test_sheet_link_is_fetched_off_thread_and_untrusted_urls_never_open(self):
+        self.service.monthly_spreadsheet_url.return_value = "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit"
+        with patch("qt_app.controllers.notice_collection_controller.QDesktopServices.openUrl", return_value=True) as opened:
+            self.controller.openNoticeSheet()
+            self.wait_for(lambda: not self.controller.sheetLinkBusy)
+            opened.assert_called_once()
+            self.assertEqual(self.controller.sheetLinkMessage, "")
+            self.controller._open_sheet_url("https://private.invalid/")
+            opened.assert_called_once()
+            self.assertIn("尚未確認", self.controller.sheetLinkMessage)
+
+    def test_real_qml_popup_keeps_unit_above_name_and_scrolls_long_subjects(self):
+        from PySide6.QtCore import QObject, QUrl, Qt
+        from PySide6.QtQml import QQmlApplicationEngine
+        from PySide6.QtQuickControls2 import QQuickStyle
+        QQuickStyle.setStyle("Basic")
+        self.now = self.now.replace(hour=9, minute=58)
+        self.reminder_controller()
+        rows = self.service.shift_records.return_value
+        rows[0]["subject"] = "長主旨測試" * 30
+        rows.extend([{"time": "09:40", "unit": "救災救護指揮中心", "name": "測試乙", "subject": "通報"}] * 20)
+        self.controller.refreshReminder()
+        engine = QQmlApplicationEngine()
+        engine.setInitialProperties({"controller": self.controller})
+        errors = []
+        engine.warnings.connect(lambda values: errors.extend(str(value) for value in values))
+        engine.load(QUrl.fromLocalFile(str(PACKAGE / "qt_app/qml/dialogs/NoticeHandoffWindow.qml")))
+        self.assertTrue(engine.rootObjects(), errors)
+        root = engine.rootObjects()[0]
+        try:
+            self.app.processEvents()
+            self.assertTrue(root.isVisible())
+            self.assertTrue(root.flags() & Qt.WindowStaysOnTopHint)
+            self.assertEqual(root.modality(), Qt.NonModal)
+            self.assertIsNone(root.transientParent())
+            shift, checked = (root.findChild(QObject, name) for name in ("noticeShiftLabel", "noticeLastChecked"))
+            self.assertEqual(shift.parent(), checked.parent())
+            listing = root.findChild(QObject, "noticeHandoffList")
+            self.assertGreater(listing.property("contentHeight"), listing.property("height"))
+            def walk(item):
+                yield item
+                for child in item.childItems():
+                    yield from walk(child)
+            visible = list(walk(root.contentItem()))
+            unit = next(item for item in visible if item.objectName() == "noticePublisherUnit")
+            name = next(item for item in visible if item.objectName() == "noticePublisherName")
+            self.assertGreaterEqual(name.y(), unit.y() + unit.height())
+            self.assertFalse(errors, errors)
+            root.findChild(QObject, "noticeDismissButton").clicked.emit()
+            self.app.processEvents()
+            self.assertFalse(root.isVisible())
+        finally:
+            root.setVisible(False)
+            engine.deleteLater()
+            self.app.processEvents()
+
     def test_shift_reminder_clears_only_after_a_confirmed_handoff(self):
         self.controller.shutdown()
         proof = {"schema_version": 1, "status": "confirmed", "actorNo": "1", "name": "持續值班甲",

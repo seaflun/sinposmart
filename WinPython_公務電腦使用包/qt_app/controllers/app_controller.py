@@ -275,6 +275,9 @@ class AppController(QObject):
             self,
             read_only_acceptance=self._read_only_acceptance,
             responsibility_provider=getattr(self._duty_controller, "notice_responsibility", None),
+            reminder_actor_provider=lambda: self._session_controller.actorNo
+                if self._session_controller.isLoggedIn and self._duty_mode_active else "",
+            reminder_state_path=package_root / "runtime_outputs" / "notice_collection" / "reminder.json",
         )
         self._session_controller.noticePasswordSaved.connect(self._notice_collection_controller.verifyLogin)
         self._notice_collection_controller.reportReady.connect(self._notice_collection_report_ready)
@@ -317,6 +320,7 @@ class AppController(QObject):
             self._automatic_tools_timer.start()
         self._tool_controller.automaticNotice.connect(self._record_automatic_notice)
         self._session_controller.sessionChanged.connect(self._sync_session_actor)
+        self._session_controller.sessionChanged.connect(self._notice_collection_controller.refreshReminder)
         self._session_controller.loginAttemptFailed.connect(self._login_attempt_failed)
         self._duty_controller.liveScheduleCaptured.connect(self._live_schedule_captured)
         self._duty_controller.liveSnapshotCaptured.connect(self._live_snapshot_captured)
@@ -1729,6 +1733,7 @@ class AppController(QObject):
     @Slot(bool)
     def setDutyModeActive(self, active: bool) -> None:
         self._duty_mode_active = bool(active)
+        self._notice_collection_controller.refreshReminder()
         if not self._duty_mode_active:
             self._duty_controller.disable_auto_execution()
             self._duty_execution_controller.set_automatic_execution_enabled(False)

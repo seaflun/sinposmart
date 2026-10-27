@@ -66,6 +66,7 @@ class NoticeShift:
     label: str
     start: datetime
     end: datetime
+    duty_nos: tuple[str, ...] = ()
 
 
 @dataclass
@@ -321,9 +322,9 @@ def current_shift(schedule_data: dict, now: datetime) -> NoticeShift | None:
     candidates = [p for p in merged if p[0] <= local < p[1]]
     if len(candidates) != 1:
         return None
-    start, end, _actors = candidates[0]
+    start, end, actors = candidates[0]
     label = f"{start:%H}-{end:%H}" if start.date() == end.date() else f"{start:%H}-翌日{end:%H}"
-    return NoticeShift(f"{start.isoformat()}/{end.isoformat()}", label, start, end)
+    return NoticeShift(f"{start.isoformat()}/{end.isoformat()}", label, start, end, actors)
 
 
 class NoticeCollectionService:
@@ -357,6 +358,11 @@ class NoticeCollectionService:
                     _local_time(datetime.fromisoformat(intent["received_at"]))
                     for row in intent["records"]:
                         self._record_key(row)
+                    publishers = intent.get("publishers", {})
+                    if (not isinstance(publishers, dict)
+                            or any(not isinstance(key, str) or not isinstance(value, str) or len(value) > 240
+                                   for key, value in publishers.items())):
+                        raise ValueError("invalid publisher metadata")
                     repair_keys = intent.get("repair_keys", [])
                     if (not isinstance(repair_keys, list)
                             or not all(isinstance(key, str) for key in repair_keys)
@@ -472,7 +478,12 @@ class NoticeCollectionService:
                 raise NoticeCollectionError("通報公布日期時間無法確認，已停止本輪補查。", code="publication_invalid")
             published_at = published.astimezone(TAIPEI).isoformat(timespec="seconds")
             if key in state["collected"]:
-                state.setdefault("confirmed", {}).setdefault(key, {}).update(published_at=published_at)
+                metadata = state.setdefault("confirmed", {}).setdefault(key, {})
+                metadata.update(published_at=published_at)
+                publisher = self._publisher_text(row.get("publisher") or (
+                    row.get("sender") if not metadata.get("publisher") else ""))
+                if publisher:
+                    metadata["publisher"] = publisher
                 manual.pop(key, None)
                 continue
             if any(key in {str(item.get("key")) for item in intent["records"]} for intent in state["pending"]):
@@ -548,6 +559,8 @@ class NoticeCollectionService:
                 self._collection_stage = "state"
                 intent = {"request_id": "notice-" + uuid4().hex,
                           "received_at": received_at.isoformat(),
+                          "publishers": {row["key"]: self._publisher_text(row.get("publisher") or row.get("sender"))
+                                         for row in batch},
                           "records": [{**self._metadata(row), "responsibility": copy.deepcopy(row["responsibility"])}
                                       for row in records],
                           "repair_keys": sorted(repairs & {row["key"] for row in records})}
@@ -784,6 +797,7 @@ class NoticeCollectionService:
                     raise _NoticeSigningError("簽收回報與收取時責任人不符，保留待確認。", code="recipient_unconfirmed")
             state.setdefault("confirmed", {})[key] = {
                 "subject": str(row.get("subject", ""))[:240], "read_state": "pending",
+                "publisher": self._publisher_text(intent.get("publishers", {}).get(key) or row.get("sender")),
                 "responsibility": copy.deepcopy(row.get("responsibility", {})),
                 "signing_state": signed.get(key, {}).get("status", "unknown"),
                 "signed_by": signed.get(key, {}).get("recipient", ""),
@@ -929,6 +943,52 @@ class NoticeCollectionService:
         shift_count = (sum(_local_time(shift.start) <= value < _local_time(shift.end) for value in timestamps)
                        if shift is not None else 0)
         return shift_count, today
+
+    @staticmethod
+    def _publisher_text(value) -> str:
+        return " ".join(value.split())[:240] if isinstance(value, str) else ""
+
+    def shift_records(self, shift: NoticeShift) -> list[dict]:
+        """Read confirmed receipts without changing their time, identity or signing."""
+        if self._state_error:
+            raise NoticeCollectionError("通報收取紀錄無法讀取，提醒暫時無法確認。")
+        rows = []
+        for key, timestamp in self._state["collected"].items():
+            received = _local_time(datetime.fromisoformat(timestamp))
+            if not _local_time(shift.start) <= received < _local_time(shift.end):
+                continue
+            metadata = self._state.get("confirmed", {}).get(key, {})
+            raw = self._publisher_text(metadata.get("publisher"))
+            parts = [part.strip() for part in raw.split("/") if part.strip()]
+            leaf = parts[-1] if parts else ""
+            match = re.fullmatch(r"(.+(?:科|室|隊|組|局|中心|所))\s*(.+)", leaf)
+            if match:
+                unit, name = match[1].strip(), match[2].strip()
+            elif len(parts) > 1:
+                unit, name = "/".join(parts[:-1]), leaf
+            elif len(leaf.split()) > 1:
+                unit, name = leaf.rsplit(None, 1)
+            elif re.search(r"(?:科|室|隊|組|局|中心|所)$", leaf):
+                unit, name = leaf, ""
+            else:
+                unit, name = "", leaf
+            rows.append((received, key, {"time": received.strftime(
+                "%H:%M" if received.date() == _local_time(shift.start).date() else "%m/%d %H:%M"),
+                "unit": unit or "單位未提供", "name": name or "發布人未提供",
+                "subject": str(metadata.get("subject") or "主旨未提供")[:240]}))
+        return [row for _at, _key, row in sorted(rows, key=lambda item: (item[0], item[1]))]
+
+    def monthly_spreadsheet_url(self, now: datetime) -> str:
+        local = _local_time(now)
+        response = self._post({"action": "getMonthlySpreadsheetLink", "year": local.year, "month": local.month})
+        identifier = response.get("spreadsheetId")
+        url = f"https://docs.google.com/spreadsheets/d/{identifier}/edit"
+        if (response.get("status") != "success" or response.get("year") != local.year
+                or response.get("month") != local.month or not isinstance(identifier, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", identifier)
+                or response.get("spreadsheetUrl") != url):
+            raise NoticeCollectionError("當月通報試算表連結尚未確認，請稍後重試。")
+        return url
 
     def has_notices_for_responsibility(self, responsibility) -> bool:
         if self._state_error:

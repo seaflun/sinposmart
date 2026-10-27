@@ -706,6 +706,11 @@ global.document={body:{innerText:''},querySelector:s=>state.dated&&s==='input#st
   return [];
 }};
 const result=run('snapshot',null);
+row.innerText='公告人員：第三救災救護大隊/測試員';
+const longUnit=run('snapshot',null).records[0].publisher;
+row.innerText='公告人員：救災救護指揮中心 測試甲';
+const spacedUnit=run('snapshot',null).records[0].publisher;
+row.innerText='公告人員：測試隊/測試員';
 state.filter=2;
 const stale=run('snapshot',null);
 state.filter=0;state.empty=true;
@@ -718,19 +723,21 @@ state.filter=2;state.empty=false;state.dated=true;link.style.fontWeight='100';
 const recent=run('snapshot',null);
 state.dated=false;
 const missingDate=run('snapshot',null);
-console.log(JSON.stringify({result,staleFiltered:stale.filtered,empty,sessionExpired,recent,missingDate}));
+console.log(JSON.stringify({result,longUnit,spacedUnit,staleFiltered:stale.filtered,empty,sessionExpired,recent,missingDate}));
 """
         asset = PACKAGE / "app_core" / "notice_collection_dom.js"
         completed = subprocess.run([shutil.which("node"), "-e", script, str(asset)],
                                    capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
+        self.assertEqual(result["longUnit"], "第三救災救護大隊/測試員")
+        self.assertEqual(result["spacedUnit"], "救災救護指揮中心 測試甲")
         self.assertEqual((result["recent"]["readFilter"], result["recent"]["dateFrom"], result["recent"]["dateTo"]),
                          (2, "115-10-21", "115-10-25"))
         self.assertFalse(result["recent"]["records"][0]["isUnread"])
         self.assertEqual(result["missingDate"]["dateFrom"], "")
         self.assertTrue(result["result"]["filtered"])
-        self.assertEqual(result["result"]["records"], [{**notice(), "subject": "測試主旨"}])
+        self.assertEqual(result["result"]["records"], [{**notice(), "subject": "測試主旨", "publisher": "測試隊/測試員"}])
         self.assertFalse(result["staleFiltered"])
         self.assertEqual((result["empty"]["total"], result["empty"]["records"]), (0, []))
         self.assertFalse(result["result"]["sessionExpired"])

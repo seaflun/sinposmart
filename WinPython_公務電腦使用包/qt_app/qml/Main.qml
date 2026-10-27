@@ -320,6 +320,11 @@ ApplicationWindow {
         transientParent: window
     }
 
+    NoticeHandoffWindow {
+        controller: window.backend.noticeCollectionController
+        hostWindow: window
+    }
+
     Connections {
         target: window.backend
 

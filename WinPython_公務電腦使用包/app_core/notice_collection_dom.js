@@ -48,10 +48,12 @@ return (function (operation, payload, done) {
     let sender = senderMatch ? senderMatch[1].trim() : '未標示';
     if (sender.includes('/')) sender = sender.split('/').pop();
     sender = sender.replace(/^(.*?(?:科|室|隊|組|局|中心|所))/, '$1 ');
+    const publisherMatch = `${row.innerText}\n${detail.innerText}`.match(/(?:發布者|公告人員|通報人員)\s*[:：][ \t]*([^\n\t\r]+)/);
+    const publisher = publisherMatch ? publisherMatch[1].trim().slice(0, 240) : '';
     const weight = links[0].style?.fontWeight || '';
     const isUnread = weight === 'bold' || Number(weight) >= 600 ? true
       : weight === 'normal' || (weight !== '' && Number(weight) > 0 && Number(weight) <= 400) ? false : null;
-    return { key: noticeId, noticeId, date: date.innerText.trim(), subject, sender,
+    return { key: noticeId, noticeId, date: date.innerText.trim(), subject, sender, publisher,
       isUnread, contentUrl: iframe.src || iframe.getAttribute('src') || '' };
   }
 

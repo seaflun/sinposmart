@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import copy
+import json
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Property, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
 
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
@@ -69,21 +73,47 @@ class _NoticeCollectionJob(QThread):
         return message[:300] or "通報收取未完成。"
 
 
+class _NoticeSheetLinkJob(QThread):
+    resolved = Signal(str)
+    failed = Signal()
+
+    def __init__(self, service, now, parent):
+        super().__init__(parent)
+        self._service, self._now = service, now
+
+    def run(self):
+        try:
+            self.resolved.emit(self._service.monthly_spreadsheet_url(self._now))
+        except Exception:
+            self.failed.emit()
+
+
 class NoticeCollectionController(QObject):
     stateChanged = Signal()
     verificationStatusChanged = Signal()
     reportReady = Signal(object)
+    reminderChanged = Signal()
 
     def __init__(
         self, service, saved_account_lookup: Callable, busy_reason: Callable,
         schedule_repository=None, parent=None, *, now_factory=None,
         read_only_acceptance=False, timer_start=True, responsibility_provider=None,
+        reminder_actor_provider=None, reminder_state_path=None,
     ):
         super().__init__(parent)
         self._service = service
         self._lookup = saved_account_lookup
         self._busy_reason = busy_reason
         self._responsibility_provider = responsibility_provider
+        self._reminder_actor_provider = reminder_actor_provider
+        self._reminder_state_path = Path(reminder_state_path) if reminder_state_path is not None else None
+        self._shown_reminders = set()
+        self._reminder_journal_error = False
+        self._active_reminder = ""
+        self._handoff_view = {"visible": False, "rows": []}
+        self._last_checked = ""
+        self._sheet_job = None
+        self._sheet_message = ""
         self._schedule_repository = schedule_repository
         self._now_factory = now_factory or (lambda: datetime.now(TAIPEI))
         self._read_only = bool(read_only_acceptance)
@@ -104,6 +134,7 @@ class NoticeCollectionController(QObject):
         self._poll_started_at = None
         self._last_wait_report_at = None
         self._next_check = self._now()
+        self._load_reminder_state()
         self._timer = QTimer(self)
         self._timer.setInterval(1_000)
         self._timer.timeout.connect(self.check_due)
@@ -127,6 +158,133 @@ class NoticeCollectionController(QObject):
     @Property(bool, notify=stateChanged)
     def hasShiftNotices(self) -> bool:
         return self._has_shift_notices
+
+    @Property("QVariantMap", notify=reminderChanged)
+    def handoffReminder(self) -> dict:
+        return copy.deepcopy(self._handoff_view)
+
+    @Property(bool, notify=reminderChanged)
+    def sheetLinkBusy(self) -> bool:
+        return self._sheet_job is not None
+
+    @Property(str, notify=reminderChanged)
+    def sheetLinkMessage(self) -> str:
+        return self._sheet_message
+
+    def _load_reminder_state(self) -> None:
+        if self._reminder_state_path is None or not self._reminder_state_path.exists():
+            return
+        try:
+            value = json.loads(self._reminder_state_path.read_text(encoding="utf-8"))
+            shown = value["shown"]
+            checked = value.get("last_checked", "")
+            if (value.get("schema_version") != 1 or not isinstance(shown, list) or len(shown) > 96
+                    or any(not isinstance(key, str) or len(key) > 300 for key in shown)
+                    or not isinstance(checked, str)):
+                raise ValueError("invalid reminder journal")
+            if checked:
+                at = datetime.fromisoformat(checked)
+                checked = (at.replace(tzinfo=TAIPEI) if at.tzinfo is None else at.astimezone(TAIPEI)).isoformat()
+            self._shown_reminders, self._last_checked = set(shown), checked
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            self._reminder_journal_error = True
+
+    def _save_reminder_state(self) -> bool:
+        if self._reminder_state_path is None:
+            return True
+        if self._reminder_journal_error:
+            return False
+        try:
+            self._reminder_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._reminder_state_path.with_name("reminder-" + uuid4().hex + ".tmp")
+            temporary.write_text(json.dumps({"schema_version": 1, "shown": sorted(
+                self._shown_reminders, key=lambda key: key.split("/", 1)[-1])[-96:],
+                "last_checked": self._last_checked}, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(self._reminder_state_path)
+            return True
+        except OSError:
+            self._reminder_journal_error = True
+            return False
+
+    @Slot()
+    def refreshReminder(self) -> None:
+        self._refresh_status()
+
+    def _refresh_reminder(self, shift, now) -> None:
+        view = {"visible": False, "rows": []}
+        eligible = False
+        key = ""
+        try:
+            actor = str(self._reminder_actor_provider() or "").strip() if self._reminder_actor_provider else ""
+            actor = actor.lstrip("0") or actor
+            eligible = (not self._read_only and not self._closing and shift is not None
+                and actor in {number.lstrip("0") or number for number in shift.duty_nos}
+                and shift.end - timedelta(minutes=2) <= now < shift.end)
+            if eligible:
+                key = actor + "/" + shift.key
+                rows = self._service.shift_records(shift)
+                if isinstance(rows, list) and rows and not self._reminder_journal_error:
+                    if key not in self._shown_reminders:
+                        self._shown_reminders.add(key)
+                        if self._save_reminder_state():
+                            self._active_reminder = key
+                    if self._active_reminder == key:
+                        checked = datetime.fromisoformat(self._last_checked).astimezone(TAIPEI).strftime("%H:%M:%S") if self._last_checked else "尚未檢查"
+                        view = {"visible": True, "rows": rows, "count": len(rows),
+                            "shiftText": f"{shift.start.year - 1911:03d}/{shift.start:%m/%d}　值班時段 {shift.start:%H:%M}–"
+                                         + ("翌日" if shift.end.date() != shift.start.date() else "") + f"{shift.end:%H:%M}",
+                            "lastCheckedText": "最後檢查 " + checked,
+                            "handoffText": f"{shift.end:%H:%M} 交班",
+                            "warning": self._notice if self._status_tone in {"warning", "error"} else ""}
+        except Exception:
+            if eligible and self._active_reminder == key and self._handoff_view.get("visible"):
+                view = {**self._handoff_view, "warning": "通報資料暫時無法更新，顯示上次已確認的紀錄。"}
+        if not view["visible"]:
+            self._active_reminder = ""
+        if view != self._handoff_view:
+            self._handoff_view = view
+            self.reminderChanged.emit()
+
+    @Slot()
+    def dismissHandoffReminder(self) -> None:
+        self._active_reminder = ""
+        self._refresh_status()
+
+    @Slot()
+    def openNoticeSheet(self) -> None:
+        if self._read_only or self._closing or self._sheet_job is not None:
+            return
+        self._sheet_message = "正在取得當月通報試算表…"
+        job = _NoticeSheetLinkJob(self._service, self._now(), self)
+        self._sheet_job = job
+        job.resolved.connect(self._open_sheet_url)
+        job.failed.connect(self._sheet_failed)
+        job.finished.connect(self._sheet_finished)
+        self.reminderChanged.emit()
+        job.start()
+
+    @Slot(str)
+    def _open_sheet_url(self, url: str) -> None:
+        if self._closing or (self._reminder_actor_provider and not self._reminder_actor_provider()):
+            return
+        if (not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]{20,128}/edit", url)
+                or not QDesktopServices.openUrl(QUrl(url))):
+            self._sheet_failed()
+            return
+        self._sheet_message = ""
+        self.reminderChanged.emit()
+
+    @Slot()
+    def _sheet_failed(self) -> None:
+        self._sheet_message = "通報試算表連結尚未確認，請稍後重試。"
+        self.reminderChanged.emit()
+
+    @Slot()
+    def _sheet_finished(self) -> None:
+        job, self._sheet_job = self._sheet_job, None
+        if job is not None:
+            job.deleteLater()
+        self.reminderChanged.emit()
 
     @Property(str, notify=stateChanged)
     def activityLabel(self) -> str:
@@ -219,11 +377,16 @@ class NoticeCollectionController(QObject):
                 text = f"當班時段待取得，今日累積 {today_count} 則。"
         except NoticeCollectionError:
             text = "當班時段通報收取紀錄暫時無法讀取。"
+        if self._reminder_journal_error:
+            text += " 交班通報提醒紀錄無法確認，請人工查看通報。"
+            if self._status_tone != "error":
+                self._status_tone = "warning"
         if self._notice and self._status_tone in {"warning", "error"}:
             text += f" {self._notice}"
         changed = (text != self._status_text or shift_text != self._shift_text
                    or had_notices != self._has_shift_notices)
         self._status_text, self._shift_text = text, shift_text
+        self._refresh_reminder(shift, now)
         if changed:
             self.stateChanged.emit()
 
@@ -315,6 +478,8 @@ class NoticeCollectionController(QObject):
         if not self._poll_run_id:
             return
         self._notice = str(result.message or "")
+        self._last_checked = result.checked_at.replace(tzinfo=TAIPEI).isoformat() if result.checked_at.tzinfo is None else result.checked_at.astimezone(TAIPEI).isoformat()
+        self._save_reminder_state()
         self._status_tone = (
             "success" if result.status == "success" and not result.error_count else "warning"
         )
@@ -327,6 +492,8 @@ class NoticeCollectionController(QObject):
         if not self._poll_run_id:
             return
         self._notice, self._status_tone = message, tone
+        self._last_checked = self._now().isoformat()
+        self._save_reminder_state()
         result = getattr(self._service, "last_result", None)
         if not isinstance(result, NoticeCollectionResult) or result.checked_at != self._poll_started_at:
             result = None
@@ -395,12 +562,16 @@ class NoticeCollectionController(QObject):
         self._closing = True
         self._verification_pending = False
         self._timer.stop()
+        self._refresh_status()
         if self._job is not None:
             self._job.requestInterruption()
         self.stateChanged.emit()
 
     def shutdown(self) -> bool:
         self.prepare_shutdown_admission()
+        if self._sheet_job is not None:
+            self._sheet_job.wait()
+            self._sheet_finished()
         if self._job is not None:
             if not self._job.wait(15_000):
                 self._job.wait()

@@ -63,6 +63,65 @@ def write_response(payload, written, *, handled=None, errors=0):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_shift_records_keep_publisher_and_original_receipt_across_restart(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeShift
+        at = datetime(2026, 10, 21, 9, 12, tzinfo=timezone(timedelta(hours=8)))
+        browser = FakeBrowser([{**notice(1), "sender": "測試員", "publisher": "第三救災救護大隊/測試員"}])
+        requests = []
+        def post(payload):
+            requests.append(payload)
+            if payload["action"] == "checkExisting":
+                return {"status": "success", "existingKeys": []}
+            return write_response(payload, ["1"])
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=post)
+            service.collect("synthetic-password", at)
+            restarted = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            shift = NoticeShift("test", "08-10", at.replace(hour=8, minute=0), at.replace(hour=10, minute=0))
+            rows = restarted.shift_records(shift)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["time"], rows[0]["unit"], rows[0]["name"]), ("09:12", "第三救災救護大隊", "測試員"))
+            written = next(item for item in requests if item["action"] == "writeRecords")["records"][0]
+            self.assertEqual(written["sender"], "測試員")
+            self.assertNotIn("publisher", written)
+
+    def test_recent_scan_backfills_publisher_without_rewriting_or_recounting(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeShift
+        at = datetime(2026, 10, 21, 9, tzinfo=timezone(timedelta(hours=8)))
+        browser = FakeBrowser()
+        browser.recent_rows = [{**notice(1), "publisher": "救災救護指揮中心 測試甲", "isUnread": False,
+                                "publishedAt": at.replace(hour=8).isoformat()}]
+        post = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=post)
+            service._state["collected"]["1"] = at.replace(minute=1).isoformat()
+            service._state["confirmed"]["1"] = {"subject": "原主旨", "read_state": "confirmed"}
+            service.collect("synthetic-password", at.replace(minute=10))
+            shift = NoticeShift("test", "08-10", at.replace(hour=8), at.replace(hour=10))
+            row = service.shift_records(shift)[0]
+            self.assertEqual((row["unit"], row["name"], row["subject"], row["time"]),
+                             ("救災救護指揮中心", "測試甲", "原主旨", "09:01"))
+            self.assertEqual(service.counts(at, shift), (1, 1))
+            post.assert_not_called()
+
+    def test_monthly_sheet_url_requires_exact_month_and_official_document(self):
+        from app_core.notice_collection_service import NoticeCollectionService, NoticeCollectionError
+        at = datetime(2026, 10, 21, 9)
+        identifier = "a" * 30
+        valid = {"status": "success", "year": 2026, "month": 10, "spreadsheetId": identifier,
+                 "spreadsheetUrl": f"https://docs.google.com/spreadsheets/d/{identifier}/edit"}
+        with tempfile.TemporaryDirectory() as directory:
+            post = Mock(return_value=valid)
+            service = NoticeCollectionService(Path(directory), poster=post)
+            self.assertEqual(service.monthly_spreadsheet_url(at), valid["spreadsheetUrl"])
+            post.assert_called_once_with({"action": "getMonthlySpreadsheetLink", "year": 2026, "month": 10})
+            for changed in ({"month": 9}, {"spreadsheetUrl": "https://private.invalid/"},
+                            {"spreadsheetId": "b" * 30}, {"status": "error"}):
+                with self.subTest(changed=changed):
+                    post.return_value = {**valid, **changed}
+                    with self.assertRaises(NoticeCollectionError):
+                        service.monthly_spreadsheet_url(at)
+
     @staticmethod
     def _handoff_responsibility_fixture():
         actions = [
