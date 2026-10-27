@@ -44,12 +44,18 @@ def _login_once(driver, request: AttendanceRequest, recognizer) -> None:
 
 
 def login_attendance(driver, request: AttendanceRequest, recognizer, progress) -> None:
+    from app_core.login_verifier import LoginVerificationError
+
     for attempt in range(1, 4):
         progress(f"使用本次值班人員帳號登入民力系統（{attempt}/3）…")
         try:
             _login_once(driver, request, recognizer)
             return
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, LoginVerificationError) and exc.reason_code in {
+                "oa_password_change_required", "oa_password_warning_blocked",
+            }:
+                raise CivilpowerError(str(exc)) from None
             if attempt == 3:
                 raise CivilpowerError("民力登入失敗，已使用同一值班帳號重試三次；請確認帳號與網站狀態。") from None
 

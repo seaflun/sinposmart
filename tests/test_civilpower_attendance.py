@@ -21,6 +21,105 @@ MEMBER = {"member_id": "m1", "name": "測試義消", "title": "隊員", "unit": 
 
 
 class OALoginTests(unittest.TestCase):
+    def make_password_warning_login(self, *, state="oa_password_expiring", dismisses=True, visible=True):
+        driver, elements, wait = self.make_login()
+        original_find = driver.find_elements.side_effect
+        warning = {"active": False}
+        skip = Mock()
+        skip.is_displayed.return_value = visible
+        skip.is_enabled.return_value = True
+        elements["skip_password_change"] = skip
+
+        def submit():
+            warning["active"] = True
+            driver.current_url = "https://oa.tyfd.gov.tw/password_expiry.php"
+
+        def dismiss():
+            if dismisses:
+                warning["active"] = False
+                driver.current_url = "https://oa.tyfd.gov.tw/index.php"
+
+        elements["loginBtn"].click.side_effect = submit
+        skip.click.side_effect = dismiss
+        driver.execute_script.side_effect = lambda script, *args: (
+            {"page_text": ("此帳號的密碼即將在 2026-11-01 到期，是否前往變更密碼？暫不變更 前往變更"
+                           if state == "oa_password_expiring" else "密碼已到期，必須變更密碼"),
+             "password_fields": 0} if warning["active"] else {"page_text": "入口網首頁", "password_fields": 0}
+        ) if "login-diagnostic-probe" in script else True
+        driver.find_elements.side_effect = lambda by, selector: (
+            [skip] if "暫不變更" in selector else [] if warning["active"] else original_find(by, selector)
+        )
+
+        class PollingWait(wait):
+            def until(self, predicate):
+                from selenium.common.exceptions import TimeoutException
+                for _ in range(4):
+                    result = predicate(self.driver)
+                    if result:
+                        return result
+                raise TimeoutException("synthetic warning did not close")
+
+        return driver, elements, PollingWait
+
+    def test_shared_oa_login_defers_optional_password_warning_before_success(self):
+        from app_core.login_verifier import run_oa_login
+        driver, elements, wait = self.make_password_warning_login()
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait):
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        elements["skip_password_change"].click.assert_called_once()
+        elements["loginBtn"].click.assert_called_once()
+        self.assertEqual(driver.current_url, "https://oa.tyfd.gov.tw/index.php")
+
+    def test_optional_warning_must_close_and_never_clicks_hidden_skip(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        for visible in (True, False):
+            driver, elements, wait = self.make_password_warning_login(dismisses=False, visible=visible)
+            recognizer = Mock()
+            recognizer.classification.return_value = "abcd"
+            with self.subTest(visible=visible):
+                with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                        self.assertRaises(LoginVerificationError) as caught:
+                    run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+                self.assertEqual(caught.exception.reason_code, "oa_password_warning_blocked")
+                self.assertEqual(elements["skip_password_change"].click.call_count, int(visible))
+
+    def test_shared_oa_login_never_skips_mandatory_password_change(self):
+        from app_core.login_verifier import LoginVerificationError, run_oa_login
+        driver, elements, wait = self.make_password_warning_login(state="oa_password_change_required")
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                self.assertRaises(LoginVerificationError) as caught:
+            run_oa_login(driver, "tyfd01214", "synthetic-password", recognizer, attempts=1)
+        self.assertEqual(caught.exception.reason_code, "oa_password_change_required")
+        elements["skip_password_change"].click.assert_not_called()
+
+    def test_civilpower_waits_for_password_warning_before_opening_module(self):
+        from app_core.civilpower_automation import _login_once
+        driver, elements, wait = self.make_password_warning_login()
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+
+        def verify_navigation(*_args):
+            elements["skip_password_change"].click.assert_called_once()
+            self.assertEqual(driver.current_url, "https://oa.tyfd.gov.tw/index.php")
+
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                patch("app_core.civilpower_automation.open_civilpower_from_oa_dashboard", side_effect=verify_navigation) as opened:
+            _login_once(driver, Mock(user_id="tyfd01214", password="synthetic-password"), recognizer)
+        opened.assert_called_once()
+
+    def test_civilpower_preserves_required_password_change_message_without_retry(self):
+        from app_core.civilpower_automation import login_attendance
+        driver, elements, wait = self.make_password_warning_login(state="oa_password_change_required")
+        recognizer = Mock()
+        recognizer.classification.return_value = "abcd"
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), self.assertRaisesRegex(CivilpowerError, "手動變更密碼"):
+            login_attendance(driver, Mock(user_id="tyfd01214", password="synthetic-password"), recognizer, lambda _: None)
+        elements["loginBtn"].click.assert_called_once()
+
     def test_oa_login_waits_for_captcha_pixels_before_ocr_and_preserves_failure_stage(self):
         from app_core.login_verifier import LoginVerificationError, run_oa_login
         driver, elements, wait = self.make_login()

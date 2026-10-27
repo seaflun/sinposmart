@@ -326,6 +326,8 @@ OA_LOGIN_FAILURE_MESSAGES = {
     "oa_login_page_failed": "通報登入頁載入失敗，請確認網站與連線。",
     "oa_login_form_timeout": "通報登入表單載入逾時，未完成登入。",
     "oa_login_verification_timeout": "通報登入送出後驗證逾時，尚未確認登入成功。",
+    "oa_password_warning_blocked": "入口網密碼到期提醒未能關閉，尚未確認登入成功，請稍後重試。",
+    "oa_password_change_required": "入口網密碼須更新，請手動變更密碼後重新登入。",
 }
 
 
@@ -450,6 +452,7 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
         field.send_keys(value)
 
     def logged_in(current) -> bool:
+        nonlocal last_code, warning_dismissed
         target = urlsplit(str(current.current_url or ""))
         if target.scheme != "https" or target.netloc != "oa.tyfd.gov.tw":
             raise LoginVerificationError("入口網登入後來源不符，已停止操作。")
@@ -464,11 +467,34 @@ def run_oa_login(driver: Any, user_id: str, password: str, recognizer: Any = Non
         """)
         if isinstance(rejection, str) and rejection in OA_LOGIN_FAILURE_MESSAGES:
             raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[rejection], reason_code=rejection)
+        probe = _login_page_probe(current)
+        page_text = str(probe.get("page_text") or "")
+        if warning_dismissed and not page_text:
+            return False
+        if _password_change_required(page_text, probe.get("password_fields", 0)):
+            code = "oa_password_change_required"
+            raise LoginVerificationError(OA_LOGIN_FAILURE_MESSAGES[code], reason_code=code)
+        if re.search(r"密碼.*即將.*(?:到期|過期)", re.sub(r"\s+", "", page_text)):
+            last_code = "oa_password_warning_blocked"
+            if not warning_dismissed:
+                buttons = current.find_elements(By.XPATH,
+                    "//button[normalize-space(.)='暫不變更'] | "
+                    "//input[(@type='button' or @type='submit') and normalize-space(@value)='暫不變更'] | "
+                    "//a[normalize-space(.)='暫不變更']")
+                visible = [button for button in buttons if button.is_displayed() and button.is_enabled()]
+                if len(visible) == 1:
+                    target = urlsplit(str(current.current_url or ""))
+                    if target.scheme != "https" or target.netloc != "oa.tyfd.gov.tw":
+                        raise LoginVerificationError("入口網登入後來源不符，已停止操作。")
+                    warning_dismissed = True
+                    visible[0].click()
+            return False
         return (target.path not in {"/login.php", "/login_main.php"}
                 and not current.find_elements(By.CSS_SELECTOR, "#login_name, #verify_code, #loginBtn"))
 
     last_code = "oa_login_page_failed"
     for _attempt in range(max(1, min(int(attempts), 3))):
+        warning_dismissed = False
         try:
             last_code = "oa_login_page_failed"
             driver.get("https://oa.tyfd.gov.tw/login.php")
