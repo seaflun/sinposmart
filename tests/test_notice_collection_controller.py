@@ -23,6 +23,78 @@ TAIPEI = timezone(timedelta(hours=8))
 
 
 class NoticeCollectionControllerTests(unittest.TestCase):
+    def test_verification_failure_reports_real_safe_code_without_collection_counts(self):
+        self.enable_saved_account()
+        reports = []
+        self.controller.reportReady.connect(reports.append)
+        for code in ("oa_credentials_rejected", "oa_account_locked", "oa_password_change_required",
+                     "oa_login_guard_unavailable", "oa_password_warning_blocked", "unknown-sensitive-code"):
+            with self.subTest(code=code):
+                reports.clear()
+                self.service.verify_login.side_effect = NoticeLoginRequired(
+                    "test-password token=fixture-secret cookie=fixture-session", code=code)
+                self.controller.verifyLogin()
+                self.wait_for(lambda: not self.controller.isRunning)
+                self.assertEqual(len(reports), 1)
+                report = reports[0]
+                self.assertIs(report["verification_only"], True)
+                self.assertEqual((report["state"], report["error_stage"]), ("failed", "login"))
+                self.assertEqual(report["error_code"], "" if code.startswith("unknown") else code)
+                self.assertEqual(report["started_at"], self.now.isoformat())
+                self.assertEqual(report["completed_at"], self.now.isoformat())
+                self.assertEqual((report["part_index"], report["part_count"]), (0, 1))
+                self.assertEqual((report["records"], report["new_keys"]), ([], []))
+                for field in ("unread_count", "new_count", "marked_read_count", "pending_write_count", "pending_read_count"):
+                    self.assertIsNone(report[field])
+                for value in ("test-password", "fixture-secret", "fixture-session", "unknown-sensitive-code"):
+                    self.assertNotIn(value, str(report))
+                    self.assertNotIn(value, self.controller.verificationStatus)
+                if code.startswith("unknown"):
+                    self.assertEqual(report["message"], "驗證未完成，原因待確認。")
+                self.now += timedelta(seconds=1)
+        self.service.collect.assert_not_called()
+        self.service.report_parts.assert_not_called()
+
+    def test_verification_busy_reports_throttled_waiting_and_success_does_not_fake_collection(self):
+        self.enable_saved_account()
+        reports = []
+        self.controller.reportReady.connect(reports.append)
+        self.busy.return_value = "勤務登打"
+        self.controller.verifyLogin()
+        self.controller.check_due()
+        self.now += timedelta(seconds=59)
+        self.controller.check_due()
+        self.assertEqual(len(reports), 1)
+        self.now += timedelta(seconds=1)
+        self.controller.check_due()
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0]["run_id"], reports[1]["run_id"])
+        for report in reports:
+            self.assertEqual((report["state"], report["error_stage"]), ("waiting", "busy"))
+            self.assertEqual((report["started_at"], report["completed_at"]), ("", ""))
+            self.assertIs(report["verification_only"], True)
+        self.service.verify_login.assert_not_called()
+        self.busy.return_value = ""
+        self.controller.check_due()
+        self.wait_for(lambda: not self.controller.isRunning)
+        self.assertEqual(self.controller.verificationState, "verified")
+        self.assertEqual(len(reports), 2)
+        self.service.collect.assert_not_called()
+
+    def test_paused_closing_and_running_gates_do_not_report_fake_verification_failure(self):
+        reports = []
+        self.controller.reportReady.connect(reports.append)
+        self.service.login_protection.return_value = {"paused": True}
+        self.controller.check_due()
+        self.controller._job = SimpleNamespace(verify_only=False)
+        self.controller.check_due()
+        self.controller._job = None
+        self.controller.prepare_shutdown_admission()
+        self.controller.verifyLogin()
+        self.controller.check_due()
+        self.assertEqual(reports, [])
+        self.service.verify_login.assert_not_called()
+
     def test_expiry_pauses_scheduler_and_collect_now_but_password_verification_can_resume(self):
         from app_core.notice_collection_service import NoticeLoginGuard
         self.now = datetime(2026, 10, 31, 23, 58, tzinfo=TAIPEI)
@@ -580,7 +652,7 @@ class NoticeCollectionControllerTests(unittest.TestCase):
                 self.service.verify_login.side_effect = error
                 self.controller.verifyLogin()
                 self.wait_for(lambda: not self.controller.isRunning)
-                self.assertIn("檢查帳號密碼或網站狀態", self.controller.verificationStatus)
+                self.assertEqual("驗證未完成，原因待確認。", self.controller.verificationStatus)
                 self.assertNotIn("test-password", self.controller.verificationStatus)
                 self.assertNotIn("private response", self.controller.verificationStatus)
                 self.assertNotIn("test-password", self.controller.statusText)
@@ -588,6 +660,8 @@ class NoticeCollectionControllerTests(unittest.TestCase):
 
     def test_shutdown_cancels_verification_and_discards_queued_requests(self):
         self.enable_saved_account()
+        reports = []
+        self.controller.reportReady.connect(reports.append)
         def verify(_password, cancel):
             while not cancel():
                 time.sleep(0.005)
@@ -599,6 +673,8 @@ class NoticeCollectionControllerTests(unittest.TestCase):
         self.assertTrue(self.controller.shutdown())
         self.controller.verifyLogin()
         self.controller.check_due()
+        self.app.processEvents()
+        self.assertEqual(reports, [])
         self.assertEqual(self.service.verify_login.call_count, 1)
         self.service.collect.assert_not_called()
 

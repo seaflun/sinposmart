@@ -33,6 +33,8 @@ NOTICE_ERROR_CODES = frozenset({
     "oa_ocr_unavailable", "oa_captcha_not_ready", "oa_captcha_unrecognized", "oa_captcha_ocr_failed",
     "oa_captcha_rejected", "oa_credentials_rejected", "oa_login_page_failed", "oa_login_form_timeout",
     "oa_login_verification_timeout",
+    "oa_password_warning_blocked", "oa_password_change_required", "oa_account_locked",
+    "oa_login_unconfirmed", "oa_password_expired", "oa_login_guard_unavailable",
     "recipient_unconfirmed",
 })
 

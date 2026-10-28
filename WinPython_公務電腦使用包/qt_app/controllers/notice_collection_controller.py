@@ -14,6 +14,7 @@ from PySide6.QtGui import QDesktopServices
 
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
+    NOTICE_ERROR_CODES,
     TAIPEI,
     NoticeCollectionError,
     NoticeCollectionResult,
@@ -22,6 +23,7 @@ from app_core.notice_collection_service import (
     next_check_at,
     notice_responsibility_key,
 )
+from app_core.login_verifier import OA_LOGIN_FAILURE_MESSAGES
 from app_core.schedule_repository import business_roc_date
 
 
@@ -36,6 +38,7 @@ class _NoticeCollectionJob(QThread):
         self._password = password
         self._received_at = received_at
         self.verify_only = bool(verify_only)
+        self.failure_code = ""
         self._responsibility = copy.deepcopy(responsibility)
         self.poll_outcome: tuple[str, object] | None = None
 
@@ -52,9 +55,9 @@ class _NoticeCollectionJob(QThread):
                 self.poll_outcome = ("collected", result)
                 self.collected.emit(result)
         except NoticeLoginRequired as exc:
-            self._report_failure(self._safe_message(exc), "warning")
+            self._report_failure(self._safe_message(exc), "warning", code=exc.code)
         except NoticeCollectionError as exc:
-            self._report_failure(self._safe_message(exc), "error")
+            self._report_failure(self._safe_message(exc), "error", code=exc.code)
         except Exception:
             message = ("通報帳號登入驗證失敗，請檢查帳號密碼或網站狀態。" if self.verify_only
                        else "通報收取未完成，請確認網站與連線狀態。")
@@ -62,7 +65,8 @@ class _NoticeCollectionJob(QThread):
         finally:
             self._password = ""
 
-    def _report_failure(self, message: str, tone: str) -> None:
+    def _report_failure(self, message: str, tone: str, *, code: str = "") -> None:
+        self.failure_code = code if code in NOTICE_ERROR_CODES else ""
         self.poll_outcome = ("failed", (message, tone))
         self.failed.emit(message, tone)
 
@@ -133,6 +137,9 @@ class NoticeCollectionController(QObject):
         self._verification_status = "尚未驗證通報帳號。"
         self._verification_state = "configured"
         self._verification_pending = False
+        self._verification_run_id = ""
+        self._verification_started_at = None
+        self._last_verification_wait_at = None
         self._poll_run_id = ""
         self._poll_started_at = None
         self._last_wait_report_at = None
@@ -441,6 +448,8 @@ class NoticeCollectionController(QObject):
             return
         now = self._now()
         verify_only = self._verification_pending
+        if verify_only and not self._verification_run_id:
+            self._verification_run_id = str(uuid4())
         if self._login_expired and not verify_only:
             try:
                 self._service.pause_expired_login(now)
@@ -454,6 +463,10 @@ class NoticeCollectionController(QObject):
         if reason:
             if verify_only:
                 self._set_verification_status(f"等待{reason}完成後驗證通報帳號。", "waiting")
+                if (self._last_verification_wait_at is None
+                        or now - self._last_verification_wait_at >= timedelta(seconds=60)):
+                    self._emit_verification_report("waiting")
+                    self._last_verification_wait_at = now
                 return
             self._set_notice(f"等待{reason}完成後檢查通報。", "muted")
             if self._last_wait_report_at is None or now - self._last_wait_report_at >= timedelta(seconds=60):
@@ -474,6 +487,7 @@ class NoticeCollectionController(QObject):
             self._next_check = next_check_at(now)
             if verify_only:
                 self._verification_pending = False
+                self._clear_verification_report()
                 self._set_verification_status(f"尚未儲存通報帳號 {FIXED_NOTICE_ACCOUNT} 的密碼，無法驗證登入。", "error")
                 return
             self._set_notice(f"請先儲存通報帳號 {FIXED_NOTICE_ACCOUNT} 的密碼。", "warning")
@@ -483,6 +497,7 @@ class NoticeCollectionController(QObject):
             return
         if verify_only:
             self._verification_pending = False
+            self._verification_started_at = now
             self._set_verification_status(f"正在驗證通報帳號 {FIXED_NOTICE_ACCOUNT}…", "verifying")
         self._notice = ""
         self._status_tone = "muted"
@@ -559,14 +574,45 @@ class NoticeCollectionController(QObject):
 
     @Slot()
     def _verified(self) -> None:
+        self._clear_verification_report()
         self._notice, self._status_tone = "", "success"
         self._refresh_status()
         self._set_verification_status(f"通報帳號 {FIXED_NOTICE_ACCOUNT} 登入驗證成功。" + self._protection_text, "verified")
 
     @Slot(str, str)
     def _verification_failed(self, message: str, tone: str) -> None:
-        self._set_verification_status(f"登入驗證失敗，請檢查帳號密碼或網站狀態。 {message}", "error")
-        self._notice, self._status_tone = message, tone
+        code = getattr(self._job, "failure_code", "")
+        code = code if isinstance(code, str) and code in NOTICE_ERROR_CODES else ""
+        safe_message = OA_LOGIN_FAILURE_MESSAGES.get(code, "驗證未完成，原因待確認。")
+        self._set_verification_status(safe_message, "error")
+        self._notice, self._status_tone = safe_message, tone
+        if self._verification_started_at is not None:
+            self._emit_verification_report("failed", code=code)
+        self._clear_verification_report()
+
+    def _clear_verification_report(self) -> None:
+        self._verification_run_id = ""
+        self._verification_started_at = None
+        self._last_verification_wait_at = None
+
+    def _emit_verification_report(self, state: str, *, code: str = "") -> None:
+        if self._read_only or self._closing or not self._verification_run_id:
+            return
+        now = self._now()
+        waiting = state == "waiting"
+        self.reportReady.emit({
+            "schema_version": 1, "verification_only": True, "run_id": self._verification_run_id,
+            "part_index": 0, "part_count": 1, "state": state,
+            "started_at": self._verification_started_at.isoformat() if self._verification_started_at else "",
+            "completed_at": "" if waiting else now.isoformat(), "reported_at": now.isoformat(),
+            "next_check_at": (now + timedelta(seconds=60) if waiting else now).isoformat(),
+            "calendar_day": now.date().isoformat(), "shift_start": "", "shift_end": "",
+            "unread_count": None, "new_count": None, "marked_read_count": None,
+            "pending_write_count": None, "pending_read_count": None, "records": [], "new_keys": [],
+            "error_stage": "busy" if waiting else "login", "error_code": code,
+            "message": ("通報登入驗證尚未開始，等待公務作業完成。" if waiting else
+                        OA_LOGIN_FAILURE_MESSAGES.get(code, "驗證未完成，原因待確認。")),
+        })
 
     def _set_verification_status(self, message: str, state: str = "configured") -> None:
         if self._verification_status != message or self._verification_state != state:

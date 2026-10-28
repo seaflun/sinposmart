@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.28.1858` | 2026-10-28 18:58（台北時間） | 通報驗證回報實際安全錯誤分類與等待狀態，排除關閉取消誤報，驗證與收取紀錄分開。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.28.1858) |
 | `2026.10.28.1610` | 2026-10-28 16:10（台北時間） | 修正通報密碼領取、確認與問題包上傳的 NAS 內網允許路徑，補齊真實傳輸層回歸。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.28.1610) |
 | `2026.10.28.1314` | 2026-10-28 13:14（台北時間） | 支援從 NAS 後台遠端修改通報密碼，加密儲存、單次登入驗證及進度回報，保留防重複與登入保護。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.28.1314) |
 | `2026.10.28.1049` | 2026-10-28 10:49（台北時間） | 問題包於背景同步 NAS，保存遮蔽後的登打、交接與通報失敗原因，保留斷線重試及原正式登打規則。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.28.1049) |

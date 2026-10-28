@@ -3041,10 +3041,13 @@ class AppController(QObject):
     def _notice_collection_report_ready(self, report: dict) -> None:
         if self._read_only_acceptance:
             return
+        verification_only = report.get("verification_only") is True
+        trigger_type = "notice_verify" if verification_only else "notice_poll"
         fields = {
-            "status": report["state"], "trigger_type": "notice_poll",
+            "status": report["state"], "trigger_type": trigger_type,
             "actor_no": "", "user_id": "", "display_name": "",
-            "content": "通報收取檢查", "error": report["message"] if report["state"] in {"failed", "partial", "uncertain"} else "",
+            "content": "通報登入驗證" if verification_only else "通報收取檢查",
+            "error": report["message"] if report["state"] in {"failed", "partial", "uncertain"} else "",
             "snapshot": {"run_id": report["run_id"], "notice_collection": report},
         }
         try:
@@ -3061,7 +3064,7 @@ class AppController(QObject):
                 package_path = self._diagnostics_service.export(DiagnosticSnapshot(
                     duty_status=str(report.get("message") or "通報收取失敗"),
                     target_date=f"{day.year - 1911:03d}{day.month:02d}{day.day:02d}",
-                    action_key=str(report.get("run_id") or ""), action_kind="notice_collection", trigger_type="notice_poll",
+                    action_key=str(report.get("run_id") or ""), action_kind="notice_collection", trigger_type=trigger_type,
                     error_code=str(report.get("error_code") or report.get("error_stage") or "unknown_error"),
                 ))
                 self._queue_diagnostic_package(package_path)

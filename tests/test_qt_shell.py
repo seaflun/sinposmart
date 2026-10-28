@@ -12284,6 +12284,22 @@ class QtShellTests(unittest.TestCase):
             self.assertEqual((fields["actor_no"], fields["user_id"], fields["display_name"]), ("", "", ""))
             controller._operational_sync_service.persist_event_payload.assert_called_once_with(payload)
 
+            controller._diagnostics_service.export = Mock(return_value=Path(directory) / "verification.zip")
+            controller._queue_diagnostic_package = Mock()
+            verification = {**report, "verification_only": True, "state": "failed",
+                            "calendar_day": "2026-10-22", "error_code": "oa_captcha_rejected",
+                            "message": "通報網站判定驗證碼不正確，請稍後重試。", "unread_count": None}
+            controller.noticeCollectionController.reportReady.emit(verification)
+            fields = controller._operational_sync_service.build_event_payload.call_args.kwargs
+            self.assertEqual(fields["trigger_type"], "notice_verify")
+            self.assertEqual(fields["content"], "通報登入驗證")
+            self.assertEqual(fields["snapshot"]["notice_collection"], verification)
+            self.assertEqual(fields["error"], verification["message"])
+            diagnostic = controller._diagnostics_service.export.call_args.args[0]
+            self.assertEqual(diagnostic.trigger_type, "notice_verify")
+            self.assertEqual(diagnostic.error_code, "oa_captcha_rejected")
+            controller._queue_diagnostic_package.assert_called_once()
+
     def test_notice_report_parts_are_durable_before_a_busy_operational_worker_can_start(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from app_core.operational_sync_service import OperationalSyncService
