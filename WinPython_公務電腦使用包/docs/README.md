@@ -1,4 +1,4 @@
-﻿# 公務電腦 WinPython 使用方式
+# 公務電腦 WinPython 使用方式
 
 這份包裝方式是給已安裝 WinPython 的公務電腦使用，不需要安裝系統版 Python，也不需要系統管理員權限。
 
@@ -67,3 +67,11 @@ NAS 接收端需與 GUI 一起更新，沿用既有同步 token 及安全傳輸�
 - 需要啟用帳密同步時，請在該電腦設定 `SINPOSMART_CREDENTIAL_SYNC_TOKEN` 與 `SINPOSMART_CREDENTIAL_SYNC_URL`；登入成功後會自動同步當次值班台帳密。
 - 勤務表與比對資料仍會留在專案資料夾內，兩台電腦可透過 Google Drive 同步。
 - 如果公務電腦不能連外網，`SETUP_WINPYTHON.bat` 可能無法下載 `requirements.txt` 內的套件；這時需要先在可連網電腦準備離線 wheel。
+
+## 從 NAS 後台修改通報密碼
+
+值班後台的「通報密碼」可傳送通報專用新密碼給目前電腦。GUI 於背景每 60 秒檢查一次；確認 NAS 身分與目標電腦後，只更新獨立的 notice_login.json，以 Windows DPAPI 加密，不改一般值班帳號。
+
+電腦加密儲存並回報後，NAS 清除待送密文；GUI 再執行一次既有登入驗證，成功恢復通報排程。驗證失敗維持登入保護；同一請求不重複儲存或登入。程式中斷或本機另行改密碼時，未確認的舊請求回報失敗，由後台重新送出新請求。
+
+本機 remote_credentials_receipt.json 只保存請求 ID 與狀態，不保存密碼、密碼雜湊或 token；登入驗證只讀取未讀列表，不直接入表或標記已讀。NAS 待送逾 24 小時不可再領取，讀取與每小時背景掃描清除密文。

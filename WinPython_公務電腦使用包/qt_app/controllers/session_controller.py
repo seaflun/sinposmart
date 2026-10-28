@@ -181,7 +181,7 @@ class SessionController(QObject):
         self.noticeSettingsChanged.emit()
 
     @Slot(str, result=bool)
-    def saveNoticePassword(self, password: str) -> bool:
+    def saveNoticePassword(self, password: str, *, verify: bool = True) -> bool:
         if self._read_only_acceptance or self._shutdown_admission:
             return False
         factory = getattr(self._repository, "notice_repository", None)
@@ -210,7 +210,7 @@ class SessionController(QObject):
         if saved:
             self._notice_password_configured = True
         self.noticeSettingsChanged.emit()
-        if saved:
+        if saved and verify:
             self.noticePasswordSaved.emit()
         return saved
 

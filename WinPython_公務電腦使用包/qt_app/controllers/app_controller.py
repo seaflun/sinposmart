@@ -279,6 +279,8 @@ class AppController(QObject):
                 if self._session_controller.isLoggedIn and self._duty_mode_active else "",
             reminder_state_path=package_root / "runtime_outputs" / "notice_collection" / "reminder.json",
         )
+        self._remote_notice_verification_request = ""
+        self._session_controller.noticePasswordSaved.connect(self._remote_notice_manual_override)
         self._session_controller.noticePasswordSaved.connect(self._notice_collection_controller.verifyLogin)
         self._notice_collection_controller.reportReady.connect(self._notice_collection_report_ready)
         self._notice_collection_controller.verificationStatusChanged.connect(
@@ -287,6 +289,7 @@ class AppController(QObject):
                 self._notice_collection_controller.verificationState,
             )
         )
+        self._notice_collection_controller.verificationStatusChanged.connect(self._remote_notice_verification_changed)
         self._background_manual_chains: dict[str, _BackgroundManualChain] = {}
         self._background_manual_workers: dict[
             int,
@@ -311,6 +314,12 @@ class AppController(QObject):
         if not self._read_only_acceptance:
             self._diagnostic_retry_timer.start()
             QTimer.singleShot(15_000, self._retry_diagnostic_uploads)
+        self._notice_credentials_timer = QTimer(self)
+        self._notice_credentials_timer.setInterval(60_000)
+        self._notice_credentials_timer.timeout.connect(self._poll_remote_notice_credentials)
+        if not self._read_only_acceptance:
+            self._notice_credentials_timer.start()
+            QTimer.singleShot(15_000, self._poll_remote_notice_credentials)
         self._tomorrow_schedule_request_id = 0
         self._tomorrow_schedule_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
         self._tomorrow_schedule_contexts: dict[int, tuple[int, str, str, str]] = {}
@@ -696,6 +705,7 @@ class AppController(QObject):
         self._hourly_refresh_timer.stop()
         self._board_retry_timer.stop()
         self._diagnostic_retry_timer.stop()
+        self._notice_credentials_timer.stop()
         self._tomorrow_schedule_timer.stop()
         if self._scheduled_folder_timer is not None:
             self._scheduled_folder_timer.stop()
@@ -2923,6 +2933,110 @@ class AppController(QObject):
         month_digits = "".join(character for character in str(month) if character.isdigit())
         return f"{self._rest_monthly_controller.rocYear:03d}{int(month_digits or '0'):02d}"
 
+    def _poll_remote_notice_credentials(self) -> None:
+        if (self._read_only_acceptance or self._worker_admissions_closed or self._operational_sync_shutting_down
+                or getattr(self._operational_sync_service, "heartbeat_enabled", False) is not True):
+            return
+        if any(item[1] == "notice_credentials_pull" for item in self._operational_sync_queue):
+            return
+        if any(getattr(worker, "operation", "") == "notice_credentials_pull"
+               for _thread, worker in self._operational_sync_workers.values()):
+            return
+        self._start_operational_sync("notice_credentials_pull")
+
+    def _ack_remote_notice_credentials(self, request_id: str, status: str, code: str = "") -> None:
+        self._start_operational_sync("notice_credentials_ack", fields={
+            "request_id": request_id, "status": status, "result_code": code})
+
+    @Slot(object)
+    def _remote_notice_credentials_received(self, command) -> None:
+        if (self._read_only_acceptance or self._worker_admissions_closed or not isinstance(command, dict)
+                or command.get("account") != "tyfd01214"):
+            return
+        request_id = str(command.get("request_id") or "")
+        if command.get("status") not in {"pending", "stored"}:
+            return
+        try:
+            receipt = self._operational_sync_service.load_notice_credential_receipt()
+            if receipt.get("request_id") != request_id:
+                if command["status"] != "pending":
+                    self._ack_remote_notice_credentials(request_id, "failed", "receipt_failed")
+                    return
+                if (self._notice_collection_controller.isRunning
+                        or self._notice_collection_controller.verificationState in {"waiting", "verifying"}):
+                    return
+                self._operational_sync_service.save_notice_credential_receipt(request_id, "applying")
+                if not self._session_controller.saveNoticePassword(command.get("password", ""), verify=False):
+                    self._operational_sync_service.save_notice_credential_receipt(request_id, "failed")
+                    self._ack_remote_notice_credentials(request_id, "failed", "storage_failed")
+                    return
+                self._operational_sync_service.save_notice_credential_receipt(request_id, "stored")
+                receipt = {"request_id": request_id, "state": "stored"}
+            state = receipt["state"]
+            if state == "verifying" and self._remote_notice_verification_request == request_id:
+                return
+            if state in {"applying", "verifying"}:
+                self._operational_sync_service.save_notice_credential_receipt(request_id, "failed")
+                self._ack_remote_notice_credentials(request_id, "failed", "verification_interrupted")
+            elif state in {"stored", "verified", "failed"}:
+                self._ack_remote_notice_credentials(request_id, state,
+                    "verification_failed" if state == "failed" else "")
+        except Exception:
+            self._ack_remote_notice_credentials(request_id, "failed", "receipt_failed")
+        finally:
+            command.pop("password", None)
+
+    @Slot(object)
+    def _remote_notice_credentials_acknowledged(self, command) -> None:
+        if (self._read_only_acceptance or self._worker_admissions_closed or not isinstance(command, dict)
+                or command.get("status") != "stored"):
+            return
+        request_id = str(command.get("request_id") or "")
+        try:
+            receipt = self._operational_sync_service.load_notice_credential_receipt()
+            if receipt != {"request_id": request_id, "state": "stored"}:
+                return
+            self._operational_sync_service.save_notice_credential_receipt(request_id, "verifying")
+            self._remote_notice_verification_request = request_id
+            self._notice_collection_controller.verifyLogin()
+        except Exception:
+            self._remote_notice_verification_request = ""
+            self._ack_remote_notice_credentials(request_id, "failed", "receipt_failed")
+
+    @Slot()
+    def _remote_notice_verification_changed(self) -> None:
+        request_id = self._remote_notice_verification_request
+        state = self._notice_collection_controller.verificationState
+        if not request_id or state not in {"verified", "error"}:
+            return
+        status = "verified" if state == "verified" else "failed"
+        try:
+            self._operational_sync_service.save_notice_credential_receipt(request_id, status)
+            self._ack_remote_notice_credentials(request_id, status,
+                "verification_failed" if status == "failed" else "")
+        except Exception:
+            self._ack_remote_notice_credentials(request_id, "failed", "receipt_failed")
+        finally:
+            self._remote_notice_verification_request = ""
+
+    @Slot()
+    def _remote_notice_manual_override(self) -> None:
+        request_id = self._remote_notice_verification_request
+        if not request_id:
+            try:
+                receipt = self._operational_sync_service.load_notice_credential_receipt()
+                if isinstance(receipt, dict) and receipt.get("state") in {"applying", "stored", "verifying"}:
+                    request_id = str(receipt.get("request_id") or "")
+            except Exception:
+                return
+        if request_id:
+            self._remote_notice_verification_request = ""
+            try:
+                self._operational_sync_service.save_notice_credential_receipt(request_id, "failed")
+            except Exception:
+                pass
+            self._ack_remote_notice_credentials(request_id, "failed", "verification_interrupted")
+
     @Slot(object)
     def _notice_collection_report_ready(self, report: dict) -> None:
         if self._read_only_acceptance:
@@ -3053,6 +3167,8 @@ class AppController(QObject):
         )
         thread = QThread(self)
         worker.moveToThread(thread)
+        worker.noticeCredentialsReceived.connect(self._remote_notice_credentials_received)
+        worker.noticeCredentialsAcknowledged.connect(self._remote_notice_credentials_acknowledged)
         thread.started.connect(worker.run)
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(self._operational_sync_worker_finished)

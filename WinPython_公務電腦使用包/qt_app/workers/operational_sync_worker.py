@@ -10,6 +10,8 @@ from app_core.operational_sync_service import OperationalSyncService
 
 class OperationalSyncWorker(QObject):
     finished = Signal(int)
+    noticeCredentialsReceived = Signal(object)
+    noticeCredentialsAcknowledged = Signal(object)
 
     def __init__(
         self,
@@ -38,6 +40,10 @@ class OperationalSyncWorker(QObject):
                 self.service.drain_event_queue()
             elif self.operation == "diagnostic_drain":
                 self.service.drain_diagnostic_queue()
+            elif self.operation == "notice_credentials_pull":
+                self.noticeCredentialsReceived.emit(self.service.fetch_notice_credentials())
+            elif self.operation == "notice_credentials_ack":
+                self.noticeCredentialsAcknowledged.emit(self.service.ack_notice_credentials(self.fields))
             elif self.operation == "board":
                 self._sync_board()
         except Exception as exc:

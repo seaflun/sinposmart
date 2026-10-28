@@ -11023,6 +11023,112 @@ class DiagnosticsServiceTests(unittest.TestCase):
 
 
 class OperationalSyncServiceTests(unittest.TestCase):
+    def test_remote_notice_storage_failure_and_manual_override_do_not_verify_remote_request(self):
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+        request_id = "22345678-1234-4234-8234-123456789012"
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory))
+            notice = SimpleNamespace(isRunning=False, verificationState="configured", verifyLogin=Mock())
+            session = SimpleNamespace(saveNoticePassword=Mock(return_value=False))
+            app = SimpleNamespace(_read_only_acceptance=False, _worker_admissions_closed=False,
+                _operational_sync_service=service, _notice_collection_controller=notice,
+                _session_controller=session, _remote_notice_verification_request="",
+                _ack_remote_notice_credentials=Mock())
+            AppController._remote_notice_credentials_received(app, {
+                "request_id": request_id, "account": "tyfd01214", "status": "pending", "password": "fixture-password"})
+            notice.verifyLogin.assert_not_called()
+            app._ack_remote_notice_credentials.assert_called_once_with(request_id, "failed", "storage_failed")
+            service.save_notice_credential_receipt(request_id, "stored")
+            AppController._remote_notice_manual_override(app)
+            AppController._remote_notice_credentials_acknowledged(app, {"request_id": request_id, "status": "stored"})
+            notice.verifyLogin.assert_not_called()
+            self.assertEqual(service.load_notice_credential_receipt()["state"], "failed")
+
+    def test_remote_notice_waits_for_store_ack_and_verifies_only_once(self):
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+        request_id = "22345678-1234-4234-8234-123456789012"
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory))
+            notice = SimpleNamespace(isRunning=False, verificationState="configured", verifyLogin=Mock())
+            session = SimpleNamespace(saveNoticePassword=Mock(return_value=True))
+            app = SimpleNamespace(_read_only_acceptance=False, _worker_admissions_closed=False,
+                _operational_sync_service=service, _notice_collection_controller=notice,
+                _session_controller=session, _remote_notice_verification_request="",
+                _ack_remote_notice_credentials=Mock())
+            def command():
+                return {"request_id": request_id, "account": "tyfd01214", "status": "pending", "password": "fixture-notice"}
+            first = command()
+            AppController._remote_notice_credentials_received(app, first)
+            self.assertNotIn("password", first)
+            session.saveNoticePassword.assert_called_once_with("fixture-notice", verify=False)
+            notice.verifyLogin.assert_not_called()
+            AppController._remote_notice_credentials_received(app, command())
+            session.saveNoticePassword.assert_called_once()
+            acknowledged = {"request_id": request_id, "status": "stored"}
+            AppController._remote_notice_credentials_acknowledged(app, acknowledged)
+            AppController._remote_notice_credentials_acknowledged(app, acknowledged)
+            notice.verifyLogin.assert_called_once()
+            notice.verificationState = "verified"
+            AppController._remote_notice_verification_changed(app)
+            self.assertEqual(service.load_notice_credential_receipt()["state"], "verified")
+            app._ack_remote_notice_credentials.assert_called_with(request_id, "verified", "")
+
+    def test_remote_notice_interrupted_verification_does_not_submit_login_again(self):
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+        request_id = "22345678-1234-4234-8234-123456789012"
+        with tempfile.TemporaryDirectory() as directory:
+            service = OperationalSyncService(Path(directory))
+            service.save_notice_credential_receipt(request_id, "verifying")
+            notice = SimpleNamespace(isRunning=False, verificationState="configured", verifyLogin=Mock())
+            session = SimpleNamespace(saveNoticePassword=Mock())
+            app = SimpleNamespace(_read_only_acceptance=False, _worker_admissions_closed=False,
+                _operational_sync_service=service, _notice_collection_controller=notice,
+                _session_controller=session, _remote_notice_verification_request="",
+                _ack_remote_notice_credentials=Mock())
+            AppController._remote_notice_credentials_received(app, {
+                "request_id": request_id, "account": "tyfd01214", "status": "stored"})
+            session.saveNoticePassword.assert_not_called()
+            notice.verifyLogin.assert_not_called()
+            self.assertEqual(service.load_notice_credential_receipt()["state"], "failed")
+            app._ack_remote_notice_credentials.assert_called_once_with(request_id, "failed", "verification_interrupted")
+
+    def test_remote_notice_credentials_bind_server_workstation_and_fixed_account(self):
+        from app_core.operational_sync_service import OperationalSyncService
+        identity = "12345678-1234-4234-8234-123456789012"
+        request_id = "22345678-1234-4234-8234-123456789012"
+        command = {"request_id": request_id, "workstation": "TEST-PC", "account": "tyfd01214",
+                   "status": "pending", "password": "fixture-remote-notice"}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-sync"}), \
+                patch("app_core.operational_sync_service.socket.gethostname", return_value="TEST-PC"):
+            service = OperationalSyncService(Path(directory))
+            service._heartbeat_server_id = identity
+            response = {"ok": True, "server": {"instance_id": identity}, "request": command}
+            with patch.object(service, "_heartbeat_request", return_value=response) as transport:
+                self.assertEqual(service.fetch_notice_credentials()["password"], "fixture-remote-notice")
+                self.assertEqual(transport.call_args.args[0], "/notice-credentials/TEST-PC")
+                for key, value in (("account", "other"), ("workstation", "OTHER-PC"), ("request_id", "invalid")):
+                    with self.subTest(key=key), patch.object(service, "_heartbeat_request", return_value={**response, "request": {**command, key: value}}):
+                        with self.assertRaises(ValueError):
+                            service.fetch_notice_credentials()
+            with patch.object(service, "_heartbeat_request", return_value={**response, "server": {"instance_id": request_id}}):
+                with self.assertRaises(ValueError):
+                    service.fetch_notice_credentials()
+
+    def test_remote_notice_receipt_is_durable_and_contains_no_password(self):
+        from app_core.operational_sync_service import OperationalSyncService
+        request_id = "22345678-1234-4234-8234-123456789012"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = OperationalSyncService(root)
+            service.save_notice_credential_receipt(request_id, "stored")
+            self.assertEqual(OperationalSyncService(root).load_notice_credential_receipt(),
+                             {"request_id": request_id, "state": "stored"})
+            with self.assertRaises(ValueError):
+                service.save_notice_credential_receipt(request_id, "fixture-password")
+
     def test_event_poster_seam_does_not_enable_real_diagnostic_transport_without_a_token(self):
         from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
         from app_core.operational_sync_service import OperationalSyncService
@@ -11998,6 +12104,23 @@ class CredentialSyncServiceTests(unittest.TestCase):
 
 
 class QtShellTests(unittest.TestCase):
+    def test_remote_notice_password_can_save_without_starting_verification_before_ack(self):
+        from app_core.credential_repository import CredentialRepository
+        from qt_app.controllers.session_controller import SessionController
+        from tests.test_credential_repository import FakeDpapi
+        with tempfile.TemporaryDirectory() as directory:
+            repository = CredentialRepository(Path(directory) / "saved_login.json", "test", FakeDpapi)
+            repository.save([{"user_id": "duty-user", "password": "fixture-duty"}], "duty-user")
+            before = repository.path.read_bytes()
+            controller = SessionController(repository=repository)
+            self.addCleanup(controller.shutdown)
+            events = []
+            controller.noticePasswordSaved.connect(lambda: events.append("verify"))
+            self.assertTrue(controller.saveNoticePassword("fixture-remote-notice", verify=False))
+            self.assertEqual(events, [])
+            self.assertEqual(repository.path.read_bytes(), before)
+            self.assertNotIn("fixture-remote-notice", repository.notice_repository().path.read_text(encoding="utf-8"))
+
     def test_notice_failure_queues_one_problem_package_for_the_first_report_part(self):
         from app_core.credential_repository import CredentialRepository
         from app_core.diagnostics_service import DiagnosticsService

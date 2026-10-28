@@ -286,6 +286,68 @@ class OperationalSyncService:
     def heartbeat_enabled(self) -> bool:
         return bool(self._heartbeat_endpoint and self._heartbeat_token)
 
+    def _notice_credentials_request(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        if not self.heartbeat_enabled:
+            return None
+        workstation = socket.gethostname()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", workstation) is None:
+            raise ValueError("通報密碼目標電腦無法確認。")
+        with self._heartbeat_lock:
+            if not self._heartbeat_server_id:
+                identity = self._heartbeat_request("/identity")
+                self._heartbeat_server_id = identity["server"]["instance_id"]
+            suffix = "/notice-credentials/" + workstation + ("/ack" if payload is not None else "")
+            response = self._heartbeat_request(suffix, payload)
+            if response.get("server", {}).get("instance_id") != self._heartbeat_server_id:
+                raise ValueError("通報密碼伺服器身分不符。")
+        command = response.get("request")
+        if command is None and payload is None:
+            return None
+        if (not isinstance(command, dict) or not _heartbeat_uuid(command.get("request_id"))
+                or command.get("workstation") != workstation or command.get("account") != "tyfd01214"
+                or command.get("status") not in {"pending", "stored", "verified", "failed", "expired"}
+                or (payload is not None and command["request_id"] != payload["request_id"])):
+            raise ValueError("通報密碼請求格式不符。")
+        if command["status"] == "pending":
+            password = command.get("password")
+            if (not isinstance(password, str) or not password.strip() or len(password) > 256
+                    or any(c in password for c in "\r\n\x00")):
+                raise ValueError("通報密碼內容無法確認。")
+        elif "password" in command:
+            raise ValueError("通報密碼回報格式不符。")
+        return {key: command[key] for key in
+                ("request_id", "workstation", "account", "status", "created_at", "updated_at", "result_code", "password")
+                if key in command}
+
+    def fetch_notice_credentials(self) -> dict[str, Any] | None:
+        return self._notice_credentials_request()
+
+    def ack_notice_credentials(self, fields: Mapping[str, Any]) -> dict[str, Any] | None:
+        if (not _heartbeat_uuid(fields.get("request_id")) or fields.get("status") not in {"stored", "verified", "failed"}
+                or fields.get("result_code", "") not in {"", "storage_failed", "receipt_failed", "verification_failed", "verification_interrupted"}):
+            raise ValueError("通報密碼確認格式不符。")
+        return self._notice_credentials_request({key: fields[key] for key in ("request_id", "status", "result_code") if key in fields})
+
+    def load_notice_credential_receipt(self) -> dict[str, str]:
+        path = self.package_root / "runtime_outputs/notice_collection/remote_credentials_receipt.json"
+        if not path.exists():
+            return {}
+        if path.stat().st_size > 4096:
+            raise ValueError("通報密碼儲存收據無法確認。")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(record, dict) or set(record) != {"request_id", "state"}
+                or not _heartbeat_uuid(record.get("request_id"))
+                or record.get("state") not in {"applying", "stored", "verifying", "verified", "failed"}):
+            raise ValueError("通報密碼儲存收據無法確認。")
+        return record
+
+    def save_notice_credential_receipt(self, request_id: str, state: str) -> None:
+        if not _heartbeat_uuid(request_id) or state not in {"applying", "stored", "verifying", "verified", "failed"}:
+            raise ValueError("通報密碼儲存收據格式不符。")
+        path = self.package_root / "runtime_outputs/notice_collection/remote_credentials_receipt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_text_atomically(path, json.dumps({"request_id": request_id, "state": state}))
+
     def _heartbeat_request(self, suffix: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         headers = {"Accept": "application/json", "X-Credential-Sync-Token": self._heartbeat_token}
         body = None
@@ -747,8 +809,10 @@ class OperationalSyncService:
     def record_unhandled_failure(self, operation: str, error: BaseException) -> None:
         """Persist a safe status when a Qt worker exits unexpectedly."""
 
-        channel = "board" if operation == "board" else "diagnostic" if operation == "diagnostic_drain" else "event"
-        label = "Google 值班名牌" if channel == "board" else "NAS 問題包" if channel == "diagnostic" else "NAS 後台事件"
+        channel = ("notice_remote" if operation.startswith("notice_credentials_") else
+                   "board" if operation == "board" else "diagnostic" if operation == "diagnostic_drain" else "event")
+        label = ("通報密碼同步" if channel == "notice_remote" else "Google 值班名牌" if channel == "board" else
+                 "NAS 問題包" if channel == "diagnostic" else "NAS 後台事件")
         self._record_sync_status(channel, "failed", self._safe_failure_detail(error, label))
 
     def _record_sync_status(
