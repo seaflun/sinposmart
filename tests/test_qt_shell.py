@@ -11881,6 +11881,72 @@ class OperationalSyncServiceTests(unittest.TestCase):
 
 
 class SecureSyncTransportTests(unittest.TestCase):
+    def test_notice_fetch_ack_and_diagnostic_upload_use_guarded_lan_requests(self):
+        import hashlib
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+        from app_core.operational_sync_service import OperationalSyncService
+        server = {"instance_id": "12345678-1234-4234-8234-123456789012", "version": "fixture", "deployment": "fixture"}
+        command = {"request_id": "22345678-1234-4234-8234-123456789012", "workstation": "TEST-PC",
+                   "account": "tyfd01214", "status": "pending", "password": "fixture-notice-password"}
+        def response(body):
+            opened = Mock()
+            opened.__enter__ = Mock(return_value=opened)
+            opened.__exit__ = Mock(return_value=False)
+            opened.read.return_value = json.dumps(body).encode("utf-8")
+            return opened
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "SINPOSMART_BACKEND_EVENT_URL": "http://10.30.65.30:8080/api/sinposmart/events",
+                "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "fixture-sync-token"}), \
+                patch("app_core.operational_sync_service.socket.gethostname", return_value="TEST-PC"), \
+                patch("app_core.credential_sync_service.urllib.request.build_opener") as build, \
+                patch("app_core.credential_sync_service._tailscale_peer_verified", side_effect=AssertionError("LAN must remain direct")):
+            root = Path(directory)
+            service = OperationalSyncService(root)
+            report = DiagnosticsService(root).export(DiagnosticSnapshot())
+            digest = hashlib.sha256(report.read_bytes()).hexdigest()
+            stored = {k: v for k, v in command.items() if k != "password"}
+            stored["status"] = "stored"
+            build.return_value.open.side_effect = [response({"ok": True, "server": server}),
+                response({"ok": True, "server": server, "request": command}),
+                response({"ok": True, "server": server, "received_at": "2026-10-28T08:00:00+08:00", "request": stored}),
+                response({"ok": True, "ack_id": digest})]
+            self.assertEqual(service.fetch_notice_credentials()["password"], "fixture-notice-password")
+            self.assertEqual(service.ack_notice_credentials({"request_id": command["request_id"], "status": "stored"})["status"], "stored")
+            service.queue_diagnostic_package(report)
+            service.drain_diagnostic_queue()
+            self.assertFalse(service.has_pending_diagnostics)
+            calls = build.return_value.open.call_args_list
+            self.assertEqual([call.args[0].full_url for call in calls], [
+                "http://10.30.65.30:8080/api/sinposmart/identity",
+                "http://10.30.65.30:8080/api/sinposmart/notice-credentials/TEST-PC",
+                "http://10.30.65.30:8080/api/sinposmart/notice-credentials/TEST-PC/ack",
+                "http://10.30.65.30:8080/api/sinposmart/diagnostics/" + digest])
+            self.assertNotIn(b"fixture-notice-password", calls[2].args[0].data)
+
+    def test_notice_commands_and_diagnostics_pass_the_real_lan_transport_policy(self):
+        import app_core.credential_sync_service as transport
+        paths = ("/api/sinposmart/notice-credentials/SP-76F413",
+                 "/api/sinposmart/notice-credentials/SP-76F413/ack",
+                 "/api/sinposmart/diagnostics/" + "a" * 64)
+        for path in paths:
+            with self.subTest(path=path), patch.object(transport.urllib.request, "build_opener") as build:
+                request = transport.urllib.request.Request("http://10.30.65.30:8080" + path)
+                transport.open_sync_request(request, timeout=1)
+                build.return_value.open.assert_called_once_with(request, timeout=1)
+                proxy = next(handler for handler in build.call_args.args if isinstance(handler, transport.urllib.request.ProxyHandler))
+                self.assertEqual(proxy.proxies, {})
+
+    def test_new_lan_routes_reject_invalid_targets_and_path_variants(self):
+        import app_core.credential_sync_service as transport
+        paths = ("/api/sinposmart/notice-credentials/../outside", "/api/sinposmart/notice-credentials/PC/unknown",
+                 "/api/sinposmart/notice-credentials/PC/ack/extra", "/api/sinposmart/notice-credentials/PC?key=value",
+                 "/api/sinposmart/diagnostics/not-a-digest", "/api/sinposmart/diagnostics/" + "a" * 65)
+        for path in paths:
+            with self.subTest(path=path), patch.object(transport.urllib.request, "build_opener") as build:
+                with self.assertRaises(transport.SyncTransportError):
+                    transport.open_sync_request(transport.urllib.request.Request("http://10.30.65.30:8080" + path), timeout=1)
+                build.assert_not_called()
+
     def test_plain_http_cannot_send_credentials_before_transport_is_verified(self) -> None:
         from app_core.credential_sync_service import CredentialSyncError, CredentialSyncService
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import ipaddress
+import re
 import subprocess
 import urllib.error
 import urllib.request
@@ -69,7 +70,9 @@ def _sync_target(url: str) -> tuple[str, bool]:
         if parsed.scheme == "https":
             return url, False
         if (parsed.hostname == "10.30.65.30" and parsed.port == 8080
-                and parsed.path in _NAS_API_PATHS and not parsed.query):
+                and (parsed.path in _NAS_API_PATHS or re.fullmatch(
+                    r"/api/sinposmart/(?:diagnostics/[0-9a-f]{64}|notice-credentials/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:/ack)?)",
+                    parsed.path) is not None) and not parsed.query):
             return url, True  # Preserve the fixed NAS LAN route without using proxies.
         address = ipaddress.ip_address(parsed.hostname)
         if address not in _OVERLAY_NETWORK:
