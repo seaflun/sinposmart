@@ -53,7 +53,15 @@ SETUP_WINPYTHON.bat
 
 值班 GUI 讀取當日勤務表後，可將完整班表同步到 Google Site 的「自動化」頁面；看板會顯示目前時段、下一時段與最後更新時間。詳細部署、設定與輪替同步金鑰方式請見 [GOOGLE_SITE_DUTY_BOARD_SETUP.md](GOOGLE_SITE_DUTY_BOARD_SETUP.md)。
 
-## 注意事項
+## 問題包與 NAS 診斷
+
+手動匯出、勤務登打／交接預檢失敗，以及通報收取失敗或待確認時，問題包先保存在本機 `issue_reports/`，再由背景工作上傳 NAS。斷線、收據不符或程式重開時保留原 ZIP 與相同 SHA-256 重試；NAS 確認相同雜湊後才停止重送，不影響正式勤務登打或通報的入表、簽收、已讀流程。
+
+問題包保存任務識別、錯誤碼、遮蔽後的例外訊息、堆疊位置與通報 Apps Script 錯誤回覆；不包含密碼、token、cookie、HTML 或截圖。個別檔案上限 2 MiB、ZIP 上限 8 MiB，略過的檔案記在 `manifest.json`。舊版尚未遮蔽的 ZIP 不會自動上傳；可重新匯出產生新問題包。
+
+NAS 接收端需與 GUI 一起更新，沿用既有同步 token 及安全傳輸設定。檔案保存在 `artifacts/sinposmart/diagnostics/<消防日>/<SHA-256>.zip`，可從值班後台當日的「問題包」區塊依時間、番號與任務下載。下載連結沿用管理頁的唯讀存取範圍，不包含同步密鑰。本功能不新增自動刪除問題包的規則。
+
+## 其他注意事項
 
 - 帳號清單存在各電腦本機，不會跟著 Google Drive 共用。
 - 需要啟用帳密同步時，請在該電腦設定 `SINPOSMART_CREDENTIAL_SYNC_TOKEN` 與 `SINPOSMART_CREDENTIAL_SYNC_URL`；登入成功後會自動同步當次值班台帳密。

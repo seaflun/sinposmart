@@ -14,6 +14,7 @@ import re
 import urllib.request
 from uuid import uuid4
 
+from app_core.diagnostics_service import diagnostic_exception
 from app_core.operational_sync_service import normalize_duty_board_day
 
 
@@ -527,12 +528,14 @@ class NoticeCollectionService:
             keys = {self._record_key(row) for row in rows}
             self.login_guard.finish_attempt(self._now(), verification=True)
         except NoticeCollectionError as exc:
+            self._save_failure_diagnostic("login_verification", exc, secrets=(password,))
             try:
                 self.login_guard.pause(exc.code)
             except NoticeCollectionError:
                 pass
             raise
-        except Exception:
+        except Exception as exc:
+            self._save_failure_diagnostic("login_verification", exc, secrets=(password,))
             self.login_guard.pause()
             raise NoticeCollectionError("通報登入驗證未完成，請確認帳密、網站與網路狀態。") from None
         finally:
@@ -563,6 +566,7 @@ class NoticeCollectionService:
                 result.message = f"已入表；{result.signing_pending_count} 則簽收人員待人工確認。"
             return result
         except Exception as exc:
+            self._save_failure_diagnostic("collect:" + self._collection_stage, exc, secrets=(password,))
             result = self.last_result
             result.written_keys = sorted(set(result.written_keys) | (set(self._state["collected"]) - before))
             result.status = ("uncertain" if self._state["pending"] else
@@ -1014,7 +1018,25 @@ class NoticeCollectionService:
         return (hmac.new(token.encode("utf-8"), b"SinpoSmartNoticeCollection:v1", hashlib.sha256).hexdigest()
                 if token else "")
 
+    def _save_failure_diagnostic(self, stage: str, error: BaseException, *, secrets: tuple[str, ...] = ()) -> None:
+        """Record bounded technical evidence without notice bodies or authentication payloads."""
+        path = self.package_root / "runtime_outputs" / "browser" / "notice_collection_failure.json"
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and path.stat().st_size <= 65536 else {}
+            failures = previous.get("failures", []) if isinstance(previous, dict) else []
+            failures = failures if isinstance(failures, list) else []
+            failures = failures[-9:] + [{"occurred_at": _local_time(self._now()).isoformat(timespec="seconds"),
+                                        "stage": stage, "exception": diagnostic_exception(error, secrets)}]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name("notice-diagnostic-" + uuid4().hex + ".tmp")
+            temporary.write_text(json.dumps({"failures": failures}, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        except Exception:
+            pass  # Evidence must not change retry, receipt or official-read behavior.
+
     def _post(self, payload: dict) -> dict:
+        sync_key = ""
+        stage = "apps_script:" + str(payload.get("action") or "unknown")[:40]
         try:
             if self._poster is not None:
                 response = self._poster(payload)
@@ -1030,8 +1052,12 @@ class NoticeCollectionService:
                     response = json.loads(opened.read(5 * 1024 * 1024))
             if not isinstance(response, dict):
                 raise ValueError("invalid response")
+            if response.get("status") == "error":
+                detail = response.get("message") or response.get("error")
+                self._save_failure_diagnostic(stage, ValueError(detail if isinstance(detail, str) else "Apps Script 回覆未成功。"), secrets=(sync_key,))
             return response
-        except Exception:
+        except Exception as exc:
+            self._save_failure_diagnostic(stage, exc, secrets=(sync_key,))
             raise NoticeCollectionError("通報試算表連線或回覆未確認，請稍後再檢查。") from None
 
     @staticmethod

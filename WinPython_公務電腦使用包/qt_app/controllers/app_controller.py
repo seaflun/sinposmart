@@ -305,6 +305,12 @@ class AppController(QObject):
         self._board_retry_timer.setInterval(60_000)
         self._board_retry_timer.timeout.connect(self._retry_current_duty_board)
         self._board_retry_timer.start()
+        self._diagnostic_retry_timer = QTimer(self)
+        self._diagnostic_retry_timer.setInterval(60_000)
+        self._diagnostic_retry_timer.timeout.connect(self._retry_diagnostic_uploads)
+        if not self._read_only_acceptance:
+            self._diagnostic_retry_timer.start()
+            QTimer.singleShot(15_000, self._retry_diagnostic_uploads)
         self._tomorrow_schedule_request_id = 0
         self._tomorrow_schedule_workers: dict[int, tuple[QThread, ScheduleCaptureWorker]] = {}
         self._tomorrow_schedule_contexts: dict[int, tuple[int, str, str, str]] = {}
@@ -577,7 +583,8 @@ class AppController(QObject):
                     target_date=self._duty_controller.targetDateText,
                     session_actor=self._session_controller.actorNo,
                     session_verified=self._session_controller.isLoggedIn,
-                )
+                ),
+                secrets=(self._session_state.session.password,) if self._session_state.session else (),
             )
         except DiagnosticExportError as exc:
             self._diagnostics_status = str(exc)
@@ -585,8 +592,28 @@ class AppController(QObject):
             self.diagnosticsStatusRequested.emit(self._diagnostics_status)
             return
         self._diagnostics_status = f"問題包已匯出：{package_path.name}"
+        if self._queue_diagnostic_package(package_path):
+            self._diagnostics_status += "；已排入 NAS 背景上傳。"
         self.diagnosticsChanged.emit()
         self.diagnosticsStatusRequested.emit(self._diagnostics_status)
+
+    def _queue_diagnostic_package(self, package_path: Path) -> bool:
+        queue = getattr(self._operational_sync_service, "queue_diagnostic_package", None)
+        if self._read_only_acceptance or not callable(queue):
+            return False
+        try:
+            queue(package_path)
+        except Exception:
+            return False  # The local ZIP remains available even if admission fails.
+        self._start_operational_sync("diagnostic_drain")
+        return True
+
+    def _retry_diagnostic_uploads(self) -> None:
+        if (self._read_only_acceptance or self._worker_admissions_closed
+                or self._operational_sync_shutting_down):
+            return
+        if getattr(self._operational_sync_service, "has_pending_diagnostics", False) is True:
+            self._start_operational_sync("diagnostic_drain")
 
     @Slot(result=bool)
     def recordUpdateLogout(self) -> bool:
@@ -668,6 +695,7 @@ class AppController(QObject):
         self._automatic_tools_timer.stop()
         self._hourly_refresh_timer.stop()
         self._board_retry_timer.stop()
+        self._diagnostic_retry_timer.stop()
         self._tomorrow_schedule_timer.stop()
         if self._scheduled_folder_timer is not None:
             self._scheduled_folder_timer.stop()
@@ -2635,7 +2663,7 @@ class AppController(QObject):
                         f"登打失敗：{detail}",
                     ),
                 )
-        if not result_path or error_code == "validation_error":
+        if error_code == "validation_error":
             return
         try:
             package_path = self._diagnostics_service.export(
@@ -2645,12 +2673,20 @@ class AppController(QObject):
                     target_date=str(request.schedule_data.get("target_date", "")),
                     session_actor=request.session_actor_no,
                     session_verified=request_is_current,
-                )
+                    action_key=request.action_key or action_completion_key(action),
+                    action_kind=str(action.get("kind") or ""),
+                    trigger_type=request.trigger_type,
+                    error_code=error_code,
+                    result_ref=Path(result_path).name if result_path else "",
+                ),
+                secrets=(request.password,),
             )
         except DiagnosticExportError as exc:
             self._diagnostics_status = str(exc)
         else:
             self._diagnostics_status = f"問題包已匯出：{package_path.name}"
+            if self._queue_diagnostic_package(package_path):
+                self._diagnostics_status += "；已排入 NAS 背景上傳。"
         self.diagnosticsChanged.emit()
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
@@ -2905,6 +2941,18 @@ class AppController(QObject):
             return
         if not self._worker_admissions_closed:
             self._start_operational_sync("event_drain")
+        if report.get("state") in {"failed", "partial", "uncertain"} and report.get("part_index", 0) == 0:
+            try:
+                day = datetime.fromisoformat(str(report.get("calendar_day") or ""))
+                package_path = self._diagnostics_service.export(DiagnosticSnapshot(
+                    duty_status=str(report.get("message") or "通報收取失敗"),
+                    target_date=f"{day.year - 1911:03d}{day.month:02d}{day.day:02d}",
+                    action_key=str(report.get("run_id") or ""), action_kind="notice_collection", trigger_type="notice_poll",
+                    error_code=str(report.get("error_code") or report.get("error_stage") or "unknown_error"),
+                ))
+                self._queue_diagnostic_package(package_path)
+            except Exception:
+                pass  # Reporting a notice failure must never repeat its write or read marker.
 
     def _send_operational_event(self, record_type: str, **fields) -> None:
         if self._read_only_acceptance:

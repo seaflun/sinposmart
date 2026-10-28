@@ -152,6 +152,27 @@ class NoticeLoginProtectionTests(unittest.TestCase):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_apps_script_failures_keep_redacted_diagnostics_without_changing_retry_response(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            response = {"status": "error", "message": "quota limit; token=private-cloud-token", "retryable": False}
+            service = NoticeCollectionService(root, poster=lambda _payload: response)
+            self.assertIs(service._post({"action": "writeRecords", "requestId": "safe-request"}), response)
+            def offline(_payload):
+                raise OSError("socket disconnected; password=private-password")
+            service._poster = offline
+            with self.assertRaises(NoticeCollectionError):
+                service._post({"action": "getWriteResult", "requestId": "safe-request"})
+            diagnostic = root / "runtime_outputs/browser/notice_collection_failure.json"
+            body = diagnostic.read_text(encoding="utf-8")
+            failures = json.loads(body)["failures"]
+            self.assertEqual([row["stage"] for row in failures], ["apps_script:writeRecords", "apps_script:getWriteResult"])
+            self.assertIn("quota limit", failures[0]["exception"]["message"])
+            self.assertEqual(failures[1]["exception"]["type"], "OSError")
+            self.assertNotIn("private-cloud-token", body)
+            self.assertNotIn("private-password", body)
+
     def test_shift_records_keep_publisher_and_original_receipt_across_restart(self):
         from app_core.notice_collection_service import NoticeCollectionService, NoticeShift
         at = datetime(2026, 10, 21, 9, 12, tzinfo=timezone(timedelta(hours=8)))

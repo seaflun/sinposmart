@@ -12,6 +12,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from uuid import UUID, uuid4
 
 from app_core.duty_task_projection import action_summary
 from app_core.credential_sync_service import SyncTransportError, open_sync_request
+from app_core.diagnostics_service import MAX_DIAGNOSTIC_ARCHIVE_BYTES
 
 
 JsonPoster = Callable[[dict[str, Any]], dict[str, Any]]
@@ -246,12 +248,17 @@ class OperationalSyncService:
         *,
         event_poster: JsonPoster | None = None,
         board_poster: JsonPoster | None = None,
+        diagnostic_poster: Callable[[Path, str], dict[str, Any]] | None = None,
     ) -> None:
         self.package_root = Path(package_root)
         self.pending_path = self.package_root / "runtime_outputs" / "sinposmart_backend_events_pending.jsonl"
         self.status_path = self.package_root / "runtime_outputs" / SYNC_STATUS_FILENAME
         self._event_poster = event_poster
         self._board_poster = board_poster
+        self._diagnostic_poster = diagnostic_poster
+        self._diagnostic_path = self.package_root / "runtime_outputs" / "sinposmart_diagnostics_outbox.json"
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostic_send_lock = threading.Lock()
         self._event_lock = threading.Lock()
         self._event_send_lock = threading.Lock()
         self._board_lock = threading.Lock()
@@ -509,6 +516,115 @@ class OperationalSyncService:
                 pending_count=len(pending),
             )
 
+    def queue_diagnostic_package(self, package_path: Path) -> str:
+        """Persist only a reference to a newly sanitized, immutable local report."""
+        path = Path(package_path).resolve()
+        if path.parent != (self.package_root / "issue_reports").resolve() or path.suffix != ".zip":
+            raise ValueError("問題包不在允許的目錄。")
+        if not 0 < path.stat().st_size <= MAX_DIAGNOSTIC_ARCHIVE_BYTES:
+            raise ValueError("問題包超過容量限制。")
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo("manifest.json")
+            if info.file_size > 65536:
+                raise ValueError("問題包資訊超過限制。")
+            manifest = json.loads(archive.read(info))
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or manifest.get("sanitized") is not True:
+            raise ValueError("舊問題包尚未通過內容遮蔽，不自動上傳。")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self._diagnostic_lock:
+            records = self._load_diagnostic_records()
+            records.setdefault(digest, {"package_name": path.name, "state": "pending"})
+            self._write_diagnostic_records(records)
+        self._record_sync_status("diagnostic", "pending" if records[digest]["state"] != "uploaded" else "ok",
+                                 "問題包已保存本機，等待 NAS 確認。" if records[digest]["state"] != "uploaded" else "問題包已由 NAS 確認。")
+        return digest
+
+    def _load_diagnostic_records(self) -> dict[str, dict[str, Any]]:
+        if not self._diagnostic_path.exists():
+            return {}
+        records = json.loads(self._diagnostic_path.read_text(encoding="utf-8"))
+        if not isinstance(records, dict) or any(
+            re.fullmatch(r"[0-9a-f]{64}", key) is None or not isinstance(item, dict)
+            or item.get("state") not in {"pending", "uploaded"}
+            or not isinstance(item.get("package_name"), str)
+            or Path(item["package_name"]).name != item["package_name"]
+            for key, item in records.items()
+        ):
+            raise ValueError("問題包上傳佇列格式不符，已保留原檔。")
+        return records
+
+    def _write_diagnostic_records(self, records: dict[str, dict[str, Any]]) -> None:
+        self._diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_text_atomically(self._diagnostic_path, json.dumps(records, ensure_ascii=False, indent=2))
+
+    @property
+    def has_pending_diagnostics(self) -> bool:
+        try:
+            with self._diagnostic_lock:
+                return any(item["state"] == "pending" for item in self._load_diagnostic_records().values())
+        except (OSError, ValueError):
+            return True
+
+    def drain_diagnostic_queue(self) -> None:
+        """Upload outside the admission lock; a matching durable NAS receipt is required."""
+        if self._diagnostic_poster is None and not (
+            self._heartbeat_base_url() and os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()
+        ):
+            self._record_sync_status("diagnostic", "disabled", "問題包已保留本機，等待 NAS 同步設定。")
+            return
+        with self._diagnostic_send_lock:
+            try:
+                with self._diagnostic_lock:
+                    records = self._load_diagnostic_records()
+            except (OSError, ValueError):
+                self._record_sync_status("diagnostic", "failed", "無法讀取問題包上傳佇列，已保留原檔。")
+                return
+            pending = [(digest, item) for digest, item in records.items() if item["state"] == "pending"]
+            attempts = 0
+            for digest, item in pending:
+                try:
+                    path = (self.package_root / "issue_reports" / item["package_name"]).resolve()
+                    if path.parent != (self.package_root / "issue_reports").resolve():
+                        raise ValueError("問題包目錄不符。")
+                    if not 0 < path.stat().st_size <= MAX_DIAGNOSTIC_ARCHIVE_BYTES or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                        raise ValueError("本機問題包已變更，無法確認上傳內容。")
+                    if attempts >= 3:
+                        break
+                    attempts += 1
+                    response = self._post_diagnostic(path, digest)
+                    if response.get("ok") is not True or response.get("ack_id") != digest:
+                        raise ValueError("未收到正確的問題包確認。")
+                    with self._diagnostic_lock:
+                        current = self._load_diagnostic_records()
+                        current[digest]["state"] = "uploaded"
+                        self._write_diagnostic_records(current)
+                except Exception as exc:
+                    self._record_sync_status("diagnostic", "failed", self._safe_failure_detail(exc, "NAS 問題包"))
+                    continue
+            if not self.has_pending_diagnostics:
+                self._record_sync_status("diagnostic", "ok", "問題包已由 NAS 確認。", pending_count=0)
+
+    def _post_diagnostic(self, path: Path, digest: str) -> dict[str, Any]:
+        if self._diagnostic_poster is not None:
+            return self._diagnostic_poster(path, digest)
+        endpoint = self._heartbeat_base_url()
+        if not endpoint:
+            raise ValueError("NAS 問題包端點不符。")
+        body = path.read_bytes()
+        if len(body) > MAX_DIAGNOSTIC_ARCHIVE_BYTES or hashlib.sha256(body).hexdigest() != digest:
+            raise ValueError("問題包內容已變更。")
+        request = urllib.request.Request(endpoint + "/diagnostics/" + digest, data=body,
+            headers={"Content-Type": "application/zip", "X-Credential-Sync-Token": os.environ.get("SINPOSMART_CREDENTIAL_SYNC_TOKEN", "").strip()},
+            method="POST")
+        with open_sync_request(request, timeout=self._timeout("SINPOSMART_BACKEND_EVENT_TIMEOUT_SECONDS", 5)) as response:
+            raw = response.read(8193)
+        if len(raw) > 8192:
+            raise ValueError("問題包確認格式不符。")
+        result = json.loads(raw.decode("utf-8"))
+        if not isinstance(result, dict):
+            raise ValueError("問題包確認格式不符。")
+        return result
+
     def sync_board_async(self, schedule_data: Mapping[str, Any]) -> bool:
         if not self.board_enabled:
             self._record_sync_status(
@@ -631,8 +747,8 @@ class OperationalSyncService:
     def record_unhandled_failure(self, operation: str, error: BaseException) -> None:
         """Persist a safe status when a Qt worker exits unexpectedly."""
 
-        channel = "board" if operation == "board" else "event"
-        label = "Google 值班名牌" if channel == "board" else "NAS 後台事件"
+        channel = "board" if operation == "board" else "diagnostic" if operation == "diagnostic_drain" else "event"
+        label = "Google 值班名牌" if channel == "board" else "NAS 問題包" if channel == "diagnostic" else "NAS 後台事件"
         self._record_sync_status(channel, "failed", self._safe_failure_detail(error, label))
 
     def _record_sync_status(

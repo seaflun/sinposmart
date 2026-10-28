@@ -14,6 +14,7 @@ from time import sleep
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
+from app_core.diagnostics_service import diagnostic_exception
 from app_core.duty_task_projection import (
     action_completion_key,
     action_staff,
@@ -474,7 +475,7 @@ class DutySubmissionService:
         except DutySubmissionExecutionError as exc:
             if self._work_save_state(action, action_date) == "pending":
                 return self._finish_work_review(request, action, action_date, result_path, exc)
-            self._write_failure(request, action, result_path)
+            self._write_failure(request, action, result_path, exc)
             exc.result_path = result_path
             raise
         except Exception as exc:
@@ -483,7 +484,7 @@ class DutySubmissionService:
                 or self._work_save_state(action, action_date) == "pending"
             ):
                 return self._finish_work_review(request, action, action_date, result_path, exc)
-            self._write_failure(request, action, result_path)
+            self._write_failure(request, action, result_path, exc)
             message, error_code = self._safe_error(exc)
             raise DutySubmissionExecutionError(message, error_code, result_path) from exc
         finally:
@@ -593,7 +594,10 @@ class DutySubmissionService:
             raise
         except Exception as exc:
             message, error_code = self._safe_error(exc)
-            raise DutySubmissionExecutionError(message, error_code) from exc
+            action = dict(request.schedule_data["actions"][request.action_index])
+            result_path = self._create_result_path(request, action)
+            self._write_failure(request, action, result_path, exc)
+            raise DutySubmissionExecutionError(message, error_code, result_path) from exc
         finally:
             if not opened and driver is not None and automation is not None:
                 try:
@@ -1158,11 +1162,13 @@ class DutySubmissionService:
         request: DutySubmissionRequest,
         action: Mapping[str, Any],
         path: Path,
+        error: BaseException,
     ) -> None:
         self._write_result(
             path,
             {
                 "stage": "failed",
+                "exception": diagnostic_exception(error, (request.password,)),
                 "action_index": request.action_index,
                 "action": dict(action),
                 "trigger_type": request.trigger_type,

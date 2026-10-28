@@ -3104,6 +3104,28 @@ raise SystemExit(1 if loaded_fallback_modules else 0)
 
 
 class DutySubmissionServiceTests(unittest.TestCase):
+    def test_failure_result_preserves_redacted_exception_and_stack(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def fail_login(*_args):
+                raise ValueError("browser disconnected; password=session-secret; token=private-token; https://example.test/page?sid=private-session")
+            automation = SimpleNamespace(build_driver=lambda **_kw: object(), login=fail_login, quit_driver=lambda _driver: None)
+            service = DutySubmissionService(root, module_loader=lambda: automation, now_factory=lambda: datetime(2026, 10, 28, 8, 1))
+            request = DutySubmissionRequest("test-user", "session-secret", 0,
+                {"target_date": "1151028", "actions": [{"kind": "handoff_preflight", "time": "08:00", "actor": "21"}]})
+            with self.assertRaises(DutySubmissionExecutionError) as caught:
+                service.execute(request)
+            result = json.loads(caught.exception.result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["exception"]["type"], "ValueError")
+            self.assertIn("browser disconnected", result["exception"]["message"])
+            self.assertTrue(any(frame["function"] == "fail_login" for frame in result["exception"]["frames"]))
+            body = json.dumps(result)
+            for secret in ("session-secret", "private-token", "private-session"):
+                self.assertNotIn(secret, body)
+
     @staticmethod
     def _training_readback_fixture():
         action = {
@@ -10851,6 +10873,39 @@ class UpdateControllerTests(unittest.TestCase):
 
 
 class DiagnosticsServiceTests(unittest.TestCase):
+    def test_issue_package_redacts_file_contents_and_preserves_failure_context(self) -> None:
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "runtime_outputs/form_tests"
+            folder.mkdir(parents=True)
+            (folder / "failed.json").write_text(json.dumps({
+                "stage": "failed", "password": "hidden-password", "Cookie": "hidden-cookie",
+                "page_html": '<input value="html-secret">',
+                "screenshot_base64": "hidden-image",
+                "inputs": [{"name": "password", "value": "hidden-input"}],
+                "headers": "Cookie: cookie-first-secret cookie-second-secret",
+                "exception": {"type": "ValueError", "message": "driver disconnected password=session-secret; token=hidden-token"},
+                "url": "https://example.test/page?sid=hidden-session#hidden-fragment",
+            }), encoding="utf-8")
+            report = DiagnosticsService(root).export(
+                DiagnosticSnapshot(target_date="1151028", session_actor="21", result_ref="failed.json",
+                                   action_key="handoff:0800", error_code="unknown_error"),
+                secrets=("session-secret",),
+            )
+            with zipfile.ZipFile(report) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                failure = json.loads(archive.read("runtime_outputs/form_tests/failed.json"))
+                body = b"\n".join(archive.read(name) for name in archive.namelist()).decode("utf-8")
+            self.assertTrue(manifest["sanitized"])
+            self.assertEqual(manifest["action_key"], "handoff:0800")
+            self.assertEqual(failure["exception"]["type"], "ValueError")
+            self.assertEqual(failure["url"], "https://example.test/page")
+            for secret in ("hidden-password", "hidden-cookie", "html-secret", "session-secret", "hidden-token", "hidden-session", "hidden-fragment",
+                           "hidden-image", "hidden-input", "cookie-first-secret", "cookie-second-secret"):
+                self.assertNotIn(secret, body)
+
     def test_retention_keeps_boundary_and_skips_linked_output(self):
         import os
         from app_core.diagnostics_service import DiagnosticsService
@@ -10968,6 +11023,97 @@ class DiagnosticsServiceTests(unittest.TestCase):
 
 
 class OperationalSyncServiceTests(unittest.TestCase):
+    def test_event_poster_seam_does_not_enable_real_diagnostic_transport_without_a_token(self):
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+        from app_core.operational_sync_service import OperationalSyncService
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SINPOSMART_CREDENTIAL_SYNC_TOKEN": ""}):
+            root = Path(directory)
+            report = DiagnosticsService(root).export(DiagnosticSnapshot())
+            service = OperationalSyncService(root, event_poster=lambda event: {"ack_id": event["event_id"]})
+            service.queue_diagnostic_package(report)
+            with patch("app_core.operational_sync_service.open_sync_request") as transport:
+                service.drain_diagnostic_queue()
+            transport.assert_not_called()
+            self.assertTrue(service.has_pending_diagnostics)
+
+    def test_diagnostic_outbox_retries_after_restart_and_requires_matching_receipt(self) -> None:
+        import hashlib
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = DiagnosticsService(root).export(DiagnosticSnapshot(target_date="1151028", error_code="unknown_error"))
+            digest = hashlib.sha256(report.read_bytes()).hexdigest()
+            calls = []
+            def unavailable(path, sha256):
+                calls.append((path, sha256))
+                raise OSError("offline")
+            service = OperationalSyncService(root, diagnostic_poster=unavailable)
+            self.assertEqual(service.queue_diagnostic_package(report), digest)
+            service.drain_diagnostic_queue()
+            self.assertTrue(service.has_pending_diagnostics)
+            self.assertTrue(report.is_file())
+            restarted = OperationalSyncService(root, diagnostic_poster=lambda path, sha: {"ok": True, "ack_id": "wrong"})
+            restarted.drain_diagnostic_queue()
+            self.assertTrue(restarted.has_pending_diagnostics)
+            restarted._diagnostic_poster = lambda path, sha: {"ok": True, "ack_id": sha}
+            restarted.drain_diagnostic_queue()
+            self.assertFalse(restarted.has_pending_diagnostics)
+            self.assertEqual(restarted.queue_diagnostic_package(report), digest)
+            restarted._diagnostic_poster = lambda *_args: self.fail("acknowledged ZIP must not be uploaded twice")
+            restarted.drain_diagnostic_queue()
+            self.assertEqual(calls, [(report.resolve(), digest)])
+            self.assertTrue(report.is_file())
+
+    def test_diagnostic_upload_uses_existing_secure_transport_without_url_secrets(self) -> None:
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "SINPOSMART_BACKEND_EVENT_URL": "http://nas.test:8080/api/sinposmart/events",
+            "SINPOSMART_CREDENTIAL_SYNC_TOKEN": "test-sync-token",
+        }):
+            root = Path(directory)
+            report = DiagnosticsService(root).export(DiagnosticSnapshot())
+            service = OperationalSyncService(root)
+            digest = service.queue_diagnostic_package(report)
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.read.return_value = json.dumps({"ok": True, "ack_id": digest}).encode()
+            with patch("app_core.operational_sync_service.open_sync_request", return_value=response) as transport:
+                service.drain_diagnostic_queue()
+            request = transport.call_args.args[0]
+            self.assertEqual(request.full_url, "http://nas.test:8080/api/sinposmart/diagnostics/" + digest)
+            self.assertEqual(request.get_header("X-credential-sync-token"), "test-sync-token")
+            self.assertEqual(request.get_header("Content-type"), "application/zip")
+            self.assertEqual(request.data, report.read_bytes())
+            self.assertFalse(service.has_pending_diagnostics)
+
+    def test_diagnostic_queue_rejects_legacy_or_external_archives_and_changed_contents(self) -> None:
+        from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
+        from app_core.operational_sync_service import OperationalSyncService
+
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory)
+            poster = Mock()
+            service = OperationalSyncService(root, diagnostic_poster=poster)
+            external = DiagnosticsService(Path(outside)).export(DiagnosticSnapshot())
+            with self.assertRaises(ValueError):
+                service.queue_diagnostic_package(external)
+            report = DiagnosticsService(root).export(DiagnosticSnapshot())
+            legacy = report.with_name("issue_report_legacy.zip")
+            with zipfile.ZipFile(legacy, "w") as archive:
+                archive.writestr("manifest.json", '{"created_at":"2026-10-28"}')
+            with self.assertRaises(ValueError):
+                service.queue_diagnostic_package(legacy)
+            service.queue_diagnostic_package(report)
+            report.write_bytes(b"changed after admission")
+            service.drain_diagnostic_queue()
+            poster.assert_not_called()
+            self.assertTrue(service.has_pending_diagnostics)
+
     def test_event_journal_admission_does_not_wait_for_http_or_lose_concurrent_payload(self) -> None:
         from app_core.operational_sync_service import OperationalSyncService
         entered, release, admitted = threading.Event(), threading.Event(), threading.Event()
@@ -11852,6 +11998,72 @@ class CredentialSyncServiceTests(unittest.TestCase):
 
 
 class QtShellTests(unittest.TestCase):
+    def test_notice_failure_queues_one_problem_package_for_the_first_report_part(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = OperationalSyncService(root, event_poster=lambda event: {"ok": True, "ack_id": event["event_id"]})
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=sync)
+            operations = []
+            controller._start_operational_sync = lambda operation, **_kw: operations.append(operation)
+            report = {"state": "failed", "run_id": "notice-test-run", "reported_at": "2026-10-28T09:39:26+08:00",
+                      "calendar_day": "2026-10-28", "part_index": 0, "error_stage": "write", "message": "試算表寫入確認失敗"}
+            try:
+                controller._notice_collection_report_ready(report)
+                controller._notice_collection_report_ready({**report, "part_index": 1})
+                packages = list((root / "issue_reports").glob("*.zip"))
+                self.assertEqual(len(packages), 1)
+                with zipfile.ZipFile(packages[0]) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual(manifest["action_kind"], "notice_collection")
+                self.assertEqual(manifest["action_key"], "notice-test-run")
+                self.assertEqual(operations.count("diagnostic_drain"), 1)
+            finally:
+                controller.shutdown()
+
+    def test_submission_and_manual_problem_packages_are_durably_queued_without_network_on_ui_thread(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            poster = Mock()
+            sync = OperationalSyncService(root, diagnostic_poster=poster)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=sync)
+            operations = []
+            controller._start_operational_sync = lambda operation, **_kw: operations.append(operation)
+            request = DutySubmissionRequest("test-user", "session-secret", 0,
+                {"target_date": "1151028", "actions": [{"kind": "handoff_preflight", "actor": "21", "time": "08:00", "duplicate_key": "handoff:0800"}]})
+            try:
+                controller._submission_failed(request, "交接預檢失敗", "unknown_error", "failure.json")
+                controller.exportIssuePackage()
+                self.assertEqual(operations, ["diagnostic_drain", "diagnostic_drain"])
+                self.assertTrue(sync.has_pending_diagnostics)
+                poster.assert_not_called()
+                packages = list((root / "issue_reports").glob("*.zip"))
+                self.assertEqual(len(packages), 2)
+                manifests = []
+                for package in packages:
+                    with zipfile.ZipFile(package) as archive:
+                        manifests.append(json.loads(archive.read("manifest.json")))
+                failed = next(item for item in manifests if item["error_code"])
+                self.assertEqual(failed["action_kind"], "handoff_preflight")
+                self.assertEqual(failed["action_key"], "handoff:0800")
+                operations.clear()
+                controller._retry_diagnostic_uploads()
+                self.assertEqual(operations, ["diagnostic_drain"])
+            finally:
+                controller.shutdown()
+
     def test_notice_reports_use_operational_queue_without_duty_identity_and_respect_read_only(self) -> None:
         from app_core.credential_repository import CredentialRepository
         from qt_app.controllers.app_controller import AppController
@@ -18846,7 +19058,7 @@ if return_code != 0 or loaded:
         from qt_app.controllers.app_controller import AppController
 
         class FakeDiagnosticsService:
-            def export(self, _snapshot):
+            def export(self, _snapshot, **_kwargs):
                 return Path("issue-package.zip")
 
         controller = AppController(diagnostics_service=FakeDiagnosticsService())
@@ -21130,7 +21342,7 @@ if return_code != 0 or loaded:
             def __init__(self) -> None:
                 self.snapshots = []
 
-            def export(self, snapshot):
+            def export(self, snapshot, **_kwargs):
                 self.snapshots.append(snapshot)
                 return Path("issue_reports/issue_report_test.zip")
 
