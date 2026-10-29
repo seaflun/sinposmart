@@ -12191,6 +12191,78 @@ class CredentialSyncServiceTests(unittest.TestCase):
 
 
 class QtShellTests(unittest.TestCase):
+    def test_duty_shift_label_preserves_separate_spans_in_fire_day_order(self):
+        from qt_app.controllers.app_controller import duty_shift_label
+
+        cases = (
+            (("8-9", "9-10", "18-19", "19-20"), "08 - 10、18 - 20"),
+            (("22-24", "0-8", "8-10"), "08 - 10、22 - 08"),
+            (("22-8", "8-10"), "08 - 10、22 - 08"),
+            (("18-20", "0-2", "4-6"), "18 - 20、00 - 02、04 - 06"),
+            (("22-24", "2-4"), "22 - 24、02 - 04"),
+            (("22-24",), "22 - 24"),
+            (("0-8",), "00 - 08"),
+            (("24-2",), "00 - 02"),
+            (("24-8", "8-10"), "08 - 10、00 - 08"),
+            (("8-9", "9-10", "8-10"), "08 - 10"),
+            (("20-22", "22-24", "0-2"), "20 - 02"),
+            ((), "今日無值班時段"),
+        )
+        for slots, expected in cases:
+            with self.subTest(slots=slots):
+                rows = [{"slot": slot, "columns": {"值班": ["10"]}} for slot in slots]
+                rows.append({"slot": "10-18", "columns": {"值班": ["11"]}})
+                self.assertEqual(duty_shift_label({"today": {"rows": rows}}, "10"), expected)
+
+    def test_duty_shift_label_ignores_invalid_intervals(self):
+        from qt_app.controllers.app_controller import duty_shift_label
+
+        rows = [{"slot": slot, "columns": {"值班": ["10"]}}
+                for slot in ("wrong", "25-26", "8-40", "8-10junk", "0-0", "8-10")]
+        self.assertEqual(duty_shift_label({"today": {"rows": rows}}, "10"), "08 - 10")
+
+    def test_qml_login_status_keeps_both_cached_and_live_duty_spans(self):
+        from PySide6.QtCore import QObject
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import business_roc_date
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = AppController(
+                repository=CredentialRepository(Path(directory) / "saved.json", "test", None),
+                read_only_acceptance=True,
+                offline_fixture_acceptance=True,
+            )
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+            try:
+                attempt = controller._session_state.begin_login()
+                controller._session_state.complete_login(
+                    attempt, LoginSession("10", "fixture-user", "fixture-password",
+                                          verified=True, actor_name="測試員"),
+                )
+                controller.sessionController.sessionChanged.emit()
+                for capture in (controller._cached_schedule_loaded, controller._live_schedule_captured):
+                    for slots, label in ((("8-10", "18-20"), "08 - 10、18 - 20"),
+                                         (("8-10", "22-24", "0-8"), "08 - 10、22 - 08")):
+                        with self.subTest(capture=capture.__name__, slots=slots):
+                            capture({"target_date": business_roc_date(), "actions": [], "today": {
+                                "staff": {"10": {"name": "測試員", "role": "隊員"}},
+                                "rows": [{"slot": slot, "columns": {"值班": ["10"]}} for slot in slots],
+                            }})
+                            QTest.qWait(25)
+                            expected = f"已登入：隊員 測試員，今日值班時段：{label}。"
+                            self.assertEqual(controller.sessionController.loginStatus, expected)
+                            self.assertEqual(root.findChild(QObject, "loggedInStatusLabel").property("text"), expected)
+            finally:
+                root.close()
+                controller.shutdown()
+                engine.deleteLater()
+                self._flush_qt_deferred_deletes()
+
     def test_remote_notice_password_can_save_without_starting_verification_before_ack(self):
         from app_core.credential_repository import CredentialRepository
         from qt_app.controllers.session_controller import SessionController

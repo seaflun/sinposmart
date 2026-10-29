@@ -3618,14 +3618,12 @@ def duty_identity_label(schedule_data: Mapping, actor_no: str, fallback: str = "
 
 
 def duty_shift_label(schedule_data: Mapping, actor_no: str) -> str:
-    """Mirror the finalized legacy GUI duty-span label."""
+    """List the actor's continuous duty spans in 08:00-to-08:00 order."""
 
     actor_no = str(actor_no or "").strip()
     today = schedule_data.get("today", {}) if isinstance(schedule_data, Mapping) else {}
     rows = today.get("rows", []) if isinstance(today, Mapping) else []
     spans: list[tuple[int, int]] = []
-    overnight_start: int | None = None
-    overnight_end: int | None = None
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, Mapping):
             continue
@@ -3633,24 +3631,30 @@ def duty_shift_label(schedule_data: Mapping, actor_no: str) -> str:
         duty_people = columns.get("值班", []) if isinstance(columns, Mapping) else []
         if actor_no not in [str(value) for value in duty_people]:
             continue
-        match = re.match(r"(\d{1,2})[~～-](\d{1,2})", str(row.get("slot", "")))
+        match = re.fullmatch(r"\s*(\d{1,2})\s*[~～-]\s*(\d{1,2})\s*", str(row.get("slot", "")))
         if not match:
             continue
         start, end = int(match.group(1)), int(match.group(2))
+        if not (0 <= start <= 24 and 0 <= end <= 24):
+            continue
+        start += 24 if start < 8 else 0
+        end += 24 if end < 8 else 0
         if end <= start:
-            return f"{start:02d} - {end:02d}"
-        if start >= 22:
-            overnight_start = start if overnight_start is None else min(overnight_start, start)
-            continue
-        if end <= 8:
-            overnight_end = end if overnight_end is None else max(overnight_end, end)
-            continue
-        spans.append((start, end))
-    if overnight_start is not None and overnight_end is not None:
-        return f"{overnight_start:02d} - {overnight_end:02d}"
+            end += 24
+        if 8 <= start < end <= 32:
+            spans.append((start, end))
     if not spans:
         return "今日無值班時段"
-    return f"{min(item[0] for item in spans):02d} - {max(item[1] for item in spans):02d}"
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return "、".join(
+        f"{start % 24:02d} - {24 if end == 24 else end % 24:02d}"
+        for start, end in merged
+    )
 
 
 def official_personnel_title_snapshot(target_roc_date: str, schedule_data: Mapping) -> dict | None:
