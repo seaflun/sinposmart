@@ -3586,6 +3586,15 @@ _DUTY_BROWSER_PROFILE_ATTRIBUTE = "_sinposmart_duty_browser_profile"
 _DUTY_BROWSER_PROFILE_ROOT_ATTRIBUTE = "_sinposmart_duty_browser_profile_root"
 _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH = Path("runtime_outputs") / "browser" / "browser_startup.jsonl"
 _CHROME_START_LOCK = threading.Lock()
+_CHROME_START_THREAD: threading.Thread | None = None
+_CHROME_START_PROFILE: Path | None = None
+CHROME_STARTUP_STAGE_MESSAGES = {
+    "queue_wait": "前一次專用瀏覽器啟動作業尚未結束，這次尚未啟動；請稍候。",
+    "driver_resolution": "專用瀏覽器的驅動準備逾時，尚未進入網站登入。",
+    "driver_service_start": "專用瀏覽器的驅動服務啟動逾時，尚未進入網站登入。",
+    "session_create": "專用瀏覽器工作階段建立逾時，尚未進入網站登入。",
+    "startup_unknown": "專用瀏覽器啟動逾時，尚未進入網站登入。",
+}
 _DUTY_BROWSER_STARTUP_MESSAGE = (
     "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
     "一般 Chrome 不需關閉；若仍失敗請匯出問題包。"
@@ -3596,11 +3605,31 @@ _DUTY_BROWSER_SESSION_OPEN_MESSAGE = (
 )
 
 
+class ChromeStartupTimeout(TimeoutError):
+    """Bounded, credential-free evidence about one startup request."""
+
+    def __init__(self, startup_stage: str, *, constructor_started: bool,
+                 in_progress: bool, blocking_stage: str = "") -> None:
+        self.startup_stage = startup_stage if startup_stage in CHROME_STARTUP_STAGE_MESSAGES else "startup_unknown"
+        self.constructor_started = bool(constructor_started)
+        self.in_progress = bool(in_progress)
+        self.blocking_stage = blocking_stage if blocking_stage in CHROME_STARTUP_STAGE_MESSAGES else ""
+        self.startup_message = CHROME_STARTUP_STAGE_MESSAGES[self.startup_stage]
+        super().__init__(self.startup_message)
+
+
 class DutyBrowserStartupError(WebDriverException):
     """Safe browser-start failure that carries no profile or credential details."""
 
-    def __init__(self, *, category: str, attempts: int, profiles_pruned: int) -> None:
-        super().__init__(_DUTY_BROWSER_STARTUP_MESSAGE)
+    def __init__(self, *, category: str, attempts: int, profiles_pruned: int,
+                 startup_stage: str = "", constructor_started: bool = False,
+                 in_progress: bool = False, blocking_stage: str = "") -> None:
+        self.startup_stage = startup_stage if startup_stage in CHROME_STARTUP_STAGE_MESSAGES else ""
+        self.constructor_started = bool(constructor_started)
+        self.in_progress = bool(in_progress)
+        self.blocking_stage = blocking_stage if blocking_stage in CHROME_STARTUP_STAGE_MESSAGES else ""
+        self.startup_message = CHROME_STARTUP_STAGE_MESSAGES.get(self.startup_stage, _DUTY_BROWSER_STARTUP_MESSAGE)
+        super().__init__(self.startup_message)
         self.diagnostic_category = category
         self.attempts = attempts
         self.profiles_pruned = profiles_pruned
@@ -3700,7 +3729,9 @@ def prune_stale_duty_browser_profiles(
         candidates.sort(key=lambda item: item.stat().st_mtime)
     except OSError:
         return 0
-    active = active_profiles if active_profiles is not None else _active_duty_browser_profiles(profile_root, candidates)
+    active = set(active_profiles if active_profiles is not None else _active_duty_browser_profiles(profile_root, candidates))
+    if _CHROME_START_PROFILE is not None:
+        active.add(_CHROME_START_PROFILE)
     removed = 0
     for profile_dir in candidates:
         if removed >= maximum_profiles or profile_dir in active:
@@ -3725,6 +3756,12 @@ def _write_duty_browser_startup_diagnostic(
     category: str,
     attempts: int,
     profiles_pruned: int,
+    startup_stage: str = "",
+    context: str = "",
+    constructor_started: bool = False,
+    actual_attempts: int = 0,
+    in_progress: bool = False,
+    blocking_stage: str = "",
 ) -> None:
     """Persist a credential-free startup record for the QML issue package."""
 
@@ -3735,6 +3772,13 @@ def _write_duty_browser_startup_diagnostic(
         "attempts": attempts,
         "profiles_pruned": profiles_pruned,
     }
+    if startup_stage in CHROME_STARTUP_STAGE_MESSAGES:
+        payload.update(startup_stage=startup_stage,
+                       context=context if context in {"duty", "notice", "notice_verify"} else "duty",
+                       constructor_started=bool(constructor_started), actual_attempts=max(0, min(int(actual_attempts), 3)),
+                       in_progress=bool(in_progress))
+        if blocking_stage in CHROME_STARTUP_STAGE_MESSAGES:
+            payload["blocking_stage"] = blocking_stage
     output_path = Path(__file__).resolve().parent / _DUTY_BROWSER_DIAGNOSTIC_RELATIVE_PATH
     output_path = output_path.with_name(f"browser_startup_{datetime.now():%Y%m%d}.jsonl")
     try:
@@ -3759,40 +3803,118 @@ def chrome_start_timeout_seconds() -> float:
         return 20
 
 
+def _chrome_startup_stage(thread: threading.Thread | None) -> str:
+    """Inspect only our startup thread's code identities, never frame locals."""
+    if thread is None or not thread.is_alive() or thread.ident is None:
+        return "startup_unknown"
+    frame = sys._current_frames().get(thread.ident)
+    try:
+        while frame is not None:
+            module_name = str(frame.f_globals.get("__name__", ""))
+            function_name = frame.f_code.co_name
+            if module_name in {"selenium.webdriver.common.selenium_manager", "selenium.webdriver.common.driver_finder"}:
+                return "driver_resolution"
+            if module_name == "selenium.webdriver.common.service" and function_name in {"start", "_start_process"}:
+                return "driver_service_start"
+            if module_name == "selenium.webdriver.remote.webdriver" and function_name == "start_session":
+                return "session_create"
+            frame = frame.f_back
+    finally:
+        del frame
+    return "startup_unknown"
+
+
+def _chrome_startup_profile(options: Options) -> Path | None:
+    for argument in options.arguments:
+        if argument.startswith("--user-data-dir="):
+            return Path(argument.split("=", 1)[1])
+    return None
+
+
 def create_webdriver_chrome_with_timeout(options: Options) -> webdriver.Chrome:
+    global _CHROME_START_THREAD, _CHROME_START_PROFILE
     result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
     timed_out = threading.Event()
+    constructor_started = threading.Event()
+    outcome_lock = threading.Lock()
+    timeout = chrome_start_timeout_seconds()
+    profile = _chrome_startup_profile(options)
+    parts = set(profile.parts) if profile is not None else set()
+    context = "notice_verify" if "notice_verification_profiles" in parts else "notice" if "notice_browser_profiles" in parts else "duty"
+
+    def timeout_error(stage: str, *, started: bool, blocking_stage: str = "") -> ChromeStartupTimeout:
+        error = ChromeStartupTimeout(stage, constructor_started=started, in_progress=True, blocking_stage=blocking_stage)
+        with suppress(Exception):
+            _write_duty_browser_startup_diagnostic(
+                "startup_timeout", category="startup_timeout", attempts=int(started), profiles_pruned=0,
+                startup_stage=error.startup_stage, context=context, constructor_started=started,
+                actual_attempts=int(started), in_progress=True, blocking_stage=error.blocking_stage,
+            )
+        return error
+
+    if not _CHROME_START_LOCK.acquire(timeout=timeout):
+        raise timeout_error("queue_wait", started=False, blocking_stage=_chrome_startup_stage(_CHROME_START_THREAD))
 
     def start() -> None:
-        with _CHROME_START_LOCK:
-            if timed_out.is_set():
-                return
+        global _CHROME_START_THREAD, _CHROME_START_PROFILE
+        driver = None
+        try:
             try:
                 service = ChromeService(
                     log_output=subprocess.DEVNULL,
                     popen_kw={"creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
                 )
+                with outcome_lock:
+                    if timed_out.is_set():
+                        return
+                    constructor_started.set()
                 driver = webdriver.Chrome(service=service, options=options)
             except BaseException as exc:
+                with outcome_lock:
+                    if not timed_out.is_set():
+                        result_queue.put(("error", exc))
+                return
+            with outcome_lock:
                 if not timed_out.is_set():
-                    result_queue.put(("error", exc))
-                return
+                    result_queue.put(("driver", driver))
+                    return
+        finally:
             if timed_out.is_set():
-                with suppress(Exception):
-                    driver.quit()
-                return
-            result_queue.put(("driver", driver))
+                quit_failed = False
+                if driver is not None:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        quit_failed = True
+                if profile is not None:
+                    with suppress(Exception):
+                        cleanup_duty_browser_profile(profile, root=profile.parent,
+                                                     terminate_processes=driver is None or quit_failed)
+            _CHROME_START_THREAD = None
+            _CHROME_START_PROFILE = None
+            _CHROME_START_LOCK.release()
 
     thread = threading.Thread(target=start, name="sinposmart-chrome-startup", daemon=True)
-    thread.start()
-    thread.join(chrome_start_timeout_seconds())
-    if thread.is_alive():
-        timed_out.set()
-        raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。")
+    _CHROME_START_THREAD = thread
+    _CHROME_START_PROFILE = profile
     try:
-        kind, value = result_queue.get_nowait()
-    except queue.Empty as exc:
-        raise TimeoutError(f"Chrome 啟動逾時，已超過 {chrome_start_timeout_seconds():g} 秒。") from exc
+        thread.start()
+    except BaseException:
+        _CHROME_START_THREAD = None
+        _CHROME_START_PROFILE = None
+        _CHROME_START_LOCK.release()
+        raise
+    thread.join(timeout)
+    with outcome_lock:
+        try:
+            kind, value = result_queue.get_nowait()
+        except queue.Empty:
+            timed_out.set()
+            error = timeout_error(_chrome_startup_stage(thread), started=constructor_started.is_set())
+        else:
+            error = None
+    if error is not None:
+        raise error
     if kind == "error":
         raise value
     return value
@@ -3991,6 +4113,15 @@ def build_driver(
             driver = create_webdriver_chrome_with_timeout(options)
         except (OSError, TimeoutError, WebDriverException) as exc:
             last_error = exc
+            if isinstance(exc, ChromeStartupTimeout):
+                if not exc.constructor_started:
+                    cleanup_duty_browser_profile(profile_dir, root=selected_profile_root, terminate_processes=False)
+                raise DutyBrowserStartupError(
+                    category="startup_timeout", attempts=attempt - 1 + int(exc.constructor_started),
+                    profiles_pruned=profiles_pruned, startup_stage=exc.startup_stage,
+                    constructor_started=exc.constructor_started, in_progress=exc.in_progress,
+                    blocking_stage=exc.blocking_stage,
+                ) from exc
             if selected_profile_root is not None:
                 cleanup_duty_browser_startup_failure(profile_dir, root=selected_profile_root)
             else:

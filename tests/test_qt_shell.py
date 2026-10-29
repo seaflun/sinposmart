@@ -922,6 +922,27 @@ const NodeFilter = {SHOW_TEXT:4};
                     self.assertNotIn("screenshot", driver.events)
                 self.assertEqual(driver.events[-1], "cleanup")
 
+    def test_login_worker_preserves_safe_browser_startup_stage_without_claiming_retry(self):
+        from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES, DutyBrowserStartupError
+        from qt_app.workers.login_worker import LoginWorker
+
+        for stage, message in CHROME_STARTUP_STAGE_MESSAGES.items():
+            with self.subTest(stage=stage):
+                error = DutyBrowserStartupError(category="startup_timeout", attempts=0 if stage == "queue_wait" else 1,
+                                               profiles_pruned=0, startup_stage=stage, in_progress=True)
+                verifier = SimpleNamespace(verify=Mock(side_effect=error))
+                worker = LoginWorker(attempt_id=7, verifier=verifier, actor_no="", user_id="synthetic-user",
+                                     password="synthetic-secret", actor_no_from_user_id=lambda _: "",
+                                     actor_no_from_name=lambda _: "", staff={})
+                failed = []
+                worker.failed.connect(lambda attempt, text: failed.append((attempt, text)))
+                worker.run()
+                self.assertEqual(failed, [(7, message)])
+                self.assertEqual(worker.failure_diagnostic["reason"], message)
+                self.assertNotIn("已自動清理", failed[0][1])
+                self.assertNotIn("synthetic-secret", str(worker.failure_diagnostic))
+                self.assertEqual(worker.password, "")
+
     def test_login_worker_preserves_safe_diagnostic_and_existing_failure_signal(self):
         from app_core.login_verifier import LoginVerificationError
         from qt_app.workers.login_worker import LoginWorker

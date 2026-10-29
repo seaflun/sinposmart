@@ -24,7 +24,13 @@ APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw5yM8234CMi67hkox091
 MAX_RECORDS = 200
 NOTICE_RESPONSIBILITY_FIELDS = ("schema_version", "status", "actorNo", "name", "role",
                                 "capturedAt", "handoffSlotAt", "evidenceKey")
+NOTICE_BROWSER_STARTUP_CODES = {
+    "queue_wait": "browser_startup_waiting", "driver_resolution": "browser_driver_resolution_timeout",
+    "driver_service_start": "browser_driver_service_timeout", "session_create": "browser_session_create_timeout",
+    "startup_unknown": "browser_startup_timeout",
+}
 NOTICE_ERROR_CODES = frozenset({
+    *NOTICE_BROWSER_STARTUP_CODES.values(),
     "browser_start_failed", "browser_window_closed", "snapshot_failed", "snapshot_invalid",
     "origin_mismatch", "account_mismatch", "login_target_mismatch", "login_page_failed",
     "list_navigation_failed", "list_wait_timeout", "page_limit", "list_changed", "duplicate_notice_id",

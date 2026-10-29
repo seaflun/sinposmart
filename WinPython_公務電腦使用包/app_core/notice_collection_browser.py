@@ -17,6 +17,7 @@ from selenium.webdriver.common.by import By
 from app_core.login_verifier import LoginVerificationError, OASessionExpiredError, OA_LOGIN_FAILURE_MESSAGES
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
+    NOTICE_BROWSER_STARTUP_CODES,
     NoticeCollectionError,
     NoticeLoginRequired,
     NoticeLoginGuard,
@@ -93,8 +94,14 @@ class NoticeBrowser:
                 self._driver = self._driver_factory()
                 self._driver.set_page_load_timeout(30)
                 self._driver.set_script_timeout(20)
-            except Exception:
+            except Exception as exc:
                 self.close()
+                from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES
+
+                stage = getattr(exc, "startup_stage", "")
+                if isinstance(stage, str) and stage in NOTICE_BROWSER_STARTUP_CODES:
+                    raise NoticeCollectionError(CHROME_STARTUP_STAGE_MESSAGES[stage],
+                                                code=NOTICE_BROWSER_STARTUP_CODES[stage]) from None
                 raise NoticeCollectionError("通報專用瀏覽器無法啟動，請確認 Chrome 狀態。", code="browser_start_failed") from None
         return self._driver
 

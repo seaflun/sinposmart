@@ -93,6 +93,27 @@ class FakeDriver:
 
 
 class NoticeBrowserTests(unittest.TestCase):
+    def test_browser_startup_stage_reaches_safe_notice_code_without_login_attempt(self):
+        from app_core.notice_collection_browser import NoticeBrowser
+        from app_core.notice_collection_service import NoticeCollectionError
+        from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES, DutyBrowserStartupError
+
+        codes = {"queue_wait": "browser_startup_waiting", "driver_resolution": "browser_driver_resolution_timeout",
+                 "driver_service_start": "browser_driver_service_timeout", "session_create": "browser_session_create_timeout",
+                 "startup_unknown": "browser_startup_timeout"}
+        for stage, code in codes.items():
+            with self.subTest(stage=stage):
+                error = DutyBrowserStartupError(category="startup_timeout", attempts=int(stage != "queue_wait"),
+                                               profiles_pruned=0, startup_stage=stage, in_progress=True)
+                login = Mock()
+                browser = NoticeBrowser(PACKAGE, login_guard=False, driver_factory=Mock(side_effect=error), login_runner=login)
+                with self.assertRaises(NoticeCollectionError) as caught:
+                    browser.scan_unread("synthetic-private-password")
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(str(caught.exception), CHROME_STARTUP_STAGE_MESSAGES[stage])
+                self.assertNotIn("synthetic-private-password", str(caught.exception))
+                login.assert_not_called()
+
     def test_guarded_success_saves_date_and_cookie_cannot_bypass_cutoff(self):
         from datetime import datetime, timezone, timedelta
         from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired, NoticeCollectionService

@@ -5160,6 +5160,222 @@ try {
         self.assertEqual(call_count, 2)
         self.assertEqual(peak_active, 1)
 
+    def test_pruner_preserves_stale_profile_owned_by_inflight_constructor(self) -> None:
+        module = duty_rehearsal_module()
+        release = threading.Event()
+        driver = mock.Mock()
+
+        def blocked_chrome(**_kwargs):
+            release.wait(2)
+            return driver
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = module.duty_browser_profile_dir(root=root)
+            options = module.Options()
+            options.add_argument("--user-data-dir=" + str(profile))
+            with mock.patch.object(module, "chrome_start_timeout_seconds", return_value=0.02), mock.patch.object(
+                module.webdriver, "Chrome", side_effect=blocked_chrome
+            ), mock.patch.object(module, "_write_duty_browser_startup_diagnostic"):
+                try:
+                    with self.assertRaises(TimeoutError):
+                        module.create_webdriver_chrome_with_timeout(options)
+                    removed = module.prune_stale_duty_browser_profiles(
+                        root=root, now=module.time.time() + 601, minimum_age_seconds=600, active_profiles=set(),
+                    )
+                    self.assertEqual(removed, 0)
+                    self.assertTrue(profile.exists())
+                finally:
+                    release.set()
+                    self.assertTrue(module._CHROME_START_LOCK.acquire(timeout=1))
+                    module._CHROME_START_LOCK.release()
+                driver.quit.assert_called_once_with()
+                self.assertFalse(profile.exists())
+
+    def test_chrome_start_timeout_keeps_one_owner_and_queue_creates_no_thread(self) -> None:
+        module = duty_rehearsal_module()
+        release = threading.Event()
+        completed = threading.Event()
+        driver = mock.Mock()
+
+        def blocked_chrome(**_kwargs):
+            release.wait(2)
+            return driver
+
+        driver.quit.side_effect = completed.set
+        with mock.patch.object(module, "chrome_start_timeout_seconds", return_value=0.04), mock.patch.object(
+            module.webdriver, "Chrome", side_effect=blocked_chrome
+        ) as constructor, mock.patch.object(module, "_write_duty_browser_startup_diagnostic") as diagnostic:
+            try:
+                with self.assertRaises(TimeoutError) as first:
+                    module.create_webdriver_chrome_with_timeout(module.Options())
+                with mock.patch.object(module.threading, "Thread", wraps=threading.Thread) as threads:
+                    with self.assertRaises(TimeoutError) as queued:
+                        module.create_webdriver_chrome_with_timeout(module.Options())
+                self.assertEqual(threads.call_count, 0)
+                self.assertEqual(constructor.call_count, 1)
+                self.assertTrue(first.exception.constructor_started)
+                self.assertEqual(queued.exception.startup_stage, "queue_wait")
+                self.assertFalse(queued.exception.constructor_started)
+                self.assertTrue(queued.exception.in_progress)
+                self.assertEqual(diagnostic.call_args.kwargs["actual_attempts"], 0)
+            finally:
+                release.set()
+                self.assertTrue(completed.wait(1))
+            driver.quit.assert_called_once_with()
+            self.assertEqual(driver.method_calls, [mock.call.quit()])
+            with mock.patch.object(module.webdriver, "Chrome", return_value=mock.sentinel.next_driver):
+                self.assertIs(module.create_webdriver_chrome_with_timeout(module.Options()), mock.sentinel.next_driver)
+
+    def test_chrome_resolver_timeout_is_identified_before_driver_service_start(self) -> None:
+        from selenium.webdriver.common.driver_finder import DriverFinder
+        from selenium.webdriver.common.service import Service
+
+        module = duty_rehearsal_module()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_resolution(_finder):
+            try:
+                release.wait(2)
+                raise RuntimeError("private resolver detail must not escape")
+            finally:
+                finished.set()
+
+        options = module.Options()
+        options.add_argument("--user-data-dir=C:/private/notice_browser_profiles/duty_gui_test")
+        with mock.patch.object(module, "chrome_start_timeout_seconds", return_value=0.04), mock.patch.object(
+            DriverFinder, "_binary_paths", blocked_resolution
+        ), mock.patch.object(Service, "start") as service_start, mock.patch.object(
+            module, "_write_duty_browser_startup_diagnostic"
+        ) as diagnostic, mock.patch.object(module, "cleanup_duty_browser_profile"):
+            try:
+                with self.assertRaises(TimeoutError) as raised:
+                    module.create_webdriver_chrome_with_timeout(options)
+                self.assertEqual(raised.exception.startup_stage, "driver_resolution")
+                self.assertTrue(raised.exception.constructor_started)
+                service_start.assert_not_called()
+                self.assertEqual(diagnostic.call_args.kwargs["context"], "notice")
+                self.assertNotIn("private", str(diagnostic.call_args))
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(1))
+                self.assertTrue(module._CHROME_START_LOCK.acquire(timeout=1))
+                module._CHROME_START_LOCK.release()
+
+    def test_chrome_constructor_is_not_started_after_request_already_timed_out(self) -> None:
+        module = duty_rehearsal_module()
+        release = threading.Event()
+
+        def delayed_service(**_kwargs):
+            release.wait(2)
+            return mock.Mock()
+
+        with mock.patch.object(module, "chrome_start_timeout_seconds", return_value=0.04), mock.patch.object(
+            module, "ChromeService", side_effect=delayed_service
+        ), mock.patch.object(module.webdriver, "Chrome") as constructor, mock.patch.object(
+            module, "_write_duty_browser_startup_diagnostic"
+        ):
+            try:
+                with self.assertRaises(TimeoutError) as raised:
+                    module.create_webdriver_chrome_with_timeout(module.Options())
+                self.assertFalse(raised.exception.constructor_started)
+            finally:
+                release.set()
+                self.assertTrue(module._CHROME_START_LOCK.acquire(timeout=1))
+                module._CHROME_START_LOCK.release()
+            constructor.assert_not_called()
+
+    def test_build_driver_does_not_retry_or_remove_profile_while_constructor_runs(self) -> None:
+        module = duty_rehearsal_module()
+        error = module.ChromeStartupTimeout("driver_resolution", constructor_started=True, in_progress=True)
+        with mock.patch.object(module, "chrome_start_attempts", return_value=2), mock.patch.object(
+            module, "prune_stale_duty_browser_profiles", return_value=0
+        ), mock.patch.object(module, "duty_browser_profile_dir", return_value=Path("C:/owned/duty_gui_one")), mock.patch.object(
+            module, "create_webdriver_chrome_with_timeout", side_effect=error
+        ) as constructor, mock.patch.object(module, "cleanup_duty_browser_startup_failure") as cleanup, mock.patch.object(
+            module, "_write_duty_browser_startup_diagnostic"
+        ):
+            with self.assertRaises(module.DutyBrowserStartupError) as raised:
+                module.build_driver(headless=True, write_diagnostics=False)
+        self.assertEqual(constructor.call_count, 1)
+        cleanup.assert_not_called()
+        self.assertEqual(raised.exception.startup_stage, "driver_resolution")
+        self.assertEqual(raised.exception.attempts, 1)
+        self.assertEqual(raised.exception.startup_message, module.CHROME_STARTUP_STAGE_MESSAGES["driver_resolution"])
+
+    def test_chrome_service_and_session_timeouts_keep_safe_distinct_stages(self) -> None:
+        from selenium.webdriver.common.driver_finder import DriverFinder
+        from selenium.webdriver.common.service import Service
+        from selenium.webdriver.remote.webdriver import WebDriver
+
+        module = duty_rehearsal_module()
+        for stage in ("driver_service_start", "session_create"):
+            with self.subTest(stage=stage), ExitStack() as stack:
+                release = threading.Event()
+                driver_closed = threading.Event()
+
+                def block(*_args, **_kwargs):
+                    release.wait(2)
+                    if stage == "driver_service_start":
+                        raise RuntimeError("private startup details")
+                    return {"value": {"sessionId": "test-only", "capabilities": {}}}
+
+                stack.enter_context(mock.patch.object(module, "chrome_start_timeout_seconds", return_value=0.04))
+                stack.enter_context(mock.patch.object(DriverFinder, "_binary_paths", return_value={
+                    "driver_path": "C:/test-only/driver", "browser_path": ""}))
+                stack.enter_context(mock.patch.object(module, "_write_duty_browser_startup_diagnostic"))
+                if stage == "driver_service_start":
+                    stack.enter_context(mock.patch.object(Service, "_start_process", block))
+                else:
+                    stack.enter_context(mock.patch.object(Service, "start"))
+                    stack.enter_context(mock.patch.object(WebDriver, "execute", block))
+                    stack.enter_context(mock.patch.object(module.webdriver.Chrome, "quit", side_effect=driver_closed.set))
+                try:
+                    with self.assertRaises(TimeoutError) as raised:
+                        module.create_webdriver_chrome_with_timeout(module.Options())
+                    self.assertEqual(raised.exception.startup_stage, stage)
+                    self.assertTrue(raised.exception.in_progress)
+                finally:
+                    release.set()
+                    self.assertTrue(module._CHROME_START_LOCK.acquire(timeout=1))
+                    module._CHROME_START_LOCK.release()
+                if stage == "session_create":
+                    self.assertTrue(driver_closed.is_set())
+
+    def test_startup_diagnostic_contains_only_safe_stage_and_context_metadata(self) -> None:
+        module = duty_rehearsal_module()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "__file__", str(Path(directory) / "source.py")):
+            module._write_duty_browser_startup_diagnostic(
+                "startup_timeout", category="startup_timeout", attempts=0, profiles_pruned=0,
+                startup_stage="queue_wait", context="C:/private/token", constructor_started=False,
+                actual_attempts=0, in_progress=True, blocking_stage="driver_resolution",
+            )
+            files = list((Path(directory) / "runtime_outputs/browser").glob("browser_startup_*.jsonl"))
+            self.assertEqual(len(files), 1)
+            payload = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["context"], "duty")
+        self.assertEqual(payload["startup_stage"], "queue_wait")
+        self.assertEqual(payload["blocking_stage"], "driver_resolution")
+        self.assertEqual(payload["actual_attempts"], 0)
+        self.assertNotIn("private", json.dumps(payload))
+
+    def test_build_driver_queue_timeout_has_zero_attempts_and_only_cleans_unused_profile(self) -> None:
+        module = duty_rehearsal_module()
+        error = module.ChromeStartupTimeout("queue_wait", constructor_started=False, in_progress=True,
+                                           blocking_stage="driver_resolution")
+        with mock.patch.object(module, "prune_stale_duty_browser_profiles", return_value=0), mock.patch.object(
+            module, "duty_browser_profile_dir", return_value=Path("C:/owned/duty_gui_one")
+        ), mock.patch.object(module, "create_webdriver_chrome_with_timeout", side_effect=error) as constructor, mock.patch.object(
+            module, "cleanup_duty_browser_profile"
+        ) as cleanup:
+            with self.assertRaises(module.DutyBrowserStartupError) as raised:
+                module.build_driver(headless=True)
+        self.assertEqual(constructor.call_count, 1)
+        self.assertEqual(raised.exception.attempts, 0)
+        self.assertEqual(raised.exception.blocking_stage, "driver_resolution")
+        cleanup.assert_called_once_with(Path("C:/owned/duty_gui_one"), root=None, terminate_processes=False)
+
     def test_legacy_daily_vehicle_launcher_never_opens_a_console(self) -> None:
         source = legacy_tk_path("daily_vehicle_automation.py").read_text(encoding="utf-8-sig")
 

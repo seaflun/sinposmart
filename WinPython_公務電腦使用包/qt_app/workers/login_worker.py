@@ -68,11 +68,15 @@ class LoginWorker(QObject):
                 reason_code='browser_start_failed' if getattr(exc, 'diagnostic_category', '') else 'login_failed',
             )
             if getattr(exc, "diagnostic_category", ""):
-                self.failed.emit(
-                    self.attempt_id,
+                from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES
+
+                stage = getattr(exc, "startup_stage", "")
+                message = CHROME_STARTUP_STAGE_MESSAGES.get(stage if isinstance(stage, str) else "", (
                     "SinpoSmart 專用瀏覽器啟動失敗，已自動清理暫存資料並重試。"
-                    "一般 Chrome 不需關閉；若仍失敗請通知管理人員。",
-                )
+                    "一般 Chrome 不需關閉；若仍失敗請通知管理人員。"
+                ))
+                self.failure_diagnostic["reason"] = message
+                self.failed.emit(self.attempt_id, message)
                 return
             self.failed.emit(
                 self.attempt_id,
