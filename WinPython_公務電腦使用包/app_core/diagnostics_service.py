@@ -284,6 +284,8 @@ class DiagnosticsService:
         candidates = [
             self.package_root / "duty_trigger_log.jsonl",
             self.package_root / "runtime_outputs" / "sinposmart_operational_sync_status.json",
+            self.package_root / "runtime_outputs" / "duty_annotation_request.json",
+            self.package_root / "runtime_outputs" / "duty_personnel_deductions.json",
             self.package_root / "requirements.txt",
             self.package_root / "VERSION.txt",
             self.package_root / "docs" / "CODE_MAP.md",

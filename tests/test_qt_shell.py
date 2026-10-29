@@ -3041,6 +3041,7 @@ class DutySheetServiceTests(unittest.TestCase):
 
     def test_execute_calls_legacy_engine_and_keeps_browser_after_verified_success(self) -> None:
         from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
+        from app_core.diagnostics_service import DiagnosticSnapshot, DiagnosticsService
 
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
@@ -3055,6 +3056,10 @@ class DutySheetServiceTests(unittest.TestCase):
             automation_calls: list[dict] = []
 
             def start_automation(_uid, _pwd, _target, _excel, _cars, **kwargs):
+                evidence = json.loads((package_root / "runtime_outputs/duty_annotation_request.json").read_text(encoding="utf-8"))
+                self.assertEqual(evidence["target_date"], "2026/07/30")
+                self.assertEqual(evidence["personnel_deductions"], [
+                    {"people": list(people), "reason": reason} for people, reason in kwargs["personnel_deductions"]])
                 automation_calls.append(kwargs)
                 status_callback = kwargs.get("status_callback")
                 if status_callback is not None:
@@ -3077,16 +3082,39 @@ class DutySheetServiceTests(unittest.TestCase):
             service = DutySheetService(package_root, module_loader=lambda _path: legacy)
             progress: list[str] = []
             service.save_personnel_deduction("20、22", "2026/07/29", "2026/07/30", "TP訓")
+            row = service.load_personnel_deductions(include_expired=True)[0]
+            service.save_personnel_deduction("18", "2026/07/31", "2026/08/01", "公差")
             request = DutySheetRequest(
                 "user10", "session-secret", str(workbook), "2026/07/30",
                 "A", "S", "M1", "M2", False,
             )
 
-            result = service.execute(request, status_callback=progress.append)
+            frozen = service.validate(request)
+            service.save_personnel_deduction("20", "2026/07/29", "2026/07/30", "公差", row["id"])
+            result = service.execute(frozen, status_callback=progress.append)
 
             self.assertEqual(result, "勤務表已登打完成：1150730")
             self.assertTrue(automation_calls[0]["keep_browser_open_on_success"])
             self.assertEqual(automation_calls[0]["personnel_deductions"], ((("20", "22"), "TP訓"),))
+            evidence_path = package_root / "runtime_outputs/duty_annotation_request.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["deduction_count"], 1)
+            self.assertEqual(evidence["person_count"], 2)
+            self.assertEqual(evidence["schema_version"], 1)
+            from datetime import datetime
+            self.assertIsNotNone(datetime.fromisoformat(evidence["recorded_at"]).utcoffset())
+            report = DiagnosticsService(package_root).export(DiagnosticSnapshot(target_date="1150730"))
+            with zipfile.ZipFile(report) as archive:
+                packaged_request = json.loads(archive.read("runtime_outputs/duty_annotation_request.json"))
+                packaged_records = json.loads(archive.read("runtime_outputs/duty_personnel_deductions.json"))
+                self.assertEqual(packaged_request, evidence)
+                self.assertEqual(packaged_records["records"][0]["reason"], "公差")
+                self.assertEqual(packaged_records["records"][1]["people"], ["18"])
+                for body in (evidence_path.read_bytes(), *(archive.read(name) for name in archive.namelist())):
+                    self.assertNotIn(b"session-secret", body)
+                    self.assertNotIn(b"user10", body)
+                    self.assertNotIn(b"user_id", body)
+                    self.assertNotIn(b"password", body)
             success_message[0] = "已登打並存檔完畢！\n勤務表截圖保存失敗：測試訊息"
             screenshot_warning_result = service.execute(request)
             self.assertEqual(
@@ -3108,6 +3136,105 @@ class DutySheetServiceTests(unittest.TestCase):
             self.assertEqual(progress, ["執行中"])
             self.assertEqual(saved[0]["login_settings"]["user_pwd"], "preserved")
             self.assertNotIn("session-secret", repr(saved))
+
+    def test_annotation_reports_follow_this_execution_and_keep_string_compatibility(self) -> None:
+        from app_core.duty_sheet_service import DutySheetExecutionError, DutySheetRequest, DutySheetService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "duty_sheet_legacy"
+            project.mkdir()
+            (project / "sinposmart_1.py").write_text("# fixture", encoding="utf-8")
+            book = project / "duty.xlsm"
+            book.write_bytes(b"fixture")
+            mode = ["success"]
+            report = {"text": "02帶隊官，20、22TP訓", "verification": "verified",
+                      "target_date": "2026/10/30", "deduction_count": 1}
+
+            def automate(*_args, **kwargs):
+                if mode[0] != "legacy":
+                    prepared = {**report, "verification": "prepared"}
+                    if mode[0] == "oversize":
+                        prepared["text"] = "測" * 8001
+                    kwargs["annotation_callback"](prepared)
+                    if mode[0] != "unsaved":
+                        kwargs["annotation_callback"](report)
+                if mode[0] == "later_failure":
+                    kwargs["stage_callback"]("vehicle_form_open")
+                    raise RuntimeError("offline mission failure")
+                return mode[0] != "unsaved"
+
+            legacy = SimpleNamespace(load_config=lambda: {}, save_config=lambda *_args, **_kwargs: None,
+                convert_to_minguo=lambda _selected: "1151030", start_automation=automate)
+            service = DutySheetService(root, module_loader=lambda _path: legacy)
+            request = DutySheetRequest("fixture-user", "fixture-password", str(book), "2026/10/30", "a", "b", "c", "d", False,
+                                       personnel_deductions=((("20", "22"), "TP訓"),))
+            for value in ("success", "later_failure", "unsaved", "legacy", "limit", "oversize"):
+                with self.subTest(mode=value):
+                    mode[0] = value
+                    report["text"] = "界" * 8000 if value == "limit" else "02帶隊官，20、22TP訓"
+                    if value in ("later_failure", "unsaved", "oversize"):
+                        with self.assertRaises(DutySheetExecutionError) as raised:
+                            service.execute(request)
+                        actual = raised.exception.annotation_report
+                        if value == "later_failure":
+                            self.assertEqual(raised.exception.failure_stage, "vehicle_form_open")
+                    else:
+                        result = service.execute(request)
+                        self.assertIsInstance(result, str)
+                        self.assertEqual(result, "勤務表已登打完成：1151030")
+                        actual = result.annotation_report
+                    expected = ({} if value in ("legacy", "oversize") else
+                                {**report, "verification": "prepared" if value == "unsaved" else "verified"})
+                    self.assertEqual(actual, expected)
+                    self.assertIsNot(actual, report)
+
+    def test_annotation_evidence_failure_stops_before_legacy_and_preserves_saved_data(self) -> None:
+        from app_core.duty_sheet_service import DutySheetExecutionError, DutySheetRequest, DutySheetService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            book = root / "duty.xlsm"
+            book.write_bytes(b"fixture")
+            loader = Mock(side_effect=AssertionError("legacy must not load before evidence is saved"))
+            service = DutySheetService(root, module_loader=loader)
+            service.save_personnel_deduction("20、22", "2099/11/01", "2099/11/03", "TP訓")
+            evidence_path = root / "runtime_outputs/duty_annotation_request.json"
+            evidence_path.write_text('{"previous":true}', encoding="utf-8")
+            previous_evidence = evidence_path.read_bytes()
+            previous_records = service.personnel_deductions_path.read_bytes()
+            request = DutySheetRequest("fixture-user", "fixture-password", str(book), "2099/11/03", "a", "b", "c", "d", False)
+            with patch("app_core.duty_sheet_service.os.replace", side_effect=OSError("fixture-password")):
+                with self.assertRaises(DutySheetExecutionError) as raised:
+                    service.execute(request)
+            self.assertEqual(raised.exception.failure_stage, "preflight")
+            self.assertIn("診斷紀錄無法儲存", str(raised.exception))
+            self.assertIn("尚未執行正式登打", str(raised.exception))
+            self.assertNotIn("fixture-password", str(raised.exception))
+            self.assertEqual(evidence_path.read_bytes(), previous_evidence)
+            self.assertEqual(service.personnel_deductions_path.read_bytes(), previous_records)
+            loader.assert_not_called()
+
+    def test_corrupt_personnel_data_blocks_execution_without_overwriting_evidence(self) -> None:
+        from app_core.duty_sheet_service import DutySheetRequest, DutySheetService, DutySheetValidationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            book = root / "duty.xlsm"
+            book.write_bytes(b"fixture")
+            loader = Mock()
+            service = DutySheetService(root, module_loader=loader)
+            service.personnel_deductions_path.parent.mkdir()
+            service.personnel_deductions_path.write_text("{broken", encoding="utf-8")
+            evidence_path = root / "runtime_outputs/duty_annotation_request.json"
+            evidence_path.write_text('{"previous":true}', encoding="utf-8")
+            previous_evidence = evidence_path.read_bytes()
+            request = DutySheetRequest("fixture-user", "fixture-password", str(book), "2099/11/03", "a", "b", "c", "d", False)
+            with self.assertRaises(DutySheetValidationError):
+                service.execute(request)
+            self.assertEqual(service.personnel_deductions_path.read_text(encoding="utf-8"), "{broken")
+            self.assertEqual(evidence_path.read_bytes(), previous_evidence)
+            loader.assert_not_called()
 
     def test_browser_start_failure_preserves_safe_shared_driver_message(self) -> None:
         from app_core.duty_sheet_service import (
@@ -10970,6 +11097,38 @@ class UpdateControllerTests(unittest.TestCase):
 
 
 class DiagnosticsServiceTests(unittest.TestCase):
+    def test_personnel_evidence_is_allowlisted_sanitized_and_corrupt_input_is_preserved(self):
+        from app_core.diagnostics_service import DiagnosticSnapshot, DiagnosticsService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime_outputs"
+            runtime.mkdir()
+            names = ("duty_annotation_request.json", "duty_personnel_deductions.json")
+            for name in names:
+                (runtime / name).write_text(json.dumps({
+                    "schema_version": 1, "target_date": "2026/10/30",
+                    "people": ["20", "22"], "reason": "TP訓",
+                    "user_id": "private-user", "password": "private-password", "token": "private-token",
+                }), encoding="utf-8")
+            service = DiagnosticsService(root)
+            with zipfile.ZipFile(service.export(DiagnosticSnapshot(target_date="1151030"))) as archive:
+                for name in names:
+                    content = json.loads(archive.read("runtime_outputs/" + name))
+                    self.assertEqual(content["people"], ["20", "22"])
+                    self.assertEqual(content["reason"], "TP訓")
+                    self.assertEqual(set(content), {"schema_version", "target_date", "people", "reason"})
+                body = b"\n".join(archive.read(name) for name in archive.namelist())
+                for secret in (b"private-user", b"private-password", b"private-token"):
+                    self.assertNotIn(secret, body)
+            corrupt = runtime / names[1]
+            corrupt.write_bytes(b"{broken")
+            with zipfile.ZipFile(service.export(DiagnosticSnapshot(target_date="1151030"))) as archive:
+                self.assertIn("runtime_outputs/" + names[0], archive.namelist())
+                self.assertNotIn("runtime_outputs/" + names[1], archive.namelist())
+                self.assertIn("runtime_outputs/" + names[1], json.loads(archive.read("manifest.json"))["omitted_files"])
+            self.assertEqual(corrupt.read_bytes(), b"{broken")
+
     def test_issue_package_redacts_file_contents_and_preserves_failure_context(self) -> None:
         from app_core.diagnostics_service import DiagnosticsService, DiagnosticSnapshot
 
@@ -12442,6 +12601,167 @@ class QtShellTests(unittest.TestCase):
                 self.assertEqual(DutySheetService(root_dir).load_personnel_deductions(), [])
                 duty._read_only_acceptance = True
                 self.assertFalse(duty.savePersonnelDeduction("23", "2099/11/01", "2099/11/03", "TP訓", ""))
+            finally:
+                window.close()
+                controller.shutdown()
+                engine.deleteLater()
+                self._flush_qt_deferred_deletes()
+
+    def test_qml_manual_duty_run_keeps_saved_personnel_snapshot_through_real_worker(self):
+        from datetime import datetime
+        from PySide6.QtCore import QObject, QMetaObject, Qt, QUrl
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtQuickControls2 import QQuickStyle
+        from PySide6.QtTest import QTest
+        from app_core.duty_sheet_service import DutySheetService, LEGACY_SCRIPT_NAME
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.duty_sheet_controller import DutySheetController
+
+        # Coverage for an already passing path, not a reproducer of the reported missing memo.
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app_core.duty_sheet_service.datetime", wraps=datetime
+        ) as clock:
+            clock.now.return_value = datetime(2026, 10, 29, 17, 44)
+            root_dir = Path(directory)
+            project_dir = root_dir / "duty_sheet_legacy"
+            project_dir.mkdir()
+            workbook = root_dir / "fixture.xlsm"
+            workbook.write_bytes(b"fixture")
+            config = {
+                "last_selection": {"workbook_path": str(workbook), "attack": "A", "stop": "S",
+                                   "amb1": "M1", "amb2": "M2"},
+                "car_options": {"attack": ["A"], "stop": ["S"], "amb": ["M1", "M2"]},
+                "notification": {"enabled": False},
+            }
+            calls, saved_cars = [], []
+
+            def start_automation(_user, _password, target, source, cars, **kwargs):
+                calls.append({"target": target, "workbook": source, "cars": dict(cars),
+                              "deductions": kwargs["personnel_deductions"],
+                              "thread": threading.get_ident()})
+                kwargs["success_callback"]("已登打並存檔完畢！")
+                return True
+
+            legacy = SimpleNamespace(
+                load_config=lambda: config,
+                save_config=lambda selection, **_kwargs: saved_cars.append(dict(selection)),
+                convert_to_minguo=lambda value: f"{value.year - 1911:03d}{value:%m%d}",
+                start_automation=start_automation,
+            )
+            service = DutySheetService(root_dir, module_loader=lambda _path: legacy)
+            service.config_path.write_text(json.dumps(config), encoding="utf-8")
+            original_config = service.config_path.read_bytes()
+            session = SessionState()
+            session.session = LoginSession("10", "fixture-user", "fixture-password", verified=True)
+            controller = DutySheetController(session, service)
+            controller.loadDefaults()
+            QQuickStyle.setStyle("Basic")
+            engine = QQmlEngine()
+            engine.rootContext().setContextProperty("fixtureDutyController", controller)
+            component = QQmlComponent(engine)
+            component.setData(('''import QtQuick
+import QtQuick.Controls
+import "%s" as Pages
+ApplicationWindow {
+    id: host
+    width: 420; height: 840; visible: true
+    property int dutyMainWidth: 0
+    property int toolSideWidth: 400
+    property color ink: "black"
+    property color muted: "gray"
+    property var backend: QtObject {
+        property bool readOnlyAcceptance: false
+        property var sessionController: QtObject {
+            property string actorNo: "10"
+            property string userId: "fixture-user"
+            property string displayName: "測試員"
+            signal sessionChanged()
+        }
+        property var toolController: QtObject {
+            signal usageChanged(string toolId)
+            function usageModel() { return null; }
+        }
+    }
+    function shiftSlashDate(value, days) { return value; }
+    function showToolSidePanel(panel) { panel.opened = true; }
+    function hideToolSidePanel(panel) { panel.opened = false; }
+    function showErrorDetails(title, message) {}
+    Pages.DutySheetToolPanel {
+        hostWindow: host
+        controller: fixtureDutyController
+        opened: true
+    }
+}''' % (PACKAGE_ROOT / "qt_app/qml/pages").as_uri()).encode("utf-8"), QUrl())
+            for _ in range(50):
+                if component.status() != QQmlComponent.Loading:
+                    break
+                QTest.qWait(10)
+            window = component.create()
+            self.assertIsNotNone(window, [error.toString() for error in component.errors()])
+
+            def find(name):
+                item = window.findChild(QObject, name)
+                if item is None:
+                    stack = [window.contentItem()]
+                    while stack:
+                        candidate = stack.pop()
+                        if candidate.objectName() == name:
+                            return candidate
+                        stack.extend(candidate.childItems())
+                self.assertIsNotNone(item, name)
+                return item
+
+            def click(name):
+                self.assertTrue(QMetaObject.invokeMethod(find(name), "clicked", Qt.DirectConnection))
+                QTest.qWait(25)
+
+            try:
+                QTest.qWait(50)
+                self.assertEqual(find("dutyDateField").property("text"), "2026/10/30")
+                click("dutyPersonnelDeductionAddButton")
+                for field in ("StartDate", "EndDate"):
+                    self.assertEqual(find("dutyPersonnelDeduction" + field + "Field").property("text"),
+                                     "2026/10/30")
+                find("dutyPersonnelDeductionPeopleField").setProperty("text", "20、22")
+                find("dutyPersonnelDeductionReasonField").setProperty("text", "TP訓")
+                click("dutyPersonnelDeductionSaveButton")
+                self.assertFalse(find("dutyPersonnelDeductionDialog").property("visible"))
+                persisted = DutySheetService(root_dir).load_personnel_deductions()
+                self.assertEqual([(row["start_date"], row["end_date"], row["people"], row["reason"])
+                                  for row in persisted], [("2026/10/30", "2026/10/30", ["20", "22"], "TP訓")])
+                self.assertEqual(service.config_path.read_bytes(), original_config)
+                panel = find("dutySheetDialog")
+                self.assertTrue(QMetaObject.invokeMethod(panel, "close", Qt.DirectConnection))
+                controller.loadDefaults()
+                self.assertTrue(QMetaObject.invokeMethod(panel, "open", Qt.DirectConnection))
+                QTest.qWait(50)
+                self.assertEqual(controller.personnelDeductions, persisted)
+                self.assertIsNotNone(find("dutyPersonnelDeductionRow_0"))
+                self.assertEqual(find("dutyDateField").property("text"), "2026/10/30")
+                click("dutySheetRunButton")
+                expected = ((("20", "22"), "TP訓"),)
+                self.assertEqual(controller._pending_request.personnel_deductions, expected)
+                self.assertEqual(controller._pending_request.target_date, "2026/10/30")
+                confirmation = find("dutySheetConfirmation")
+                accept = confirmation.findChild(QObject, "appleDialogYesButton")
+                self.assertIsNotNone(accept)
+                entrypoint = project_dir / LEGACY_SCRIPT_NAME
+                original_is_file = Path.is_file
+                # The final legacy entrypoint is a replacement; no Python script is created.
+                with patch.object(Path, "is_file", lambda path: path == entrypoint or original_is_file(path)):
+                    self.assertTrue(QMetaObject.invokeMethod(accept, "clicked", Qt.DirectConnection))
+                    for _ in range(100):
+                        QTest.qWait(10)
+                        if not controller.isRunning:
+                            break
+                self.assertFalse(controller.isRunning)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual((calls[0]["target"], calls[0]["workbook"], calls[0]["deductions"]),
+                                 ("1151030", str(workbook), expected))
+                self.assertNotEqual(calls[0]["thread"], threading.get_ident())
+                self.assertEqual(set(calls[0]["cars"]), {"attack", "stop", "amb1", "amb2", "workbook_path"})
+                self.assertEqual(saved_cars, [calls[0]["cars"]])
+                self.assertEqual(controller.statusText, "勤務表已登打完成：1151030")
             finally:
                 window.close()
                 controller.shutdown()
@@ -22019,6 +22339,73 @@ if return_code != 0 or loaded:
         self.assertEqual(operational_sync.events[0][1]["trigger_type"], "schedule")
         self.assertEqual(operational_sync.events[0][1]["snapshot"]["error_code"], "login_failed")
         self.assertEqual(operational_sync.events[1][1]["trigger_type"], "login")
+
+    def test_duty_annotation_worker_events_keep_this_run_and_preserve_full_payload(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.duty_sheet_service import DutySheetExecutionError, DutySheetRequest, DutySheetResult
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.tool_controller import ToolController
+        from qt_app.workers.duty_sheet_worker import DutySheetWorker
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "test", None),
+                tool_controller=ToolController(root), read_only_acceptance=True)
+            events = []
+            controller._send_operational_event = lambda kind, **fields: events.append((kind, fields))
+            controller._finish_automatic_tool = lambda *_args: None
+            controller._tray_controller.notify = Mock()
+            sheet = controller.dutySheetController
+            request = DutySheetRequest("fixture-user", "fixture-password", "fixture.xlsm", "2026/10/30", "a", "b", "c", "d", False)
+            last_report = {}
+            try:
+                for index, (outcome, verification) in enumerate((("success", "verified"), ("failure", "verified"),
+                        ("failure", "prepared"), ("legacy", ""), ("unexpected", "")), 1):
+                    with self.subTest(outcome=outcome, verification=verification):
+                        report = ({"text": "界" * 8000, "verification": verification,
+                                   "target_date": "2026/10/30", "deduction_count": 1} if verification else {})
+                        def execute(_request, **_kwargs):
+                            if outcome == "unexpected":
+                                raise RuntimeError("fixture-password")
+                            if outcome == "failure":
+                                raise DutySheetExecutionError("編組失敗", failure_stage="vehicle_form_open", annotation_report=report)
+                            return DutySheetResult("完成", annotation_report=report) if report else "舊版完成"
+                        worker = DutySheetWorker(index, SimpleNamespace(execute=execute), request)
+                        worker.annotation_report = dict(last_report)
+                        sheet._request_id = index
+                        sheet._workers[index] = (None, worker)
+                        sheet._target_date = request.target_date
+                        sheet._annotation_report = dict(last_report)
+                        worker.succeeded.connect(sheet._succeeded)
+                        worker.failed.connect(sheet._failed)
+                        sheet.runStarted.emit()
+                        self.assertEqual(sheet.completed_run_details(), {})
+                        self.assertNotIn("duty_annotation", events[-1][1]["snapshot"])
+                        worker.run()
+                        start, terminal = events[-2:]
+                        self.assertEqual(start[1]["snapshot"]["run_id"], terminal[1]["snapshot"]["run_id"])
+                        self.assertEqual(terminal[1]["status"], "failed" if outcome in ("failure", "unexpected") else "completed")
+                        if report:
+                            self.assertEqual(terminal[1]["snapshot"]["duty_annotation"], report)
+                            payload = OperationalSyncService(root).build_event_payload(terminal[0], **terminal[1])
+                            self.assertEqual(payload["snapshot"]["duty_annotation"], report)
+                            self.assertIs(type(payload["snapshot"]["duty_annotation"]["deduction_count"]), int)
+                            self.assertEqual(len(payload["snapshot"]["duty_annotation"]["text"]), 8000)
+                        else:
+                            self.assertNotIn("duty_annotation", terminal[1]["snapshot"])
+                        self.assertNotIn("fixture-password", repr(events))
+                        previous_events = len(events)
+                        sheet._succeeded(index - 1, "stale")
+                        sheet._failed(index - 1, "stale")
+                        self.assertEqual(len(events), previous_events)
+                        last_report = dict(report)
+                        sheet._workers.clear()
+                controller._tool_run_finished("duty_sheet", "勤務表登打", "無對應執行", notify=False)
+                self.assertNotIn("duty_annotation", events[-1][1]["snapshot"])
+            finally:
+                sheet._workers.clear()
+                controller.shutdown()
 
     def test_duty_sheet_events_keep_source_file_and_date_from_start(self) -> None:
         from app_core.credential_repository import CredentialRepository

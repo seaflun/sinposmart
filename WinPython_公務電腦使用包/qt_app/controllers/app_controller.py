@@ -2730,6 +2730,7 @@ class AppController(QObject):
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         run_context = {}
         if tool_name == "duty_sheet":
+            self._duty_sheet_controller.clear_annotation_report()
             automatic_record = getattr(self, "_automatic_tool_record", None)
             automatic = bool(automatic_record and automatic_record["tool_id"] == tool_name)
             if automatic and not self._duty_sheet_controller.isRunning:
@@ -2793,6 +2794,8 @@ class AppController(QObject):
             snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
         if run_id:
             snapshot["run_id"] = run_id
+            if tool_name == "duty_sheet":
+                snapshot.update(self._duty_sheet_controller.completed_run_details())
         if snapshot_extra:
             snapshot.update(snapshot_extra)
         self._send_operational_event(
@@ -2849,6 +2852,8 @@ class AppController(QObject):
             snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
         if run_id:
             snapshot["run_id"] = run_id
+            if tool_name == "duty_sheet":
+                snapshot.update(self._duty_sheet_controller.completed_run_details())
         failure_stage = self._failure_stage_for_tool(tool_name)
         if failure_stage:
             snapshot["failure_stage"] = failure_stage

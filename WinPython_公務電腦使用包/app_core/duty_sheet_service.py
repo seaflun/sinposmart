@@ -35,9 +35,19 @@ class DutySheetValidationError(ValueError):
 class DutySheetExecutionError(RuntimeError):
     """A safe execution failure for the native form."""
 
-    def __init__(self, message: str, *, failure_stage: str = "unknown") -> None:
+    def __init__(self, message: str, *, failure_stage: str = "unknown", annotation_report: dict | None = None) -> None:
         super().__init__(message)
         self.failure_stage = failure_stage
+        self.annotation_report = dict(annotation_report or {})
+
+
+class DutySheetResult(str):
+    """Keep the existing message API while carrying this execution's annotation."""
+
+    def __new__(cls, message: str, *, annotation_report: dict | None = None):
+        result = super().__new__(cls, message)
+        result.annotation_report = dict(annotation_report or {})
+        return result
 
 
 @dataclass(frozen=True)
@@ -241,6 +251,31 @@ class DutySheetService:
         return tuple((tuple(row["people"]), row["reason"])
                      for row in self.load_personnel_deductions(include_expired=True)
                      if row["start_date"] <= target <= row["end_date"])
+
+    def _record_annotation_request(self, request: DutySheetRequest) -> None:
+        path = self.package_root / "runtime_outputs" / "duty_annotation_request.json"
+        try:
+            records = [{"people": list(people), "reason": reason}
+                       for people, reason in request.personnel_deductions or ()]
+            payload = {
+                "schema_version": 1,
+                "recorded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "target_date": request.target_date,
+                "deduction_count": len(records),
+                "person_count": len({number for row in records for number in row["people"]}),
+                "personnel_deductions": records,
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix="duty-annotation-", suffix=".tmp", dir=path.parent)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as exc:
+            raise DutySheetExecutionError(
+                "勤務附記診斷紀錄無法儲存，尚未執行正式登打。", failure_stage="preflight"
+            ) from exc
 
     def load_defaults(self, now: datetime | None = None) -> DutySheetDefaults:
         config = self._load_legacy_display_config()
@@ -524,6 +559,7 @@ class DutySheetService:
         stage_callback: Callable[[str], None] | None = None,
     ) -> str:
         stage = "preflight"
+        annotation_report: dict = {}
 
         def report_stage(value: str) -> None:
             nonlocal stage
@@ -531,8 +567,20 @@ class DutySheetService:
             if stage_callback is not None:
                 stage_callback(value)
 
+        def record_annotation(report: dict) -> None:
+            if (not isinstance(report, dict) or set(report) != {"text", "verification", "target_date", "deduction_count"}
+                    or not isinstance(report["text"], str) or len(report["text"]) > 8000
+                    or report["verification"] not in ("prepared", "verified")
+                    or report["target_date"] != request.target_date
+                    or type(report["deduction_count"]) is not int or report["deduction_count"] < 0):
+                raise DutySheetExecutionError("勤務附記回報格式不正確或超過長度限制。", failure_stage=stage,
+                                              annotation_report=annotation_report)
+            annotation_report.clear()
+            annotation_report.update(report)
+
         report_stage(stage)
         request = self.validate(request)
+        self._record_annotation_request(request)
         if request.automatic:
             stat = Path(request.workbook_path).stat()
             if request.workbook_signature != WorkbookSignature(stat.st_size, stat.st_mtime_ns):
@@ -573,6 +621,7 @@ class DutySheetService:
                     raise_errors=True,
                     stage_callback=report_stage,
                     personnel_deductions=request.personnel_deductions,
+                    annotation_callback=record_annotation,
                 )
         except DutySheetValidationError:
             raise
@@ -580,6 +629,7 @@ class DutySheetService:
             raise DutySheetExecutionError(
                 str(exc) or "勤務表登打失敗。",
                 failure_stage=stage,
+                annotation_report=annotation_report,
             ) from exc
         finally:
             if legacy is not None and hasattr(legacy, "_runtime_status_callback"):
@@ -588,6 +638,7 @@ class DutySheetService:
             raise DutySheetExecutionError(
                 errors[-1] if errors else "勤務表登打未完成。",
                 failure_stage=stage,
+                annotation_report=annotation_report,
             )
         selection_warning = ""
         if request.automatic:
@@ -603,7 +654,7 @@ class DutySheetService:
             suffix = "（LINE 截圖通知失敗）"
         else:
             suffix = ""
-        return f"勤務表已登打完成：{target_date}{suffix}{selection_warning}"
+        return DutySheetResult(f"勤務表已登打完成：{target_date}{suffix}{selection_warning}", annotation_report=annotation_report)
 
     def _resolve_workbook(self, value: str) -> Path | None:
         value = str(value or "").strip()

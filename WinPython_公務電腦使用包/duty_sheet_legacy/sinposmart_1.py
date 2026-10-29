@@ -1778,36 +1778,157 @@ def resolve_duty_annotation_field(driver):
 
 def step_batch_fill_duty(driver, duty_map):
     """批次填寫勤務基準表"""
-    if not duty_map: return
+    if not duty_map:
+        raise RuntimeError("勤務基準表沒有可填寫欄位，未執行儲存。")
     js_fill = """
     const data = arguments[0] || {};
-    function deepBatchFill(win, data) {
-        var oldAlert = win.alert; var oldConfirm = win.confirm;
-        win.alert = function(msg) { console.log("攔截: " + msg); };
-        win.confirm = function(msg) { return true; };
-        var count = 0;
-        for (var id in data) {
-            var el = win.document.getElementById(id);
+    const targets = {};
+    function collect(win) {
+        for (const id of Object.keys(data)) {
+            const el = win.document.getElementById(id);
             if (el) {
-                el.focus(); el.value = data[id];
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new Event('blur', {bubbles: true}));
-                try { if(typeof el.onchange === 'function') el.onchange({target: el, type: 'change'}); } catch(e){}
-                count++;
+                if (targets[id] || el.disabled || el.readOnly) throw new Error('Required duty field unavailable');
+                targets[id] = {el, win};
             }
         }
-        for(var i=0; i<win.frames.length; i++) {
-            try { count += deepBatchFill(win.frames[i], data); } catch(e){}
-        }
-        win.alert = oldAlert; win.confirm = oldConfirm;
-        return count;
+        for (let index = 0; index < win.frames.length; index++) collect(win.frames[index]);
     }
-    return deepBatchFill(window.top, data);
+    collect(window.top);
+    if (Object.keys(targets).length !== Object.keys(data).length) throw new Error('Required duty field missing');
+    const filled = [];
+    for (const id of Object.keys(data)) {
+        const {el, win} = targets[id];
+        const oldAlert = win.alert, oldConfirm = win.confirm;
+        try {
+            win.alert = function() {};
+            win.confirm = function() { return true; };
+            el.focus();
+            el.value = data[id];
+            const FieldEvent = win.Event || Event;
+            for (const type of ['input', 'change', 'blur']) el.dispatchEvent(new FieldEvent(type, {bubbles: true}));
+            filled.push(id);
+        } finally {
+            win.alert = oldAlert;
+            win.confirm = oldConfirm;
+        }
+    }
+    for (const id of Object.keys(data)) {
+        if (String(targets[id].el.value).replace(/\\r\\n/g, '\\n') !== String(data[id]).replace(/\\r\\n/g, '\\n'))
+            throw new Error('Duty field value changed during fill');
+    }
+    return {filled_ids: filled};
     """
     try:
-        count = driver.execute_script(js_fill, duty_map)
-    except Exception as e: log_status(f"   ❌ 批次填寫異常: {e}")
+        result = driver.execute_script(js_fill, duty_map)
+    except Exception as error:
+        raise RuntimeError("勤務基準表欄位填寫失敗，未執行儲存。") from error
+    if not isinstance(result, dict) or set(result.get("filled_ids", [])) != set(duty_map):
+        raise RuntimeError("勤務基準表必要欄位未完整填入，未執行儲存。")
+    return result
+
+
+_DUTY_POSTBACK_FORM_JS = r"""
+const forms = [];
+let inaccessible = false;
+function collectDutyForm(win) {
+    try {
+        const doc = win.document;
+        const memo = doc.getElementById('_areMEMO');
+        if (memo) {
+            const date = doc.getElementById('_txtTaskDate');
+            const query = doc.getElementById('_btnQuery');
+            const form = memo.form;
+            if (doc.querySelectorAll('[id="_areMEMO"]').length !== 1 || !form || form.id !== 'frm' ||
+                !date || date.form !== form || !query || query.form !== form) inaccessible = true;
+            else forms.push({win, doc, form, date, query});
+        }
+        for (let index = 0; index < win.frames.length; index++) collectDutyForm(win.frames[index]);
+    } catch (error) { inaccessible = true; }
+}
+collectDutyForm(window.top);
+const current = !inaccessible && forms.length === 1 ? forms[0] : null;
+function buttonReady(button) {
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true' || !button.getClientRects().length) return false;
+    const style = current.win.getComputedStyle(button);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+}
+"""
+
+
+def start_duty_postback(driver, target_date, button_id):
+    """標記精確勤務文件後只點一次；不重送結果未明的保存或查詢。"""
+    action = "儲存" if button_id == "_btnSave" else "查詢"
+    if button_id not in ("_btnSave", "_btnQuery"):
+        raise ValueError("不支援的勤務表動作。")
+    token = str(time.monotonic_ns())
+    driver.switch_to.default_content()
+    prepared = driver.execute_script(_DUTY_POSTBACK_FORM_JS + r"""
+        const [expectedDate, token, buttonId] = arguments;
+        if (!current || current.doc.readyState !== 'complete') return false;
+        const button = current.doc.getElementById(buttonId);
+        if (!button || button.form !== current.form || !buttonReady(button)) return false;
+        if (buttonId === '_btnQuery') current.date.value = expectedDate;
+        if (String(current.date.value).trim() !== expectedDate) return false;
+        current.doc.__sinposmartDutyPostbackToken = token;
+        return true;
+    """, target_date, token, button_id)
+    if prepared is not True:
+        raise RuntimeError(f"勤務基準表{action}欄位尚未就緒，{action}未啟動。")
+    try:
+        clicked = driver.execute_script(_DUTY_POSTBACK_FORM_JS + r"""
+            const [expectedDate, token, buttonId] = arguments;
+            if (!current || current.doc.__sinposmartDutyPostbackToken !== token ||
+                String(current.date.value).trim() !== expectedDate) return false;
+            const button = current.doc.getElementById(buttonId);
+            if (!button || button.form !== current.form || !buttonReady(button)) return false;
+            button.click();
+            return true;
+        """, target_date, token, button_id)
+    except UnexpectedAlertPresentException:
+        clicked = None  # 點擊可能已觸發原生提醒；只等文件替換，不再次送出。
+    if clicked is not True and clicked is not None:
+        raise RuntimeError(f"勤務基準表{action}按鈕未啟動，已停止後續流程。")
+    return token
+
+
+def wait_for_duty_postback(driver, wait, target_date, token, *, field_ids=(), require_existing=False):
+    """只接受標記文件被替換後，同一勤務表文件的欄位讀值。"""
+    def read_fresh(candidate):
+        candidate.switch_to.default_content()
+        return candidate.execute_script(_DUTY_POSTBACK_FORM_JS + r"""
+            const [expectedDate, token, fieldIds, requireExisting] = arguments;
+            if (!current || current.doc.__sinposmartDutyPostbackToken === token ||
+                current.doc.readyState !== 'complete' || String(current.date.value).trim() !== expectedDate ||
+                !buttonReady(current.query)) return false;
+            if (requireExisting && (!current.doc.getElementById('_pln_8_1') ||
+                !buttonReady(current.doc.getElementById('_btnDelete')))) return false;
+            const values = {};
+            for (const id of fieldIds) {
+                const elements = current.doc.querySelectorAll('[id="' + id + '"]');
+                if (elements.length !== 1 || elements[0].form !== current.form) return false;
+                values[id] = String(elements[0].value || '');
+            }
+            return {values};
+        """, target_date, token, list(field_ids), require_existing)
+    try:
+        result = wait.until(read_fresh)
+    except TimeoutException as error:
+        raise RuntimeError("勤務基準表已嘗試儲存，但重新載入或讀回逾時，尚未確認完成。") from error
+    if not isinstance(result, dict) or not isinstance(result.get("values"), dict):
+        raise RuntimeError("勤務基準表已嘗試儲存，但讀回結果無法確認。")
+    return result["values"]
+
+
+def verify_saved_duty_fields(driver, target_date, expected_fields, wait=None):
+    """重新查詢指定日期，從第二份新文件核對已保存附記。"""
+    token = start_duty_postback(driver, target_date, "_btnQuery")
+    accept_pending_alerts(driver, timeout=0.2)
+    values = wait_for_duty_postback(driver, wait or WebDriverWait(driver, 60, poll_frequency=0.5),
+        target_date, token, field_ids=tuple(expected_fields), require_existing=True)
+    if any(str(values.get(key, "")).replace("\r\n", "\n").strip() != str(expected).replace("\r\n", "\n").strip()
+           for key, expected in expected_fields.items()):
+        raise RuntimeError("勤務基準表儲存後附記或文字欄位不一致，已停止完成流程。")
+    return True
 
 def step_fill_mission_cells(driver, mission_map):
     """批次填寫救災任務編組表"""
@@ -1919,6 +2040,7 @@ def start_automation(
     raise_errors=False,
     stage_callback=None,
     personnel_deductions=(),
+    annotation_callback=None,
 ):
     def report_stage(stage):
         if callable(stage_callback):
@@ -2020,12 +2142,12 @@ def start_automation(
     duty_annotation = build_duty_annotation(
         duty_leader_numbers(wb, sheet, day_int, excluded_numbers), personnel_deductions
     )
-    capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sinposmart-duty-capture")
-    capture_future = capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)
-    log_status("勤務表截圖與網站登打同步進行...")
-    
+    def report_annotation(verification):
+        if callable(annotation_callback):
+            annotation_callback({"text": duty_annotation, "verification": verification,
+                "target_date": f"{int(target_date[:3]) + 1911:04d}/{int(target_date[3:5]):02d}/{day_int:02d}",
+                "deduction_count": len(personnel_deductions)})
     # ---------------- 2. 瀏覽器自動化 ----------------
-    report_stage("browser_start")
     def initialize_browser(candidate: webdriver.Chrome) -> None:
         try:
             candidate.set_page_load_timeout(max(10, int(os.environ.get("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "45"))))
@@ -2041,6 +2163,11 @@ def start_automation(
         step_navigate_menu(candidate, WebDriverWait(candidate, 20))
 
     try:
+        report_annotation("prepared")
+        capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sinposmart-duty-capture")
+        capture_future = capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)
+        log_status("勤務表截圖與網站登打同步進行...")
+        report_stage("browser_start")
         popup_main_window = ""
         annotation_field = None
 
@@ -2157,15 +2284,7 @@ def start_automation(
             step_batch_fill_duty(driver, duty_map)
             time.sleep(1)
             report_stage("duty_save")
-            driver.execute_script("""
-                function clickSave(win) {
-                    var btn = win.document.getElementById('_btnSave');
-                    if(btn) { btn.click(); return true; }
-                    for(var i=0; i<win.frames.length; i++) {
-                        try { if(clickSave(win.frames[i])) return true; } catch(e){}
-                    } return false;
-                } clickSave(window.top);
-            """)
+            save_token = start_duty_postback(driver, target_date, "_btnSave")
 
             for _ in range(3): 
                 try:
@@ -2176,6 +2295,12 @@ def start_automation(
                 except (NoAlertPresentException, TimeoutException):
                     break
             time.sleep(2)
+            wait_for_duty_postback(driver, WebDriverWait(driver, 60, poll_frequency=0.5), target_date, save_token)
+            report_stage("duty_verify")
+            verify_saved_duty_fields(driver, target_date, {key: duty_map[key] for key in
+                ("_areMEMO", "_arePSREMARK", "_areTeamTra") if key in duty_map})
+            report_annotation("verified")
+            log_status("✅ 勤務基準表重新查詢後附記驗證通過")
             
             # --- 進入救災任務編組表 ---
             report_stage("vehicle_form_open")

@@ -21,10 +21,12 @@ class DutySheetWorker(QObject):
         self.service = service
         self.request = request
         self.prepare_only = prepare_only
+        self.annotation_report: dict = {}
 
     @Slot()
     def run(self) -> None:
         stage = "preflight"
+        self.annotation_report = {}
 
         def update_stage(value: str) -> None:
             nonlocal stage
@@ -52,11 +54,15 @@ class DutySheetWorker(QObject):
                 )
         except (DutySheetExecutionError, DutySheetValidationError) as exc:
             self.failure_stage = getattr(exc, "failure_stage", stage)
+            report = getattr(exc, "annotation_report", None)
+            self.annotation_report = dict(report) if isinstance(report, dict) else {}
             self.failed.emit(self.request_id, str(exc))
         except Exception:
             self.failure_stage = stage
             self.failed.emit(self.request_id, "勤務表登打失敗，請檢查輸入與網站狀態。")
         else:
+            report = getattr(result, "annotation_report", None)
+            self.annotation_report = dict(report) if isinstance(report, dict) else {}
             self.succeeded.emit(self.request_id, result)
         finally:
             self.request = DutySheetRequest("", "", "", "", "", "", "", "", False)

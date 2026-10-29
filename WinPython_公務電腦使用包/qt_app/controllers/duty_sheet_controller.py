@@ -56,6 +56,7 @@ class DutySheetController(QObject):
         self._pending_request: DutySheetRequest | None = None
         self._request_id = 0
         self._failure_stage = "unknown"
+        self._annotation_report: dict = {}
         self._workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
         self._shutdown_admission = False
         self._read_only_acceptance = bool(read_only_acceptance)
@@ -319,6 +320,7 @@ class DutySheetController(QObject):
         self._request_id += 1
         request_id = self._request_id
         self._failure_stage = "unknown"
+        self.clear_annotation_report()
         request = self._pending_request
         self._pending_request = None
         self._confirmation_summary = ""
@@ -373,6 +375,7 @@ class DutySheetController(QObject):
     def _succeeded(self, request_id: int, message: str) -> None:
         if request_id != self._request_id:
             return
+        self._capture_annotation_report(request_id)
         self._status_text = message
         self.stateChanged.emit()
         self.runSucceeded.emit(message)
@@ -384,8 +387,20 @@ class DutySheetController(QObject):
         worker_pair = self._workers.get(request_id)
         worker = worker_pair[1] if worker_pair is not None else None
         self._failure_stage = str(getattr(worker, "failure_stage", "unknown") or "unknown")
+        self._capture_annotation_report(request_id)
         self.runFailed.emit(message)
         self._set_error(message)
+
+    def clear_annotation_report(self) -> None:
+        self._annotation_report = {}
+
+    def _capture_annotation_report(self, request_id: int) -> None:
+        worker_pair = self._workers.get(request_id)
+        report = getattr(worker_pair[1], "annotation_report", None) if worker_pair is not None else None
+        self._annotation_report = dict(report) if isinstance(report, dict) else {}
+
+    def completed_run_details(self) -> dict:
+        return {"duty_annotation": dict(self._annotation_report)} if self._annotation_report else {}
 
     @Slot(int)
     def _worker_finished(self, request_id: int) -> None:

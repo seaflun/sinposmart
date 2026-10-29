@@ -4795,6 +4795,8 @@ try {
                 ) as configure, mock.patch.object(
                     module, "wait_for_duty_result_grid", return_value=True
                 ), mock.patch.object(module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
+                ), mock.patch.multiple(module, start_duty_postback=mock.Mock(return_value="saved-token"),
+                    wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
                 ), mock.patch.object(module, "step_batch_fill_duty") as fill_duty, mock.patch.object(
                     module, "step_navigate_to_task_table"
                 ), mock.patch.object(module, "super_js_execute", return_value=True), mock.patch.object(
@@ -4865,6 +4867,8 @@ try {
                     module, "step_config_popups"
                 ) as configure, mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
                     module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
+                ), mock.patch.multiple(module, start_duty_postback=mock.Mock(return_value="saved-token"),
+                    wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
                 ), mock.patch.object(
                     module, "step_batch_fill_duty"
                 ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
@@ -4987,6 +4991,8 @@ try {
             module, "step_config_popups"
         ), mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
             module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
+        ), mock.patch.multiple(module, start_duty_postback=mock.Mock(return_value="saved-token"),
+            wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
         ), mock.patch.object(
             module, "step_batch_fill_duty"
         ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
@@ -8226,6 +8232,308 @@ if ($record.close_failure) {{ throw 'Stale failure contaminated a successful upd
         self.assertEqual(len(scheduled), 2)
 
 
+class DutySaveVerificationTests(unittest.TestCase):
+    def _batch_driver(self, *, missing=(), failing=""):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser JavaScript fixtures")
+        driver = mock.Mock()
+        self.batch_observed = {}
+        def execute(script, payload):
+            harness = """
+const payload = JSON.parse(process.argv[1]);
+const missing = JSON.parse(process.argv[2]);
+const failing = process.argv[3];
+const cells = {};
+for (const id of Object.keys(payload)) {
+    if (missing.includes(id)) continue;
+    cells[id] = {value: 'old', changes: 0, focus() {
+        if (id === failing) throw new Error('fixture focus failure');
+    }, dispatchEvent(event) { if (event.type === 'change') this.onchange(); },
+    onchange() { this.changes++; }};
+}
+global.Event = class Event { constructor(type) { this.type = type; }};
+const child = {document: {getElementById: id => cells[id] || null}, frames: [], alert() {}, confirm() {}};
+global.window = {top: {document: {getElementById: () => null}, frames: [child], alert() {}, confirm() {}}};
+let result = null, error = '';
+try { result = new Function(JSON.parse(process.argv[4]))(payload); } catch (failure) { error = failure.message; }
+process.stdout.write(JSON.stringify({result, error, values: Object.fromEntries(Object.entries(cells).map(
+    ([id, cell]) => [id, cell.value])), changes: Object.fromEntries(Object.entries(cells).map(
+    ([id, cell]) => [id, cell.changes]))}));
+"""
+            result = subprocess.run([node, "-e", harness, json.dumps(payload), json.dumps(missing), failing,
+                json.dumps(script)], capture_output=True, text=True, encoding="utf-8", check=True, timeout=10)
+            self.batch_observed = json.loads(result.stdout)
+            if self.batch_observed["error"]:
+                from selenium.common.exceptions import JavascriptException
+                raise JavascriptException(self.batch_observed["error"])
+            return self.batch_observed["result"]
+        driver.execute_script.side_effect = execute
+        return driver
+
+    def test_batch_failure_and_missing_required_field_cannot_be_silent(self):
+        module = legacy_duty_sheet_module()
+        payload = {"_pln_8_1": "2", "_areMEMO": "02帶隊官，22TP訓"}
+        for options in ({"failing": "_pln_8_1"}, {"missing": ("_areMEMO",)}):
+            with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, "勤務基準表.*儲存"):
+                module.step_batch_fill_duty(self._batch_driver(**options), payload)
+            self.assertEqual(self.batch_observed["values"]["_pln_8_1"], "old")
+
+    def test_batch_success_reports_required_ids_and_changes_once(self):
+        module = legacy_duty_sheet_module()
+        payload = {"_pln_8_1": "2", "_areMEMO": "02帶隊官，22TP訓"}
+        result = module.step_batch_fill_duty(self._batch_driver(), payload)
+        self.assertEqual(set(result["filled_ids"]), set(payload))
+        self.assertEqual(self.batch_observed["values"], payload)
+        self.assertEqual(self.batch_observed["changes"], {key: 1 for key in payload})
+
+    def test_postback_click_is_single_and_an_unstarted_save_fails(self):
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        driver.execute_script.side_effect = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "儲存.*未啟動"):
+            module.start_duty_postback(driver, "1151030", "_btnSave")
+        self.assertEqual(driver.execute_script.call_count, 2)
+
+    def test_readback_requeries_and_requires_server_values(self):
+        module = legacy_duty_sheet_module()
+        expected = {"_areMEMO": "02帶隊官，20、22TP訓", "_arePSREMARK": "原備註"}
+        for actual in (expected, {**expected, "_areMEMO": "02帶隊官"}):
+            with self.subTest(actual=actual), mock.patch.object(module, "start_duty_postback", return_value="query-token") as start, mock.patch.object(
+                module, "wait_for_duty_postback", return_value=actual
+            ), mock.patch.object(module, "accept_pending_alerts"):
+                read = module.wait_for_duty_postback
+                if actual == expected:
+                    self.assertTrue(module.verify_saved_duty_fields(mock.Mock(), "1151030", expected))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "儲存後.*不一致"):
+                        module.verify_saved_duty_fields(mock.Mock(), "1151030", expected)
+                self.assertEqual(start.call_args.args[1:], ("1151030", "_btnQuery"))
+                self.assertEqual(read.call_args.kwargs["field_ids"], tuple(expected))
+                self.assertTrue(read.call_args.kwargs["require_existing"])
+
+    def test_readback_timeout_fails_after_one_query(self):
+        module = legacy_duty_sheet_module()
+        with mock.patch.object(module, "start_duty_postback", return_value="query-token") as start, mock.patch.object(
+            module, "wait_for_duty_postback", side_effect=RuntimeError("勤務表重新查詢逾時，讀回未確認。")
+        ), mock.patch.object(module, "accept_pending_alerts"):
+            with self.assertRaisesRegex(RuntimeError, "讀回未確認"):
+                module.verify_saved_duty_fields(mock.Mock(), "1151030", {"_areMEMO": "22TP訓"})
+        start.assert_called_once()
+
+    def _postback_driver(self, *, server_memo="02帶隊官，20、22TP訓", frozen="", wrong_date=False, missing_save=False):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser JavaScript fixtures")
+        driver = mock.Mock()
+        self.postback_state = {"document": 0, "marker": None, "clicks": [], "tokens": [], "pending": None,
+            "server_memo": server_memo, "frozen": frozen, "wrong_date": wrong_date, "missing_save": missing_save,
+            "values": {"_txtTaskDate": "1151030", "_areMEMO": "02帶隊官，20、22TP訓", "_arePSREMARK": "原備註"}}
+        def execute(script, *args):
+            state = self.postback_state
+            if "const [expectedDate, token, fieldIds" in script and state["pending"]:
+                state["pending"]["remaining"] -= 1
+                if state["pending"]["remaining"] <= 0 and state["pending"]["button"] != state["frozen"]:
+                    state["document"] += 1
+                    state["marker"] = None
+                    state["values"]["_areMEMO"] = state["server_memo"]
+                    if state["wrong_date"]:
+                        state["values"]["_txtTaskDate"] = "1151029"
+                    state["pending"] = None
+            harness = """
+const state = JSON.parse(process.argv[1]);
+const form = {id: 'frm'};
+const cells = Object.fromEntries(Object.entries(state.values).map(([id, value]) =>
+    [id, {id, value, form, focus() {}, dispatchEvent() {}}]));
+for (const id of ['_btnSave', '_btnQuery', '_btnDelete']) {
+    if (id === '_btnSave' && state.missing_save) continue;
+    cells[id] = {id, form, disabled: false, getAttribute() {return null;}, getClientRects() {return [{}];}, click() {
+        state.clicks.push(id); state.pending = {button: id, remaining: 2};
+    }};
+}
+cells._pln_8_1 = cells._pln_8_1 || {id: '_pln_8_1', form};
+global.Event = class Event {};
+const doc = {readyState: 'complete', __sinposmartDutyPostbackToken: state.marker,
+    getElementById: id => cells[id] || null,
+    querySelectorAll: selector => {const id = selector.match(/^\\[id="(.*)"\\]$/)[1]; return cells[id] ? [cells[id]] : [];} };
+const child = {document: doc, frames: [], getComputedStyle() {return {display:'block',visibility:'visible'};}};
+global.window = {top: {document: {getElementById() {return null;}}, frames: [child]}};
+const before = state.marker;
+const result = new Function(JSON.parse(process.argv[2]))(...JSON.parse(process.argv[3]));
+state.marker = doc.__sinposmartDutyPostbackToken;
+if (state.marker !== before && state.marker) state.tokens.push(state.marker);
+for (const id of Object.keys(state.values)) state.values[id] = cells[id].value;
+process.stdout.write(JSON.stringify({result, state}));
+"""
+            result = subprocess.run([node, "-e", harness, json.dumps(state), json.dumps(script), json.dumps(args)],
+                capture_output=True, text=True, encoding="utf-8", check=True, timeout=10)
+            observed = json.loads(result.stdout)
+            self.postback_state = observed["state"]
+            return observed["result"]
+        driver.execute_script.side_effect = execute
+        return driver
+
+    def _wait(self, module):
+        class WaitForFixture:
+            def until(self, predicate):
+                for _ in range(4):
+                    result = predicate(driver)
+                    if result:
+                        return result
+                raise module.TimeoutException("fixture document never changed")
+        driver = self.postback_driver
+        return WaitForFixture()
+
+    def test_save_and_requery_wait_for_two_independent_delayed_documents(self):
+        module = legacy_duty_sheet_module()
+        self.postback_driver = self._postback_driver()
+        driver, wait = self.postback_driver, self._wait(module)
+        token = module.start_duty_postback(driver, "1151030", "_btnSave")
+        self.assertEqual(self.postback_state["document"], 0)
+        module.wait_for_duty_postback(driver, wait, "1151030", token)
+        self.assertEqual(self.postback_state["document"], 1)
+        with mock.patch.object(module, "accept_pending_alerts"):
+            self.assertTrue(module.verify_saved_duty_fields(driver, "1151030", {"_areMEMO": "02帶隊官，20、22TP訓"}, wait))
+        self.assertEqual(self.postback_state["document"], 2)
+        self.assertEqual(self.postback_state["clicks"], ["_btnSave", "_btnQuery"])
+        self.assertEqual(len(set(self.postback_state["tokens"])), 2)
+        self.assertGreaterEqual(driver.switch_to.default_content.call_count, 6)
+
+    def test_unchanged_dirty_document_and_wrong_returned_date_never_pass(self):
+        module = legacy_duty_sheet_module()
+        for options in ({"frozen": "_btnQuery"}, {"wrong_date": True}):
+            with self.subTest(options=options), mock.patch.object(module, "accept_pending_alerts"):
+                self.postback_driver = self._postback_driver(**options)
+                with self.assertRaisesRegex(RuntimeError, "讀回逾時"):
+                    module.verify_saved_duty_fields(self.postback_driver, "1151030", {"_areMEMO": "02帶隊官，20、22TP訓"}, self._wait(module))
+                self.assertEqual(self.postback_state["clicks"], ["_btnQuery"])
+
+    def test_fresh_server_whitespace_is_normalized_but_content_is_not(self):
+        module = legacy_duty_sheet_module()
+        expected = {"_areMEMO": "02帶隊官，20、22TP訓"}
+        for value, valid in (("\t\r\n\u3000" + expected["_areMEMO"] + "\r\n\t", True),
+                             ("02帶隊官，20、22TP 訓", False), ("02帶隊官", False)):
+            with self.subTest(value=value), mock.patch.object(module, "accept_pending_alerts"):
+                self.postback_driver = self._postback_driver(server_memo=value)
+                if valid:
+                    self.assertTrue(module.verify_saved_duty_fields(self.postback_driver, "1151030", expected, self._wait(module)))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "儲存後.*不一致"):
+                        module.verify_saved_duty_fields(self.postback_driver, "1151030", expected, self._wait(module))
+
+    def _run_automation(self, *, batch_error=False, mission_error=False, annotation_error=False, **browser_options):
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "30號"
+        for column, label in {3: "值班", 4: "外勤", 5: "休息", 6: "備勤緊急救護", 10: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 14, "指揮官")
+        for row in range(10, 34):
+            hour = (row - 2) % 24
+            for column, value in {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20", 4: "31", 5: "30",
+                6: "16,28,1", 11: "8,9", 14: "2"}.items():
+                sheet.cell(row, column, value)
+        self.postback_driver = self._postback_driver(**browser_options)
+        driver = self.postback_driver
+        execute = driver.execute_script.side_effect
+        def browser_script(script, *args):
+            if "const targets = {};" in script:
+                if batch_error:
+                    from selenium.common.exceptions import JavascriptException
+                    raise JavascriptException("offline fixture batch failure")
+                self.postback_state["values"].update({key: "old" for key in args[0]})
+                return execute(script, *args)
+            if "collectDutyForm(window.top)" in script:
+                return execute(script, *args)
+            return False
+        driver.execute_script.side_effect = browser_script
+        def use_mock_browser(_open, verify, **_kwargs):
+            verify(driver)
+            return driver
+        success, error = mock.Mock(), mock.Mock()
+        stages = []
+        self.annotation_reports = []
+        def receive_annotation(report):
+            if annotation_error:
+                raise RuntimeError("offline annotation report failure")
+            self.annotation_reports.append(report)
+        with ExitStack() as stack:
+            for name, options in {
+                "ThreadPoolExecutor": {}, "log_status": {},
+                "retry_duty_number_popup_preflight": {"side_effect": use_mock_browser},
+                "preflight_duty_number_popup": {"return_value": "main"},
+                "expected_on_duty_numbers": {"return_value": ["1", "2", "8", "9", "16", "20", "28", "30", "31"]},
+                "resolve_duty_annotation_field": {"return_value": {"field_id": "_areMEMO", "frame_path": [0]}},
+                "step_config_popups": {}, "wait_for_duty_result_grid": {"return_value": True},
+                "WebDriverWait": {"side_effect": lambda *_args, **_kwargs: self._wait(module)},
+                "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
+                "step_fill_mission_cells": ({"side_effect": RuntimeError("offline mission failure")} if mission_error
+                    else {"return_value": {"status": "saved"}}), "verify_mission_cells": {"return_value": []},
+                "accept_pending_alerts": {"return_value": []}, "load_config": {"return_value": {"notification": {"enabled": False}}},
+                "build_driver": {"side_effect": AssertionError("不得啟動真實瀏覽器")},
+            }.items():
+                stack.enter_context(mock.patch.object(module, name, **options))
+            stack.enter_context(mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook))
+            stack.enter_context(mock.patch.object(module.time, "sleep"))
+            result = module.start_automation("fixture", "fixture", "1151030", "fixture.xlsm", {}, show_dialogs=False,
+                success_callback=success, error_callback=error, stage_callback=stages.append,
+                annotation_callback=receive_annotation,
+                personnel_deductions=((("20", "22"), "TP訓"),))
+            mission_calls = module.step_fill_mission_cells.call_count
+        return result, success, error, stages, mission_calls
+
+    def test_actual_save_query_pipeline_succeeds_only_after_fresh_readback(self):
+        result, success, error, stages, mission_calls = self._run_automation()
+        self.assertTrue(result)
+        success.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(mission_calls, 1)
+        self.assertLess(stages.index("duty_verify"), stages.index("vehicle_form_open"))
+        self.assertEqual(self.postback_state["document"], 2)
+        self.assertEqual(self.postback_state["clicks"], ["_btnSave", "_btnQuery"])
+
+    def test_annotation_report_requires_readback_and_survives_later_mission_failure(self):
+        for options, success, verifications in (
+            ({}, True, ["prepared", "verified"]),
+            ({"mission_error": True}, False, ["prepared", "verified"]),
+            ({"server_memo": "02帶隊官"}, False, ["prepared"]),
+        ):
+            with self.subTest(options=options):
+                result, *_ = self._run_automation(**options)
+                self.assertEqual(result, success)
+                self.assertEqual([report["verification"] for report in self.annotation_reports], verifications)
+                for report in self.annotation_reports:
+                    self.assertEqual(report, {"text": "02帶隊官，20、22TP訓", "verification": report["verification"],
+                        "target_date": "2026/10/30", "deduction_count": 1})
+
+    def test_annotation_report_failure_stops_before_browser_and_reports_failure(self):
+        result, success, error, stages, mission_calls = self._run_automation(annotation_error=True)
+        self.assertFalse(result)
+        success.assert_not_called()
+        error.assert_called_once_with("offline annotation report failure")
+        self.assertEqual(stages[-1], "preflight")
+        self.assertEqual(mission_calls, 0)
+        self.postback_driver.execute_script.assert_not_called()
+
+    def test_actual_pipeline_never_reports_success_after_duty_failure(self):
+        for options, stage, clicks in (
+            ({"batch_error": True}, "duty_fill", []),
+            ({"missing_save": True}, "duty_save", []),
+            ({"frozen": "_btnSave"}, "duty_save", ["_btnSave"]),
+            ({"frozen": "_btnQuery"}, "duty_verify", ["_btnSave", "_btnQuery"]),
+            ({"server_memo": "02帶隊官"}, "duty_verify", ["_btnSave", "_btnQuery"]),
+        ):
+            with self.subTest(options=options):
+                result, success, error, stages, mission_calls = self._run_automation(**options)
+                self.assertFalse(result)
+                success.assert_not_called()
+                error.assert_called_once()
+                self.assertEqual(stages[-1], stage)
+                self.assertEqual(mission_calls, 0)
+                self.assertEqual(self.postback_state["clicks"], clicks)
+
+
 class DutyAnnotationTests(unittest.TestCase):
     def _sheet(self):
         module = legacy_duty_sheet_module()
@@ -8344,6 +8652,8 @@ process.stdout.write(JSON.stringify(result));
                 "wait_for_duty_query_completion": {"side_effect": ["existing", "setup"]},
                 "preflight_duty_number_popup": {"return_value": "main"},
                 "wait_for_duty_result_grid": {"return_value": True}, "step_navigate_to_task_table": {},
+                "start_duty_postback": {"return_value": "saved-token"},
+                "wait_for_duty_postback": {"return_value": {}}, "verify_saved_duty_fields": {"return_value": True},
                 "step_fill_mission_cells": {"side_effect": RuntimeError("offline-stop-before-save")},
                 "build_driver": {"side_effect": AssertionError("測試不得啟動真實瀏覽器")},
             }.items():
@@ -8413,6 +8723,8 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
                 "preflight_duty_number_popup": {"return_value": "main"},
                 "step_config_popups": {}, "wait_for_duty_result_grid": {"return_value": True},
                 "resolve_duty_annotation_field": {"return_value": {"field_id": "_areMEMO", "frame_path": []}},
+                "start_duty_postback": {"return_value": "saved-token"},
+                "wait_for_duty_postback": {"return_value": {}}, "verify_saved_duty_fields": {"return_value": True},
                 "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
                 "trainee_numbers_from_workbook": {"return_value": set()},
                 "expected_on_duty_numbers_from_daily_sheet": {"return_value": normal_staff},
@@ -8602,14 +8914,15 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
             self.skipTest("Node.js is required for the isolated browser-script contract")
         module = legacy_duty_sheet_module()
         driver = mock.Mock()
+        driver.execute_script.return_value = {"filled_ids": ["_pln_8_4"]}
         module.step_batch_fill_duty(driver, {"_pln_8_4": ""})
         script, payload = driver.execute_script.call_args.args
         harness = """
 const cell = {value:'2', focus(){}, dispatchEvent(){}};
 global.window = {top:{document:{getElementById(){return cell;}}, frames:[], alert(){}, confirm(){}}};
 global.Event = class Event {};
-const count = new Function(SCRIPT)(PAYLOAD);
-if (cell.value !== '' || count !== 1) throw new Error('Unstaffed ambulance cell was not cleared');
+const result = new Function(SCRIPT)(PAYLOAD);
+if (cell.value !== '' || result.filled_ids.length !== 1) throw new Error('Unstaffed ambulance cell was not cleared');
 """.replace("SCRIPT", json.dumps(script)).replace("PAYLOAD", json.dumps(payload))
         result = subprocess.run([node, "-e", harness], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
