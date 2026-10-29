@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.29.1333` | 2026-10-29 13:33（台北時間） | 新增帶隊官附記、人力扣除日期設定與獨立欄位檢查，清理訓練及備註開頭格式。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.1333) |
 | `2026.10.29.1052` | 2026-10-29 10:52（台北時間） | 同日多班分段顯示，保留白天與跨午夜班，修正單獨深夜或清晨班誤顯示無班。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.1052) |
 | `2026.10.29.0848` | 2026-10-29 08:48（台北時間） | 修正瀏覽器啟動逾時後的排隊行為，新增登入及通報的安全分階段診斷，避免虛構重試。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.0848) |
 | `2026.10.28.1858` | 2026-10-28 18:58（台北時間） | 通報驗證回報實際安全錯誤分類與等待狀態，排除關閉取消誤報，驗證與收取紀錄分開。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.28.1858) |

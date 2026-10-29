@@ -4794,6 +4794,7 @@ try {
                     module, "step_config_popups"
                 ) as configure, mock.patch.object(
                     module, "wait_for_duty_result_grid", return_value=True
+                ), mock.patch.object(module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
                 ), mock.patch.object(module, "step_batch_fill_duty") as fill_duty, mock.patch.object(
                     module, "step_navigate_to_task_table"
                 ), mock.patch.object(module, "super_js_execute", return_value=True), mock.patch.object(
@@ -4863,6 +4864,8 @@ try {
                 ), mock.patch.object(module, "preflight_duty_number_popup", return_value="main") as preflight, mock.patch.object(
                     module, "step_config_popups"
                 ) as configure, mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
+                    module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
+                ), mock.patch.object(
                     module, "step_batch_fill_duty"
                 ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
                     module, "super_js_execute", return_value=True
@@ -4983,6 +4986,8 @@ try {
         ), mock.patch.object(module, "preflight_duty_number_popup", return_value="main"), mock.patch.object(
             module, "step_config_popups"
         ), mock.patch.object(module, "wait_for_duty_result_grid", return_value=True), mock.patch.object(
+            module, "resolve_duty_annotation_field", return_value={"field_id": "_areMEMO", "frame_path": []}
+        ), mock.patch.object(
             module, "step_batch_fill_duty"
         ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
             module, "super_js_execute", return_value=True
@@ -8221,8 +8226,162 @@ if ($record.close_failure) {{ throw 'Stale failure contaminated a successful upd
         self.assertEqual(len(scheduled), 2)
 
 
+class DutyAnnotationTests(unittest.TestCase):
+    def _sheet(self):
+        module = legacy_duty_sheet_module()
+        workbook = module.openpyxl.Workbook()
+        sheet = workbook.active
+        for column, label in {3: "值班", 4: "外勤", 5: "休息", 6: "備勤緊急救護", 10: "備勤救災"}.items():
+            sheet.cell(5, column, label)
+        sheet.cell(6, 14, "指揮官")
+        sheet.cell(10, 2, "08-09")
+        return module, workbook, sheet
+
+    def test_leaders_follow_normal_staff_and_actual_duty_projection(self):
+        module, workbook, sheet = self._sheet()
+        sheet.cell(10, 3, "2")
+        sheet.cell(10, 6, "3,03,29")
+        sheet.cell(10, 11, "4,5,8")
+        sheet.cell(10, 14, "1")
+        for normal, excluded, expected in (
+            (["01", "2", "3", "4", "5", "29"], {"29"}, ["02", "03", "04", "05"]),
+            (["2", "3", "4", "5", "8"], set(), ["02", "03", "04", "05"]),
+            (["2", "3", "4", "5", "8"], {"3", "5"}, ["02", "04"]),
+        ):
+            with self.subTest(normal=normal, excluded=excluded), mock.patch.object(
+                module, "expected_on_duty_numbers", return_value=normal
+            ) as on_duty:
+                self.assertEqual(module.duty_leader_numbers(workbook, sheet, 1, excluded), expected)
+                on_duty.assert_called_once_with(workbook, sheet, 1, excluded)
+        self.assertEqual(sheet.cell(10, 6).value, "3,03,29")
+
+    def test_leaders_ignore_external_and_single_unprojected_ambulance2_candidate(self):
+        module, workbook, sheet = self._sheet()
+        sheet.cell(10, 3, "20")
+        sheet.cell(10, 4, "2,3,4,5")
+        sheet.cell(10, 6, "16,28")
+        sheet.cell(10, 11, "2")
+        for normal, expected in ((["2", "3", "4", "5"], ["04", "05"]), (["2"], ["02"]), ([], [])):
+            with self.subTest(normal=normal), mock.patch.object(module, "expected_on_duty_numbers", return_value=normal):
+                self.assertEqual(module.duty_leader_numbers(workbook, sheet, 1, set()), expected)
+
+    def test_annotation_groups_equal_reasons_and_preserves_distinct_reasons(self):
+        module = legacy_duty_sheet_module()
+        deductions = ((("22", "20", "020"), "TP訓"), (("05", "4"), "帶隊官"), (("23",), "公假"), (("24",), "TP訓"))
+        self.assertEqual(module.build_duty_annotation(["05", "3", "03"], deductions),
+            "03、04、05帶隊官，20、22、24TP訓，23公假")
+        self.assertEqual(module.build_duty_annotation([], ()), "")
+        self.assertEqual(deductions[0][0], ("22", "20", "020"))
+
+    def test_original_remark_and_training_only_lose_their_leading_ordinal(self):
+        module = legacy_duty_sheet_module()
+        self.assertEqual(module.clean_duty_text("\u3000\ufeff 二、08-10訓練，二、保留\n 16-18", "二"),
+            "08-10訓練，二、保留\n 16-18")
+        self.assertEqual(module.clean_duty_text("\u3000一、原備註 08-翌08", "一"), "原備註 08-翌08")
+        self.assertEqual(module.clean_duty_text("二、原備註", "一"), "二、原備註")
+        self.assertEqual(module.clean_duty_text(None, "一"), "")
+
+    def _resolve_dom(self, rows, frames=()):
+        module = legacy_duty_sheet_module()
+        driver = mock.Mock()
+        def execute(script):
+            harness = """
+const source = JSON.parse(process.argv[1]);
+function makeWindow(spec) {
+    const rows = spec.rows.map(row => ({
+        cells: [{textContent: row.label}],
+        querySelectorAll: () => row.fields.map(field => ({
+            id: field.id || '', tagName: field.tag || 'TEXTAREA', type: field.type || 'text'
+        }))
+    }));
+    return {document: {querySelectorAll: selector => selector === 'tr' ? rows :
+        rows.flatMap(row => row.querySelectorAll()).filter(field => field.id === '_areMEMO')},
+        frames: (spec.frames || []).map(makeWindow)};
+}
+const top = makeWindow(source);
+global.window = {top};
+const result = new Function(JSON.parse(process.argv[2]))();
+process.stdout.write(JSON.stringify(result));
+"""
+            result = subprocess.run(["node", "-e", harness, json.dumps({"rows": rows, "frames": frames}), json.dumps(script)],
+                capture_output=True, text=True, encoding="utf-8", check=True, timeout=10)
+            return json.loads(result.stdout)
+        driver.execute_script.side_effect = execute
+        return module.resolve_duty_annotation_field(driver)
+
+    def test_annotation_resolver_checks_confirmed_id_label_and_frames_without_values(self):
+        original = [{"label": "備註", "fields": [{"id": "_arePSREMARK"}]},
+            {"label": "在隊訓練", "fields": [{"id": "_areTeamTra"}]}]
+        field = {"label": "\u3000附 記：", "fields": [{"id": "_areMEMO"}]}
+        self.assertEqual(self._resolve_dom(original, [{"rows": [field]}]),
+            {"field_id": "_areMEMO", "frame_path": [0]})
+        for rows in ([field, field], [field, {"label": "備註", "fields": [{"id": "_areMEMO"}]}],
+            [{"label": "附記", "fields": [{"id": "_areMemo"}]}],
+            [{"label": "附記", "fields": [{"id": "_arePSREMARK"}]}],
+            [{"label": "備註", "fields": [{"id": "_areMEMO"}]}],
+            [{"label": "附記", "fields": [{"id": "_areMEMO"}, {"id": "other", "tag": "INPUT"}]}],
+            [{"label": "附記", "fields": [{"id": ""}]}], []):
+            with self.subTest(rows=rows), self.assertRaisesRegex(RuntimeError, "附記.*未執行登打"):
+                self._resolve_dom(rows)
+
+    def _automation_preflight(self, resolver):
+        module, workbook, sheet = self._sheet()
+        sheet.title = "1號"
+        for column, value in {3: "20", 6: "16,28", 11: "8,9", 14: "2"}.items():
+            sheet.cell(10, column, value)
+        driver = mock.Mock()
+        driver.execute_script.return_value = False
+        error = mock.Mock()
+        calls = mock.Mock()
+        with ExitStack() as stack:
+            for name, options in {
+                "ThreadPoolExecutor": {}, "log_status": {},
+                "expected_on_duty_numbers": {"return_value": ["2", "8", "9", "16", "20", "28"]},
+                "validate_daily_sheet_assignments": {"return_value": []},
+                "retry_duty_browser_session_open": {"return_value": driver},
+                "step_prepare_content": {"return_value": True}, "super_js_execute": {"return_value": True},
+                "click_duty_query_button_when_ready": {},
+                "wait_for_duty_query_completion": {"side_effect": ["existing", "setup"]},
+                "preflight_duty_number_popup": {"return_value": "main"},
+                "wait_for_duty_result_grid": {"return_value": True}, "step_navigate_to_task_table": {},
+                "step_fill_mission_cells": {"side_effect": RuntimeError("offline-stop-before-save")},
+                "build_driver": {"side_effect": AssertionError("測試不得啟動真實瀏覽器")},
+            }.items():
+                stack.enter_context(mock.patch.object(module, name, **options))
+            for name, label, options in (
+                ("resolve_duty_annotation_field", "resolve", {"side_effect": resolver}),
+                ("ensure_existing_duty_delete", "delete", {}), ("step_config_popups", "config", {}),
+                ("step_batch_fill_duty", "fill", {}), ("quit_driver", "close", {}),
+            ):
+                calls.attach_mock(stack.enter_context(mock.patch.object(module, name, **options)), label)
+            stack.enter_context(mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook))
+            stack.enter_context(mock.patch.object(module.time, "sleep"))
+            result = module.start_automation("test-user", "test-password", "1151101", "test.xlsm", {},
+                error_callback=error, show_dialogs=False, personnel_deductions=((("22",), "TP訓"),))
+        self.assertFalse(result)
+        return calls, error, driver
+
+    def test_missing_annotation_stops_before_existing_delete_and_closes_its_browser(self):
+        calls, error, driver = self._automation_preflight(RuntimeError("勤務表附記欄位無法唯一確認，未執行登打。"))
+        error.assert_called_once_with("勤務表附記欄位無法唯一確認，未執行登打。")
+        calls.delete.assert_not_called()
+        calls.config.assert_not_called()
+        calls.fill.assert_not_called()
+        calls.close.assert_called_once_with(driver)
+
+    def test_annotation_preflight_precedes_delete_and_rechecks_before_fill(self):
+        field = {"field_id": "_areMEMO", "frame_path": [0]}
+        calls, error, _driver = self._automation_preflight([field, field])
+        error.assert_called_once_with("offline-stop-before-save")
+        self.assertEqual([call[0] for call in calls.mock_calls], ["resolve", "delete", "config", "resolve", "fill"])
+        self.assertEqual(calls.fill.call_args.args[1]["_areMEMO"], "02帶隊官，22TP訓")
+        calls, error, _driver = self._automation_preflight([field, {"field_id": "_areMEMO", "frame_path": [1]}])
+        error.assert_called_once_with("勤務表附記欄位位置已變更，未執行登打。")
+        calls.fill.assert_not_called()
+
+
 class DutyAmbulanceSplitTests(unittest.TestCase):
-    def _payloads(self, standby, commander, external, ambulance=None):
+    def _payloads(self, standby, commander, external, ambulance=None, *, personnel_deductions=(), remarks=()):
         module = legacy_duty_sheet_module()
         workbook = module.openpyxl.Workbook()
         sheet = workbook.active
@@ -8231,6 +8390,8 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
         for column, label in {3: "值班", 4: "外勤", 5: "休息", 6: "備勤緊急救護", 10: "備勤救災"}.items():
             sheet.cell(5, column, label)
         sheet.cell(6, 14, "指揮官")
+        for cell, value in remarks:
+            sheet[cell] = value
         for row in range(10, 34):
             hour = (row - 2) % 24
             values = {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20", 4: ",".join(external),
@@ -8251,6 +8412,7 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
                 "retry_duty_number_popup_preflight": {"side_effect": use_mock_browser},
                 "preflight_duty_number_popup": {"return_value": "main"},
                 "step_config_popups": {}, "wait_for_duty_result_grid": {"return_value": True},
+                "resolve_duty_annotation_field": {"return_value": {"field_id": "_areMEMO", "frame_path": []}},
                 "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
                 "trainee_numbers_from_workbook": {"return_value": set()},
                 "expected_on_duty_numbers_from_daily_sheet": {"return_value": normal_staff},
@@ -8263,10 +8425,21 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
             fill_mission = stack.enter_context(mock.patch.object(module, "step_fill_mission_cells",
                 side_effect=RuntimeError("offline-stop-before-save")))
             result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
-                error_callback=error, show_dialogs=False)
+                error_callback=error, show_dialogs=False, personnel_deductions=personnel_deductions)
         self.assertFalse(result)
         error.assert_called_once_with("offline-stop-before-save")
         return fill_duty.call_args.args[1], fill_mission.call_args.args[1], sheet
+
+    def test_annotation_is_separate_from_original_remark_and_training(self):
+        duty, mission, sheet = self._payloads(["4", "5", "8"], ["2"], ["31"], ["16", "28", "3"],
+            personnel_deductions=((("22", "20"), "TP訓"),),
+            remarks=(("C34", "\u3000一、原備註 08-翌08"), ("C35", "\u3000二、08-10訓練，二、保留")))
+        self.assertEqual(duty["_areMEMO"], "03、04、05帶隊官，20、22TP訓")
+        self.assertEqual(duty["_arePSREMARK"], "原備註 08-翌08")
+        self.assertEqual(duty["_areTeamTra"], "08-10訓練，二、保留")
+        self.assertNotIn("_areMEMO", mission)
+        self.assertEqual(sheet["C34"].value, "\u3000一、原備註 08-翌08")
+        self.assertEqual(sheet["C35"].value, "\u3000二、08-10訓練，二、保留")
 
     def test_duty_and_mission_use_distinct_ambulance2_fallbacks(self):
         for standby, commander, external, expected_duty, expected_mission, remaining in (

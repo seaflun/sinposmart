@@ -2792,6 +2792,80 @@ class DutyTaskProjectionTests(unittest.TestCase):
 
 
 class DutySheetServiceTests(unittest.TestCase):
+    def test_personnel_deductions_persist_edit_and_expire_by_date(self):
+        from datetime import datetime
+        from app_core.duty_sheet_service import DutySheetService
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = DutySheetService(Path(directory))
+            rows = service.save_personnel_deduction("22、20,20", "2099/11/01", "2099/11/03", " TP訓 ")
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["people"], ["20", "22"])
+            reopened = DutySheetService(Path(directory))
+            self.assertEqual(reopened.load_personnel_deductions(datetime(2099, 11, 3)), rows)
+            self.assertEqual(reopened.load_personnel_deductions(datetime(2099, 11, 4)), [])
+            updated = reopened.save_personnel_deduction("02、03", "2099-11-02", "2099-11-04", "公差", row["id"])
+            self.assertEqual(len(updated), 1)
+            self.assertEqual(updated[0]["id"], row["id"])
+            self.assertEqual(updated[0]["start_date"], "2099/11/02")
+            self.assertEqual(updated[0]["people"], ["02", "03"])
+            self.assertEqual(reopened.remove_personnel_deduction(row["id"]), [])
+
+    def test_personnel_deductions_snapshot_uses_target_date_and_survives_edits(self):
+        from app_core.duty_sheet_service import DutySheetService, DutySheetRequest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            book = root / "test.xlsm"
+            book.write_bytes(b"fixture")
+            service = DutySheetService(root)
+            row = service.save_personnel_deduction("20、22", "2099/11/01", "2099/11/03", "TP訓")[0]
+            request = DutySheetRequest("fixture-user", "fixture-password", str(book), "2099/11/03", "a", "b", "c", "d", False)
+            frozen = service.validate(request)
+            self.assertEqual(frozen.personnel_deductions, ((("20", "22"), "TP訓"),))
+            service.save_personnel_deduction("20", "2099/11/01", "2099/11/04", "公差", row["id"])
+            self.assertEqual(service.validate(frozen).personnel_deductions, frozen.personnel_deductions)
+            self.assertEqual(service.validate(request).personnel_deductions, ((("20",), "公差"),))
+            outside = service.validate(DutySheetRequest("u", "p", str(book), "2099/11/05", "a", "b", "c", "d", False))
+            self.assertEqual(outside.personnel_deductions, ())
+
+    def test_personnel_deductions_validation_and_corruption_never_overwrite_data(self):
+        from app_core.duty_sheet_service import DutySheetService, DutySheetValidationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = DutySheetService(root)
+            path = root / "runtime_outputs/duty_personnel_deductions.json"
+            for people, start, end, reason in (("0", "2099/11/01", "2099/11/03", "TP訓"),
+                                               ("20x", "2099/11/01", "2099/11/03", "TP訓"),
+                                               ("20", "2099/11/04", "2099/11/03", "TP訓"),
+                                               ("20", "2099/02/30", "2099/11/03", "TP訓"),
+                                               ("20", "2099/11/01", "2099/11/03", "")):
+                with self.subTest(people=people, start=start, reason=reason), self.assertRaises(DutySheetValidationError):
+                    service.save_personnel_deduction(people, start, end, reason)
+                self.assertFalse(path.exists())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{broken", encoding="utf-8")
+            before = path.read_bytes()
+            with self.assertRaises(DutySheetValidationError):
+                service.load_personnel_deductions()
+            with self.assertRaises(DutySheetValidationError):
+                service.save_personnel_deduction("20", "2099/11/01", "2099/11/03", "TP訓")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_personnel_deductions_failed_atomic_save_preserves_previous_version(self):
+        from app_core.duty_sheet_service import DutySheetService, DutySheetValidationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = DutySheetService(Path(directory))
+            rows = service.save_personnel_deduction("20", "2099/11/01", "2099/11/03", "TP訓")
+            before = service.personnel_deductions_path.read_bytes()
+            with patch("app_core.duty_sheet_service.os.replace", side_effect=OSError("fixture")):
+                with self.assertRaises(DutySheetValidationError):
+                    service.save_personnel_deduction("22", "2099/11/01", "2099/11/03", "公差", rows[0]["id"])
+            self.assertEqual(service.personnel_deductions_path.read_bytes(), before)
+
     def test_loading_execution_core_does_not_import_legacy_tk_ui(self) -> None:
         command = (
             "import sys; "
@@ -3002,6 +3076,7 @@ class DutySheetServiceTests(unittest.TestCase):
             )
             service = DutySheetService(package_root, module_loader=lambda _path: legacy)
             progress: list[str] = []
+            service.save_personnel_deduction("20、22", "2026/07/29", "2026/07/30", "TP訓")
             request = DutySheetRequest(
                 "user10", "session-secret", str(workbook), "2026/07/30",
                 "A", "S", "M1", "M2", False,
@@ -3011,6 +3086,7 @@ class DutySheetServiceTests(unittest.TestCase):
 
             self.assertEqual(result, "勤務表已登打完成：1150730")
             self.assertTrue(automation_calls[0]["keep_browser_open_on_success"])
+            self.assertEqual(automation_calls[0]["personnel_deductions"], ((("20", "22"), "TP訓"),))
             success_message[0] = "已登打並存檔完畢！\n勤務表截圖保存失敗：測試訊息"
             screenshot_warning_result = service.execute(request)
             self.assertEqual(
@@ -12280,6 +12356,77 @@ class QtShellTests(unittest.TestCase):
             self.assertEqual(repository.path.read_bytes(), before)
             self.assertNotIn("fixture-remote-notice", repository.notice_repository().path.read_text(encoding="utf-8"))
 
+    def test_qml_duty_personnel_card_persists_add_edit_and_remove(self):
+        from PySide6.QtCore import QObject, QMetaObject, Qt
+        from PySide6.QtTest import QTest
+        from app_core.credential_repository import CredentialRepository
+        from app_core.duty_sheet_service import DutySheetService
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            root_dir = Path(directory)
+            service = DutySheetService(root_dir)
+            controller = AppController(
+                repository=CredentialRepository(root_dir / "saved.json", "test", None),
+                duty_sheet_service=service, read_only_acceptance=True, offline_fixture_acceptance=True,
+            )
+            duty = controller.dutySheetController
+            duty._read_only_acceptance = False
+            duty.loadDefaults()
+            attempt = controller._session_state.begin_login()
+            controller._session_state.complete_login(attempt, LoginSession(
+                "10", "fixture-user", "fixture-password", verified=True, actor_name="測試員"))
+            controller.sessionController.sessionChanged.emit()
+            engine = create_engine(controller)
+            window = engine.rootObjects()[0]
+            def find_visual(name):
+                stack = [window.contentItem()]
+                while stack:
+                    item = stack.pop()
+                    if item.objectName() == name:
+                        return item
+                    stack.extend(item.childItems())
+                self.fail(f"找不到人力扣除控制項：{name}")
+            try:
+                panel = window.findChild(QObject, "dutySheetDialog")
+                self.assertTrue(QMetaObject.invokeMethod(panel, "open", Qt.DirectConnection))
+                QTest.qWait(100)
+                fields = {key: window.findChild(QObject, "dutyPersonnelDeduction" + key + "Field")
+                          for key in ("People", "StartDate", "EndDate", "Reason")}
+                for key, value in (("People", "20、22"), ("StartDate", "2099/11/01"),
+                                   ("EndDate", "2099/11/03"), ("Reason", "TP訓")):
+                    fields[key].setProperty("text", value)
+                save = window.findChild(QObject, "dutyPersonnelDeductionSaveButton")
+                self.assertTrue(QMetaObject.invokeMethod(save, "clicked", Qt.DirectConnection))
+                QTest.qWait(50)
+                rows = DutySheetService(root_dir).load_personnel_deductions()
+                self.assertEqual([(row["people"], row["reason"]) for row in rows], [(["20", "22"], "TP訓")])
+                record_id = rows[0]["id"]
+                edit = find_visual("dutyPersonnelDeductionEditButton_0")
+                self.assertTrue(QMetaObject.invokeMethod(edit, "clicked", Qt.DirectConnection))
+                fields["Reason"].setProperty("text", "公差")
+                self.assertTrue(QMetaObject.invokeMethod(save, "clicked", Qt.DirectConnection))
+                QTest.qWait(50)
+                updated = DutySheetService(root_dir).load_personnel_deductions()
+                self.assertEqual((updated[0]["id"], updated[0]["reason"]), (record_id, "公差"))
+                duty.set_automatic_preparing(True)
+                self.assertFalse(duty.savePersonnelDeduction("23", "2099/11/01", "2099/11/03", "TP訓", ""))
+                self.assertFalse(duty.removePersonnelDeduction(record_id))
+                duty.set_automatic_preparing(False)
+                remove = find_visual("dutyPersonnelDeductionRemoveButton_0")
+                self.assertTrue(QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection))
+                QTest.qWait(50)
+                self.assertEqual(DutySheetService(root_dir).load_personnel_deductions(), [])
+                duty._read_only_acceptance = True
+                self.assertFalse(duty.savePersonnelDeduction("23", "2099/11/01", "2099/11/03", "TP訓", ""))
+            finally:
+                window.close()
+                controller.shutdown()
+                engine.deleteLater()
+                self._flush_qt_deferred_deletes()
+
     def test_notice_failure_queues_one_problem_package_for_the_first_report_part(self):
         from app_core.credential_repository import CredentialRepository
         from app_core.diagnostics_service import DiagnosticsService
@@ -14420,8 +14567,9 @@ class QtShellTests(unittest.TestCase):
         ):
             self.assertNotIn(unauthorized, panel)
         self.assertIn("ToolPanelHeader {", panel)
-        self.assertEqual(panel.count("ToolFormCard {"), 2)
+        self.assertEqual(panel.count("ToolFormCard {"), 3)
         self.assertLess(panel.index('text: "來源檔案及日期設定"'), panel.index('text: "主力車設定"'))
+        self.assertLess(panel.index('text: "主力車設定"'), panel.index('text: "人力扣除"'))
         self.assertNotIn('objectName: "dutySheetCloseButton"', panel)
         self.assertLess(panel.index('objectName: "dutySheetStatusBar"'), panel.index('objectName: "dutySheetRunButton"'))
 

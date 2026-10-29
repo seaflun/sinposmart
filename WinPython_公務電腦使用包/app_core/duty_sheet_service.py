@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, Iterator
+from uuid import uuid4
 
 from app_core.duty_task_projection import parse_roc_date
 from app_core.schedule_repository import business_roc_date
@@ -23,6 +25,7 @@ from app_core.schedule_repository import business_roc_date
 LEGACY_MODULE_NAME = "_sinposmart_qt_duty_sheet_automation"
 LEGACY_SCRIPT_NAME = "sinposmart_1.py"
 DUTY_SHEET_WORKDIR_LOCK = threading.Lock()
+DUTY_PERSONNEL_LOCK = threading.RLock()
 
 
 class DutySheetValidationError(ValueError):
@@ -70,6 +73,7 @@ class DutySheetRequest:
     notification_enabled: bool
     automatic: bool = False
     workbook_signature: WorkbookSignature | None = None
+    personnel_deductions: tuple[tuple[tuple[str, ...], str], ...] | None = None
 
     @property
     def cars_config(self) -> dict[str, str]:
@@ -134,6 +138,109 @@ class DutySheetService:
         self.project_dir = self.package_root / "duty_sheet_legacy"
         self.config_path = self.project_dir / "config.json"
         self.module_loader = module_loader
+
+    @property
+    def personnel_deductions_path(self) -> Path:
+        return self.package_root / "runtime_outputs" / "duty_personnel_deductions.json"
+
+    @staticmethod
+    def _personnel_date(value: str) -> str:
+        try:
+            return datetime.strptime(str(value).strip().replace("-", "/"), "%Y/%m/%d").strftime("%Y/%m/%d")
+        except (ValueError, TypeError) as exc:
+            raise DutySheetValidationError("人力扣除日期須為 YYYY/MM/DD。") from exc
+
+    @staticmethod
+    def _personnel_people(value) -> list[str]:
+        parts = re.split(r"[,，、;；\s]+", value.strip()) if isinstance(value, str) else value
+        if not isinstance(parts, (list, tuple)) or not parts:
+            raise DutySheetValidationError("請輸入人員番號，多人以頓號或逗號分隔。")
+        if any(not isinstance(part, str) or not re.fullmatch(r"[0-9]{1,3}", part)
+               or int(part) == 0 for part in parts):
+            raise DutySheetValidationError("人員番號須為 1～999 的數字。")
+        return [f"{number:02d}" for number in sorted({int(part) for part in parts})]
+
+    @staticmethod
+    def _personnel_reason(value) -> str:
+        if not isinstance(value, str) or not value.strip() or any(ord(char) < 32 for char in value):
+            raise DutySheetValidationError("請輸入單行的人力扣除原因。")
+        return value.strip()
+
+    def _read_personnel_deductions(self) -> list[dict]:
+        path = self.personnel_deductions_path
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
+                    or payload["schema_version"] != 1 or not isinstance(payload.get("records"), list)):
+                raise ValueError("schema")
+            records, ids = [], set()
+            for row in payload["records"]:
+                if not isinstance(row, dict):
+                    raise ValueError("record")
+                record_id = row["id"]
+                if (not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", record_id)
+                        or record_id in ids):
+                    raise ValueError("id")
+                start, end = self._personnel_date(row["start_date"]), self._personnel_date(row["end_date"])
+                if start > end:
+                    raise ValueError("date order")
+                records.append({"id": record_id, "people": self._personnel_people(row["people"]),
+                                "start_date": start, "end_date": end, "reason": self._personnel_reason(row["reason"])})
+                ids.add(record_id)
+            return records
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+            raise DutySheetValidationError("人力扣除設定無法讀取，未覆寫原檔。") from exc
+
+    def _write_personnel_deductions(self, records: list[dict]) -> None:
+        path = self.personnel_deductions_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix="duty-personnel-", suffix=".tmp", dir=path.parent)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump({"schema_version": 1, "records": records}, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            raise DutySheetValidationError("人力扣除設定無法儲存，原有內容未變更。") from exc
+
+    def load_personnel_deductions(self, now: datetime | None = None, *, include_expired: bool = False) -> list[dict]:
+        today = (now or datetime.now()).strftime("%Y/%m/%d")
+        with DUTY_PERSONNEL_LOCK:
+            return [row for row in self._read_personnel_deductions() if include_expired or row["end_date"] >= today]
+
+    def save_personnel_deduction(self, people: str, start_date: str, end_date: str,
+                                reason: str, record_id: str = "") -> list[dict]:
+        start, end = self._personnel_date(start_date), self._personnel_date(end_date)
+        if start > end:
+            raise DutySheetValidationError("結束日不能早於起始日。")
+        normalized = {"id": record_id or str(uuid4()), "people": self._personnel_people(people),
+                      "start_date": start, "end_date": end, "reason": self._personnel_reason(reason)}
+        with DUTY_PERSONNEL_LOCK:
+            records = self._read_personnel_deductions()
+            if record_id and not any(row["id"] == record_id for row in records):
+                raise DutySheetValidationError("這筆人力扣除已不存在，請重新載入。")
+            records = [normalized if row["id"] == record_id else row for row in records]
+            if not record_id:
+                records.append(normalized)
+            self._write_personnel_deductions(records)
+            return self.load_personnel_deductions()
+
+    def remove_personnel_deduction(self, record_id: str) -> list[dict]:
+        with DUTY_PERSONNEL_LOCK:
+            records = self._read_personnel_deductions()
+            if not record_id or not any(row["id"] == record_id for row in records):
+                raise DutySheetValidationError("這筆人力扣除已不存在，請重新載入。")
+            self._write_personnel_deductions([row for row in records if row["id"] != record_id])
+            return self.load_personnel_deductions()
+
+    def _personnel_snapshot(self, target_date: str) -> tuple[tuple[tuple[str, ...], str], ...]:
+        target = self._personnel_date(target_date)
+        return tuple((tuple(row["people"]), row["reason"])
+                     for row in self.load_personnel_deductions(include_expired=True)
+                     if row["start_date"] <= target <= row["end_date"])
 
     def load_defaults(self, now: datetime | None = None) -> DutySheetDefaults:
         config = self._load_legacy_display_config()
@@ -273,6 +380,8 @@ class DutySheetService:
             notification_enabled=bool(request.notification_enabled),
             automatic=request.automatic,
             workbook_signature=request.workbook_signature,
+            personnel_deductions=(self._personnel_snapshot(request.target_date)
+                                  if request.personnel_deductions is None else request.personnel_deductions),
         )
 
     def prepare_automatic_request(self, user_id: str, password: str, target_date: str) -> DutySheetRequest:
@@ -463,6 +572,7 @@ class DutySheetService:
                     keep_browser_open_on_success=True,
                     raise_errors=True,
                     stage_callback=report_stage,
+                    personnel_deductions=request.personnel_deductions,
                 )
         except DutySheetValidationError:
             raise

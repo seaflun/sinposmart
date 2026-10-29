@@ -860,6 +860,68 @@ def select_duty_ambulance2_members(standby_ids, commander_ids, ambulance1_ids):
     return selected if len(selected) == 2 else []
 
 
+def duty_leader_numbers(workbook, sheet, day_int, excluded_numbers):
+    """依正常上班名單及網站實際值班、救護車投影計算帶隊番號。"""
+    excluded = {normalize_staff_number(number) for number in excluded_numbers}
+    on_duty = {normalize_staff_number(number) for number in
+        expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers)} - excluded
+    candidates = on_duty & {"2", "3", "4", "5"}
+    if "1" in on_duty:
+        selected = candidates
+    else:
+        ex_map = {"時間": 2, "值班": 3}
+        for row in (5, 6):
+            for col in range(1, 100):
+                label = str(sheet.cell(row=row, column=col).value or "").strip()
+                if "備勤緊急救護" in label: ex_map["救護_Excel"] = col
+                if "備勤救災" in label: ex_map["備勤_Excel"] = col
+                if "指揮官" in label: ex_map["指揮官"] = col
+        effective_excluded = set(excluded_numbers) | excluded
+        for row in range(10, 34):
+            for col in range(ex_map["值班"], ex_map["指揮官"] + 1):
+                for number in clean_to_list(get_merged_val(sheet, row, col)):
+                    if normalize_staff_number(number) not in on_duty:
+                        effective_excluded.add(number)
+        assigned = set()
+        for row in range(10, 34):
+            if "-" not in str(sheet.cell(row=row, column=ex_map["時間"]).value or ""):
+                continue
+            ambulance1, standby, commanders = read_duty_row_crews(sheet, row, ex_map, effective_excluded)
+            ambulance2 = select_duty_ambulance2_members(standby, commanders, ambulance1)
+            duty = clean_to_list_excluding(get_merged_val(sheet, row, ex_map["值班"]), effective_excluded)
+            assigned.update(normalize_staff_number(number) for number in duty + ambulance1 + ambulance2)
+        selected = candidates & assigned
+        if not selected:
+            selected = sorted(candidates, key=int)[-2:]
+    return [f"{int(number):02d}" for number in sorted(selected, key=int)]
+
+
+def build_duty_annotation(leaders, personnel_deductions=()):
+    """相同原因合併番號，保持原因順序且各組番號升冪去重。"""
+    groups = {}
+    for people, reason in ((leaders, "帶隊官"),) + tuple(personnel_deductions):
+        reason = str(reason).strip()
+        numbers = {normalize_staff_number(number) for number in people}
+        numbers.discard("")
+        if reason and numbers:
+            groups.setdefault(reason, set()).update(numbers)
+    return "，".join("、".join(f"{int(number):02d}" for number in sorted(numbers, key=int)) + reason
+        for reason, numbers in groups.items())
+
+
+def clean_duty_text(text, ordinal):
+    """只移除段首 Unicode 空白及指定序號，保留內文與時段。"""
+    text = str(text or "")
+    def trim_start(value):
+        index = 0
+        while index < len(value) and (value[index].isspace() or unicodedata.category(value[index]) == "Cf"):
+            index += 1
+        return value[index:]
+    text = trim_start(text)
+    prefix = str(ordinal) + "、"
+    return trim_start(text[len(prefix):]) if text.startswith(prefix) else text
+
+
 def select_ambulance2_members(standby_ids, out_ids, ambulance1_ids):
     """救護車 2 優先取備勤，不足時取同時段外勤，且不得與救護車 1 重複。"""
     ambulance1 = set(unique_member_ids(ambulance1_ids))
@@ -1683,6 +1745,37 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
     except Exception as e: log_status(f"   ❌ 車輛設定執行錯誤: {e}")
     driver.switch_to.window(main_window)
 
+def resolve_duty_annotation_field(driver):
+    """唯讀確認正式附記欄位，僅回傳 ID 與 frame 路徑。"""
+    metadata = driver.execute_script("""
+    const fields = [];
+    let unsafe = false;
+    let idCount = 0;
+    const normalize = value => String(value || '').replace(/\\s/g, '').replace(/[：:]$/, '');
+    function visit(win, path) {
+        try {
+            idCount += win.document.querySelectorAll('[id="_areMEMO"]').length;
+            for (const row of win.document.querySelectorAll('tr')) {
+                if (!row.cells.length || normalize(row.cells[0].textContent) !== '附記') continue;
+                const inputs = Array.from(row.querySelectorAll('textarea,input')).filter(el =>
+                    el.tagName.toLowerCase() === 'textarea' || String(el.type || 'text').toLowerCase() === 'text');
+                if (inputs.length !== 1 || inputs[0].id !== '_areMEMO') {
+                    unsafe = true;
+                    continue;
+                }
+                fields.push({field_id: inputs[0].id, frame_path: path});
+            }
+            for (let index = 0; index < win.frames.length; index++) visit(win.frames[index], path.concat(index));
+        } catch (error) { unsafe = true; }
+    }
+    visit(window.top, []);
+    return !unsafe && fields.length === 1 && idCount === 1 ? fields[0] : null;
+    """)
+    if not isinstance(metadata, dict) or metadata.get("field_id") != "_areMEMO" or not isinstance(metadata.get("frame_path"), list):
+        raise RuntimeError("勤務表附記欄位無法唯一確認，未執行登打。")
+    return metadata
+
+
 def step_batch_fill_duty(driver, duty_map):
     """批次填寫勤務基準表"""
     if not duty_map: return
@@ -1825,6 +1918,7 @@ def start_automation(
     keep_browser_open_on_success=False,
     raise_errors=False,
     stage_callback=None,
+    personnel_deductions=(),
 ):
     def report_stage(stage):
         if callable(stage_callback):
@@ -1923,6 +2017,9 @@ def start_automation(
         _runtime_status_callback = previous_status_callback
         return False
     log_status("✅ 勤務表檢查通過，未發現重複或漏排")
+    duty_annotation = build_duty_annotation(
+        duty_leader_numbers(wb, sheet, day_int, excluded_numbers), personnel_deductions
+    )
     capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sinposmart-duty-capture")
     capture_future = capture_executor.submit(capture_duty_sheet_images, excel_path, target_date)
     log_status("勤務表截圖與網站登打同步進行...")
@@ -1945,8 +2042,10 @@ def start_automation(
 
     try:
         popup_main_window = ""
+        annotation_field = None
 
         def open_duty_browser_for_popup_preflight():
+            nonlocal annotation_field
             candidate = retry_duty_browser_session_open(
                 lambda: build_driver(headless=False),
                 initialize_browser,
@@ -1969,6 +2068,11 @@ def start_automation(
                 query_wait,
                 prewrite=True,
             )
+            try:
+                annotation_field = resolve_duty_annotation_field(candidate)
+            except Exception:
+                quit_driver(candidate)
+                raise
             if query_mode == "existing":
                 report_stage("duty_existing_data_delete")
                 ensure_existing_duty_delete(candidate)
@@ -2014,6 +2118,9 @@ def start_automation(
                 WebDriverWait(driver, 60, poll_frequency=0.5),
                 expected_columns=web_idx["休息"],
             )
+            current_annotation_field = resolve_duty_annotation_field(driver)
+            if annotation_field is not None and current_annotation_field != annotation_field:
+                raise RuntimeError("勤務表附記欄位位置已變更，未執行登打。")
             
             log_status("🧠 勤務基準表計算中...")
             
@@ -2037,8 +2144,9 @@ def start_automation(
                 duty_map[f"_pln_{hour}_{web_idx['備勤']}"] = ",".join(remaining_standby)
                 duty_map[f"_pln_{hour}_{web_idx['休息']}"] = clean_v_excluding(get_merged_val(sheet, r, ex_map["休息_Excel"]), excluded_numbers)
 
-            team_tra_val = str(sheet["C35"].value or "").strip()
-            remark_val = str(sheet["C34"].value or "").strip()
+            duty_map[current_annotation_field["field_id"]] = duty_annotation
+            team_tra_val = clean_duty_text(sheet["C35"].value, "二")
+            remark_val = clean_duty_text(sheet["C34"].value, "一")
             if team_tra_val: duty_map["_areTeamTra"] = team_tra_val
             if remark_val: duty_map["_arePSREMARK"] = remark_val
 

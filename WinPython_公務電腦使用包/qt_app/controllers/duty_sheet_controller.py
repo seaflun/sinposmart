@@ -6,6 +6,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Property, QThread, QTimer, QUrl, Signal, Slot
 
 from app_core.duty_sheet_service import (
+    DutySheetExecutionError,
     DutySheetRequest,
     DutySheetService,
     DutySheetValidationError,
@@ -59,6 +60,11 @@ class DutySheetController(QObject):
         self._shutdown_admission = False
         self._read_only_acceptance = bool(read_only_acceptance)
         self._automatic_preparing = False
+        self._personnel_deductions: list[dict] = []
+        self._personnel_deduction_timer = QTimer(self)
+        self._personnel_deduction_timer.setInterval(60_000)
+        self._personnel_deduction_timer.timeout.connect(self.refreshPersonnelDeductions)
+        self._personnel_deduction_timer.start()
 
     @Property(str, notify=stateChanged)
     def workbookPath(self) -> str:
@@ -95,6 +101,19 @@ class DutySheetController(QObject):
     @Property("QVariantList", notify=stateChanged)
     def ambOptions(self) -> list[str]:
         return self._amb_options
+
+    @Property("QVariantList", notify=stateChanged)
+    def personnelDeductions(self) -> list[dict]:
+        return self._personnel_deductions
+
+    @Property(bool, notify=stateChanged)
+    def canEditPersonnelDeductions(self) -> bool:
+        return not (
+            self._read_only_acceptance
+            or self._shutdown_admission
+            or self.isRunning
+            or self._pending_request is not None
+        )
 
     @Property(bool, notify=stateChanged)
     def notificationEnabled(self) -> bool:
@@ -136,8 +155,64 @@ class DutySheetController(QObject):
             return
         defaults = self._service.load_defaults()
         self._apply_defaults(defaults)
+        try:
+            self._personnel_deductions = self._load_personnel_deductions()
+        except (DutySheetValidationError, DutySheetExecutionError) as exc:
+            self._set_error(str(exc))
+            return
         self._status_text = "準備就緒。"
         self.stateChanged.emit()
+
+    def _load_personnel_deductions(self) -> list[dict]:
+        loader = getattr(self._service, "load_personnel_deductions", None)
+        return list(loader()) if callable(loader) else []
+
+    @Slot()
+    def refreshPersonnelDeductions(self) -> None:
+        if self._shutdown_admission:
+            return
+        try:
+            rows = self._load_personnel_deductions()
+        except (DutySheetValidationError, DutySheetExecutionError) as exc:
+            self._set_error(str(exc))
+            return
+        if rows != self._personnel_deductions:
+            self._personnel_deductions = rows
+            self.stateChanged.emit()
+
+    @Slot(str, str, str, str, str, result=bool)
+    def savePersonnelDeduction(
+        self, people: str, start_date: str, end_date: str, reason: str, record_id: str
+    ) -> bool:
+        if self._reject_read_only_execution() or not self.canEditPersonnelDeductions:
+            return False
+        try:
+            self._personnel_deductions = list(
+                self._service.save_personnel_deduction(
+                    people, start_date, end_date, reason, record_id
+                )
+            )
+        except (DutySheetValidationError, DutySheetExecutionError) as exc:
+            self._set_error(str(exc))
+            return False
+        self._status_text = "已儲存人力扣除。" if record_id else "已新增人力扣除。"
+        self.stateChanged.emit()
+        return True
+
+    @Slot(str, result=bool)
+    def removePersonnelDeduction(self, record_id: str) -> bool:
+        if self._reject_read_only_execution() or not self.canEditPersonnelDeductions:
+            return False
+        try:
+            self._personnel_deductions = list(
+                self._service.remove_personnel_deduction(record_id)
+            )
+        except (DutySheetValidationError, DutySheetExecutionError) as exc:
+            self._set_error(str(exc))
+            return False
+        self._status_text = "已移除人力扣除。"
+        self.stateChanged.emit()
+        return True
 
     def _apply_defaults(self, defaults) -> None:
         self._workbook_path = defaults.workbook_path
@@ -345,6 +420,7 @@ class DutySheetController(QObject):
     @Slot()
     def prepare_shutdown_admission(self) -> None:
         self._shutdown_admission = True
+        self._personnel_deduction_timer.stop()
 
     @Slot()
     def shutdown(self) -> None:
