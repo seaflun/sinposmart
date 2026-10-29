@@ -14,6 +14,7 @@ from PySide6.QtGui import QDesktopServices
 
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
+    NOTICE_BROWSER_STARTUP_CODES,
     NOTICE_ERROR_CODES,
     TAIPEI,
     NoticeCollectionError,
@@ -25,6 +26,19 @@ from app_core.notice_collection_service import (
 )
 from app_core.login_verifier import OA_LOGIN_FAILURE_MESSAGES
 from app_core.schedule_repository import business_roc_date
+
+
+_SPREADSHEET_CHECK_TIMEOUT_MESSAGE = "試算表既有通報比對逾時，尚未確認本批是否已入表。"
+
+
+def _verification_failure_message(code: str) -> str:
+    if code in NOTICE_BROWSER_STARTUP_CODES.values():
+        from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES
+        stage = next(stage for stage, notice_code in NOTICE_BROWSER_STARTUP_CODES.items() if notice_code == code)
+        return CHROME_STARTUP_STAGE_MESSAGES[stage]
+    if code == "browser_start_failed":
+        return "通報專用瀏覽器無法啟動，請確認 Chrome 狀態。"
+    return OA_LOGIN_FAILURE_MESSAGES.get(code, "驗證未完成，原因待確認。")
 
 
 class _NoticeCollectionJob(QThread):
@@ -524,7 +538,8 @@ class NoticeCollectionController(QObject):
     def _collected(self, result) -> None:
         if not self._poll_run_id:
             return
-        self._notice = str(result.message or "")
+        self._notice = (_SPREADSHEET_CHECK_TIMEOUT_MESSAGE if getattr(result, "error_code", "") == "spreadsheet_check_timeout"
+                        else str(result.message or ""))
         self._last_checked = result.checked_at.replace(tzinfo=TAIPEI).isoformat() if result.checked_at.tzinfo is None else result.checked_at.astimezone(TAIPEI).isoformat()
         self._save_reminder_state()
         self._status_tone = (
@@ -544,6 +559,9 @@ class NoticeCollectionController(QObject):
         result = getattr(self._service, "last_result", None)
         if not isinstance(result, NoticeCollectionResult) or result.checked_at != self._poll_started_at:
             result = None
+        if ((result is not None and result.error_code == "spreadsheet_check_timeout")
+                or getattr(self._job, "failure_code", "") == "spreadsheet_check_timeout"):
+            self._notice = _SPREADSHEET_CHECK_TIMEOUT_MESSAGE
         state = result.status if result is not None and result.status in {"partial", "uncertain"} else "failed"
         self._emit_report(state, result=result,
                           error_stage=(result.error_stage if result is not None else "login" if tone == "warning" else "unknown"))
@@ -583,7 +601,7 @@ class NoticeCollectionController(QObject):
     def _verification_failed(self, message: str, tone: str) -> None:
         code = getattr(self._job, "failure_code", "")
         code = code if isinstance(code, str) and code in NOTICE_ERROR_CODES else ""
-        safe_message = OA_LOGIN_FAILURE_MESSAGES.get(code, "驗證未完成，原因待確認。")
+        safe_message = _verification_failure_message(code)
         self._set_verification_status(safe_message, "error")
         self._notice, self._status_tone = safe_message, tone
         if self._verification_started_at is not None:
@@ -611,7 +629,7 @@ class NoticeCollectionController(QObject):
             "pending_write_count": None, "pending_read_count": None, "records": [], "new_keys": [],
             "error_stage": "busy" if waiting else "login", "error_code": code,
             "message": ("通報登入驗證尚未開始，等待公務作業完成。" if waiting else
-                        OA_LOGIN_FAILURE_MESSAGES.get(code, "驗證未完成，原因待確認。")),
+                        _verification_failure_message(code)),
         })
 
     def _set_verification_status(self, message: str, state: str = "configured") -> None:

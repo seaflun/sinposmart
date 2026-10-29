@@ -119,13 +119,46 @@ class NoticeBrowser:
 
     def _assert_identity(self, state: dict) -> None:
         if state.get("origin") != OA_ORIGIN:
-            raise NoticeCollectionError("通報頁來源不符，已停止操作。", code="origin_mismatch")
+            raise self._page_failure("通報頁來源不符，已停止操作。", "origin_mismatch", state,
+                                     checks={"origin_class": False})
         if state.get("sessionExpired") is True:
             raise NoticeLoginRequired("入口網作業逾時，請重新登入。", code="session_expired")
         if state.get("login") or self._is_session_exceeded_page():
             raise NoticeLoginRequired("通報背景登入狀態已失效。", code="session_expired")
         if state.get("accountCount") != 1 or state.get("account") != EXPECTED_ACCOUNT_LABEL:
-            raise NoticeCollectionError("通報頁登入身分不符，僅允許新坡分隊公務信箱。", code="account_mismatch")
+            raise self._page_failure("通報頁登入身分不符，僅允許新坡分隊公務信箱。", "account_mismatch", state,
+                                     checks={"account_confirmed": False})
+
+    def _page_failure(self, message, code, state=None, *, expected_page=None, read_filter=None, checks=None):
+        """Attach only readiness flags and counts; never retain a URL, identity or notice."""
+        state, checks = state or {}, checks or {}
+        origin = state.get("origin")
+        origin_class = ("expected" if origin == OA_ORIGIN else "opaque" if origin == "null" else
+                        "browser_error" if origin == "chrome-error://chromewebdata" else
+                        "unknown" if origin is None else "other")
+        try:
+            location = urlsplit(str(self._driver.current_url))
+            url_class = ("expected" if location.scheme == "https" and location.netloc == "oa.tyfd.gov.tw" else
+                         "blank" if location.scheme == "about" and location.path == "blank" else
+                         "browser_error" if location.scheme == "chrome-error" else "other")
+        except Exception:
+            url_class = "unknown"
+        count = lambda value: value if type(value) is int and 0 <= value <= 10000000 else None
+        rows = state.get("records")
+        error = NoticeCollectionError(message, code=code)
+        error.page_context = {
+            "origin_class": origin_class, "url_class": url_class,
+            "expected_page": count(expected_page), "expected_filter": count(read_filter),
+            **{key: count(state.get(key)) for key in ("page", "pages", "total")},
+            "row_count": len(rows) if isinstance(rows, list) else None,
+            "date_rows": count(state.get("dateRows")),
+            "ajax_active": bool(state.get("ajaxActive")), "loading": bool(state.get("loading")),
+            "filtered": state.get("filtered") is True, "read_filter": count(state.get("readFilter")),
+            "account_confirmed": state.get("accountCount") == 1 and state.get("account") == EXPECTED_ACCOUNT_LABEL,
+            **{key: checks.get(key) for key in ("date_range_confirmed", "keys_complete", "keys_unique", "page_changed")},
+            "blocked_checks": [key for key, passed in checks.items() if not passed],
+        }
+        return error
 
     def _is_session_exceeded_page(self) -> bool:
         parsed = urlsplit(str(self._driver.current_url))
@@ -229,25 +262,24 @@ class NoticeBrowser:
             page = state.get("page")
             pages = state.get("pages")
             total = state.get("total")
-            ready = (
-                state.get("filtered") is True and not state.get("loading")
-                and state.get("readFilter", 0) == read_filter
-                and (date_range is None or (state.get("dateFrom"), state.get("dateTo")) == date_range)
-                and not state.get("ajaxActive") and page == expected_page
-                and isinstance(pages, int) and pages >= page
-                and isinstance(total, int) and total >= len(rows)
-                and state.get("dateRows") == len(rows)
-                and len(keys) == len(set(keys))
-                and all(keys)
-                and (previous_keys is None or keys != previous_keys)
-                and ((total == 0 and not rows and page == pages == 1) or bool(rows))
-            )
-            if ready:
+            checks = {
+                "filtered": state.get("filtered") is True, "loading": not state.get("loading"),
+                "read_filter": state.get("readFilter", 0) == read_filter,
+                "date_range_confirmed": date_range is None or (state.get("dateFrom"), state.get("dateTo")) == date_range,
+                "ajax_active": not state.get("ajaxActive"), "page": page == expected_page,
+                "pages": isinstance(pages, int) and isinstance(page, int) and pages >= page,
+                "total": isinstance(total, int) and total >= len(rows), "date_rows": state.get("dateRows") == len(rows),
+                "keys_unique": len(keys) == len(set(keys)), "keys_complete": all(keys),
+                "page_changed": previous_keys is None or keys != previous_keys,
+                "row_presence": (total == 0 and not rows and page == pages == 1) or bool(rows),
+            }
+            if all(checks.values()):
                 for row in rows:
                     self._validated_content_url(row)
                 return state
             if time.monotonic() >= deadline:
-                raise NoticeCollectionError("未讀列表尚未完成載入或資料不完整，已停止本輪收取。", code="list_wait_timeout")
+                raise self._page_failure("未讀列表尚未完成載入或資料不完整，已停止本輪收取。", "list_wait_timeout",
+                                         state, expected_page=expected_page, read_filter=read_filter, checks=checks)
             time.sleep(self._poll_seconds)
 
     def _scan_pages(self, cancel, *, read_filter=0, date_range=None) -> list[dict]:
@@ -266,7 +298,8 @@ class NoticeBrowser:
             self.close()
             raise NoticeCollectionError("通報專用視窗已關閉，下輪將重新開啟。", code="browser_window_closed") from None
         except Exception:
-            raise NoticeCollectionError("通報列表重新整理失敗，請確認連線。", code="list_navigation_failed") from None
+            raise self._page_failure("通報列表重新整理失敗，請確認連線。", "list_navigation_failed",
+                                     checks={"navigation": False}) from None
         state = self._wait_page(1, None, cancel, read_filter=read_filter, date_range=date_range)
         pages, total = state["pages"], state["total"]
         if pages > self._max_pages:

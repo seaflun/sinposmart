@@ -10,6 +10,7 @@
 
 | 版本 | 更新時間 | 更新摘要 | 完整說明 |
 | --- | --- | --- | --- |
+| `2026.10.29.2018` | 2026-10-29 20:18（台北時間） | 校正通報補查已讀狀態與待確認數量，精準顯示試算表比對逾時及Chrome啟動錯誤，補安全列表與標讀診斷。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.2018) |
 | `2026.10.29.1919` | 2026-10-29 19:19（台北時間） | 勤務附記儲存後重新查詢比對，漏存不再回報成功；後台顯示當次附記及驗證狀態，問題包保留扣除快照。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.1919) |
 | `2026.10.29.1348` | 2026-10-29 13:48（台北時間） | 扣除人力改獨立新增／編輯視窗並更名卡片；精簡通報例行到期提示，保留登入保護。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.1348) |
 | `2026.10.29.1333` | 2026-10-29 13:33（台北時間） | 新增帶隊官附記、人力扣除日期設定與獨立欄位檢查，清理訓練及備註開頭格式。 | [Release](https://github.com/seaflun/sinposmart/releases/tag/public-package-2026.10.29.1333) |

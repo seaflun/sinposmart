@@ -23,6 +23,52 @@ TAIPEI = timezone(timedelta(hours=8))
 
 
 class NoticeCollectionControllerTests(unittest.TestCase):
+    def test_verification_reports_known_browser_startup_stages_without_raw_errors_or_retry(self):
+        from app_core.notice_collection_service import NOTICE_BROWSER_STARTUP_CODES
+        from duty_rehearsal import CHROME_STARTUP_STAGE_MESSAGES
+        self.enable_saved_account()
+        reports = []
+        self.controller.reportReady.connect(reports.append)
+        for index, (stage, code) in enumerate(NOTICE_BROWSER_STARTUP_CODES.items(), 1):
+            with self.subTest(stage=stage):
+                reports.clear()
+                self.service.verify_login.side_effect = NoticeCollectionError(
+                    "test-password token=private-startup-response", code=code)
+                self.controller.verifyLogin()
+                self.wait_for(lambda: not self.controller.isRunning)
+                expected = CHROME_STARTUP_STAGE_MESSAGES[stage]
+                self.assertEqual(self.controller.verificationStatus, expected)
+                self.assertEqual(reports[0]["message"], expected)
+                self.assertEqual(reports[0]["error_code"], code)
+                self.assertEqual(self.service.verify_login.call_count, index)
+                self.assertNotIn("private-startup-response", str(reports))
+                self.assertNotIn("原因待確認", self.controller.verificationStatus)
+        self.service.collect.assert_not_called()
+
+    def test_spreadsheet_precheck_timeout_uses_fixed_message_and_preserves_zero_pending(self):
+        self.enable_saved_account()
+        expected = "試算表既有通報比對逾時，尚未確認本批是否已入表。"
+        result = NoticeCollectionResult(self.now, unread_count=2, pending_write_count=0,
+            pending_read_count=0, status="failed", error_stage="write", error_code="spreadsheet_check_timeout")
+        self.service.last_result = result
+        self.service.collect.side_effect = NoticeCollectionError(
+            "test-password token=private-sheet-response", code="spreadsheet_check_timeout")
+        self.controller.collectNow()
+        self.wait_for(lambda: not self.controller.isRunning)
+        self.assertIn(expected, self.controller.statusText)
+        self.assertNotIn("private-sheet-response", self.controller.statusText)
+        self.assertEqual(result.pending_write_count, 0)
+        self.assertEqual(result.error_stage, "write")
+        self.assertEqual(self.service.collect.call_count, 1)
+        self.service.collect.side_effect = None
+        result.status, result.error_count, result.message = "partial", 1, "部分通報尚未確認。"
+        self.service.collect.return_value = result
+        self.controller.collectNow()
+        self.wait_for(lambda: not self.controller.isRunning)
+        self.assertIn(expected, self.controller.statusText)
+        self.assertEqual(result.pending_write_count, 0)
+        self.assertEqual(self.service.collect.call_count, 2)
+
     def test_verification_failure_reports_real_safe_code_without_collection_counts(self):
         self.enable_saved_account()
         reports = []

@@ -11,10 +11,11 @@ import hmac
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from uuid import uuid4
 
-from app_core.diagnostics_service import diagnostic_exception
+from app_core.diagnostics_service import diagnostic_exception, sanitize_diagnostic_value
 from app_core.operational_sync_service import normalize_duty_board_day
 
 
@@ -22,6 +23,7 @@ FIXED_NOTICE_ACCOUNT = "tyfd01214"
 TAIPEI = timezone(timedelta(hours=8))
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw5yM8234CMi67hkox091wgoubwNIuWC8yxtNsQ024SpbpXhAGWVC5hB-HU4UQQavPO1A/exec"
 MAX_RECORDS = 200
+PENDING_READ_MESSAGE = "部分已入表通報的已讀狀態尚未確認，保留待確認狀態。"
 NOTICE_RESPONSIBILITY_FIELDS = ("schema_version", "status", "actorNo", "name", "role",
                                 "capturedAt", "handoffSlotAt", "evidenceKey")
 NOTICE_BROWSER_STARTUP_CODES = {
@@ -41,7 +43,7 @@ NOTICE_ERROR_CODES = frozenset({
     "oa_login_verification_timeout",
     "oa_password_warning_blocked", "oa_password_change_required", "oa_account_locked",
     "oa_login_unconfirmed", "oa_password_expired", "oa_login_guard_unavailable",
-    "recipient_unconfirmed",
+    "recipient_unconfirmed", "spreadsheet_check_timeout",
 })
 
 
@@ -459,6 +461,7 @@ class NoticeCollectionService:
         self._collection_stage = "scan"
         self._confirmed_for_read: set[str] = set()
         self._marked_for_read: set[str] = set()
+        self._pending_read_for_attempt: set[str] = set()
         self._state = {"schema_version": 1, "collected": {}, "pending": [], "confirmed": {}, "manual": {}}
         if self.state_path.exists():
             try:
@@ -562,11 +565,17 @@ class NoticeCollectionService:
         before = set(self._state["collected"])
         self.last_result = NoticeCollectionResult(received_at, unread_count=None, marked_read_count=None)
         self._confirmed_for_read, self._marked_for_read = set(), set()
+        self._pending_read_for_attempt = set()
         self._collection_stage = "scan"
         try:
             result = self._collect(password, received_at, cancel)
             self._collection_stage = "scan"
             self._reconcile_recent(password, received_at, cancel)
+            self._pending_read_for_attempt = {key for key in self._pending_read_for_attempt
+                if self._state["confirmed"].get(key, {}).get("read_state") != "confirmed"}
+            result.pending_read_count = len(self._pending_read_for_attempt | self._pending_read_keys(received_at))
+            if result.pending_read_count and result.status == "success":
+                result.status, result.error_stage, result.message = "partial", "mark_read", PENDING_READ_MESSAGE
             result.signing_pending_count = sum(self._state["confirmed"].get(key, {}).get("signing_state") != "confirmed"
                                                for key in result.written_keys)
             if result.signing_pending_count and result.status == "success":
@@ -585,7 +594,10 @@ class NoticeCollectionService:
             result.error_code = _safe_notice_error_code(getattr(exc, "code", ""))
             if result.unread_count is not None:
                 result.pending_write_count = self._pending_write_count()
-                result.pending_read_count = len((self._confirmed_for_read | set(result.written_keys)) - self._marked_for_read)
+                self._pending_read_for_attempt = {key for key in
+                    (self._confirmed_for_read | set(result.written_keys)) - self._marked_for_read
+                    if self._state["confirmed"].get(key, {}).get("read_state") != "confirmed"}
+                result.pending_read_count = len(self._pending_read_for_attempt | self._pending_read_keys(received_at))
             raise
 
     def _reconcile_recent(self, password: str, now: datetime, cancel) -> None:
@@ -613,6 +625,8 @@ class NoticeCollectionService:
             if key in state["collected"]:
                 metadata = state.setdefault("confirmed", {}).setdefault(key, {})
                 metadata.update(published_at=published_at)
+                if metadata.get("read_state") == "pending":
+                    metadata["read_state"] = "confirmed"
                 publisher = self._publisher_text(row.get("publisher") or (
                     row.get("sender") if not metadata.get("publisher") else ""))
                 if publisher:
@@ -715,14 +729,20 @@ class NoticeCollectionService:
         if to_mark:
             self._check_cancel(cancel)
             self._collection_stage = "mark_read"
+            self._pending_read_for_attempt = {row["key"] for row in to_mark}
             try:
                 marked = set(self._browser.mark_read(to_mark, cancel=cancel))
                 expected = {row["key"] for row in to_mark}
                 result.marked_read_count = len(marked & expected)
                 result.error_count += len(expected - marked)
                 self._marked_for_read = marked & expected
-            except Exception:
+                if expected - marked:
+                    self._save_failure_diagnostic("collect:mark_read", NoticeCollectionError(
+                        "通報已讀回報不完整，未確認的通報保留待確認狀態。"), secrets=(password,))
+            except Exception as exc:
+                self._save_failure_diagnostic("collect:mark_read", exc, secrets=(password,))
                 result.error_count += len(to_mark)
+            self._pending_read_for_attempt.difference_update(self._marked_for_read)
             result.pending_read_count = len({row["key"] for row in to_mark} - self._marked_for_read)
             if result.pending_read_count:
                 result.error_stage = "mark_read"
@@ -942,6 +962,17 @@ class NoticeCollectionService:
     def _pending_write_count(self) -> int:
         return len({row["key"] for intent in self._state["pending"] for row in intent["records"]})
 
+    def _pending_read_keys(self, now: datetime, shift: NoticeShift | None = None, extra_keys=()) -> set[str]:
+        local = _local_time(now)
+        pending = set()
+        for key, timestamp in self._state["collected"].items():
+            received = _local_time(datetime.fromisoformat(timestamp))
+            if (self._state["confirmed"].get(key, {}).get("read_state") == "pending"
+                    and (received.date() == local.date() or key in extra_keys
+                         or shift is not None and _local_time(shift.start) <= received < _local_time(shift.end))):
+                pending.add(key)
+        return pending
+
     def report_parts(self, run_id: str, state: str, reported_at: datetime, *, started_at=None,
                      next_check: datetime, shift: NoticeShift | None = None,
                      result: NoticeCollectionResult | None = None, error_stage: str = "") -> list[dict]:
@@ -994,6 +1025,13 @@ class NoticeCollectionService:
             "pending_read_count": result.pending_read_count if result is not None else None,
             "error_stage": error_stage or (result.error_stage if result is not None else ""),
             "message": messages[state]}
+        if not self._state_error and result is not None and result.pending_read_count is not None:
+            pending = self._pending_read_keys(now, shift, raw_new)
+            if result is self.last_result:
+                pending.update(self._pending_read_for_attempt)
+            report["pending_read_count"] = max(result.pending_read_count, len(pending))
+            if report["pending_read_count"] and state == "success":
+                report.update(state="partial", error_stage="mark_read", message=PENDING_READ_MESSAGE)
         if result is not None and result.scan_scope == "publication_window":
             report.update(scan_scope=result.scan_scope, scan_from=result.scan_from, scan_to=result.scan_to,
                           scan_verified_at=now.isoformat(timespec="seconds"))
@@ -1033,8 +1071,35 @@ class NoticeCollectionService:
             previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and path.stat().st_size <= 65536 else {}
             failures = previous.get("failures", []) if isinstance(previous, dict) else []
             failures = failures if isinstance(failures, list) else []
-            failures = failures[-9:] + [{"occurred_at": _local_time(self._now()).isoformat(timespec="seconds"),
-                                        "stage": stage, "exception": diagnostic_exception(error, secrets)}]
+            entry = {"occurred_at": _local_time(self._now()).isoformat(timespec="seconds"),
+                     "stage": stage, "exception": diagnostic_exception(error, secrets)}
+            raw_context = getattr(error, "page_context", {})
+            context = sanitize_diagnostic_value(raw_context, secrets)
+            if isinstance(context, dict):
+                if isinstance(raw_context, dict) and type(raw_context.get("account_confirmed")) is bool:
+                    context["account_confirmed"] = raw_context["account_confirmed"]
+                safe_context = {}
+                for key in ("origin_class", "url_class"):
+                    value = context.get(key)
+                    if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", value):
+                        safe_context[key] = value
+                for key in ("expected_page", "expected_filter", "page", "pages", "total", "row_count",
+                            "date_rows", "read_filter"):
+                    if key in context and (context[key] is None or type(context[key]) is int and 0 <= context[key] <= 10_000_000):
+                        safe_context[key] = context[key]
+                for key in ("loading", "filtered", "ajax_active", "account_confirmed", "date_range_confirmed",
+                            "keys_complete", "keys_unique", "page_changed"):
+                    if key in context and (context[key] is None or type(context[key]) is bool):
+                        safe_context[key] = context[key]
+                blocked = context.get("blocked_checks")
+                if isinstance(blocked, list):
+                    allowed = {"filtered", "loading", "read_filter", "date_range_confirmed", "ajax_active",
+                        "page", "pages", "total", "date_rows", "keys_unique", "keys_complete", "page_changed",
+                        "row_presence", "origin_class", "account_confirmed", "navigation"}
+                    safe_context["blocked_checks"] = sorted({key for key in blocked if isinstance(key, str) and key in allowed})
+                if safe_context:
+                    entry["context"] = safe_context
+            failures = failures[-9:] + [entry]
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name("notice-diagnostic-" + uuid4().hex + ".tmp")
             temporary.write_text(json.dumps({"failures": failures}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1066,6 +1131,10 @@ class NoticeCollectionService:
             return response
         except Exception as exc:
             self._save_failure_diagnostic(stage, exc, secrets=(sync_key,))
+            if payload.get("action") == "checkExisting" and (isinstance(exc, TimeoutError)
+                    or isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)):
+                raise NoticeCollectionError("既有通報比對逾時，本批尚未送出新寫入，將於下輪重新比對。",
+                                            code="spreadsheet_check_timeout") from None
             raise NoticeCollectionError("通報試算表連線或回覆未確認，請稍後再檢查。") from None
 
     @staticmethod

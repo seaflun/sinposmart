@@ -93,6 +93,58 @@ class FakeDriver:
 
 
 class NoticeBrowserTests(unittest.TestCase):
+    def test_list_timeout_identifies_blocked_checks_without_private_page_data(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+        driver = FakeDriver([snapshot([notice("private-id")], filtered=False, ajaxActive=1,
+                                      password="synthetic-private-password")])
+        driver.on_get = lambda current: setattr(current, "current_url", current.current_url + "&token=private-token")
+        with self.assertRaises(NoticeCollectionError) as caught:
+            self.browser(driver).scan_unread("synthetic-private-password")
+        self.assertEqual(caught.exception.code, "list_wait_timeout")
+        context = caught.exception.page_context
+        self.assertEqual(set(context["blocked_checks"]), {"filtered", "ajax_active"})
+        self.assertEqual(context["row_count"], 1)
+        self.assertEqual(context["origin_class"], "expected")
+        self.assertEqual(context["url_class"], "expected")
+        self.assertEqual(context["expected_page"], 1)
+        self.assertEqual(context["expected_filter"], 0)
+        raw = json.dumps(context, ensure_ascii=False)
+        for private in ("private-id", "private-token", "synthetic-private-password", "測試通報", "https://"):
+            self.assertNotIn(private, raw)
+        self.assertEqual(driver.async_calls, [])
+
+    def test_origin_diagnostic_distinguishes_opaque_and_foreign_without_relaxing_identity(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+        for origin, kind in (("null", "opaque"), ("https://private.invalid", "other")):
+            with self.subTest(origin=origin):
+                driver = FakeDriver([snapshot(origin=origin)])
+                login = Mock()
+                with self.assertRaises(NoticeCollectionError) as caught:
+                    self.browser(driver, login_runner=login).scan_unread("synthetic-private-password")
+                self.assertEqual(caught.exception.code, "origin_mismatch")
+                self.assertEqual(caught.exception.page_context["origin_class"], kind)
+                self.assertEqual(caught.exception.page_context["blocked_checks"], ["origin_class"])
+                self.assertNotIn("private.invalid", json.dumps(caught.exception.page_context))
+                login.assert_not_called()
+                self.assertEqual(driver.async_calls, [])
+
+    def test_navigation_diagnostic_keeps_owned_browser_and_omits_raw_exception(self):
+        from app_core.notice_collection_service import NoticeCollectionError
+        driver = FakeDriver()
+        driver.on_get = Mock(side_effect=TimeoutError("synthetic-private-password https://private.invalid/?token=x"))
+        factory, login = Mock(return_value=driver), Mock()
+        from app_core.notice_collection_browser import NoticeBrowser
+        browser = NoticeBrowser(PACKAGE, driver_factory=factory, login_runner=login, login_guard=False)
+        with self.assertRaises(NoticeCollectionError) as caught:
+            browser.scan_unread("synthetic-private-password")
+        self.assertEqual(caught.exception.code, "list_navigation_failed")
+        self.assertEqual(caught.exception.page_context["blocked_checks"], ["navigation"])
+        self.assertEqual(caught.exception.page_context["url_class"], "expected")
+        self.assertNotIn("synthetic-private-password", json.dumps(caught.exception.page_context))
+        self.assertEqual(driver.quit_calls, 0)
+        factory.assert_called_once()
+        login.assert_not_called()
+
     def test_browser_startup_stage_reaches_safe_notice_code_without_login_attempt(self):
         from app_core.notice_collection_browser import NoticeBrowser
         from app_core.notice_collection_service import NoticeCollectionError

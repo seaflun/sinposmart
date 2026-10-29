@@ -152,6 +152,161 @@ class NoticeLoginProtectionTests(unittest.TestCase):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_positive_recent_read_evidence_repairs_pending_without_recounting(self):
+        from app_core.notice_collection_service import NoticeCollectionService, TAIPEI
+        at = datetime(2026, 10, 29, 12, tzinfo=TAIPEI)
+        browser = FakeBrowser()
+        browser.recent_rows = [{**notice(1, "115-10-29"), "isUnread": False,
+                                "publishedAt": at.replace(hour=10).isoformat()}]
+        poster = Mock(side_effect=AssertionError("read reconciliation must not write records"))
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            received = at.replace(hour=11, minute=36).isoformat()
+            metadata = {"subject": "原主旨", "read_state": "pending", "signing_state": "confirmed",
+                        "signed_by": "測試員", "responsibility": {"original": "preserved"}}
+            service._state["collected"]["1"] = received
+            service._state["confirmed"]["1"] = dict(metadata)
+            before_count = service.counts(at)
+            result = service.collect("synthetic-password", at)
+            self.assertEqual((result.status, result.pending_read_count, result.written_keys), ("success", 0, []))
+            self.assertEqual(service._state["collected"]["1"], received)
+            self.assertEqual(service._state["confirmed"]["1"], {
+                **metadata, "read_state": "confirmed", "published_at": at.replace(hour=10).isoformat(), "publisher": "測試單位"})
+            self.assertEqual(service.counts(at), before_count)
+            poster.assert_not_called()
+            self.assertFalse(any(event.startswith("mark:") for event in browser.events))
+            restarted = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            self.assertEqual(restarted._state["confirmed"]["1"]["read_state"], "confirmed")
+
+    def test_empty_unread_list_preserves_current_pending_but_does_not_warn_for_old_receipts(self):
+        from app_core.notice_collection_service import NoticeCollectionService, TAIPEI
+        at = datetime(2026, 10, 29, 12, tzinfo=TAIPEI)
+        for age, expected in ((0, 1), (7, 0)):
+            with self.subTest(age=age), tempfile.TemporaryDirectory() as directory:
+                service = NoticeCollectionService(Path(directory), browser=FakeBrowser(), poster=Mock())
+                service._state["collected"]["1"] = (at - timedelta(days=age, minutes=10)).isoformat()
+                service._state["confirmed"]["1"] = {"subject": "原主旨", "read_state": "pending"}
+                result = service.collect("synthetic-password", at)
+                self.assertEqual(result.pending_read_count, expected)
+                self.assertEqual(result.status, "partial" if expected else "success")
+                self.assertEqual(result.error_stage, "mark_read" if expected else "")
+                self.assertEqual(service._state["confirmed"]["1"]["read_state"], "pending")
+                report = service.report_parts("test-run", result.status, at, next_check=at, result=result)[0]
+                self.assertEqual((report["state"], report["pending_read_count"]), (result.status, expected))
+                service._poster.assert_not_called()
+
+    def test_report_projects_cross_midnight_pending_without_upgrading_other_or_unknown_states(self):
+        from app_core.notice_collection_service import NoticeCollectionResult, NoticeCollectionService, NoticeShift, TAIPEI
+        at = datetime(2026, 10, 30, 0, 30, tzinfo=TAIPEI)
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=FakeBrowser())
+            service._state["collected"] = {"1": (at - timedelta(minutes=40)).isoformat(),
+                                            "2": (at - timedelta(days=7)).isoformat()}
+            service._state["confirmed"] = {key: {"subject": "原主旨", "read_state": "pending"} for key in ("1", "2")}
+            result = service.collect("synthetic-password", at)
+            self.assertEqual((result.status, result.pending_read_count), ("success", 0))
+            shift = NoticeShift("cross-midnight", "22-08", at.replace(day=29, hour=22, minute=0), at.replace(hour=8, minute=0))
+            report = service.report_parts("test-run", "success", at, next_check=at, shift=shift, result=result)[0]
+            self.assertEqual((report["state"], report["pending_read_count"], report["error_stage"]), ("partial", 1, "mark_read"))
+            self.assertEqual(len(report["records"]), 1)
+            for state in ("failed", "uncertain", "partial"):
+                report = service.report_parts("test-run", state, at, next_check=at, shift=shift, result=result)[0]
+                self.assertEqual(report["state"], state)
+            unknown = NoticeCollectionResult(at, unread_count=None, pending_read_count=None)
+            report = service.report_parts("test-run", "failed", at, next_check=at, shift=shift, result=unknown)[0]
+            self.assertIsNone(report["pending_read_count"])
+            self.assertIsNone(report["unread_count"])
+
+    def test_existing_check_timeout_is_specific_and_never_writes_this_batch(self):
+        from urllib.error import URLError
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        at = datetime(2026, 10, 29, 19, 6)
+        for error in (TimeoutError("private timeout"), URLError(TimeoutError("private timeout"))):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                poster = Mock(side_effect=error)
+                service = NoticeCollectionService(Path(directory), browser=FakeBrowser([notice(1)]), poster=poster)
+                with self.assertRaises(NoticeCollectionError) as caught:
+                    service.collect("synthetic-password", at)
+                self.assertEqual(caught.exception.code, "spreadsheet_check_timeout")
+                self.assertIn("本批尚未送出新寫入", str(caught.exception))
+                self.assertEqual(service.last_result.error_stage, "write")
+                self.assertEqual(service.last_result.error_code, "spreadsheet_check_timeout")
+                self.assertEqual([call.args[0]["action"] for call in poster.call_args_list], ["checkExisting"])
+                self.assertEqual(service._browser.events, ["scan"])
+                self.assertNotIn("private", str(caught.exception))
+        for action, error in (("writeRecords", TimeoutError()), ("getWriteResult", URLError(TimeoutError())),
+                              ("checkExisting", URLError("connection refused"))):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                service = NoticeCollectionService(Path(directory), poster=Mock(side_effect=error))
+                with self.assertRaises(NoticeCollectionError) as caught:
+                    service._post({"action": action})
+                self.assertEqual(caught.exception.code, "")
+                self.assertNotIn("本批", str(caught.exception))
+
+    def test_mark_read_failures_record_sanitized_evidence_without_notice_content(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        for raised in (False, True):
+            with self.subTest(raised=raised), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                browser = FakeBrowser([notice(1)])
+                browser.mark_read = Mock(side_effect=RuntimeError("password=synthetic-password; token=private-token")) if raised else Mock(return_value=[])
+                service = NoticeCollectionService(root, browser=browser, poster=lambda payload: (
+                    {"status": "success", "existingKeys": []} if payload["action"] == "checkExisting"
+                    else write_response(payload, ["1"])))
+                result = service.collect("synthetic-password", datetime(2026, 10, 21, 9))
+                self.assertEqual((result.status, result.error_stage, result.pending_read_count), ("partial", "mark_read", 1))
+                body = (root / "runtime_outputs/browser/notice_collection_failure.json").read_text(encoding="utf-8")
+                entries = json.loads(body)["failures"]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["stage"], "collect:mark_read")
+                for secret in ("synthetic-password", "private-token", "有效通報內文"):
+                    self.assertNotIn(secret, body)
+
+    def test_existing_check_timeout_keeps_receipts_from_an_earlier_successful_batch(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        rows = [notice(number, "115-10-29") for number in range(1, 202)]
+        browser = FakeBrowser(rows)
+        calls = []
+        def poster(payload):
+            calls.append(payload["action"])
+            if payload["action"] == "checkExisting":
+                if calls.count("checkExisting") == 2:
+                    raise TimeoutError("fixture timeout")
+                return {"status": "success", "existingKeys": []}
+            return write_response(payload, [row["key"] for row in payload["records"]])
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            with self.assertRaises(NoticeCollectionError) as caught:
+                service.collect("synthetic-password", datetime(2026, 10, 29, 19, 6))
+            self.assertEqual(caught.exception.code, "spreadsheet_check_timeout")
+            self.assertIn("本批尚未送出新寫入", str(caught.exception))
+            result = service.last_result
+            self.assertEqual((result.status, result.pending_write_count, result.pending_read_count), ("partial", 0, 200))
+            self.assertEqual(len(result.written_keys), 200)
+            self.assertEqual(len(service._state["collected"]), 200)
+            self.assertEqual(calls, ["checkExisting", "writeRecords", "checkExisting"])
+            self.assertFalse(any(event.startswith("mark:") for event in browser.events))
+
+    def test_browser_failure_context_is_bounded_allowlisted_and_sanitized(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = NoticeCollectionService(root)
+            error = NoticeCollectionError("safe", code="list_wait_timeout")
+            error.page_context = {"origin_class": "oa", "url_class": "oa_list", "expected_page": 1,
+                "expected_filter": 0, "page": None, "row_count": 2, "loading": True, "ajax_active": True,
+                "blocked_checks": ["page", "loading", "private-password", "https://private.invalid"],
+                "account_confirmed": False, "url": "https://private.invalid/?token=private-token",
+                "account": "private-account", "password": "private-password", "raw": "private-password"}
+            service._save_failure_diagnostic("collect:scan", error, secrets=("private-password",))
+            body = (root / "runtime_outputs/browser/notice_collection_failure.json").read_text(encoding="utf-8")
+            context = json.loads(body)["failures"][0]["context"]
+            self.assertEqual(context, {"origin_class": "oa", "url_class": "oa_list", "expected_page": 1,
+                "expected_filter": 0, "page": None, "row_count": 2, "loading": True, "ajax_active": True,
+                "blocked_checks": ["loading", "page"], "account_confirmed": False})
+            for secret in ("private-password", "private-token", "private-account", "private.invalid"):
+                self.assertNotIn(secret, body)
+
     def test_apps_script_failures_keep_redacted_diagnostics_without_changing_retry_response(self):
         from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
         with tempfile.TemporaryDirectory() as directory:
