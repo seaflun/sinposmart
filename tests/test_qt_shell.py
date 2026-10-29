@@ -12393,6 +12393,11 @@ class QtShellTests(unittest.TestCase):
                 panel = window.findChild(QObject, "dutySheetDialog")
                 self.assertTrue(QMetaObject.invokeMethod(panel, "open", Qt.DirectConnection))
                 QTest.qWait(100)
+                add = window.findChild(QObject, "dutyPersonnelDeductionAddButton")
+                self.assertTrue(QMetaObject.invokeMethod(add, "clicked", Qt.DirectConnection))
+                QTest.qWait(25)
+                dialog = window.findChild(QObject, "dutyPersonnelDeductionDialog")
+                self.assertTrue(dialog.property("visible"))
                 fields = {key: window.findChild(QObject, "dutyPersonnelDeduction" + key + "Field")
                           for key in ("People", "StartDate", "EndDate", "Reason")}
                 for key, value in (("People", "20、22"), ("StartDate", "2099/11/01"),
@@ -12401,16 +12406,32 @@ class QtShellTests(unittest.TestCase):
                 save = window.findChild(QObject, "dutyPersonnelDeductionSaveButton")
                 self.assertTrue(QMetaObject.invokeMethod(save, "clicked", Qt.DirectConnection))
                 QTest.qWait(50)
+                self.assertFalse(dialog.property("visible"))
                 rows = DutySheetService(root_dir).load_personnel_deductions()
                 self.assertEqual([(row["people"], row["reason"]) for row in rows], [(["20", "22"], "TP訓")])
                 record_id = rows[0]["id"]
                 edit = find_visual("dutyPersonnelDeductionEditButton_0")
                 self.assertTrue(QMetaObject.invokeMethod(edit, "clicked", Qt.DirectConnection))
+                self.assertTrue(dialog.property("visible"))
                 fields["Reason"].setProperty("text", "公差")
                 self.assertTrue(QMetaObject.invokeMethod(save, "clicked", Qt.DirectConnection))
                 QTest.qWait(50)
+                self.assertFalse(dialog.property("visible"))
                 updated = DutySheetService(root_dir).load_personnel_deductions()
                 self.assertEqual((updated[0]["id"], updated[0]["reason"]), (record_id, "公差"))
+                self.assertTrue(QMetaObject.invokeMethod(add, "clicked", Qt.DirectConnection))
+                fields["People"].setProperty("text", "23")
+                fields["StartDate"].setProperty("text", "2099/11/04")
+                fields["EndDate"].setProperty("text", "2099/11/03")
+                fields["Reason"].setProperty("text", "TP訓")
+                self.assertTrue(QMetaObject.invokeMethod(save, "clicked", Qt.DirectConnection))
+                self.assertTrue(dialog.property("visible"))
+                self.assertEqual(DutySheetService(root_dir).load_personnel_deductions(), updated)
+                cancel = window.findChild(QObject, "dutyPersonnelDeductionCancelButton")
+                self.assertTrue(QMetaObject.invokeMethod(cancel, "clicked", Qt.DirectConnection))
+                QTest.qWait(25)
+                self.assertFalse(dialog.property("visible"))
+                self.assertEqual(DutySheetService(root_dir).load_personnel_deductions(), updated)
                 duty.set_automatic_preparing(True)
                 self.assertFalse(duty.savePersonnelDeduction("23", "2099/11/01", "2099/11/03", "TP訓", ""))
                 self.assertFalse(duty.removePersonnelDeduction(record_id))
@@ -14561,7 +14582,6 @@ class QtShellTests(unittest.TestCase):
             'text: "救護車 1"',
             'text: "救護車 2"',
             'text: "完成後發送群組通知"',
-            'text: "取消"',
             '"確認並執行"',
             "ToolUsageCard {",
         ):
@@ -14569,7 +14589,7 @@ class QtShellTests(unittest.TestCase):
         self.assertIn("ToolPanelHeader {", panel)
         self.assertEqual(panel.count("ToolFormCard {"), 3)
         self.assertLess(panel.index('text: "來源檔案及日期設定"'), panel.index('text: "主力車設定"'))
-        self.assertLess(panel.index('text: "主力車設定"'), panel.index('text: "人力扣除"'))
+        self.assertLess(panel.index('text: "主力車設定"'), panel.index('text: "扣除人力情形"'))
         self.assertNotIn('objectName: "dutySheetCloseButton"', panel)
         self.assertLess(panel.index('objectName: "dutySheetStatusBar"'), panel.index('objectName: "dutySheetRunButton"'))
 

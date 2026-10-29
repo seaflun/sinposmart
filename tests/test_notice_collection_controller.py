@@ -125,6 +125,63 @@ class NoticeCollectionControllerTests(unittest.TestCase):
             self.wait_for(lambda: not self.controller.isRunning)
             self.assertEqual(self.service.collect.call_count, count + 1)
 
+    def test_login_protection_hides_unknown_and_unexpired_routine_information(self):
+        from app_core.notice_collection_service import NoticeLoginGuard
+
+        for expiry in ("", "2027-02-01"):
+            with self.subTest(expiry=expiry), tempfile.TemporaryDirectory() as temporary:
+                guard = NoticeLoginGuard(Path(temporary))
+                if expiry:
+                    guard.record_expiry(expiry)
+                protection = guard.status(self.now)
+                self.assertFalse(protection["paused"])
+                self.service.login_protection.side_effect = lambda now: guard.status(now)
+                self.controller.refreshReminder()
+                self.assertEqual(self.controller.loginProtectionText, "")
+                self.assertNotIn(protection["message"], self.controller.statusText)
+        self.service.collect.assert_not_called()
+        self.service.verify_login.assert_not_called()
+
+    def test_login_protection_keeps_expired_locked_and_paused_warnings(self):
+        from app_core.notice_collection_service import NoticeLoginGuard
+
+        for code in ("oa_password_expired", "oa_account_locked", "oa_login_unconfirmed"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
+                guard = NoticeLoginGuard(Path(temporary))
+                if code == "oa_password_expired":
+                    guard.record_expiry("2026-10-21")
+                else:
+                    guard.pause(code)
+                protection = guard.status(self.now)
+                self.assertTrue(protection["paused"])
+                self.service.login_protection.side_effect = lambda now: guard.status(now)
+                self.controller.refreshReminder()
+                self.assertEqual(self.controller.loginProtectionText, protection["message"])
+                self.assertIn(protection["message"], self.controller.statusText)
+
+    def test_login_protection_read_failure_keeps_fail_closed_warning(self):
+        self.service.login_protection.side_effect = OSError("fixture")
+        self.controller.refreshReminder()
+        warning = "通報登入保護狀態無法確認，已停止自動登入。"
+        self.assertEqual(self.controller.loginProtectionText, warning)
+        self.assertIn(warning, self.controller.statusText)
+
+    def test_verification_success_does_not_repeat_unknown_or_future_expiry(self):
+        from app_core.notice_collection_service import NoticeLoginGuard
+
+        self.enable_saved_account()
+        for expiry in ("", "2027-02-01"):
+            with self.subTest(expiry=expiry), tempfile.TemporaryDirectory() as temporary:
+                guard = NoticeLoginGuard(Path(temporary))
+                if expiry:
+                    guard.record_expiry(expiry)
+                self.service.login_protection.side_effect = lambda now: guard.status(now)
+                self.controller.verifyLogin()
+                self.wait_for(lambda: not self.controller.isRunning)
+                self.assertEqual(self.controller.verificationState, "verified")
+                self.assertEqual(self.controller.verificationStatus, "通報帳號 tyfd01214 登入驗證成功。")
+        self.service.collect.assert_not_called()
+
     def reminder_controller(self, path=None, actor=None):
         self.controller.shutdown()
         self.service.shift_records.return_value = [{"time": "09:12", "unit": "第三救災救護大隊",

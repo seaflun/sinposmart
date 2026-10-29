@@ -29,10 +29,8 @@ ToolSidePanel {
         dutyPersonnelDeductionStartDateField.text = record.start_date;
         dutyPersonnelDeductionEndDateField.text = record.end_date;
         dutyPersonnelDeductionReasonField.text = record.reason;
-        dutyPersonnelDeductionPeopleField.forceActiveFocus();
-        var flickable = dutySheetSettingsScroll.contentItem;
-        flickable.contentY = Math.max(0, Math.min(dutyPersonnelDeductionCard.y,
-                                                flickable.contentHeight - flickable.height));
+        dutyPersonnelDeductionDialog.errorText = "";
+        dutyPersonnelDeductionDialog.open();
     }
 
     QtObject {
@@ -192,12 +190,152 @@ ToolSidePanel {
         }
     }
 
+    AppleDialog {
+        id: dutyPersonnelDeductionDialog
+        objectName: "dutyPersonnelDeductionDialog"
+        parent: dutySheetDialog.hostWindow.contentItem
+        anchors.centerIn: parent
+        width: Math.min(window.width - 72, 440)
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        title: dutySheetDialog.personnelDeductionEditingId ? "編輯扣除人力" : "新增扣除人力"
+        property string errorText: ""
+        onOpened: {
+            if (!dutySheetDialog.controller.canEditPersonnelDeductions) {
+                close();
+                return;
+            }
+            dutyPersonnelDeductionPeopleField.forceActiveFocus();
+        }
+        onClosed: {
+            personnelDeductionStartCalendar.closeCalendar();
+            personnelDeductionEndCalendar.closeCalendar();
+            dutySheetDialog.resetPersonnelDeductionForm();
+            errorText = "";
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 10
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                rowSpacing: 8
+                columnSpacing: 10
+
+                ToolFieldLabel {
+                    text: "人員"
+                }
+                AppleTextField {
+                    id: dutyPersonnelDeductionPeopleField
+                    objectName: "dutyPersonnelDeductionPeopleField"
+                    compact: true
+                    Layout.fillWidth: true
+                    placeholderText: "20、22"
+                    enabled: dutySheetDialog.controller.canEditPersonnelDeductions
+                }
+                ToolFieldLabel {
+                    text: "開始日期"
+                }
+                AppleTextField {
+                    id: dutyPersonnelDeductionStartDateField
+                    objectName: "dutyPersonnelDeductionStartDateField"
+                    compact: true
+                    Layout.fillWidth: true
+                    text: dutyDateField.text
+                    enabled: dutySheetDialog.controller.canEditPersonnelDeductions
+                    clickAction: function () {
+                        personnelDeductionStartCalendar.openForCurrentDate();
+                    }
+                }
+                ToolFieldLabel {
+                    text: "結束日期"
+                }
+                AppleTextField {
+                    id: dutyPersonnelDeductionEndDateField
+                    objectName: "dutyPersonnelDeductionEndDateField"
+                    compact: true
+                    Layout.fillWidth: true
+                    text: dutyDateField.text
+                    enabled: dutySheetDialog.controller.canEditPersonnelDeductions
+                    clickAction: function () {
+                        personnelDeductionEndCalendar.openForCurrentDate();
+                    }
+                }
+                ToolFieldLabel {
+                    text: "原因"
+                }
+                AppleTextField {
+                    id: dutyPersonnelDeductionReasonField
+                    objectName: "dutyPersonnelDeductionReasonField"
+                    compact: true
+                    Layout.fillWidth: true
+                    placeholderText: "例如：TP訓"
+                    enabled: dutySheetDialog.controller.canEditPersonnelDeductions
+                }
+            }
+            Label {
+                objectName: "dutyPersonnelDeductionErrorText"
+                Layout.fillWidth: true
+                visible: dutyPersonnelDeductionDialog.errorText.length > 0
+                text: dutyPersonnelDeductionDialog.errorText
+                textFormat: Text.PlainText
+                color: Design.dangerStrong
+                font.pixelSize: Design.bodySize
+                wrapMode: Text.WrapAnywhere
+            }
+        }
+        footer: Item {
+            implicitHeight: 52
+
+            Rectangle {
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: Design.borderWidth
+                color: Design.divider
+            }
+            RowLayout {
+                anchors.right: parent.right
+                anchors.rightMargin: 12
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 8
+
+                AppleButton {
+                    objectName: "dutyPersonnelDeductionCancelButton"
+                    implicitHeight: Design.toolSmallButtonHeight
+                    text: "取消"
+                    onClicked: dutyPersonnelDeductionDialog.close()
+                }
+                ToolAddButton {
+                    objectName: "dutyPersonnelDeductionSaveButton"
+                    text: dutySheetDialog.personnelDeductionEditingId ? "儲存" : "新增"
+                    enabled: dutySheetDialog.controller.canEditPersonnelDeductions
+                    onClicked: {
+                        if (!dutySheetDialog.controller.canEditPersonnelDeductions)
+                            return;
+                        if (dutySheetDialog.controller.savePersonnelDeduction(
+                                dutyPersonnelDeductionPeopleField.text,
+                                dutyPersonnelDeductionStartDateField.text,
+                                dutyPersonnelDeductionEndDateField.text,
+                                dutyPersonnelDeductionReasonField.text,
+                                dutySheetDialog.personnelDeductionEditingId)) {
+                            dutyPersonnelDeductionDialog.close();
+                        } else {
+                            dutyPersonnelDeductionDialog.errorText = dutySheetDialog.controller.statusText;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     AppleCalendarButton {
         id: personnelDeductionStartCalendar
         objectName: "dutyPersonnelDeductionStartCalendarButton"
         triggerOnly: true
         anchorItem: dutyPersonnelDeductionStartDateField
-        popupParent: dutySheetDialog.hostWindow.contentItem
+        popupParent: dutyPersonnelDeductionDialog.contentItem
         dateText: dutyPersonnelDeductionStartDateField.text
         dateFormat: "slash"
         enabled: dutySheetDialog.controller.canEditPersonnelDeductions
@@ -211,7 +349,7 @@ ToolSidePanel {
         objectName: "dutyPersonnelDeductionEndCalendarButton"
         triggerOnly: true
         anchorItem: dutyPersonnelDeductionEndDateField
-        popupParent: dutySheetDialog.hostWindow.contentItem
+        popupParent: dutyPersonnelDeductionDialog.contentItem
         dateText: dutyPersonnelDeductionEndDateField.text
         dateFormat: "slash"
         enabled: dutySheetDialog.controller.canEditPersonnelDeductions
@@ -445,94 +583,23 @@ ToolSidePanel {
                     contentItem: ColumnLayout {
                         spacing: 8
 
-                        ToolSectionTitle {
-                            text: "人力扣除"
-                        }
-                        GridLayout {
-                            Layout.fillWidth: true
-                            columns: 2
-                            rowSpacing: 8
-                            columnSpacing: 10
-
-                            ToolFieldLabel {
-                                text: "人員"
-                            }
-                            AppleTextField {
-                                id: dutyPersonnelDeductionPeopleField
-                                objectName: "dutyPersonnelDeductionPeopleField"
-                                compact: true
-                                Layout.fillWidth: true
-                                placeholderText: "20、22"
-                                enabled: dutySheetDialog.controller.canEditPersonnelDeductions
-                            }
-                            ToolFieldLabel {
-                                text: "開始日期"
-                            }
-                            AppleTextField {
-                                id: dutyPersonnelDeductionStartDateField
-                                objectName: "dutyPersonnelDeductionStartDateField"
-                                compact: true
-                                Layout.fillWidth: true
-                                text: dutyDateField.text
-                                enabled: dutySheetDialog.controller.canEditPersonnelDeductions
-                                clickAction: function () {
-                                    personnelDeductionStartCalendar.openForCurrentDate();
-                                }
-                            }
-                            ToolFieldLabel {
-                                text: "結束日期"
-                            }
-                            AppleTextField {
-                                id: dutyPersonnelDeductionEndDateField
-                                objectName: "dutyPersonnelDeductionEndDateField"
-                                compact: true
-                                Layout.fillWidth: true
-                                text: dutyDateField.text
-                                enabled: dutySheetDialog.controller.canEditPersonnelDeductions
-                                clickAction: function () {
-                                    personnelDeductionEndCalendar.openForCurrentDate();
-                                }
-                            }
-                            ToolFieldLabel {
-                                text: "原因"
-                            }
-                            AppleTextField {
-                                id: dutyPersonnelDeductionReasonField
-                                objectName: "dutyPersonnelDeductionReasonField"
-                                compact: true
-                                Layout.fillWidth: true
-                                placeholderText: "例如：TP訓"
-                                enabled: dutySheetDialog.controller.canEditPersonnelDeductions
-                            }
-                        }
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 8
 
-                            Item {
-                                Layout.fillWidth: true
-                            }
-                            AppleButton {
-                                objectName: "dutyPersonnelDeductionCancelButton"
-                                implicitHeight: Design.toolSmallButtonHeight
-                                text: "取消編輯"
-                                visible: dutySheetDialog.personnelDeductionEditingId.length > 0
-                                enabled: dutySheetDialog.controller.canEditPersonnelDeductions
-                                onClicked: dutySheetDialog.resetPersonnelDeductionForm()
+                            ToolSectionTitle {
+                                text: "扣除人力情形"
                             }
                             ToolAddButton {
-                                objectName: "dutyPersonnelDeductionSaveButton"
-                                text: dutySheetDialog.personnelDeductionEditingId ? "儲存" : "新增"
+                                objectName: "dutyPersonnelDeductionAddButton"
+                                text: "新增"
                                 enabled: dutySheetDialog.controller.canEditPersonnelDeductions
                                 onClicked: {
-                                    if (dutySheetDialog.controller.savePersonnelDeduction(
-                                            dutyPersonnelDeductionPeopleField.text,
-                                            dutyPersonnelDeductionStartDateField.text,
-                                            dutyPersonnelDeductionEndDateField.text,
-                                            dutyPersonnelDeductionReasonField.text,
-                                            dutySheetDialog.personnelDeductionEditingId)) {
-                                        dutySheetDialog.resetPersonnelDeductionForm();
-                                    }
+                                    if (!dutySheetDialog.controller.canEditPersonnelDeductions)
+                                        return;
+                                    dutySheetDialog.resetPersonnelDeductionForm();
+                                    dutyPersonnelDeductionDialog.errorText = "";
+                                    dutyPersonnelDeductionDialog.open();
                                 }
                             }
                         }

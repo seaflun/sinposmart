@@ -163,7 +163,7 @@ class NoticeCollectionController(QObject):
 
     @Property(str, notify=stateChanged)
     def loginProtectionText(self) -> str:
-        return self._protection_text
+        return self._protection_text if self._login_paused else ""
 
     @Property(bool, notify=stateChanged)
     def isRunning(self) -> bool:
@@ -577,7 +577,7 @@ class NoticeCollectionController(QObject):
         self._clear_verification_report()
         self._notice, self._status_tone = "", "success"
         self._refresh_status()
-        self._set_verification_status(f"通報帳號 {FIXED_NOTICE_ACCOUNT} 登入驗證成功。" + self._protection_text, "verified")
+        self._set_verification_status(f"通報帳號 {FIXED_NOTICE_ACCOUNT} 登入驗證成功。" + self.loginProtectionText, "verified")
 
     @Slot(str, str)
     def _verification_failed(self, message: str, tone: str) -> None:
