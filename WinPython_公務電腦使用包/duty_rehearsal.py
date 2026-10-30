@@ -1661,6 +1661,15 @@ def inspect_entry_log_format(
 
 # Login and query readers
 
+class DutyCredentialsRejectedError(RuntimeError):
+    """Explicit duty-login rejection without retaining submitted credentials."""
+
+    error_code = "invalid_credentials"
+
+    def __init__(self) -> None:
+        super().__init__("帳號或密碼錯誤，已停止登入。")
+
+
 def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     def require_authorized_login_page() -> None:
         try:
@@ -1687,6 +1696,7 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     password_field = driver.find_element(By.ID, "_txtPassword")
     require_authorized_login_page()
     password_field.send_keys(password)
+    require_authorized_login_page()
     driver.execute_script(
         """
         if (document.getElementById('hidFlag')) {
@@ -1702,6 +1712,11 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
     for _ in range(20):
         error = detect_login_error(driver)
         if error:
+            if not re.search(r"驗證碼|認證碼|captcha|verification\s*code|net::ERR_", error, re.I) and re.search(
+                r"(?:帳號(?:或|與|及|/|、)?密碼|密碼)(?:有誤|錯誤|不正確)|"
+                r"invalid\s+credentials|(?:invalid|incorrect)\s+password", error, re.I
+            ):
+                raise DutyCredentialsRejectedError() from None
             raise RuntimeError(error)
         time.sleep(0.25)
     # The legacy app can keep login119 in the address bar after posting. The

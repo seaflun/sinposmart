@@ -27,6 +27,7 @@ if str(PACKAGE_DIR) not in sys.path:
 
 from duty_rehearsal import (
     build_driver,
+    login as shared_duty_login,
     quit_driver,
     retain_browser_for_seconds,
     retry_duty_browser_session_open,
@@ -1092,13 +1093,8 @@ def wait_for_popup_close_and_return_to_main(driver, wait, main_window, popup_win
 
 def step_login(driver, uid, pwd):
     log_status("➡️ 執行登入勤務管理系統...")
-    driver.get("https://dutymgt.tyfd.gov.tw/tyfd119/login119")
-    driver.find_element(By.ID, "_txtUsername").send_keys(uid)
-    driver.find_element(By.ID, "_txtPassword").send_keys(pwd)
-    driver.find_element(By.NAME, "login").click()
-
-    log_status("⏳ 登入資料已送出，等待載入中...")
-    time.sleep(5)
+    shared_duty_login(driver, uid, pwd)
+    log_status("⏳ 登入資料已送出，正在確認勤務頁面...")
 
 def step_navigate_menu(driver, wait):
     log_status("➡️ 正在開啟勤務分配表維護(外勤)...")

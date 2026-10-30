@@ -6073,6 +6073,87 @@ try {
                 wait.return_value.until.return_value.send_keys.assert_not_called()
                 driver.find_element.return_value.send_keys.assert_not_called()
 
+    def test_duty_login_explicit_credentials_rejection_is_safe_and_not_retried(self) -> None:
+        module = duty_rehearsal_module()
+        for message in (
+            "帳號密碼有誤或尚未申請帳號權限,請確認後再重新登入",
+            "帳號或密碼錯誤。fixture-user fixture-secret",
+            "Invalid credentials: fixture-user fixture-secret",
+        ):
+            with self.subTest(message=message):
+                driver = mock.Mock(current_url=f"{module.BASE_URL}/login119")
+                factory, cleanup = mock.Mock(return_value=driver), mock.Mock()
+                with mock.patch.object(module, "WebDriverWait"), mock.patch.object(
+                    module, "detect_login_error", return_value=message
+                ) as detect, mock.patch.object(module.time, "sleep"), self.assertRaises(
+                    module.DutyCredentialsRejectedError
+                ) as rejected:
+                    module.retry_duty_browser_session_open(
+                        factory, lambda candidate: module.login(candidate, "fixture-user", "fixture-secret"),
+                        cleanup=cleanup, write_diagnostics=False,
+                    )
+                self.assertEqual(str(rejected.exception), "帳號或密碼錯誤，已停止登入。")
+                self.assertEqual(rejected.exception.error_code, "invalid_credentials")
+                self.assertNotIn("fixture-secret", repr(rejected.exception))
+                factory.assert_called_once_with()
+                cleanup.assert_called_once_with(driver)
+                detect.assert_called_once_with(driver)
+                driver.execute_script.assert_called_once()
+
+    def test_duty_login_other_alerts_and_captcha_are_not_credentials_rejection(self) -> None:
+        module = duty_rehearsal_module()
+        for message in ("系統暫停服務", "驗證碼錯誤", "Captcha invalid; please check password",
+                        "驗證碼錯誤，非帳號密碼錯誤", "net::ERR_CONNECTION_TIMED_OUT"):
+            with self.subTest(message=message):
+                driver = mock.Mock(current_url=f"{module.BASE_URL}/login119")
+                with mock.patch.object(module, "WebDriverWait"), mock.patch.object(
+                    module, "detect_login_error", return_value=message
+                ), mock.patch.object(module.time, "sleep"), self.assertRaises(RuntimeError) as failed:
+                    module.login(driver, "fixture-user", "fixture-secret")
+                self.assertNotIsInstance(failed.exception, module.DutyCredentialsRejectedError)
+
+    def test_duty_login_network_and_browser_errors_preserve_their_types(self) -> None:
+        module = duty_rehearsal_module()
+        for error in (module.WebDriverException("net::ERR_NAME_NOT_RESOLVED"),
+                      module.TimeoutException("page timed out")):
+            with self.subTest(error=type(error).__name__):
+                driver = mock.Mock(current_url=f"{module.BASE_URL}/login119")
+                with mock.patch.object(module, "WebDriverWait"), mock.patch.object(
+                    module, "detect_login_error", side_effect=error
+                ), mock.patch.object(module.time, "sleep"), self.assertRaises(type(error)) as failed:
+                    module.login(driver, "fixture-user", "fixture-secret")
+                self.assertIs(failed.exception, error)
+
+    def test_duty_login_no_error_preserves_authenticated_page_verification(self) -> None:
+        module = duty_rehearsal_module()
+        driver = mock.Mock(current_url=f"{module.BASE_URL}/login119")
+        with mock.patch.object(module, "WebDriverWait"), mock.patch.object(
+            module, "detect_login_error", return_value=""
+        ) as detect, mock.patch.object(module.time, "sleep"):
+            module.login(driver, "fixture-user", "fixture-secret")
+        self.assertEqual(detect.call_count, 20)
+        driver.execute_script.assert_called_once()
+
+    def test_legacy_duty_login_uses_shared_login_and_preserves_rejection(self) -> None:
+        module, shared = legacy_duty_sheet_module(), duty_rehearsal_module()
+        driver = mock.Mock()
+        with mock.patch.object(module, "shared_duty_login", side_effect=shared.DutyCredentialsRejectedError()) as login, \
+                mock.patch.object(module, "log_status"):
+            with self.assertRaises(shared.DutyCredentialsRejectedError):
+                module.step_login(driver, "fixture-user", "fixture-secret")
+        login.assert_called_once_with(driver, "fixture-user", "fixture-secret")
+        driver.get.assert_not_called()
+        driver.find_element.assert_not_called()
+
+    def test_legacy_duty_login_preserves_authorized_origin_check(self) -> None:
+        module, shared = legacy_duty_sheet_module(), duty_rehearsal_module()
+        driver = mock.Mock(current_url="https://untrusted.example/tyfd119/login119")
+        with mock.patch.object(shared, "WebDriverWait") as wait, mock.patch.object(module, "log_status"):
+            with self.assertRaisesRegex(RuntimeError, "授權.*登入頁面"):
+                module.step_login(driver, "fixture-user", "fixture-secret")
+        wait.return_value.until.return_value.send_keys.assert_not_called()
+        driver.find_element.assert_not_called()
+
     def test_visible_table_reads_all_pages_without_joining_page_headers(self) -> None:
         module = duty_rehearsal_module()
 

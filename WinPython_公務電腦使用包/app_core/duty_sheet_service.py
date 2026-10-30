@@ -35,10 +35,12 @@ class DutySheetValidationError(ValueError):
 class DutySheetExecutionError(RuntimeError):
     """A safe execution failure for the native form."""
 
-    def __init__(self, message: str, *, failure_stage: str = "unknown", annotation_report: dict | None = None) -> None:
+    def __init__(self, message: str, *, failure_stage: str = "unknown", annotation_report: dict | None = None,
+                 error_code: str = "unknown") -> None:
         super().__init__(message)
         self.failure_stage = failure_stage
         self.annotation_report = dict(annotation_report or {})
+        self.error_code = error_code if error_code == "invalid_credentials" else "unknown"
 
 
 class DutySheetResult(str):
@@ -544,10 +546,13 @@ class DutySheetService:
         os.replace(temporary, path)
 
     def confirmation_summary(self, request: DutySheetRequest) -> str:
+        deductions = "\n".join(f"{'、'.join(people)} {reason}"
+                               for people, reason in request.personnel_deductions or ()) or "無"
         return (
             f"日期：{request.target_date}\n"
             f"Excel：{Path(request.workbook_path).name}\n"
-            f"車輛：{request.attack}、{request.stop}、{request.amb1}、{request.amb2}\n\n"
+            f"車輛：{request.attack}、{request.stop}、{request.amb1}、{request.amb2}\n"
+            f"扣除人力情形：\n{deductions}\n\n"
             "確認後將登入正式勤務系統並執行勤務表登打。"
         )
 
@@ -627,9 +632,11 @@ class DutySheetService:
             raise
         except Exception as exc:
             raise DutySheetExecutionError(
-                str(exc) or "勤務表登打失敗。",
+                "帳號或密碼錯誤，已停止登入。" if getattr(exc, "error_code", "") == "invalid_credentials"
+                else str(exc) or "勤務表登打失敗。",
                 failure_stage=stage,
                 annotation_report=annotation_report,
+                error_code=getattr(exc, "error_code", "unknown"),
             ) from exc
         finally:
             if legacy is not None and hasattr(legacy, "_runtime_status_callback"):

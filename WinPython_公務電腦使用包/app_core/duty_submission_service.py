@@ -1184,6 +1184,8 @@ class DutySubmissionService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        if getattr(exc, "error_code", "") == "invalid_credentials":
+            return "帳號或密碼錯誤，已停止登入。", "invalid_credentials"
         category = str(getattr(exc, "diagnostic_category", "") or "")
         if category == "browser_session_open":
             return (

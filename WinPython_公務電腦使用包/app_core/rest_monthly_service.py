@@ -30,10 +30,12 @@ class RestMonthlyExecutionError(RuntimeError):
         *,
         failure_stage: str = "unknown",
         failure_detail: str = "",
+        error_code: str = "unknown",
     ) -> None:
         super().__init__(message)
         self.failure_stage = failure_stage
         self.failure_detail = failure_detail
+        self.error_code = error_code if error_code == "invalid_credentials" else "unknown"
 
 
 @dataclass(frozen=True)
@@ -260,6 +262,7 @@ class RestMonthlyService:
                 self._format_error(legacy, exc, "休息時間登打失敗。"),
                 failure_stage=stage,
                 failure_detail=self._failure_detail(exc),
+                error_code=getattr(exc, "error_code", "unknown"),
             ) from exc
 
     def execute_monthly(
@@ -300,6 +303,7 @@ class RestMonthlyService:
                 self._format_error(legacy, exc, "勤務基準表登打失敗。"),
                 failure_stage=stage,
                 failure_detail=self._failure_detail(exc),
+                error_code=getattr(exc, "error_code", "unknown"),
             ) from exc
 
     def _legacy(self) -> ModuleType:
@@ -375,6 +379,8 @@ class RestMonthlyService:
 
     @staticmethod
     def _format_error(legacy: ModuleType, exc: Exception, fallback: str) -> str:
+        if getattr(exc, "error_code", "") == "invalid_credentials":
+            return "帳號或密碼錯誤，已停止登入。"
         failure_detail = RestMonthlyService._failure_detail(exc)
         if failure_detail == "browser_session_open":
             return (

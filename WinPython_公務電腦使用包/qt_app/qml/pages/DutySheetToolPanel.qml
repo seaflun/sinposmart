@@ -420,7 +420,7 @@ ToolSidePanel {
                             RowLayout {
                                 Layout.fillWidth: true
                                 Layout.columnSpan: 2
-                                spacing: 6
+                                spacing: 4
 
                                 AppleTextField {
                                     id: dutyDateField
@@ -454,22 +454,17 @@ ToolSidePanel {
                                              && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
                                     onClicked: dutyDateField.text = window.shiftSlashDate(dutyDateField.text, 1)
                                 }
+                                AppleCheckBox {
+                                    id: dutyNotificationCheck
+                                    objectName: "dutyNotificationCheck"
+                                    text: "發送截圖"
+                                    checked: dutySheetDialog.controller.notificationEnabled
+                                    enabled: !dutySheetDialog.controller.isRunning
+                                    onToggled: dutySheetDialog.controller.setNotificationEnabled(checked)
+                                }
                                 Item {
                                     Layout.fillWidth: true
                                 }
-                            }
-
-                            Item {
-                                Layout.preferredWidth: 0
-                            }
-                            AppleCheckBox {
-                                id: dutyNotificationCheck
-                                objectName: "dutyNotificationCheck"
-                                Layout.columnSpan: 2
-                                text: "完成後發送勤務表截圖"
-                                checked: dutySheetDialog.controller.notificationEnabled
-                                enabled: !dutySheetDialog.controller.isRunning
-                                onToggled: dutySheetDialog.controller.setNotificationEnabled(checked)
                             }
                         }
                     }
@@ -712,11 +707,24 @@ ToolSidePanel {
         }
         onRejected: dutySheetDialog.controller.cancelPendingRun()
 
-        Label {
-            width: parent.width
-            text: dutySheetDialog.controller.confirmationSummary
-            color: window.ink
-            wrapMode: Text.Wrap
+        contentItem: ScrollView {
+            id: dutySheetConfirmationScroll
+            objectName: "dutySheetConfirmationScroll"
+            implicitHeight: Math.min(dutySheetConfirmationText.implicitHeight,
+                                     dutySheetDialog.hostWindow.height - 180)
+            contentWidth: availableWidth
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            Label {
+                id: dutySheetConfirmationText
+                objectName: "dutySheetConfirmationText"
+                width: dutySheetConfirmationScroll.availableWidth
+                text: dutySheetDialog.controller.confirmationSummary
+                textFormat: Text.PlainText
+                color: window.ink
+                wrapMode: Text.Wrap
+            }
         }
     }
 

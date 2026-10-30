@@ -64,10 +64,12 @@ class RestMonthlyWorker(QObject):
         self.request = request
         self.failure_stage = "unknown"
         self.failure_detail = ""
+        self.failure_code = "unknown"
 
     @Slot()
     def run(self) -> None:
         stage = "preflight"
+        self.failure_code = "unknown"
 
         def update_stage(value: str) -> None:
             nonlocal stage
@@ -100,6 +102,7 @@ class RestMonthlyWorker(QObject):
         except RestMonthlyExecutionError as exc:
             self.failure_stage = getattr(exc, "failure_stage", stage)
             self.failure_detail = str(getattr(exc, "failure_detail", "") or "")
+            self.failure_code = "invalid_credentials" if getattr(exc, "error_code", "") == "invalid_credentials" else "unknown"
             self.failed.emit(self.request_id, self.tool_id, str(exc))
         except Exception:
             self.failure_stage = stage

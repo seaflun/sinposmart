@@ -48,6 +48,7 @@ class DutyExecutionController(QObject):
     submissionFinished = Signal(object, object)
     submissionFailed = Signal(object, str, str, str)
     submissionCancelled = Signal(object, str, str)
+    prewarmFailed = Signal(object, str, str)
     allLanesUnavailable = Signal(str)
 
     def __init__(
@@ -284,6 +285,7 @@ class DutyExecutionController(QObject):
         worker.requestStarted.connect(self._entry_request_started)
         worker.succeeded.connect(self._succeeded)
         worker.failed.connect(self._failed)
+        worker.prewarmFailed.connect(self._prewarm_failed)
         worker.requestCancelled.connect(self._entry_request_cancelled)
         worker.requestFinished.connect(self._entry_request_finished)
         worker.stopped.connect(worker.deleteLater)
@@ -307,6 +309,7 @@ class DutyExecutionController(QObject):
         worker.requestStarted.connect(self._work_request_started)
         worker.succeeded.connect(self._succeeded)
         worker.failed.connect(self._failed)
+        worker.prewarmFailed.connect(self._prewarm_failed)
         worker.requestCancelled.connect(self._work_request_cancelled)
         worker.requestFinished.connect(self._work_request_finished)
         worker.stopped.connect(worker.deleteLater)
@@ -316,6 +319,11 @@ class DutyExecutionController(QObject):
         self._work_stopping = False
         thread.start()
         return worker
+
+    @Slot(object, str, str)
+    def _prewarm_failed(self, request: DutySubmissionRequest, message: str, error_code: str) -> None:
+        if self._request_matches_current_session(request):
+            self.prewarmFailed.emit(request, message, error_code)
 
     @Slot(int, int)
     def _entry_request_started(self, request_id: int, action_index: int) -> None:

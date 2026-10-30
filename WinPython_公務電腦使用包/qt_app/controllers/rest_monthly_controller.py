@@ -47,6 +47,7 @@ class RestMonthlyController(QObject):
         self._pending_tool_id = ""
         self._request_id = 0
         self._failure_stage = "unknown"
+        self._failure_code = "unknown"
         self._failure_detail = ""
         self._workers: dict[int, tuple[QThread, RestMonthlyWorker]] = {}
         self._monthly_source_request_id = 0
@@ -97,6 +98,10 @@ class RestMonthlyController(QObject):
     @Property(str, notify=stateChanged)
     def failureStage(self) -> str:
         return self._failure_stage
+
+    @Property(str, notify=stateChanged)
+    def failureCode(self) -> str:
+        return self._failure_code
 
     @Property(str, notify=stateChanged)
     def failureDetail(self) -> str:
@@ -230,6 +235,7 @@ class RestMonthlyController(QObject):
         self._request_id += 1
         request_id = self._request_id
         self._failure_stage = "unknown"
+        self._failure_code = "unknown"
         self._failure_detail = ""
         request = self._pending_request
         tool_id = self._pending_tool_id
@@ -327,6 +333,7 @@ class RestMonthlyController(QObject):
             worker = worker_pair[1] if worker_pair is not None else None
             self._failure_stage = str(getattr(worker, "failure_stage", "unknown") or "unknown")
             self._failure_detail = str(getattr(worker, "failure_detail", "") or "")
+            self._failure_code = "invalid_credentials" if getattr(worker, "failure_code", "") == "invalid_credentials" else "unknown"
             self.runFailed.emit(tool_id, message)
             self._set_error(message)
 

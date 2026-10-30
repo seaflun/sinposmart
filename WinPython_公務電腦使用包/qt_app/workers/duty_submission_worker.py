@@ -91,6 +91,7 @@ class DutyEntryQueueWorker(QObject):
     failed = Signal(int, int, str, str, str)
     requestFinished = Signal(int)
     requestCancelled = Signal(int, int, str, str)
+    prewarmFailed = Signal(object, str, str)
     stopped = Signal()
 
     _STOP_PRIORITY = -1
@@ -126,6 +127,7 @@ class DutyEntryQueueWorker(QObject):
         self._cancelled_request_ids: set[int] = set()
         self._cancelled_request_ids_lock = Lock()
         self._browser_session: DutySubmissionBrowserSession | None = None
+        self._rejected_credentials_session: tuple[int, str] | None = None
 
     def enqueue(self, request_id: int, request: DutySubmissionRequest) -> bool:
         """Thread-safe; the controller may call it while this worker is running."""
@@ -262,6 +264,8 @@ class DutyEntryQueueWorker(QObject):
                 try:
                     result = self._execute(request_id, request)
                 except DutySubmissionExecutionError as exc:
+                    if exc.error_code == "invalid_credentials":
+                        self._rejected_credentials_session = (request.session_generation, request.user_id)
                     self.failed.emit(
                         request_id,
                         request.action_index,
@@ -289,6 +293,8 @@ class DutyEntryQueueWorker(QObject):
             QThread.currentThread().quit()
 
     def _execute(self, request_id: int, request: DutySubmissionRequest) -> DutySubmissionResult:
+        if self._rejected_credentials_session == (request.session_generation, request.user_id):
+            raise DutySubmissionExecutionError("帳號或密碼錯誤，已停止登入。", "invalid_credentials")
         if not self._supports_browser_sessions():
             return self._execute_without_browser_session(request_id, request)
         stale_checker = getattr(self._service, "is_stale_due_request", None)
@@ -311,6 +317,8 @@ class DutyEntryQueueWorker(QObject):
             return result
 
         except DutySubmissionExecutionError as exc:
+            if exc.error_code == "invalid_credentials":
+                self._rejected_credentials_session = (request.session_generation, request.user_id)
             session_expired = exc.error_code == "login_failed" and had_compatible_session
             if exc.error_code != "browser_startup" and not session_expired:
                 self._close_browser_session()
@@ -360,7 +368,8 @@ class DutyEntryQueueWorker(QObject):
         *,
         preserve_incompatible_session: bool = False,
     ) -> None:
-        if self._stop_requested.is_set() or self._has_compatible_session(request):
+        if (self._stop_requested.is_set() or self._has_compatible_session(request)
+                or self._rejected_credentials_session == (request.session_generation, request.user_id)):
             return
         session = self._browser_session
         if (
@@ -372,6 +381,12 @@ class DutyEntryQueueWorker(QObject):
         self._close_browser_session()
         try:
             self._browser_session = self._service.open_browser_session(request)
+        except DutySubmissionExecutionError as exc:
+            self._close_browser_session()
+            if exc.error_code == "invalid_credentials":
+                self._rejected_credentials_session = (request.session_generation, request.user_id)
+                self.prewarmFailed.emit(request, "帳號或密碼錯誤，已停止登入。", exc.error_code)
+            return
         except Exception:
             self._close_browser_session()
             return

@@ -57,6 +57,7 @@ class DutyController(QObject):
     handoffWorkPrewarmRequested = Signal(int)
     autoLogoutRequested = Signal(str)
     reloginRequired = Signal(str)
+    credentialsRejected = Signal(str)
     manualSubmissionConfirmationRequested = Signal()
     externalReturnManualSubmissionConfirmationRequested = Signal()
     manualSubmissionRequested = Signal(object)
@@ -128,6 +129,7 @@ class DutyController(QObject):
         self._staff: dict[str, dict[str, Any]] = {}
         self._comparisons: dict[int, dict[str, Any]] = {}
         self._notice_live_comparisons = False
+        self._notice_verified_handoff_keys: set[str] = set()
         self._notice_last_responsibility = self._load_notice_responsibility()
         self._audit_kind_filter = "全部"
         self._audit_status_filter = "需處理"
@@ -919,6 +921,7 @@ class DutyController(QObject):
             return
         self._session_generation = generation
         self._session_user_id = user_id
+        self._notice_verified_handoff_keys.clear()
         self._session_closing = not bool(user_id)
         if not user_id:
             self._retry_unreturned_return_after_verified_login = False
@@ -1192,6 +1195,48 @@ class DutyController(QObject):
             self._cancel_auto_logout()
         self._refresh_projection()
 
+    def record_verified_notice_handoff(self, request: DutySubmissionRequest, status: str) -> None:
+        """Keep only current terminal callbacks, separate from restored queue markers."""
+        if status not in {"submitted", "skipped_duplicate"} or not self.request_matches_current_session(request):
+            return
+        index = self._resolve_request_action_index(request)
+        if index is None:
+            return
+        action = self._actions[index]
+        if (action.get("kind") == "entry_log" and action.get("source") == "值班交接"
+                and action.get("fields", {}).get("出或入") in {"值班", "值退"}):
+            self._notice_verified_handoff_keys.add(action_completion_key(action))
+
+    def notice_handoff_pending(self, now: datetime) -> bool:
+        """Let due handoffs reach a result before freezing a notice recipient."""
+        if (not self._auto_execution_enabled or not self._actor_no
+                or self._session_closing or self._preview_loaded):
+            return False
+        current = (now.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+                   if now.tzinfo is not None else now)
+        for index, action in enumerate(self._actions):
+            if (action.get("kind") != "entry_log" or action.get("source") != "值班交接"
+                    or str(action.get("actor", "")) != self._actor_no
+                    or action.get("fields", {}).get("出或入") != "值退"):
+                continue
+            at = action_datetime(action, self._target_date_text)
+            if not at <= current < at + AUTO_DUE_CATCH_UP_WINDOW:
+                continue
+            indices = self._handoff_group_indices(index)
+            entries = [i for i in indices if self._actions[i].get("kind") == "entry_log"]
+            if len(entries) != 2:
+                continue
+            state = self._handoff_preflight_groups.get(self._handoff_group_id(indices), {})
+            if state.get("paused") or any(
+                    self._comparisons.get(i, {}).get("group") in {"paused", "near", "review"}
+                    or self._comparisons.get(i, {}).get("cancelled")
+                    or i in self._external_return_queue_ids_by_action_index for i in indices):
+                continue
+            if any(i not in self._executed_indices and self._comparisons.get(i, {}).get("group") != "done"
+                   for i in entries):
+                return True
+        return False
+
     def notice_responsibility(self, now: datetime) -> dict:
         from app_core.notice_collection_service import confirmed_notice_responsibility
 
@@ -1199,7 +1244,8 @@ class DutyController(QObject):
         proof = confirmed_notice_responsibility(
             {} if self._preview_loaded else self._schedule_data,
             self._comparisons, self._executed_indices, now, live=self._notice_live_comparisons,
-            previous=previous, actual_handoff_times=self._actual_handoff_times)
+            previous=previous, actual_handoff_times=self._actual_handoff_times,
+            verified_handoff_keys=self._notice_verified_handoff_keys)
         if proof.get("status") == "confirmed":
             self._notice_last_responsibility = proof
             if not previous or any(previous.get(key) != value for key, value in proof.items() if key != "capturedAt"):
@@ -2245,12 +2291,15 @@ class DutyController(QObject):
     @Slot(int, str, str)
     def handle_submission_failure(self, action_index: int, message: str, error_code: str) -> None:
         self._submitting_indices.discard(action_index)
-        if error_code == "login_failed":
+        if error_code in {"login_failed", "invalid_credentials"}:
             self._retry_after.clear()
             self._schedule_status = message
             self._refresh_projection()
             self.errorOccurred.emit(message)
-            self.reloginRequired.emit(message)
+            if error_code == "invalid_credentials":
+                self.credentialsRejected.emit(message)
+            else:
+                self.reloginRequired.emit(message)
             return
         if 0 <= action_index < len(self._actions):
             self._retry_after[action_index] = datetime.now() + timedelta(minutes=1)
@@ -2427,6 +2476,7 @@ class DutyController(QObject):
         comparisons: Mapping[int, Mapping[str, Any]] | None = None,
         comparison_data: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
+        self._notice_verified_handoff_keys.clear()
         self._notice_live_comparisons = False
         next_target_date = str(data.get("target_date", "") or "")
         same_schedule_date = bool(next_target_date) and next_target_date == self._target_date_text
@@ -3252,13 +3302,18 @@ class DutyController(QObject):
             self._retry_after[index] = datetime.now() + timedelta(minutes=1)
         self._schedule_status = message
         self._refresh_projection()
+        if error_code == "invalid_credentials":
+            self.disable_auto_execution()
         self._refresh_due_tasks(force_emit=True)
-        if error_code == "login_failed":
+        if error_code in {"login_failed", "invalid_credentials"}:
             login_failure_message = (
                 f"交接預檢登入失敗，尚未執行正式交接：{message}"
             )
             self.errorOccurred.emit(login_failure_message)
-            self.reloginRequired.emit(login_failure_message)
+            if error_code == "invalid_credentials":
+                self.credentialsRejected.emit(login_failure_message)
+            else:
+                self.reloginRequired.emit(login_failure_message)
 
     def _handoff_preflight_blocked_indices(self) -> set[int]:
         return {
@@ -3807,7 +3862,11 @@ class DutyController(QObject):
         self._notice_live_comparisons = False
         self._schedule_status = message
         self.scheduleChanged.emit()
-        if error_code in {"login_failed", "comparison_login_failed"}:
+        if error_code in {"invalid_credentials", "comparison_invalid_credentials"}:
+            self.disable_auto_execution()
+            self.errorOccurred.emit(message)
+            self.credentialsRejected.emit(message)
+        elif error_code in {"login_failed", "comparison_login_failed"}:
             self.errorOccurred.emit(message)
             self.reloginRequired.emit(message)
         else:
@@ -3859,7 +3918,8 @@ class DutyController(QObject):
             self.disable_auto_execution()
         self._schedule_status = message
         self.scheduleChanged.emit()
-        is_login_failure = error_code in {"login_failed", "comparison_login_failed"}
+        credentials_rejected = error_code in {"invalid_credentials", "comparison_invalid_credentials"}
+        is_login_failure = error_code in {"login_failed", "comparison_login_failed"} or credentials_rejected
         if comparison_failure and not is_login_failure:
             self.comparisonWarningOccurred.emit(message)
         else:
@@ -3867,7 +3927,10 @@ class DutyController(QObject):
         if self._capture_publish_events.get(request_id, True):
             self.liveCaptureFailed.emit(message, error_code)
         if is_login_failure:
-            self.reloginRequired.emit(message)
+            if credentials_rejected:
+                self.credentialsRejected.emit(message)
+            else:
+                self.reloginRequired.emit(message)
             return
         if comparison_failure:
             return

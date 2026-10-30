@@ -159,6 +159,7 @@ class AppController(QObject):
         self._automatic_prepare_workers: dict[int, tuple[QThread, DutySheetWorker]] = {}
         self._tool_run_actors: dict[str, dict[str, str]] = {}
         self._tool_run_contexts: dict[str, dict[str, str]] = {}
+        self._tool_run_sessions: dict[str, tuple[int, str]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
@@ -351,6 +352,7 @@ class AppController(QObject):
         self._duty_controller.handoffWorkPrewarmRequested.connect(self._prewarm_handoff_work_browser)
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
+        self._duty_controller.credentialsRejected.connect(self._credentials_rejected)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
         self._duty_controller.manualWaitingScheduled.connect(self._register_background_manual_waiting)
         self._duty_controller.manualWaitingCancelled.connect(self._cancel_background_manual_waiting)
@@ -441,6 +443,7 @@ class AppController(QObject):
         self._duty_execution_controller.submissionProgress.connect(self._submission_progress)
         self._duty_execution_controller.submissionFinished.connect(self._submission_finished)
         self._duty_execution_controller.submissionFailed.connect(self._submission_failed)
+        self._duty_execution_controller.prewarmFailed.connect(self._prewarm_failed)
         self._duty_execution_controller.submissionCancelled.connect(self._submission_cancelled)
         self._duty_execution_controller.submissionFinished.connect(self._background_manual_submission_succeeded)
         self._duty_execution_controller.submissionFailed.connect(self._background_manual_submission_failed)
@@ -945,6 +948,8 @@ class AppController(QObject):
         if (self._logout_pending or self._background_manual_workers
                 or self._duty_execution_controller.hasPendingSubmissions):
             return "勤務登打或交接正在執行"
+        if self._duty_controller.notice_handoff_pending(datetime.now()):
+            return "值班交接待處理"
         if self._session_controller.isBusy or self._session_controller.hasRunningLoginWorkers:
             return "登入驗證正在執行"
         if self._duty_controller.isRefreshing or self._tomorrow_schedule_workers:
@@ -2161,7 +2166,9 @@ class AppController(QObject):
     ) -> None:
         if not self._tomorrow_schedule_request_is_current(request_id):
             return
-        if error_code == "login_failed":
+        if error_code == "invalid_credentials":
+            self._credentials_rejected(message)
+        elif error_code == "login_failed":
             self._force_logout(message)
 
     @Slot(int)
@@ -2505,6 +2512,8 @@ class AppController(QObject):
         queue_id = self._external_return_queue_id(request)
         is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
         request_is_current = self._duty_controller.request_matches_current_session(request)
+        if not is_handoff_preflight:
+            self._duty_controller.record_verified_notice_handoff(request, result.status)
         result_applied = False
         if is_handoff_preflight and request_is_current:
             if result.status == "paused_external":
@@ -2595,6 +2604,8 @@ class AppController(QObject):
         error_code: str,
         result_path: str,
     ) -> None:
+        credentials_rejected = (error_code == "invalid_credentials"
+                                and self._duty_controller.request_matches_current_session(request))
         if self._read_only_acceptance:
             is_handoff_preflight = self._duty_controller.is_handoff_preflight_request(request)
             if not is_handoff_preflight:
@@ -2610,6 +2621,8 @@ class AppController(QObject):
             if error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()
                 self._force_logout(message)
+            elif credentials_rejected:
+                self._credentials_rejected(message)
             return
         queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
@@ -2698,12 +2711,17 @@ class AppController(QObject):
             if self._queue_diagnostic_package(package_path):
                 self._diagnostics_status += "；已排入 NAS 背景上傳。"
         self.diagnosticsChanged.emit()
+        if credentials_rejected:
+            self._credentials_rejected(message)
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
         run_id = uuid4().hex
         self._active_tool_runs[tool_name] = (tool_label, mode, run_id)
         self._shutdown_terminal_tool_runs.discard(tool_name)
         session = self._session_state.session
+        self._tool_run_sessions[tool_name] = (
+            self._session_state.generation, str(session.user_id or "") if session else ""
+        )
         self._tool_run_actors[tool_name] = {
             "actor_no": str(session.actor_no or "") if session else self._session_controller.actorNo,
             "user_id": str(session.user_id or "") if session else self._session_controller.userId,
@@ -2779,6 +2797,7 @@ class AppController(QObject):
         if tool_name in self._shutdown_terminal_tool_runs:
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
+        self._tool_run_sessions.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
         if tool_name == "daily_vehicle" and not run_context:
@@ -2832,6 +2851,7 @@ class AppController(QObject):
             )
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
+        run_session = self._tool_run_sessions.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
         if tool_name == "daily_vehicle" and not run_context:
@@ -2860,6 +2880,12 @@ class AppController(QObject):
         failure_detail = self._failure_detail_for_tool(tool_name)
         if failure_detail:
             snapshot["failure_detail"] = failure_detail
+        controller = {"duty_sheet": self._duty_sheet_controller,
+                      "rest_time": self._rest_monthly_controller,
+                      "monthly_base": self._rest_monthly_controller}.get(tool_name)
+        failure_code = str(getattr(controller, "failureCode", "unknown") or "unknown")
+        if failure_code == "invalid_credentials":
+            snapshot["error_code"] = failure_code
         if mode:
             snapshot["mode"] = mode
         if snapshot_extra:
@@ -2874,6 +2900,10 @@ class AppController(QObject):
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
+        session = self._session_state.session
+        if (active_run is not None and failure_code == "invalid_credentials" and session is not None
+                and run_session == (self._session_state.generation, session.user_id)):
+            self._credentials_rejected(message)
 
     def _finalize_active_tool_runs_for_shutdown(self) -> None:
         for tool_name, (tool_label, mode, _run_id) in tuple(self._active_tool_runs.items()):
@@ -3401,6 +3431,28 @@ class AppController(QObject):
             logout_method="automatic",
             apply_update=remote_update,
         )
+
+    @Slot(object, str, str)
+    def _prewarm_failed(self, request: DutySubmissionRequest, message: str, error_code: str) -> None:
+        if error_code == "invalid_credentials" and self._duty_controller.request_matches_current_session(request):
+            self._credentials_rejected(message)
+
+    @Slot(str)
+    def _credentials_rejected(self, _message: str) -> None:
+        session = self._session_state.session
+        if session is None or not session.verified or self._logout_pending:
+            return
+        message = "帳號或密碼錯誤，已自動登出，請重新登入。"
+        self._send_operational_event(
+            "login_expired", status="failed", trigger_type="login", error=message,
+            snapshot={"error_code": "invalid_credentials"},
+        )
+        self._pending_auto_login_actor_no = ""
+        self._clear_auto_login_marker()
+        self._duty_execution_controller.set_automatic_execution_enabled(False)
+        self._tray_controller.notify("SinpoSmart", message)
+        self._begin_session_logout(message)
+        self._tray_controller.showWindow()
 
     @Slot(str)
     def _force_logout(self, message: str) -> None:

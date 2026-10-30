@@ -2824,11 +2824,16 @@ class DutySheetServiceTests(unittest.TestCase):
             request = DutySheetRequest("fixture-user", "fixture-password", str(book), "2099/11/03", "a", "b", "c", "d", False)
             frozen = service.validate(request)
             self.assertEqual(frozen.personnel_deductions, ((("20", "22"), "TP訓"),))
+            summary = service.confirmation_summary(frozen)
+            self.assertIn("扣除人力情形：\n20、22 TP訓", summary)
+            self.assertNotIn("fixture-password", summary)
             service.save_personnel_deduction("20", "2099/11/01", "2099/11/04", "公差", row["id"])
             self.assertEqual(service.validate(frozen).personnel_deductions, frozen.personnel_deductions)
+            self.assertEqual(service.confirmation_summary(frozen), summary)
             self.assertEqual(service.validate(request).personnel_deductions, ((("20",), "公差"),))
             outside = service.validate(DutySheetRequest("u", "p", str(book), "2099/11/05", "a", "b", "c", "d", False))
             self.assertEqual(outside.personnel_deductions, ())
+            self.assertIn("扣除人力情形：\n無", service.confirmation_summary(outside))
 
     def test_personnel_deductions_validation_and_corruption_never_overwrite_data(self):
         from app_core.duty_sheet_service import DutySheetService, DutySheetValidationError
@@ -8383,6 +8388,22 @@ class ScheduleCaptureServiceTests(unittest.TestCase):
         self.assertLess(events.index("schedule-ready"), events.index("query:work"))
         self.assertEqual(events.count("quit"), 1)
 
+    def test_live_capture_stops_after_one_explicit_credentials_rejection(self) -> None:
+        from app_core.schedule_capture_service import ScheduleCaptureError, ScheduleCaptureRequest, ScheduleCaptureService
+        from duty_rehearsal import DutyCredentialsRejectedError
+
+        automation = SimpleNamespace(build_driver=Mock(return_value=object()),
+            login=Mock(side_effect=DutyCredentialsRejectedError()), quit_driver=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            service = ScheduleCaptureService(Path(directory), module_loader=lambda: automation)
+            with self.assertRaises(ScheduleCaptureError) as raised:
+                service.capture_live(ScheduleCaptureRequest("fixture-user", "fixture-password", "10", "1151030"))
+            self.assertEqual(raised.exception.error_code, "invalid_credentials")
+            self.assertNotIn("fixture-password", str(raised.exception))
+            automation.login.assert_called_once()
+            automation.build_driver.assert_called_once()
+            automation.quit_driver.assert_called_once()
+
     def test_capture_classifies_login_failure_and_closes_driver(self) -> None:
         from app_core.schedule_capture_service import (
             ScheduleCaptureError,
@@ -12718,6 +12739,13 @@ ApplicationWindow {
             try:
                 QTest.qWait(50)
                 self.assertEqual(find("dutyDateField").property("text"), "2026/10/30")
+                notification = find("dutyNotificationCheck")
+                date_field, next_date = find("dutyDateField"), find("dutyNextDateButton")
+                self.assertEqual(notification.property("text"), "發送截圖")
+                self.assertEqual(notification.parentItem(), date_field.parentItem())
+                self.assertGreaterEqual(notification.x(), next_date.x() + next_date.width())
+                self.assertLessEqual(notification.x() + notification.width(), notification.parentItem().width())
+                self.assertGreaterEqual(notification.width(), notification.implicitWidth())
                 click("dutyPersonnelDeductionAddButton")
                 for field in ("StartDate", "EndDate"):
                     self.assertEqual(find("dutyPersonnelDeduction" + field + "Field").property("text"),
@@ -12743,6 +12771,7 @@ ApplicationWindow {
                 self.assertEqual(controller._pending_request.personnel_deductions, expected)
                 self.assertEqual(controller._pending_request.target_date, "2026/10/30")
                 confirmation = find("dutySheetConfirmation")
+                self.assertIn("扣除人力情形：\n20、22 TP訓", find("dutySheetConfirmationText").property("text"))
                 accept = confirmation.findChild(QObject, "appleDialogYesButton")
                 self.assertIsNotNone(accept)
                 entrypoint = project_dir / LEGACY_SCRIPT_NAME
@@ -12762,6 +12791,18 @@ ApplicationWindow {
                 self.assertEqual(set(calls[0]["cars"]), {"attack", "stop", "amb1", "amb2", "workbook_path"})
                 self.assertEqual(saved_cars, [calls[0]["cars"]])
                 self.assertEqual(controller.statusText, "勤務表已登打完成：1151030")
+                service.save_personnel_deduction("23", "2026/10/30", "2026/10/30", "<b>訓練</b>" * 160)
+                click("dutySheetRunButton")
+                scroll = find("dutySheetConfirmationScroll")
+                text = find("dutySheetConfirmationText")
+                self.assertIn("23 <b>訓練</b>", text.property("text"))
+                self.assertGreater(text.implicitHeight(), scroll.height())
+                self.assertGreaterEqual(confirmation.property("y"), 0)
+                self.assertLessEqual(confirmation.property("y") + confirmation.property("height"), window.height())
+                scroll.property("contentItem").setProperty("contentY", 100)
+                self.assertGreater(scroll.property("contentItem").property("contentY"), 0)
+                self.assertTrue(QMetaObject.invokeMethod(confirmation, "reject", Qt.DirectConnection))
+                self.assertEqual(len(calls), 1)
             finally:
                 window.close()
                 controller.shutdown()
@@ -13160,6 +13201,100 @@ ApplicationWindow {
             service.collect.assert_not_called()
             root.deleteLater()
             engine.deleteLater()
+
+    def test_notice_terminal_proof_is_separate_from_restored_queue_markers(self) -> None:
+        from dataclasses import replace
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionResult
+        from app_core.duty_task_projection import action_completion_key
+        from qt_app.controllers.app_controller import AppController
+
+        app = AppController(read_only_acceptance=True)
+        app._send_operational_event = Mock()
+        app.dutyController.handle_submission_request_result = Mock(return_value=True)
+        app._should_send_operational_submission_event = Mock(return_value=False)
+        action = {"kind": "entry_log", "source": "值班交接", "actor": "10", "target": "20",
+            "time": "10:00", "fields": {"出或入": "值班"}, "duplicate_key": "verified-entry"}
+        data = {"target_date": "1151021", "actions": [action]}
+        duty = app.dutyController
+        duty.set_session_context(2, "fixture-user")
+        duty._actor_no = "10"
+        duty._actions, duty._target_date_text, duty._schedule_data = [action], "1151021", data
+        key = action_completion_key(action)
+        request = DutySubmissionRequest("fixture-user", "fixture-password", 0, data,
+            session_generation=2, session_actor_no="10", action_key=key,
+            schedule_generation=duty.schedule_generation)
+        result = DutySubmissionResult(0, "submitted", "safe", Path("fixture.json"), {}, action)
+        try:
+            duty._executed_indices.add(0)
+            self.assertEqual(duty._notice_verified_handoff_keys, set())
+            app._submission_finished(replace(request, session_generation=1), result)
+            self.assertEqual(duty._notice_verified_handoff_keys, set())
+            app._submission_finished(request, replace(result, status="paused_external"))
+            self.assertEqual(duty._notice_verified_handoff_keys, set())
+            app._submission_finished(request, result)
+            self.assertEqual(duty._notice_verified_handoff_keys, {key})
+            duty.replace_schedule_data(data)
+            self.assertEqual(duty._notice_verified_handoff_keys, set())
+            duty._notice_verified_handoff_keys.add(key)
+            duty.set_session_context(3, "fixture-user")
+            self.assertEqual(duty._notice_verified_handoff_keys, set())
+        finally:
+            app.shutdown()
+
+    def test_notice_collection_waits_for_due_handoff_admission_but_not_unreturned_pause(self) -> None:
+        from datetime import datetime
+        from PySide6.QtTest import QTest
+        from app_core.notice_collection_service import NoticeCollectionResult, TAIPEI
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.controllers.notice_collection_controller import NoticeCollectionController
+
+        now = datetime(2026, 10, 21, 10, 0, tzinfo=TAIPEI)
+        actions = []
+        for hour, outgoing, incoming in ((8, "3", "1"), (10, "1", "2")):
+            for kind, target in (("值退", outgoing), ("值班", incoming)):
+                actions.append({"kind": "entry_log", "source": "值班交接", "actor": outgoing,
+                    "target": target, "time": f"{hour:02d}:00", "fields": {"出或入": kind},
+                    "duplicate_key": f"{hour}:{kind}:{target}"})
+        data = {"target_date": "1151021", "today": {"staff": {
+            "1": {"name": "前班員", "role": "隊員"}, "2": {"name": "接班員", "role": "隊員"}}}, "actions": actions}
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                app = AppController(read_only_acceptance=True)
+                duty = app.dutyController
+                duty._schedule_data, duty._actions, duty._target_date_text = data, actions, "1151021"
+                duty._actor_no, duty._auto_execution_enabled, duty._notice_live_comparisons = "1", True, True
+                duty._comparisons = {0: {"group": "done"}, 1: {"group": "done"},
+                    2: {"group": "paused" if paused else "todo"}, 3: {"group": "paused" if paused else "todo"}}
+                duty._save_manual_departure_pair_keys = Mock()
+                service = Mock()
+                service.counts.return_value = (0, 0)
+                service.collect.return_value = NoticeCollectionResult(now)
+                notice = NoticeCollectionController(service,
+                    lambda _user: {"user_id": "tyfd01214", "password": "fixture-password"},
+                    app._notice_collection_busy_reason, responsibility_provider=duty.notice_responsibility,
+                    now_factory=lambda: now, timer_start=False)
+                try:
+                    with patch("qt_app.controllers.app_controller.datetime") as clock:
+                        clock.now.return_value = now.replace(tzinfo=None)
+                        notice.check_due()
+                        if not paused:
+                            service.collect.assert_not_called()
+                            self.assertFalse(app.dutyExecutionController.hasPendingSubmissions)
+                            self.assertTrue(duty.notice_handoff_pending(now))
+                            duty._comparisons.update({2: {"group": "done"}, 3: {"group": "done"}})
+                            notice.check_due()
+                        for _ in range(100):
+                            QTest.qWait(10)
+                            if not notice.isRunning:
+                                break
+                        self.assertFalse(notice.isRunning)
+                        service.collect.assert_called_once()
+                        proof = service.collect.call_args.kwargs["responsibility"]
+                        self.assertEqual(proof["actorNo"], "1" if paused else "2")
+                        self.assertEqual(proof["handoffSlotAt"], now.replace(hour=8 if paused else 10).isoformat())
+                finally:
+                    notice.shutdown()
+                    app.shutdown()
 
     def test_notice_work_keeps_duty_logout_independent_and_blocks_update_while_running(self) -> None:
         from app_core.credential_repository import CredentialRepository
@@ -14878,7 +15013,7 @@ ApplicationWindow {
             'text: "中繼車"',
             'text: "救護 1 車"',
             'text: "救護 2 車"',
-            'text: "完成後發送勤務表截圖"',
+            'text: "發送截圖"',
             'text: dutySheetDialog.controller.isRunning ? "啟動中..." : "啟動登打"',
             'objectName: "dutyPreviousDateButton"',
             'objectName: "dutyNextDateButton"',
@@ -18858,6 +18993,75 @@ if return_code != 0 or loaded:
             release_first_entry.set()
             controller.shutdown()
 
+    def test_prewarm_credentials_rejection_reports_once_and_blocks_the_rejected_session(self) -> None:
+        from dataclasses import replace
+        from PySide6.QtTest import QSignalSpy
+        from app_core.duty_submission_service import DutySubmissionExecutionError, DutySubmissionRequest
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        service = SimpleNamespace(
+            open_browser_session=Mock(side_effect=DutySubmissionExecutionError(
+                "帳號或密碼錯誤，已停止登入。", "invalid_credentials")),
+            execute_with_browser_session=Mock(), close_browser_session=Mock(),
+        )
+        worker = DutyEntryQueueWorker(service)
+        rejected = QSignalSpy(worker.prewarmFailed)
+        request = DutySubmissionRequest("fixture-user", "fixture-password", 0,
+            {"target_date": "1151030", "actions": [{"kind": "entry_log"}]}, session_generation=3)
+        worker._prewarm_browser_session(request)
+        worker._prewarm_browser_session(request)
+        with self.assertRaises(DutySubmissionExecutionError) as raised:
+            worker._execute(1, request)
+        self.assertEqual(raised.exception.error_code, "invalid_credentials")
+        self.assertEqual(service.open_browser_session.call_count, 1)
+        self.assertEqual(rejected.count(), 1)
+        self.assertEqual(rejected.at(0)[0], request)
+        service.execute_with_browser_session.assert_not_called()
+        service.open_browser_session.side_effect = None
+        service.open_browser_session.return_value = SimpleNamespace(user_id=request.user_id, visible=request.visible)
+        try:
+            worker._prewarm_browser_session(replace(request, session_generation=4, password="new-password"))
+            self.assertEqual(service.open_browser_session.call_count, 2)
+        finally:
+            worker._close_browser_session()
+
+    def test_prewarm_credentials_rejection_logs_out_gui_without_submitting(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.duty_submission_service import DutySubmissionExecutionError, DutySubmissionRequest
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for code in ("invalid_credentials", "browser_startup"):
+            with self.subTest(code=code):
+                service = SimpleNamespace(validate=lambda request: request,
+                    open_browser_session=Mock(side_effect=DutySubmissionExecutionError("safe failure", code)),
+                    execute_with_browser_session=Mock(), close_browser_session=Mock())
+                controller = AppController(read_only_acceptance=True, duty_submission_service=service)
+                controller.dutyController.load_current_schedule = Mock()
+                controller.dutyController.refresh_live_schedule = Mock()
+                controller._send_operational_event = Mock()
+                controller._clear_auto_login_marker = Mock(return_value=True)
+                controller.trayController.notify = Mock()
+                controller.trayController.showWindow = Mock()
+                controller._session_state.session = LoginSession("10", "fixture-user", "fixture-password", verified=True)
+                controller.sessionController.sessionChanged.emit()
+                request = DutySubmissionRequest("fixture-user", "fixture-password", 0,
+                    {"target_date": "1151030", "actions": [{"kind": "entry_log"}]},
+                    session_generation=controller._session_state.generation, session_actor_no="10")
+                try:
+                    self.assertTrue(controller.dutyExecutionController.prewarm_entry_browser(request))
+                    for _ in range(100):
+                        QTest.qWait(10)
+                        if service.open_browser_session.call_count and (
+                                code != "invalid_credentials" or not controller.sessionController.isLoggedIn):
+                            break
+                    self.assertEqual(controller.sessionController.isLoggedIn, code != "invalid_credentials")
+                    self.assertEqual(service.open_browser_session.call_count, 1)
+                    service.execute_with_browser_session.assert_not_called()
+                    self.assertEqual(controller.loginFailureMessage, "")
+                finally:
+                    controller.shutdown()
+
     def test_duty_execution_controller_prewarm_reuses_entry_session_without_submitting(self) -> None:
         from PySide6.QtTest import QSignalSpy, QTest
 
@@ -21295,6 +21499,227 @@ if return_code != 0 or loaded:
         finally:
             controller.dutyExecutionController._entry_active_request_id = None
             controller.shutdown()
+
+    def test_explicit_tool_credentials_rejection_logs_out_only_the_same_session(self) -> None:
+        from app_core.credential_repository import CredentialRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for code, stale, started in (("invalid_credentials", False, True),
+                                     ("invalid_credentials", True, True),
+                                     ("invalid_credentials", False, False),
+                                     ("unknown", False, True), ("browser_startup", False, True)):
+            with self.subTest(code=code, stale=stale, started=started), tempfile.TemporaryDirectory() as directory:
+                controller = AppController(read_only_acceptance=True,
+                    repository=CredentialRepository(Path(directory) / "saved.json", "test", None))
+                controller.dutyController.load_current_schedule = Mock()
+                controller.dutyController.refresh_live_schedule = Mock()
+                controller._send_operational_event = Mock()
+                controller.trayController.notify = Mock()
+                controller.trayController.showWindow = Mock()
+                controller._clear_auto_login_marker = Mock(return_value=True)
+                controller.noticeCollectionController.prepare_shutdown_admission = Mock()
+                controller._session_state.session = LoginSession("10", "fixture-user", "old-password", verified=True)
+                controller.sessionController.sessionChanged.emit()
+                try:
+                    if started:
+                        controller._tool_run_started("duty_sheet", "勤務表登打")
+                    if stale:
+                        controller._session_state.session = LoginSession("10", "fixture-user", "new-password", verified=True)
+                        controller.sessionController.sessionChanged.emit()
+                    controller._pending_auto_login_actor_no = "10"
+                    controller.dutySheetController._failure_code = code
+                    controller.dutySheetController.runFailed.emit("帳號或密碼錯誤，已停止登入。")
+                    should_logout = code == "invalid_credentials" and not stale and started
+                    self.assertEqual(controller.sessionController.isLoggedIn, not should_logout)
+                    self.assertFalse(controller.sessionController._shutdown_admission)
+                    self.assertEqual(controller.loginFailureMessage, "")
+                    self.assertFalse(controller.trayController.quitRequested)
+                    controller.noticeCollectionController.prepare_shutdown_admission.assert_not_called()
+                    if should_logout:
+                        self.assertIn("帳號或密碼錯誤", controller.sessionController.loginStatus)
+                        self.assertEqual(controller._pending_auto_login_actor_no, "")
+                        controller._clear_auto_login_marker.assert_called_once()
+                        controller._session_state.session = LoginSession("10", "fixture-user", "new-password", verified=True)
+                        controller.sessionController.sessionChanged.emit()
+                        self.assertTrue(controller.sessionController.isLoggedIn)
+                        self.assertFalse(controller.dutyExecutionController._session_closing)
+                finally:
+                    controller.shutdown()
+
+    def test_credentials_logout_waits_for_active_submission_and_cancels_queued_work(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        controller.dutyController.load_current_schedule = Mock()
+        controller.dutyController.refresh_live_schedule = Mock()
+        controller._send_operational_event = Mock()
+        controller._clear_auto_login_marker = Mock(return_value=True)
+        controller.trayController.notify = Mock()
+        controller.trayController.showWindow = Mock()
+        controller._session_state.session = LoginSession("10", "fixture-user", "old-password", verified=True)
+        controller.sessionController.sessionChanged.emit()
+        controller.dutyExecutionController._entry_active_request_id = 41
+        controller.dutyExecutionController._cancel_queued_foreground_entry_requests = Mock()
+        try:
+            controller._credentials_rejected("帳號或密碼錯誤，已停止登入。")
+            self.assertTrue(controller._logout_pending)
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            controller.dutyExecutionController._cancel_queued_foreground_entry_requests.assert_called_once()
+            controller.dutyExecutionController._entry_active_request_id = None
+            controller._finish_pending_logout()
+            self.assertFalse(controller._logout_pending)
+            self.assertFalse(controller.sessionController.isLoggedIn)
+            self.assertFalse(controller.sessionController._shutdown_admission)
+        finally:
+            controller.dutyExecutionController._entry_active_request_id = None
+            controller.shutdown()
+
+    def test_duty_credential_rejection_reaches_gui_through_real_worker(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.duty_sheet_service import DutySheetService, LEGACY_SCRIPT_NAME
+        from app_core.session import LoginSession
+        from duty_rehearsal import DutyCredentialsRejectedError
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "duty_sheet_legacy"
+            project.mkdir()
+            workbook = root / "fixture.xlsm"
+            workbook.write_bytes(b"fixture")
+            errors = [DutyCredentialsRejectedError(), RuntimeError("browser unavailable")]
+            calls = []
+
+            def automate(*_args, **kwargs):
+                calls.append(threading.get_ident())
+                kwargs["stage_callback"]("login")
+                raise errors.pop(0)
+
+            legacy = SimpleNamespace(load_config=lambda: {}, save_config=lambda *_a, **_k: None,
+                convert_to_minguo=lambda _date: "1151030", start_automation=automate)
+            service = DutySheetService(root, module_loader=lambda _path: legacy)
+            controller = AppController(read_only_acceptance=True, duty_sheet_service=service)
+            controller.dutyController.load_current_schedule = Mock()
+            controller.dutyController.refresh_live_schedule = Mock()
+            controller._send_operational_event = Mock()
+            controller._clear_auto_login_marker = Mock(return_value=True)
+            controller.trayController.notify = Mock()
+            controller.trayController.showWindow = Mock()
+            controller.dutySheetController._read_only_acceptance = False
+            original_is_file = Path.is_file
+            try:
+                with patch.object(Path, "is_file", lambda path: path == project / LEGACY_SCRIPT_NAME or original_is_file(path)):
+                    for rejected in (True, False):
+                        controller._session_state.session = LoginSession("10", "fixture-user", "fixture-password", verified=True)
+                        controller.sessionController.sessionChanged.emit()
+                        tool = controller.dutySheetController
+                        tool.prepareRun(str(workbook), "2026/10/30", "A", "S", "M1", "M2", False)
+                        tool.confirmRun()
+                        self.assertEqual(tool.failureCode, "unknown")
+                        for _ in range(100):
+                            QTest.qWait(10)
+                            if not tool.isRunning:
+                                break
+                        self.assertFalse(tool.isRunning)
+                        self.assertEqual(tool.failureCode, "invalid_credentials" if rejected else "unknown")
+                        self.assertEqual(controller.sessionController.isLoggedIn, not rejected)
+                        self.assertEqual(controller.loginFailureMessage, "")
+                        self.assertNotIn("fixture-password", tool.statusText)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(all(thread != threading.get_ident() for thread in calls))
+            finally:
+                controller.shutdown()
+
+    def test_rest_and_monthly_credentials_rejection_reaches_gui_through_real_worker(self) -> None:
+        from PySide6.QtTest import QTest
+        from app_core.rest_monthly_service import RestMonthlyService, LEGACY_SCRIPT_NAME
+        from app_core.session import LoginSession
+        from duty_rehearsal import DutyCredentialsRejectedError
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook = root / "fixture.xlsm"
+            workbook.write_bytes(b"fixture")
+            calls = []
+
+            def fail(*_args, **kwargs):
+                calls.append(threading.get_ident())
+                kwargs["stage_callback"]("login")
+                raise DutyCredentialsRejectedError()
+
+            service = RestMonthlyService(root, module_loader=lambda _path: SimpleNamespace(
+                submit_rest_entries=fail, submit_monthly_base_entries=fail))
+            controller = AppController(read_only_acceptance=True, rest_monthly_service=service)
+            controller.dutyController.load_current_schedule = Mock()
+            controller.dutyController.refresh_live_schedule = Mock()
+            controller._send_operational_event = Mock()
+            controller._clear_auto_login_marker = Mock(return_value=True)
+            controller.trayController.notify = Mock()
+            controller.trayController.showWindow = Mock()
+            tool = controller.restMonthlyController
+            tool._read_only_acceptance = False
+            tool._roc_year, tool._monthly_month, tool._monthly_source_ready = 115, "10", True
+            original_is_file = Path.is_file
+            try:
+                with patch.object(Path, "is_file", lambda path: path == root / LEGACY_SCRIPT_NAME or original_is_file(path)):
+                    for tool_id in ("rest_time", "monthly_base"):
+                        with self.subTest(tool=tool_id):
+                            controller._session_state.session = LoginSession("10", "fixture-user", "fixture-password",
+                                verified=True, actor_name="測試員")
+                            controller.sessionController.sessionChanged.emit()
+                            if tool_id == "rest_time":
+                                tool.prepareRestRun(str(workbook), "10")
+                            else:
+                                tool.prepareMonthlyRun()
+                            tool.confirmRun()
+                            self.assertEqual(tool.failureCode, "unknown")
+                            for _ in range(100):
+                                QTest.qWait(10)
+                                if not tool.isRunning:
+                                    break
+                            self.assertFalse(tool.isRunning)
+                            self.assertEqual(tool.failureCode, "invalid_credentials")
+                            self.assertFalse(controller.sessionController.isLoggedIn)
+                            self.assertFalse(controller.sessionController._shutdown_admission)
+                            self.assertEqual(controller.loginFailureMessage, "")
+                            self.assertNotIn("fixture-password", tool.statusText)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(all(thread != threading.get_ident() for thread in calls))
+            finally:
+                controller.shutdown()
+
+    def test_capture_credentials_rejection_cannot_logout_a_new_session(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        for comparison, stale in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(comparison=comparison, stale=stale):
+                controller = AppController(read_only_acceptance=True)
+                controller.dutyController.load_current_schedule = Mock()
+                controller.dutyController.refresh_live_schedule = Mock()
+                controller._send_operational_event = Mock()
+                controller._clear_auto_login_marker = Mock(return_value=True)
+                controller.trayController.notify = Mock()
+                controller.trayController.showWindow = Mock()
+                controller._session_state.session = LoginSession("10", "fixture-user", "old-password", verified=True)
+                controller.sessionController.sessionChanged.emit()
+                duty = controller.dutyController
+                contexts = duty._comparison_contexts if comparison else duty._capture_contexts
+                contexts[7] = (controller._session_state.generation, "fixture-user", "10")
+                duty._active_capture_request = 7
+                if stale:
+                    controller._session_state.session = LoginSession("10", "fixture-user", "new-password", verified=True)
+                    controller.sessionController.sessionChanged.emit()
+                try:
+                    callback = duty._comparisons_failed if comparison else duty._capture_failed
+                    callback(7, "10", "帳號或密碼錯誤，已停止登入。", "invalid_credentials")
+                    self.assertEqual(controller.sessionController.isLoggedIn, stale)
+                    self.assertEqual(controller.loginFailureMessage, "")
+                finally:
+                    controller.shutdown()
 
     def test_background_manual_waiting_chain_uses_current_account_after_logout_and_new_login(self) -> None:
         from datetime import datetime as RealDateTime

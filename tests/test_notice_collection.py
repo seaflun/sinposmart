@@ -410,6 +410,7 @@ class NoticeCollectionTests(unittest.TestCase):
         resolve = lambda rows, times: confirmed_notice_responsibility(
             data, rows, set(), now, live=True, actual_handoff_times=times)
         self.assertEqual(resolve(comparisons, actual)["actorNo"], "25")
+        self.assertEqual(resolve(comparisons, actual)["handoffSlotAt"], "2026-10-27T08:10:00+08:00")
         self.assertEqual(resolve(comparisons, {})["status"], "unknown")
         for changed in ({0: {"group": "todo", "matched": []}},
                         {1: {"group": "near", "matched": []}},
@@ -423,6 +424,93 @@ class NoticeCollectionTests(unittest.TestCase):
                 self.assertEqual(resolve(comparisons, {next(iter(actual)): stamp})["status"], "unknown")
         utc_actual = {next(iter(actual)): "2026-10-27T00:10:00+00:00"}
         self.assertEqual(resolve(comparisons, utc_actual)["actorNo"], "25")
+
+    def test_recovery_recipient_changes_only_at_the_verified_actual_handoff(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        data["actions"].extend([
+            {"kind": "entry_log", "source": "值班交接", "actor": "3", "target": target,
+             "time": "06:00", "duplicate_key": f"entry:6:{kind}:{target}", "fields": {"出或入": kind}}
+            for kind, target in (("值退", "3"), ("值班", "14"))])
+        paused = {0: {"group": "paused"}, 1: {"group": "paused"},
+                  3: {"group": "done"}, 4: {"group": "done"}}
+        resolve = lambda rows, now, **kwargs: confirmed_notice_responsibility(
+            data, rows, set(), now, live=True, **kwargs)
+        previous = resolve(paused, datetime(2026, 10, 27, 7, 59))
+        self.assertEqual(resolve(paused, datetime(2026, 10, 27, 8))["actorNo"], "14")
+        actual = {data["actions"][2]["duplicate_key"]: "2026-10-27T08:10:00+08:00"}
+        verified = {**paused, **{i: {"group": "near", "matched": [
+            f"115/10/27 08:10 | 新坡分隊 | 值班(宿) | {name} | 隊員 | {kind}"]}
+            for i, (name, kind) in enumerate((("原班甲", "值退"), ("接班乙", "值班")))}}
+        before = resolve(verified, datetime(2026, 10, 27, 8, 9, 59), previous=previous,
+                         actual_handoff_times=actual)
+        self.assertEqual(before["actorNo"], "14")
+        self.assertEqual(before["evidenceKey"], previous["evidenceKey"])
+        after = resolve(verified, datetime(2026, 10, 27, 8, 10), previous=previous,
+                        actual_handoff_times=actual)
+        normal = resolve({i: {"group": "done"} for i in (0, 1, 3, 4)}, datetime(2026, 10, 27, 8))
+        self.assertEqual(normal["actorNo"], "25")
+        self.assertEqual(normal["handoffSlotAt"], "2026-10-27T08:00:00+08:00")
+        self.assertEqual((after["actorNo"], after["handoffSlotAt"]), ("25", "2026-10-27T08:10:00+08:00"))
+        self.assertEqual(after["evidenceKey"], normal["evidenceKey"])
+        restarted = resolve(verified, datetime(2026, 10, 27, 8, 15),
+                            previous=json.loads(json.dumps(after)), actual_handoff_times=actual)
+        self.assertEqual((restarted["actorNo"], restarted["handoffSlotAt"], restarted["evidenceKey"]),
+                         (after["actorNo"], after["handoffSlotAt"], after["evidenceKey"]))
+        for changed in ({1: {"group": "near", "matched": []}},
+                        {0: {"group": "done"}, 1: {"group": "done"}}):
+            with self.subTest(changed=changed):
+                partial = resolve({**verified, **changed}, datetime(2026, 10, 27, 8, 15),
+                                  previous=after, actual_handoff_times=actual)
+                self.assertEqual(partial["status"], "unknown")
+
+    def test_recovery_effective_time_collision_never_selects_one_group(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        data = self._handoff_responsibility_fixture()
+        data["actions"].extend([
+            {**action, "time": "08:10", "duplicate_key": action["duplicate_key"] + ":collision"}
+            for action in data["actions"][:2]])
+        comparisons = {i: {"group": "near", "matched": [
+            f"115/10/27 08:10 | 新坡分隊 | 值班(宿) | {name} | 隊員 | {kind}"]}
+            for i, (name, kind) in enumerate((("原班甲", "值退"), ("接班乙", "值班")))}
+        comparisons.update({3: {"group": "done"}, 4: {"group": "done"}})
+        actual = {data["actions"][2]["duplicate_key"]: "2026-10-27T08:10:00+08:00"}
+        self.assertEqual(confirmed_notice_responsibility(data, comparisons, set(),
+            datetime(2026, 10, 27, 8, 15), live=True, actual_handoff_times=actual)["status"], "unknown")
+
+    def test_recovery_terminal_pair_requires_both_own_results_and_a_saved_actual_time(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+        from app_core.duty_task_projection import action_completion_key
+        data = self._handoff_responsibility_fixture()
+        done = {0: {"group": "done", "matched": []}, 1: {"group": "done", "matched": []}}
+        actual = {data["actions"][2]["duplicate_key"]: "2026-10-27T08:10:00+08:00"}
+        now = datetime(2026, 10, 27, 8, 15)
+        keys = {action_completion_key(action) for action in data["actions"][:2]}
+        resolve = lambda rows, executed, times=actual, at=now, verified_keys=None: confirmed_notice_responsibility(
+            data, rows, executed, at, live=True, actual_handoff_times=times,
+            verified_handoff_keys=verified_keys)
+        proof = resolve(done, {0, 1}, verified_keys=keys)
+        self.assertEqual((proof["actorNo"], proof["handoffSlotAt"]), ("25", "2026-10-27T08:10:00+08:00"))
+        normal = resolve(done, {0, 1}, {})
+        self.assertEqual(normal["handoffSlotAt"], "2026-10-27T08:00:00+08:00")
+        self.assertEqual(proof["evidenceKey"], normal["evidenceKey"])
+        self.assertEqual(resolve(done, set(), verified_keys=keys)["handoffSlotAt"], proof["handoffSlotAt"])
+        self.assertEqual(resolve(done, {0, 1}, verified_keys=frozenset(keys)), proof)
+        first, second = (action_completion_key(action) for action in data["actions"][:2])
+        # Durable queue/bridge indices do not establish current callback provenance.
+        for verified_keys in (None, set(), {first}, {second},
+                              {first, action_completion_key(data["actions"][2])}, list(keys), "invalid"):
+            with self.subTest(verified_keys=verified_keys):
+                self.assertEqual(resolve(done, {0, 1}, verified_keys=verified_keys)["status"], "unknown")
+        self.assertEqual(resolve(done, {0, 1}, at=datetime(2026, 10, 27, 8, 9, 59),
+                                 verified_keys=keys)["status"], "unknown")
+        self.assertEqual(resolve(done, {0, 1}, {next(iter(actual)): "invalid"}, verified_keys=keys)["status"], "unknown")
+        near = {index: {"group": "near", "matched": []} for index in (0, 1)}
+        self.assertEqual(resolve(near, {0, 1}, {}, verified_keys=keys)["status"], "unknown")
+        for change in ({"group": "done", "cancelled": True}, {"group": "review"},
+                       {"group": "paused"}, {"group": "near"}):
+            with self.subTest(change=change):
+                self.assertEqual(resolve({**done, 1: change}, {0, 1}, verified_keys=keys)["status"], "unknown")
 
     def test_incomplete_or_conflicting_handoff_never_certifies_a_recipient(self):
         from app_core.notice_collection_service import confirmed_notice_responsibility
@@ -467,8 +555,10 @@ class NoticeCollectionTests(unittest.TestCase):
             for i, (name, kind) in enumerate((("原班甲", "值退"), ("接班乙", "值班")))}
         actual = {data["actions"][2]["duplicate_key"]: "2026-10-28T00:10:00+08:00"}
         now = datetime(2026, 10, 28, 0, 15)
-        self.assertEqual(confirmed_notice_responsibility(data, comparisons, set(), now,
-            live=True, actual_handoff_times=actual).get("actorNo"), "25")
+        proof = confirmed_notice_responsibility(data, comparisons, set(), now,
+            live=True, actual_handoff_times=actual)
+        self.assertEqual(proof.get("actorNo"), "25")
+        self.assertEqual(proof["handoffSlotAt"], "2026-10-28T00:10:00+08:00")
         comparisons[1]["matched"] = [comparisons[1]["matched"][0].replace("00:10", "00:11")]
         self.assertEqual(confirmed_notice_responsibility(data, comparisons, set(), now,
             live=True, actual_handoff_times=actual)["status"], "unknown")

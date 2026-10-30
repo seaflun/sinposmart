@@ -214,7 +214,8 @@ def _local_time(value: datetime) -> datetime:
 
 
 def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *,
-                                    live=False, previous=None, actual_handoff_times=None) -> dict:
+                                    live=False, previous=None, actual_handoff_times=None,
+                                    verified_handoff_keys=None) -> dict:
     """Use completed official handoffs; a scheduled boundary never transfers ownership."""
     from app_core.duty_task_projection import action_datetime, action_completion_key, action_staff, action_time_value, parse_roc_date
     from compare_rehearsal_records import find_entry_matches
@@ -235,6 +236,8 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
                        and action.get("source") == "值班交接" for action in data["actions"])):
         return unknown
     groups, work_keys, action_comparisons = {}, {}, {}
+    verified_handoff_keys = (set(verified_handoff_keys)
+                             if isinstance(verified_handoff_keys, (set, frozenset)) else set())
     actual_handoff_times = actual_handoff_times if isinstance(actual_handoff_times, dict) else {}
     for index, action in enumerate(data.get("actions", [])):
         if (not isinstance(action, dict) or action.get("kind") not in {"entry_log", "work_log"}
@@ -275,31 +278,49 @@ def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set
 
     # A resolved recovery group already records its actual time durably. Require
     # both live official rows at that exact time; an arbitrary near match is insufficient.
-    for group_key, entries in list(groups.items()):
+    effective_groups = {}
+    for group_key, entries in groups.items():
         at, actor = group_key
         keys = work_keys.get(group_key, [])
-        if len(keys) != 1 or incoming_pair(actor, entries) is None:
-            continue
-        try:
-            actual = _local_time(datetime.fromisoformat(actual_handoff_times[keys[0]]))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not at <= actual <= now:
-            continue
-        verified = []
-        for action, done, cancelled in entries:
-            comparison = action_comparisons[id(action)]
-            if comparison.get("cancelled") or comparison.get("group") not in {"near", "done"}:
-                break
-            adjusted = {**action, "fields": {**action["fields"], "系統寫入時間": actual.strftime("%H:%M")}}
-            matched = comparison.get("matched", [])
-            if (not isinstance(matched, list) or any(not isinstance(row, str) for row in matched)
-                    or not find_entry_matches(matched, f"{actual.year - 1911:03d}{actual:%m%d}",
-                                              action_staff(data, action), adjusted)):
-                break
-            verified.append((action, True, False))
-        if len(verified) == len(entries):
-            groups[group_key] = verified
+        effective_key = group_key
+        if len(keys) == 1 and incoming_pair(actor, entries) is not None and keys[0] in actual_handoff_times:
+            try:
+                actual = _local_time(datetime.fromisoformat(actual_handoff_times[keys[0]]))
+            except (TypeError, ValueError):
+                return unknown
+            if actual < at:
+                return unknown
+            if actual > now:
+                entries = [(action, False, bool(action_comparisons[id(action)].get("cancelled"))
+                            or action_comparisons[id(action)].get("group") == "review")
+                           for action, _done, _cancelled in entries]
+            else:
+                verified = []
+                # Only explicitly tracked current-session callbacks authorize this terminal shortcut.
+                if all(action_completion_key(action) in verified_handoff_keys and done and not cancelled
+                       and action_comparisons[id(action)].get("group") == "done"
+                       for action, done, cancelled in entries):
+                    verified = [(action, True, False) for action, _done, _cancelled in entries]
+                else:
+                    for action, done, cancelled in entries:
+                        comparison = action_comparisons[id(action)]
+                        if comparison.get("cancelled") or comparison.get("group") not in {"near", "done"}:
+                            break
+                        adjusted = {**action, "fields": {**action["fields"], "系統寫入時間": actual.strftime("%H:%M")}}
+                        matched = comparison.get("matched", [])
+                        if (not isinstance(matched, list) or any(not isinstance(row, str) for row in matched)
+                                or not find_entry_matches(matched, f"{actual.year - 1911:03d}{actual:%m%d}",
+                                                          action_staff(data, action), adjusted)):
+                            break
+                        verified.append((action, True, False))
+                if len(verified) == len(entries):
+                    effective_key, entries = (actual, actor), verified
+                else:
+                    entries = [(action, False, done or cancelled) for action, done, cancelled in entries]
+        if effective_key in effective_groups:
+            return unknown
+        effective_groups[effective_key] = entries
+    groups = effective_groups
     completed = []
     for (at, actor), entries in groups.items():
         incoming = incoming_pair(actor, entries)
