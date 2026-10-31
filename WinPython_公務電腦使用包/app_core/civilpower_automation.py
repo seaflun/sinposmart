@@ -19,7 +19,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from duty_rehearsal import RETAINED_BROWSER_DRIVERS as RETAINED_DRIVERS, retain_browser_for_seconds
 
-from app_core.civilpower_service import AttendancePlan, AttendanceRequest, CivilpowerError, _write_json
+from app_core.civilpower_service import AttendancePlan, AttendanceRequest, CivilpowerError, CIVILPOWER_LOGIN_MESSAGES, _write_json
 
 OA_LOGIN_URL = "https://oa.tyfd.gov.tw/login.php"
 CIVILPOWER_SSO_LOGIN_URL = "https://civilpower.tyfd.gov.tw/TYCC/Home/SSOLogin"
@@ -28,6 +28,7 @@ OUT_STATUS = "出"
 DEFAULT_WAIT_SECONDS = 30
 IO_QUERY_SETTLE_SECONDS = 5
 CIVILPOWER_STAGE_LABELS = {
+    "civilpower_open": "開啟民力系統…",
     "io_query": "查詢既有出入紀錄…", "io_add": "填寫出入登記…",
     "io_unit": "確認所屬及服勤單位…", "io_person": "選擇義消…",
     "io_save_verify": "儲存並回查出入紀錄…",
@@ -36,28 +37,64 @@ _DATE_PATTERN = re.compile(r"(?<!\d)\d{1,4}[/-]\d{1,2}[/-]\d{1,2}(?!\d)")
 _DATETIME_PATTERN = re.compile(r"(?<!\d)(\d{1,4})[/-](\d{1,2})[/-](\d{1,2})[ T]+(?:(上午|下午)[ T]*)?(\d{1,2})[:：](\d{1,2})(?!\d)")
 
 
-def _login_once(driver, request: AttendanceRequest, recognizer) -> None:
+def _login_once(driver, request: AttendanceRequest, recognizer, *, before_submit=None) -> None:
     from app_core.login_verifier import run_oa_login
 
-    run_oa_login(driver, request.user_id, request.password, recognizer, attempts=1)
-    open_civilpower_from_oa_dashboard(driver, WebDriverWait(driver, DEFAULT_WAIT_SECONDS))
+    run_oa_login(driver, request.user_id, request.password, recognizer,
+                 attempts=3, submit_limit=1, before_submit=before_submit)
 
 
-def login_attendance(driver, request: AttendanceRequest, recognizer, progress) -> None:
-    from app_core.login_verifier import LoginVerificationError
+def login_attendance(driver, request: AttendanceRequest, recognizer, progress, *, diagnostic_state=None) -> None:
+    from app_core.login_verifier import LoginVerificationError, OASessionExpiredError
 
-    for attempt in range(1, 4):
-        progress(f"使用本次值班人員帳號登入民力系統（{attempt}/3）…")
-        try:
-            _login_once(driver, request, recognizer)
-            return
-        except Exception as exc:
-            if isinstance(exc, LoginVerificationError) and exc.reason_code in {
-                "oa_password_change_required", "oa_password_warning_blocked",
-            }:
-                raise CivilpowerError(str(exc)) from None
-            if attempt == 3:
-                raise CivilpowerError("民力登入失敗，已使用同一值班帳號重試三次；請確認帳號與網站狀態。") from None
+    state = diagnostic_state if diagnostic_state is not None else {}
+    state.update(login_submit_attempts=0, oa_authenticated=False)
+
+    def before_submit():
+        state["login_submit_attempts"] = 1
+
+    progress("使用本次值班人員帳號登入民力入口網…")
+    try:
+        _login_once(driver, request, recognizer, before_submit=before_submit)
+    except Exception as exc:
+        code = ("oa_session_expired" if isinstance(exc, OASessionExpiredError) else
+                getattr(exc, "reason_code", "") if isinstance(exc, LoginVerificationError) else "")
+        code = code if isinstance(code, str) and code in CIVILPOWER_LOGIN_MESSAGES else "oa_login_failed"
+        raise CivilpowerError(CIVILPOWER_LOGIN_MESSAGES[code], failure_stage="login", error_code=code) from None
+    state["oa_authenticated"] = True
+    progress(CIVILPOWER_STAGE_LABELS["civilpower_open"])
+    try:
+        open_civilpower_from_oa_dashboard(driver, WebDriverWait(driver, DEFAULT_WAIT_SECONDS))
+    except Exception as exc:
+        code = "civilpower_sso_timeout" if isinstance(exc, TimeoutException) else "civilpower_sso_failed"
+        raise CivilpowerError(CIVILPOWER_LOGIN_MESSAGES[code], failure_stage="civilpower_open", error_code=code) from None
+
+
+def _save_failure_diagnostic(package_root, error, state, checkpoint, record_verified, source_error=None):
+    """Persist bounded technical state without page content, identities or credentials."""
+    source = source_error if source_error is not None else error
+    if isinstance(source, CivilpowerError) and source.__context__ is not None:
+        source = source.__context__
+    exception_type = type(source).__name__
+    if exception_type not in {"CivilpowerError", "TimeoutException", "StaleElementReferenceException",
+                              "NoSuchElementException", "OSError", "RuntimeError", "LoginVerificationError"}:
+        exception_type = "OtherError"
+    payload = {
+        "schema_version": 1, "recorded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "failure_stage": error.failure_stage if error.failure_stage in {
+            "browser_start", "login", *CIVILPOWER_STAGE_LABELS,
+        } else "unknown",
+        "error_code": error.error_code, "exception_type": exception_type,
+        "login_submit_attempts": int(state.get("login_submit_attempts") == 1),
+        "oa_authenticated": state.get("oa_authenticated") is True,
+        "record_state": "verified" if record_verified else "pending_verification" if any(
+            checkpoint.get(key) == "pending_verification" for key in ("out_save_state", "in_save_state")
+        ) else "not_attempted",
+    }
+    try:
+        _write_json(Path(package_root) / "runtime_outputs" / "browser" / "civilpower_failure.json", payload)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def run_attendance(package_root: Path, request: AttendanceRequest, plan: AttendancePlan, progress) -> str:
@@ -75,13 +112,9 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         raise CivilpowerError("此筆曾送出但尚未確認，請由原登打帳號登入後回查，勿換帳號重送。")
     if previous.get("state") == "verified":
         return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：此筆已確認完成，未重複新增。"
-    try:
-        import ddddocr
-        recognizer = ddddocr.DdddOcr(show_ad=False)
-    except Exception:
-        raise CivilpowerError("民力自動登入所需 OCR 未就緒，請確認公務電腦使用包依賴已安裝。") from None
     driver = None
     checkpoint = {}
+    login_state = {"login_submit_attempts": 0, "oa_authenticated": False}
     record_verified = False
     current_stage = "browser_start"
 
@@ -94,13 +127,19 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         progress(message)
 
     try:
+        try:
+            import ddddocr
+            recognizer = ddddocr.DdddOcr(show_ad=False)
+        except Exception:
+            raise CivilpowerError(CIVILPOWER_LOGIN_MESSAGES["oa_ocr_unavailable"],
+                                  failure_stage="login", error_code="oa_ocr_unavailable") from None
         options = Options()
         options.add_argument("--window-size=1280,900")
         driver = create_login_webdriver(options, profile_root=Path(package_root) / "runtime_outputs" / "civilpower_profiles",
                                         prune_profiles=False, write_diagnostics=False)
         configure_login_webdriver_timeouts(driver)
         current_stage = "login"
-        login_attendance(driver, request, recognizer, report_progress)
+        login_attendance(driver, request, recognizer, report_progress, diagnostic_state=login_state)
 
         def before_save():
             _write_json(ledger, {"state": "pending_verification", "user_id": request.user_id,
@@ -113,24 +152,31 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
                             "updated_at": datetime.now().isoformat(timespec="seconds")})
         return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：" + ("已儲存並回查確認。" if created else "網站已有相同紀錄，未重複新增。")
     except CivilpowerError as exc:
+        error = exc
         if exc.failure_stage == "unknown":
-            raise CivilpowerError(str(exc), failure_stage=current_stage) from None
+            error = CivilpowerError(str(exc), failure_stage=current_stage, error_code=exc.error_code)
+        _save_failure_diagnostic(package_root, error, login_state, checkpoint, record_verified)
+        if error is not exc:
+            raise error from None
         raise
     except Exception as exc:
         if checkpoint.get("out_save_state") == "pending_verification" or checkpoint.get("in_save_state") == "pending_verification":
-            raise CivilpowerError("已進入儲存階段，但結果尚未確認；請使用原值班帳號重試回查，勿另建不同時間的紀錄。",
-                                  failure_stage=current_stage) from None
-        if record_verified:
-            raise CivilpowerError("網站紀錄已回查確認，但本機查核紀錄無法寫入；請確認磁碟狀態，勿另建不同時間的紀錄。",
-                                  failure_stage="io_save_verify") from None
-        stage_label = {"browser_start": "啟動瀏覽器", "login": "登入民力系統"}.get(
-            current_stage, CIVILPOWER_STAGE_LABELS.get(current_stage, "登打").rstrip("…"))
-        reason = ("等待逾時" if isinstance(exc, TimeoutException) else
-                  "頁面節點已被替換" if isinstance(exc, StaleElementReferenceException) else
-                  "查詢未完成" if isinstance(exc, _IncompleteQueryError) else
-                  "查詢結果不唯一" if isinstance(exc, _AmbiguousSelectionError) else "操作未完成")
-        raise CivilpowerError(f"民力系統「{stage_label}」{reason}；查詢不明時不會新增紀錄，請使用相同人員與時間重試。",
-                              failure_stage=current_stage) from None
+            error = CivilpowerError("已進入儲存階段，但結果尚未確認；請使用原值班帳號重試回查，勿另建不同時間的紀錄。",
+                                    failure_stage=current_stage)
+        elif record_verified:
+            error = CivilpowerError("網站紀錄已回查確認，但本機查核紀錄無法寫入；請確認磁碟狀態，勿另建不同時間的紀錄。",
+                                    failure_stage="io_save_verify")
+        else:
+            stage_label = {"browser_start": "啟動瀏覽器", "login": "登入民力系統"}.get(
+                current_stage, CIVILPOWER_STAGE_LABELS.get(current_stage, "登打").rstrip("…"))
+            reason = ("等待逾時" if isinstance(exc, TimeoutException) else
+                      "頁面節點已被替換" if isinstance(exc, StaleElementReferenceException) else
+                      "查詢未完成" if isinstance(exc, _IncompleteQueryError) else
+                      "查詢結果不唯一" if isinstance(exc, _AmbiguousSelectionError) else "操作未完成")
+            error = CivilpowerError(f"民力系統「{stage_label}」{reason}；查詢不明時不會新增紀錄，請使用相同人員與時間重試。",
+                                    failure_stage=current_stage)
+        _save_failure_diagnostic(package_root, error, login_state, checkpoint, record_verified, source_error=exc)
+        raise error from None
     finally:
         if driver is not None:
             if record_verified:

@@ -2806,14 +2806,11 @@ try {
 
     def test_mission_fill_returns_browser_result_and_readback_ignores_non_blocking_alerts(self) -> None:
         module = legacy_duty_sheet_module()
-
-        class FakeDriver:
-            def execute_script(self, *_args):
-                return {"status": "saved", "found_ids": ["_pln_8_1"], "save_found": True}
-
-        result = module.step_fill_mission_cells(FakeDriver(), {"_pln_8_1": "1,2"})
-
-        self.assertEqual(result["status"], "saved")
+        driver = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+            with self.assertRaisesRegex(RuntimeError, "救災任務編組"):
+                module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2"})
+        driver.execute_script.assert_not_called()
         self.assertEqual(
             module.validate_mission_cell_values(
                 {"_pln_8_1": "1,2"},
@@ -8550,7 +8547,7 @@ process.stdout.write(JSON.stringify({result, state}));
                 "WebDriverWait": {"side_effect": lambda *_args, **_kwargs: self._wait(module)},
                 "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
                 "step_fill_mission_cells": ({"side_effect": RuntimeError("offline mission failure")} if mission_error
-                    else {"return_value": {"status": "saved"}}), "verify_mission_cells": {"return_value": []},
+                    else {"return_value": {"status": "saved", "verified": True}}), "verify_mission_cells": {"return_value": []},
                 "accept_pending_alerts": {"return_value": []}, "load_config": {"return_value": {"notification": {"enabled": False}}},
                 "build_driver": {"side_effect": AssertionError("不得啟動真實瀏覽器")},
             }.items():
@@ -8613,6 +8610,189 @@ process.stdout.write(JSON.stringify({result, state}));
                 self.assertEqual(stages[-1], stage)
                 self.assertEqual(mission_calls, 0)
                 self.assertEqual(self.postback_state["clicks"], clicks)
+
+
+class DutyMissionVerificationTests(unittest.TestCase):
+    def _driver(self, **options):
+        module = legacy_duty_sheet_module()
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is required for the real mission DOM contract")
+        state = {"date": "1151101", "document": 1, "saved": {"_pln_8_1": "old", "_pln_8_2": "old"},
+                 "values": {"_pln_8_1": "old", "_pln_8_2": "old"}, "writes": 0,
+                 "saves": 0, "queries": 0, "reads": 0, **options}
+        harness = r'''
+const s=JSON.parse(process.argv[1]), script=JSON.parse(process.argv[2]), args=JSON.parse(process.argv[3]);
+let top;
+function render(extra=false){
+ const form={id:'frm'}, elements={}, doc={readyState:s.loading?'loading':'complete'};
+ const win={document:doc, frames:[], location:{href:s.origin||'https://dutymgt.tyfd.gov.tw/tyfd119/task'},
+   Event:function(type){this.type=type;}, getComputedStyle:()=>({display:'block',visibility:'visible'})};
+ function field(id,value){let v=value; const el={id,form,disabled:false,readOnly:false,
+  getAttribute:()=>null,getClientRects:()=>[1],dispatchEvent:()=>true,focus:()=>{}};
+  Object.defineProperty(el,'value',{get:()=>v,set:x=>{v=String(x);if(id==='_txtTaskDate')s.date=v;
+   if(id.startsWith('_pln_')){s.writes++;s.values[id]=v;}}});
+  elements[id]=el;return el;}
+ field('_txtTaskDate',s.date);field('_btnOpenWinTaskCode','');field('_btnQuery','');
+ if(!s.save_missing){const save=field('_btnSave','');save.disabled=!!s.save_disabled||!!(s.disable_after_save&&s.saves);save.click=()=>{
+  s.saves++;if(!s.no_persist)s.saved={...s.values};
+  if(!s.freeze_save){s.document++;s.token=null;s.fill_token=null;s.values={...s.saved};top=render();}
+ };}
+ elements._btnQuery.click=()=>{s.queries++;if(!s.freeze_query){s.document++;s.token=null;s.fill_token=null;
+  s.values={...s.saved};if(s.wrong_query_date)s.date='1151031';top=render();}};
+ if(s.wrong_page)field('_areMEMO','private duty memo');
+ for(const [id,value]of Object.entries(s.values))if(id!==s.missing&&!(s.late_ready&&s.reads<2)){
+  const el=field(id,value);el.readOnly=!!s.readonly||!!(s.disable_after_save&&s.saves);}
+ doc.getElementById=id=>elements[id]||null;
+ doc.querySelectorAll=selector=>{const m=selector.match(/^\[id="([^"]+)"\]$/);if(!m)return[];
+  const el=elements[m[1]];return el?(s.duplicate_id===m[1]?[el,el]:[el]):[];};
+ Object.defineProperty(doc,'__sinposmartMissionToken',{get:()=>s.token,set:v=>{s.token=v;}});
+ Object.defineProperty(doc,'__sinposmartMissionFillToken',{get:()=>s.fill_token,set:v=>{s.fill_token=v;}});
+ if(s.duplicate_form&&!extra)win.frames=[render(true)];
+ return win;
+}
+top=render();s.reads++;const window={top};
+try{const result=Function('window',script).apply(null,[window]);process.stdout.write(JSON.stringify({result,state:s}));}
+catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}));}
+'''
+        driver = mock.Mock()
+        def execute(script, *args):
+            if options.get("script_error"):
+                raise RuntimeError("fixture-secret token=private-value")
+            adapted = "const argumentsFromDriver=" + json.dumps(args) + ";\n" + script.replace("arguments", "argumentsFromDriver")
+            result = subprocess.run([node, "-e", harness, json.dumps(state), json.dumps(adapted), json.dumps(args)],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            state.clear()
+            state.update(output["state"])
+            if options.get("swap_after_fill") and len(args) > 2 and args[2] == "fill":
+                state["document"] += 1
+                state["fill_token"] = None
+            if options.get("alert_after_save") and len(args) > 2 and args[2] == "save":
+                raise module.UnexpectedAlertPresentException("fixture-secret native save alert")
+            if options.get("missing_save_reply") and len(args) > 2 and args[2] == "save":
+                return None
+            if "error" in output:
+                raise RuntimeError(output["error"])
+            return output.get("result")
+        driver.execute_script.side_effect = execute
+        class Wait:
+            def until(self, predicate):
+                for _ in range(4):
+                    result = predicate(driver)
+                    if result:
+                        return result
+                raise module.TimeoutException("offline readiness timeout")
+        return module, driver, state, Wait()
+
+    def test_mission_requires_unique_ready_form_before_any_fill_or_save(self):
+        for options in ({"missing": "_pln_8_2"}, {"save_missing": True}, {"save_disabled": True},
+                        {"duplicate_form": True}, {"duplicate_id": "_pln_8_1"}, {"duplicate_id": "_btnSave"}, {"wrong_page": True},
+                        {"date": "1151031"}, {"readonly": True}, {"origin": "https://untrusted.example/task"}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(**options)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+                    with self.assertRaisesRegex(RuntimeError, "救災任務編組"):
+                        module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"},
+                                                       "1151101", wait=wait)
+                self.assertEqual((state["writes"], state["saves"], state["queries"]), (0, 0, 0))
+
+    def test_mission_waits_for_complete_grid_then_saves_and_queries_once(self):
+        module, driver, state, wait = self._driver(late_ready=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            result = module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"},
+                                                   "1151101", wait=wait)
+        self.assertEqual((result["status"], result["verified"]), ("saved", True))
+        self.assertEqual((state["saves"], state["queries"], state["document"]), (1, 1, 3))
+        self.assertEqual(state["saved"], {"_pln_8_1": "1,2", "_pln_8_2": "3,4"})
+
+    def test_mission_navigation_requires_a_confirmed_menu_click(self):
+        module = legacy_duty_sheet_module()
+        driver, wait = mock.Mock(), mock.Mock()
+        driver.execute_script.return_value = False
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "log_status"):
+            with self.assertRaisesRegex(RuntimeError, "導覽尚未確認"):
+                module.step_navigate_to_task_table(driver, wait, "1151101")
+            payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+            self.assertEqual(payload["failure_stage"], "vehicle_form_open")
+            self.assertFalse(payload["save_attempted"])
+        driver.execute_script.assert_called_once()
+
+    def test_mission_navigation_queries_the_exact_date_and_waits_for_a_new_document(self):
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(date="1151031", freeze_query=frozen)
+                execute = driver.execute_script.side_effect
+                driver.execute_script.side_effect = lambda script, *args: True if "function bClick(w)" in script else execute(script, *args)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)), mock.patch.object(module, "log_status"), \
+                        mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+                    if frozen:
+                        with self.assertRaisesRegex(RuntimeError, "導覽尚未確認"):
+                            module.step_navigate_to_task_table(driver, wait, "1151101")
+                    else:
+                        self.assertTrue(module.step_navigate_to_task_table(driver, wait, "1151101"))
+                self.assertEqual((state["date"], state["queries"], state["writes"], state["saves"]),
+                                 ("1151101", 1, 0, 0))
+
+    def test_mission_native_save_alert_never_submits_a_second_time(self):
+        module, driver, state, wait = self._driver(alert_after_save=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            result = module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait)
+        self.assertTrue(result["verified"])
+        self.assertEqual((state["saves"], state["queries"]), (1, 1))
+
+    def test_mission_lost_save_reply_stays_unknown_without_repeating_or_querying(self):
+        module, driver, state, wait = self._driver(missing_save_reply=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+            with self.assertRaisesRegex(RuntimeError, "已嘗試儲存"):
+                module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait)
+            payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+            self.assertTrue(payload["save_attempted"])
+            self.assertEqual(payload["reason"], "save_unknown")
+        self.assertEqual((state["saves"], state["queries"]), (1, 0))
+
+    def test_mission_dirty_document_or_unsaved_values_never_report_success(self):
+        for options in ({"freeze_save": True}, {"freeze_query": True}, {"no_persist": True}, {"wrong_query_date": True}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(**options)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                        mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+                    with self.assertRaisesRegex(RuntimeError, "救災任務編組"):
+                        module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"},
+                                                       "1151101", wait=wait)
+                self.assertEqual(state["saves"], 1)
+                self.assertLessEqual(state["queries"], 1)
+
+    def test_mission_document_replaced_after_fill_never_saves_another_form(self):
+        module, driver, state, wait = self._driver(swap_after_fill=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+            with self.assertRaisesRegex(RuntimeError, "未執行儲存"):
+                module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait)
+        self.assertEqual(state["saves"], 0)
+
+    def test_mission_readonly_saved_page_can_be_queried_without_another_save(self):
+        module, driver, state, wait = self._driver(disable_after_save=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            result = module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait)
+        self.assertTrue(result["verified"])
+        self.assertEqual((state["saves"], state["queries"]), (1, 1))
+
+    def test_mission_diagnostic_excludes_html_values_and_raw_browser_errors(self):
+        module, driver, state, wait = self._driver(script_error=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+            with self.assertRaisesRegex(RuntimeError, "救災任務編組") as failed:
+                module.step_fill_mission_cells(driver, {"_pln_8_1": "private-member-value"}, "1151101", wait=wait)
+            payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+            self.assertEqual(payload["target_date"], "1151101")
+            self.assertFalse(payload["save_attempted"])
+            for value in ("fixture-secret", "private-value", "private-member-value", "https://", "<html"):
+                self.assertNotIn(value, str(failed.exception) + json.dumps(payload))
+        self.assertEqual(state["saves"], 0)
 
 
 class DutyAnnotationTests(unittest.TestCase):

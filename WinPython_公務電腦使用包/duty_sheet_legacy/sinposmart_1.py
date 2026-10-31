@@ -1113,13 +1113,18 @@ def step_navigate_menu(driver, wait):
     """)
     time.sleep(5)
 
-def step_navigate_to_task_table(driver, wait):
+def step_navigate_to_task_table(driver, wait, target_date=""):
     log_status("➡️ 正在開啟救災任務編組表...")
-    driver.switch_to.default_content()
-    try: wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
-    except Exception as e: log_status(f"   ⚠️ 切換 ehrFrame 發生狀況: {e}")
+    try:
+        driver.switch_to.default_content()
+        wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
+    except Exception:
+        raise _mission_failure("navigation", target_date, stage="vehicle_form_open") from None
 
-    driver.execute_script("""
+    try:
+        clicked = driver.execute_script("""
+        const url = new URL(window.top.location.href);
+        if (url.origin !== 'https://dutymgt.tyfd.gov.tw' || !url.pathname.startsWith('/tyfd119/')) return false;
         function bClick(w){
             var i=w.document.getElementsByName('nodeIcon1');
             for(var j=0;j<i.length;j++){if(i[j].src.indexOf('pnode')>-1)i[j].click();}
@@ -1134,9 +1139,38 @@ def step_navigate_to_task_table(driver, wait):
             for(var l=0;l<f.length;l++){if(bClick(f[l].contentWindow))return true;}
             return false;
         }
-        bClick(window.top);
-    """)
-    time.sleep(5)
+        return bClick(window.top);
+        """)
+    except Exception:
+        raise _mission_failure("navigation", target_date, stage="vehicle_form_open") from None
+    if clicked is not True:
+        raise _mission_failure("navigation", target_date, stage="vehicle_form_open")
+    state = {}
+    try:
+        if not re.fullmatch(r"\d{7}", str(target_date)):
+            raise ValueError("invalid mission date")
+        def query_ready(candidate):
+            nonlocal state
+            driver.switch_to.default_content()
+            observed = driver.execute_script(_MISSION_FORM_JS, target_date, [], "query_ready", "", {})
+            state = observed if isinstance(observed, dict) else {}
+            return state.get("ready") is True
+        wait.until(query_ready)
+        token = str(time.monotonic_ns())
+        try:
+            started = driver.execute_script(_MISSION_FORM_JS, target_date, [], "prepare_query", token, {})
+        except UnexpectedAlertPresentException:
+            started = None
+        if started is not True and started is not None:
+            raise ValueError("mission query not started")
+        accept_pending_alerts(driver, timeout=0.5)
+        def query_finished(candidate):
+            driver.switch_to.default_content()
+            observed = driver.execute_script(_MISSION_FORM_JS, target_date, [], "read", token, {})
+            return isinstance(observed, dict) and isinstance(observed.get("values"), dict)
+        wait.until(query_finished)
+    except Exception:
+        raise _mission_failure("navigation", target_date, state, stage="vehicle_form_open") from None
     return True
 
 def step_prepare_content(driver, wait):
@@ -1926,51 +1960,207 @@ def verify_saved_duty_fields(driver, target_date, expected_fields, wait=None):
         raise RuntimeError("勤務基準表儲存後附記或文字欄位不一致，已停止完成流程。")
     return True
 
-def step_fill_mission_cells(driver, mission_map):
-    """批次填寫救災任務編組表"""
-    js_fill_and_save = """
-    const data = arguments[0] || {};
-    function deepProcess(win, data) {
-        var foundIds = [];
-        for (var id in data) {
-            var el = win.document.getElementById(id);
-            if (el) {
-                el.value = data[id];
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new Event('blur', {bubbles: true}));
-                if(typeof el.onchange === 'function') el.onchange();
-                foundIds.push(id);
-            }
+_MISSION_FORM_JS = r"""
+const [expectedDate, fieldIds, mode, token, data] = arguments;
+const forms = [];
+let unsafe = false;
+function authorized(win) {
+    const url = new URL(win.location.href);
+    return url.origin === 'https://dutymgt.tyfd.gov.tw' && url.pathname.startsWith('/tyfd119/');
+}
+function collectMissionForm(win) {
+    try {
+        const doc = win.document;
+        const markers = doc.querySelectorAll('[id="_btnOpenWinTaskCode"]');
+        if (markers.length) {
+            const marker = markers[0], date = doc.getElementById('_txtTaskDate');
+            const query = doc.getElementById('_btnQuery'), save = doc.getElementById('_btnSave');
+            const form = marker.form;
+            if (!authorized(win) || markers.length !== 1 || doc.getElementById('_areMEMO') || !form ||
+                !date || date.form !== form || !query || query.form !== form ||
+                doc.querySelectorAll('[id="_txtTaskDate"]').length !== 1 ||
+                doc.querySelectorAll('[id="_btnQuery"]').length !== 1 ||
+                (save && doc.querySelectorAll('[id="_btnSave"]').length !== 1)) unsafe = true;
+            else forms.push({win, doc, form, date, query, save});
         }
-        var btn = win.document.getElementById('_btnSave');
-        if (btn && foundIds.length) {
-            btn.click();
-            return {status: "saved", found_ids: foundIds, save_found: true};
-        }
-        for(var i=0; i<win.frames.length; i++) {
-            try { var res = deepProcess(win.frames[i], data); if (res) return res; } catch(e){}
-        }
-        return foundIds.length ? {status: "filled", found_ids: foundIds, save_found: false} : null;
+        for (let index = 0; index < win.frames.length; index++) collectMissionForm(win.frames[index]);
+    } catch (error) { unsafe = true; }
+}
+try { if (!authorized(window.top)) unsafe = true; } catch (error) { unsafe = true; }
+collectMissionForm(window.top);
+const current = !unsafe && forms.length === 1 ? forms[0] : null;
+function available(el) {
+    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true' || !el.getClientRects().length) return false;
+    const style = current.win.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+}
+const targets = {}, missing = [];
+for (const id of fieldIds) {
+    const elements = current ? current.doc.querySelectorAll('[id="' + id + '"]') : [];
+    if (elements.length !== 1 || elements[0].form !== current.form)
+        missing.push(id);
+    else targets[id] = elements[0];
+}
+const state = {origin_ok: !unsafe, form_count: forms.length, task_marker_found: forms.length > 0,
+    expected_count: fieldIds.length, found_count: Object.keys(targets).length, missing_ids: missing,
+    fields_writable: !missing.length && fieldIds.every(id => !targets[id].disabled && !targets[id].readOnly),
+    document_ready: !!current && current.doc.readyState === 'complete',
+    date_matches: !!current && String(current.date.value).trim() === expectedDate,
+    save_found: !!current && !!current.save && current.save.form === current.form,
+    save_ready: !!current && !!current.save && current.save.form === current.form && available(current.save),
+    query_ready: !!current && available(current.query)};
+const readReady = current && state.document_ready && state.date_matches && !missing.length && state.query_ready;
+const ready = readReady && state.fields_writable && state.save_ready;
+const queryReady = current && state.document_ready && state.query_ready;
+if (mode === 'query_ready') return {...state, ready: !!queryReady};
+if (mode === 'prepare_query') {
+    if (!queryReady) return false;
+    current.date.value = expectedDate;
+    if (String(current.date.value).trim() !== expectedDate) return false;
+    current.doc.__sinposmartMissionToken = token;
+    current.query.click();
+    return true;
+}
+if (mode === 'inspect') return {...state, ready: !!ready};
+if (mode === 'read') {
+    if (!readReady) return false;
+    if (current.doc.__sinposmartMissionToken === token) return false;
+    const values = {};
+    for (const id of fieldIds) values[id] = String(targets[id].value || '');
+    return {values, ...state};
+}
+if (mode === 'fill') {
+    if (!ready) return {ready: false, ...state};
+    for (const id of fieldIds) targets[id].value = String(data[id]);
+    const FieldEvent = current.win.Event;
+    for (const id of fieldIds)
+        for (const type of ['input', 'change', 'blur']) targets[id].dispatchEvent(new FieldEvent(type, {bubbles: true}));
+    for (const id of fieldIds)
+        if (String(targets[id].value) !== String(data[id])) return {ready: false, ...state};
+    current.doc.__sinposmartMissionFillToken = token;
+    return {ready: true, ...state};
+}
+if (mode === 'save' || mode === 'query') {
+    if (mode === 'save' ? !ready : !readReady) return false;
+    if (mode === 'save' && (current.doc.__sinposmartMissionFillToken !== token ||
+        fieldIds.some(id => String(targets[id].value) !== String(data[id])))) return false;
+    current.doc.__sinposmartMissionToken = token;
+    (mode === 'save' ? current.save : current.query).click();
+    return true;
+}
+return false;
+"""
+
+
+def _mission_failure(reason, target_date, state=None, *, save_attempted=False, stage="vehicle_fill"):
+    messages = {
+        "navigation": "救災任務編組表導覽尚未確認，已停止後續登打。",
+        "not_ready": "救災任務編組表尚未確認正確日期與完整欄位，未執行填寫或儲存。",
+        "fill_failed": "救災任務編組表欄位填寫未完整確認，未執行儲存。",
+        "save_unknown": "救災任務編組表已嘗試儲存，但重新載入尚未確認，請勿重複送出。",
+        "query_unknown": "救災任務編組表儲存後重新查詢尚未確認，未確認完成。",
+        "readback_mismatch": "救災任務編組表重新查詢資料不一致，未確認完成。",
     }
-    return deepProcess(window.top, data);
-    """
+    payload = {"schema_version": 1, "recorded_at": datetime.now().astimezone().isoformat(),
+               "target_date": str(target_date) if re.fullmatch(r"\d{7}", str(target_date)) else "",
+               "failure_stage": stage, "reason": reason, "save_attempted": bool(save_attempted)}
+    state = state if isinstance(state, dict) else {}
+    for key in ("origin_ok", "task_marker_found", "document_ready", "date_matches", "save_found", "save_ready", "query_ready", "fields_writable"):
+        if type(state.get(key)) is bool:
+            payload[key] = state[key]
+    for key in ("form_count", "expected_count", "found_count"):
+        if type(state.get(key)) is int and 0 <= state[key] <= 1000:
+            payload[key] = state[key]
+    missing = state.get("missing_ids", [])
+    payload["missing_ids"] = [value for value in (missing[:200] if isinstance(missing, list) else [])
+                              if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", value)]
+    temporary = None
     try:
-        result = driver.execute_script(js_fill_and_save, mission_map)
-    except UnexpectedAlertPresentException as e:
-        alert_text = ""
+        folder = PACKAGE_DIR / "runtime_outputs" / "browser"
+        folder.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix="duty-sheet-", suffix=".tmp", dir=folder)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, folder / "duty_sheet_failure.json")
+    except OSError:
+        pass  # Diagnostic storage cannot turn an unconfirmed save into success.
+    return RuntimeError(messages.get(reason, messages["not_ready"]))
+
+
+def step_fill_mission_cells(driver, mission_map, target_date="", *, wait=None, stage_callback=None):
+    """完整核對同一任務表單後只儲存一次，再從新的查詢文件驗證。"""
+    wait = wait or WebDriverWait(driver, 60, poll_frequency=0.5)
+    state = {}
+    save_attempted = False
+    stage = "vehicle_fill"
+    reason = "not_ready"
+    fields = list(mission_map)
+    if (not re.fullmatch(r"\d{7}", str(target_date)) or not fields
+            or any(not re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", field) for field in fields)):
+        raise _mission_failure(reason, target_date)
+
+    def script(mode, token=""):
+        driver.switch_to.default_content()
+        return driver.execute_script(_MISSION_FORM_JS, target_date, fields, mode, token, mission_map)
+
+    def ready(candidate):
+        nonlocal state
+        observed = script("inspect")
+        state = observed if isinstance(observed, dict) else {}
+        return state.get("ready") is True
+
+    def fresh(token):
+        def read(candidate):
+            nonlocal state
+            observed = script("read", token)
+            if isinstance(observed, dict):
+                state = observed
+                if isinstance(observed.get("values"), dict):
+                    return observed["values"]
+            return False
+        return wait.until(read)
+
+    try:
+        wait.until(ready)
+        reason = "fill_failed"
+        token = str(time.monotonic_ns())
+        filled = script("fill", token)
+        if not isinstance(filled, dict) or filled.get("ready") is not True:
+            raise _mission_failure(reason, target_date, state)
+        stage, reason = "vehicle_save", "save_unknown"
+        if callable(stage_callback):
+            stage_callback(stage)
+        save_attempted = True
         try:
-            alert_text = str(driver.switch_to.alert.text or "").strip()
-        except Exception:
+            dispatched = script("save", token)
+            if dispatched is False:
+                save_attempted, reason = False, "fill_failed"
+                raise _mission_failure(reason, target_date, state, stage=stage)
+            if dispatched is not True:
+                raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
+        except UnexpectedAlertPresentException:
+            pass  # A click may have reached the server; never submit it again.
+        accept_pending_alerts(driver, timeout=0.5)
+        fresh(token)
+        stage, reason = "vehicle_verify", "query_unknown"
+        if callable(stage_callback):
+            stage_callback(stage)
+        query_token = str(time.monotonic_ns())
+        try:
+            if script("query", query_token) is not True:
+                raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
+        except UnexpectedAlertPresentException:
             pass
-        log_status(f"   ⚠️ 救災任務編組表提示：{alert_text or e}")
-        return {"status": "alert", "found_ids": [], "save_found": False, "alert": alert_text}
-    except Exception as e:
-        log_status(f"   ❌ 任務填寫報錯: {e}")
-        return {"status": "error", "found_ids": [], "save_found": False, "error": str(e)}
-    if isinstance(result, dict):
-        return result
-    return {"status": str(result or "missing"), "found_ids": [], "save_found": False}
+        accept_pending_alerts(driver, timeout=0.5)
+        actual_values = fresh(query_token)
+        reason = "readback_mismatch"
+        if validate_mission_cell_values(mission_map, actual_values):
+            raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
+        return {"status": "saved", "verified": True, "found_ids": fields, "save_found": True}
+    except Exception:
+        raise _mission_failure(reason, target_date, state, save_attempted=save_attempted, stage=stage) from None
 
 def read_mission_cells(driver, mission_map):
     values = driver.execute_script(
@@ -2300,14 +2490,7 @@ def start_automation(
             
             # --- 進入救災任務編組表 ---
             report_stage("vehicle_form_open")
-            step_navigate_to_task_table(driver, wait) 
-            driver.switch_to.default_content()
-            wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
-            wait.until(EC.frame_to_be_available_and_switch_to_it("contentFrame"))
-            
-            super_js_execute(driver, "_txtTaskDate", "set", target_date)
-            super_js_execute(driver, "_btnQuery", "click")
-            time.sleep(2)
+            step_navigate_to_task_table(driver, wait, target_date)
             
             js_click_car = "function findAndClickBtn(win, id) { var btn = win.document.getElementById(id); if (btn) { btn.click(); return true; } for (var i = 0; i < win.frames.length; i++) { try { if (findAndClickBtn(win.frames[i], id)) return true; } catch(e) {} } return false; } return findAndClickBtn(window.top, '_btnOpenWinTaskCode');"
             if driver.execute_script(js_click_car):
@@ -2317,14 +2500,6 @@ def start_automation(
             driver.switch_to.default_content()
             
             # 🌟 同樣回歸 JS 大法
-            for _ in range(15):
-                if super_js_execute(driver, "_pln_8_1", "exists"):
-                    time.sleep(1)
-                    break
-                time.sleep(1)
-            else:
-                log_status("⚠️ 等待表格載入較久，將強制繼續執行")
-            
             log_status("🧠 救災任務編組計算中...")
             
             # --- 收集編組 24H 購物車 ---
@@ -2353,20 +2528,12 @@ def start_automation(
             if not mission_map:
                 raise RuntimeError("救災任務編組表沒有可登打資料，已停止完成流程。")
             log_status(f"✅ 救災任務編組運算完畢，共填入 {len(mission_map)} 格")
-            time.sleep(5)
-            driver.switch_to.default_content()
-            for frame_name in ['main', 'Content', 'contents', 'ehrFrame', 'contentFrame']:
-                try:
-                    driver.switch_to.frame(frame_name)
-                except NoSuchFrameException:
-                    continue
-
             report_stage("vehicle_fill")
-            mission_result = step_fill_mission_cells(driver, mission_map)
+            mission_result = step_fill_mission_cells(driver, mission_map, target_date, stage_callback=report_stage)
             alert_messages = accept_pending_alerts(driver, timeout=2)
             for message in alert_messages:
                 log_status(f"⚠️ 救災任務編組表提示：{message}")
-            if mission_result.get("status") not in ("saved", "alert"):
+            if mission_result.get("status") != "saved" or mission_result.get("verified") is not True:
                 raise RuntimeError("救災任務編組表未找到完整欄位或儲存按鈕，已停止完成流程。")
             verification_issues = verify_mission_cells(driver, mission_map)
             if verification_issues:

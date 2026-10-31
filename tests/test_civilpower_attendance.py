@@ -160,7 +160,7 @@ class OALoginTests(unittest.TestCase):
         elements["skip_password_change"].click.assert_not_called()
 
     def test_civilpower_waits_for_password_warning_before_opening_module(self):
-        from app_core.civilpower_automation import _login_once
+        from app_core.civilpower_automation import login_attendance
         driver, elements, wait = self.make_password_warning_login()
         recognizer = Mock()
         recognizer.classification.return_value = "abcd"
@@ -171,7 +171,7 @@ class OALoginTests(unittest.TestCase):
 
         with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
                 patch("app_core.civilpower_automation.open_civilpower_from_oa_dashboard", side_effect=verify_navigation) as opened:
-            _login_once(driver, Mock(user_id="tyfd01214", password="synthetic-password"), recognizer)
+            login_attendance(driver, Mock(user_id="tyfd01214", password="synthetic-password"), recognizer, Mock())
         opened.assert_called_once()
 
     def test_civilpower_preserves_required_password_change_message_without_retry(self):
@@ -291,8 +291,41 @@ class OALoginTests(unittest.TestCase):
         with patch("app_core.login_verifier.run_oa_login") as login, \
                 patch.object(automation, "open_civilpower_from_oa_dashboard") as open_module:
             automation._login_once(driver, request, recognizer)
-        login.assert_called_once_with(driver, "duty1", "synthetic-password", recognizer, attempts=1)
+        login.assert_called_once_with(driver, "duty1", "synthetic-password", recognizer,
+                                      attempts=3, submit_limit=1, before_submit=None)
+        open_module.assert_not_called()
+
+    def test_civilpower_preserves_rejections_and_never_resubmits(self):
+        from app_core import civilpower_automation as automation
+        from app_core.login_verifier import LoginVerificationError
+        for code in ("oa_credentials_rejected", "oa_account_locked", "oa_captcha_rejected",
+                     "oa_login_verification_timeout", "oa_password_change_required"):
+            with self.subTest(code=code), patch.object(
+                automation, "_login_once", side_effect=LoginVerificationError("password=secret", reason_code=code)
+            ) as login, patch.object(automation, "open_civilpower_from_oa_dashboard") as open_module:
+                with self.assertRaises(CivilpowerError) as caught:
+                    automation.login_attendance(Mock(), Mock(user_id="duty1", password="synthetic-password"), Mock(), Mock())
+                login.assert_called_once()
+                open_module.assert_not_called()
+                self.assertEqual(caught.exception.error_code, code)
+                self.assertEqual(caught.exception.failure_stage, "login")
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertNotIn("通報", str(caught.exception))
+
+    def test_civilpower_retries_only_ocr_before_its_single_submission(self):
+        from app_core import civilpower_automation as automation
+        driver, elements, wait = self.make_login()
+        recognizer = Mock()
+        recognizer.classification.side_effect = ["", "", "abcd"]
+        state = {}
+        with patch("selenium.webdriver.support.ui.WebDriverWait", wait), \
+                patch.object(automation, "open_civilpower_from_oa_dashboard") as open_module:
+            automation.login_attendance(driver, Mock(user_id="duty1", password="synthetic-password"),
+                                        recognizer, Mock(), diagnostic_state=state)
+        self.assertEqual(recognizer.classification.call_count, 3)
+        elements["loginBtn"].click.assert_called_once()
         open_module.assert_called_once()
+        self.assertEqual(state, {"login_submit_attempts": 1, "oa_authenticated": True})
 
 
 class AttendanceTests(unittest.TestCase):
@@ -351,12 +384,13 @@ class AttendanceTests(unittest.TestCase):
             with self.assertRaises(CivilpowerError):
                 service.load_roster()
 
-    def test_login_retries_only_the_supplied_actor(self):
+    def test_login_never_retries_unknown_failure_or_switches_actor(self):
         from app_core import civilpower_automation as automation
         request = self.request()
         with patch.object(automation, "_login_once", side_effect=[RuntimeError(), None]) as login:
-            automation.login_attendance(Mock(), request, Mock(), Mock())
-        self.assertEqual(login.call_count, 2)
+            with self.assertRaises(CivilpowerError):
+                automation.login_attendance(Mock(), request, Mock(), Mock())
+        self.assertEqual(login.call_count, 1)
         self.assertTrue(all(call.args[1] is request for call in login.call_args_list))
 
     def test_failed_login_masks_raw_errors_and_does_not_fallback(self):
@@ -364,7 +398,8 @@ class AttendanceTests(unittest.TestCase):
         with patch.object(automation, "_login_once", side_effect=RuntimeError("password=secret")) as login:
             with self.assertRaises(CivilpowerError) as result:
                 automation.login_attendance(Mock(), self.request(), Mock(), Mock())
-        self.assertEqual(login.call_count, 3)
+        self.assertEqual(login.call_count, 1)
+        self.assertEqual(result.exception.error_code, "oa_login_failed")
         self.assertNotIn("secret", str(result.exception))
 
     def test_person_lookup_waits_for_replaced_dialog(self):
@@ -547,6 +582,53 @@ class AttendanceTests(unittest.TestCase):
                     automation.run_attendance(Path(root), request, plan, Mock())
                 browser.assert_not_called()
 
+    def test_sso_failure_keeps_oa_success_and_safe_failure_diagnostic(self):
+        from selenium.common.exceptions import TimeoutException
+        from app_core import civilpower_automation as automation
+        with TemporaryDirectory() as root, ExitStack() as stack:
+            driver = Mock()
+            stack.enter_context(patch("app_core.login_verifier.create_login_webdriver", return_value=driver))
+            stack.enter_context(patch("app_core.login_verifier.configure_login_webdriver_timeouts"))
+            stack.enter_context(patch.dict(sys.modules, {"ddddocr": Mock()}))
+            def authenticated(*_args, **kwargs):
+                kwargs["before_submit"]()
+            login = stack.enter_context(patch("app_core.login_verifier.run_oa_login", side_effect=authenticated))
+            opened = stack.enter_context(patch.object(automation, "open_civilpower_from_oa_dashboard",
+                side_effect=TimeoutException("password=secret token=private https://example.invalid/?session=secret")))
+            save = stack.enter_context(patch.object(automation, "_ensure_io_record"))
+            request = self.request()
+            with self.assertRaises(CivilpowerError) as caught:
+                automation.run_attendance(Path(root), request, CivilpowerService(PACKAGE).validate(request), Mock())
+            self.assertEqual(caught.exception.failure_stage, "civilpower_open")
+            self.assertEqual(caught.exception.error_code, "civilpower_sso_timeout")
+            login.assert_called_once()
+            opened.assert_called_once()
+            save.assert_not_called()
+            driver.quit.assert_called_once()
+            diagnostic = json.loads((Path(root) / "runtime_outputs/browser/civilpower_failure.json").read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["failure_stage"], "civilpower_open")
+            self.assertEqual(diagnostic["error_code"], "civilpower_sso_timeout")
+            self.assertEqual(diagnostic["login_submit_attempts"], 1)
+            self.assertTrue(diagnostic["oa_authenticated"])
+            self.assertEqual(diagnostic["exception_type"], "TimeoutException")
+            serialized = json.dumps(diagnostic, ensure_ascii=False)
+            for sensitive in ("secret", "private", "https://", request.password, request.user_id, MEMBER["name"]):
+                self.assertNotIn(sensitive, serialized)
+
+    def test_ocr_unavailable_has_safe_diagnostic_before_browser_or_submission(self):
+        from app_core import civilpower_automation as automation
+        with TemporaryDirectory() as root, patch.dict(sys.modules, {"ddddocr": None}), \
+                patch("app_core.login_verifier.create_login_webdriver") as browser:
+            request = self.request()
+            with self.assertRaises(CivilpowerError) as caught:
+                automation.run_attendance(Path(root), request, CivilpowerService(PACKAGE).validate(request), Mock())
+            self.assertEqual(caught.exception.error_code, "oa_ocr_unavailable")
+            browser.assert_not_called()
+            diagnostic = json.loads((Path(root) / "runtime_outputs/browser/civilpower_failure.json").read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["login_submit_attempts"], 0)
+            self.assertFalse(diagnostic["oa_authenticated"])
+            self.assertEqual(diagnostic["error_code"], "oa_ocr_unavailable")
+
     def test_standalone_execution_logs_in_verifies_keeps_browser_and_remembers_success(self):
         from app_core import civilpower_automation as automation
         with TemporaryDirectory() as root, ExitStack() as stack:
@@ -661,6 +743,41 @@ class AttendanceTests(unittest.TestCase):
         state.clear_session()
         self.assertEqual(request.user_id, "duty2")
         self.assertEqual(request.action, "退勤")
+
+    def test_controller_keeps_safe_failure_code_and_frozen_run_context(self):
+        from PySide6.QtTest import QTest
+        from app_core.session import LoginSession, SessionState
+        from qt_app.controllers.civilpower_controller import CivilpowerController
+        state = SessionState()
+        state.session = LoginSession("1", "duty1", "fake", verified=True, actor_name="測試")
+        runner = Mock(side_effect=CivilpowerError("入口網帳密已遭拒絕。", failure_stage="login",
+                                                error_code="oa_credentials_rejected"))
+        controller = CivilpowerController(state, CivilpowerService(PACKAGE, runner=runner))
+        controller._members = [MEMBER]
+        try:
+            controller.prepareRun("2026-11-01", "09:05", "m1", "到勤")
+            controller.confirmRun()
+            for _ in range(100):
+                QTest.qWait(10)
+                if not controller.isRunning:
+                    break
+            self.assertFalse(controller.isRunning)
+            self.assertEqual(controller.failureCode, "oa_credentials_rejected")
+            self.assertEqual(controller.failureStage, "login")
+            self.assertEqual(controller.run_context, {"target_date": "2026-11-01", "time_text": "09:05", "action": "到勤"})
+            controller.prepareRun("2026-11-02", "10:10", "m1", "退勤")
+            self.assertEqual(controller.run_context["target_date"], "2026-11-01")
+            runner.side_effect = None
+            runner.return_value = "已確認。"
+            controller.confirmRun()
+            self.assertEqual(controller.failureCode, "unknown")
+            for _ in range(100):
+                QTest.qWait(10)
+                if not controller.isRunning:
+                    break
+            self.assertEqual(controller.run_context, {"target_date": "2026-11-02", "time_text": "10:10", "action": "退勤"})
+        finally:
+            controller.shutdown()
 
     def test_read_only_controller_never_starts_network_or_browser(self):
         from PySide6.QtWidgets import QApplication

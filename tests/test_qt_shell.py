@@ -12894,6 +12894,217 @@ ApplicationWindow {
             finally:
                 controller.shutdown()
 
+    def test_failed_tool_exports_one_problem_package_with_frozen_run_and_roc_date(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = OperationalSyncService(root)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=sync)
+            controller._start_operational_sync = Mock()
+            controller._send_operational_event = Mock()
+            controller.dutySheetController._target_date = "2026/11/01"
+            controller.dutySheetController._workbook_path = "勤務表11月.xlsm"
+            try:
+                controller._tool_run_started("duty_sheet", "勤務表登打")
+                run_id = controller._active_tool_runs["duty_sheet"][2]
+                controller.dutySheetController._target_date = "2026/11/02"
+                controller.dutySheetController._failure_stage = "vehicle_fill"
+                controller._tool_run_failed("duty_sheet", "勤務表登打", "任務編組尚未確認。", notify=False)
+                controller._tool_run_failed("duty_sheet", "勤務表登打", "重複回覆。", notify=False)
+                packages = list((root / "issue_reports").glob("*.zip"))
+                self.assertEqual(len(packages), 1)
+                with zipfile.ZipFile(packages[0]) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual(manifest["action_kind"], "duty_sheet")
+                self.assertEqual(manifest["action_key"], run_id)
+                self.assertEqual(manifest["target_date"], "1151101")
+                self.assertEqual(manifest["error_code"], "vehicle_fill")
+                self.assertEqual(manifest["trigger_type"], "tool_finish")
+                self.assertTrue(sync.has_pending_diagnostics)
+                self.assertEqual([call.args for call in controller._start_operational_sync.call_args_list], [("diagnostic_drain",)])
+            finally:
+                controller.shutdown()
+
+    def test_tool_problem_package_export_failure_preserves_terminal_result_and_safe_status(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = OperationalSyncService(root)
+            diagnostics = DiagnosticsService(root)
+            diagnostics.export = Mock(side_effect=ValueError("private-password cookie=private-session"))
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=diagnostics, operational_sync_service=sync)
+            controller._send_operational_event = Mock()
+            controller._start_operational_sync = Mock()
+            try:
+                controller._tool_run_started("duty_sheet", "勤務表登打")
+                controller._tool_run_failed("duty_sheet", "勤務表登打", "原本的工具錯誤。", notify=False)
+                event = controller._send_operational_event.call_args.kwargs
+                self.assertEqual(event["status"], "failed")
+                self.assertIn("原本的工具錯誤", event["error"])
+                status = sync.status_path.read_text(encoding="utf-8")
+                self.assertEqual(json.loads(status)["diagnostic"]["state"], "failed")
+                self.assertIn("問題包建立失敗", controller.diagnosticsStatus)
+                self.assertNotIn("private-password", status + controller.diagnosticsStatus)
+                self.assertNotIn("private-session", status + controller.diagnosticsStatus)
+                diagnostics.export.assert_called_once()
+            finally:
+                controller.shutdown()
+
+    def test_tool_problem_packages_skip_readonly_shutdown_and_rescue_needs_input(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from qt_app.controllers.app_controller import AppController
+
+        for scenario in ("readonly", "shutdown", "needs_input"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                diagnostics = DiagnosticsService(root)
+                diagnostics.export = Mock()
+                controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                    diagnostics_service=diagnostics)
+                controller._send_operational_event = Mock()
+                controller._start_operational_sync = Mock()
+                try:
+                    tool = "rescue_video" if scenario == "needs_input" else "duty_sheet"
+                    controller._tool_run_started(tool, "工具")
+                    if scenario == "readonly":
+                        controller._read_only_acceptance = True
+                    controller._tool_run_failed(tool, "工具", "未完成。", notify=False,
+                        allow_during_shutdown=scenario == "shutdown",
+                        snapshot_extra={"rescue_video_state": "needs_input"} if scenario == "needs_input" else None)
+                    diagnostics.export.assert_not_called()
+                finally:
+                    controller.shutdown()
+
+    def test_failed_tool_package_redacts_original_session_secret_after_actor_changes(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=OperationalSyncService(root))
+            controller._send_operational_event = Mock()
+            controller._start_operational_sync = Mock()
+            original_secret = "OpaqueValue_7648"
+            try:
+                generation = controller._session_state.begin_login()
+                controller._session_state.complete_login(generation,
+                    LoginSession("10", "test-user", original_secret, verified=True))
+                controller._tool_run_started("duty_sheet", "勤務表登打")
+                diagnostic = root / "runtime_outputs/browser/tool_failure.json"
+                diagnostic.parent.mkdir(parents=True, exist_ok=True)
+                diagnostic.write_text(json.dumps({"note": "failed input " + original_secret}), encoding="utf-8")
+                controller._session_state.clear_session()
+                generation = controller._session_state.begin_login()
+                controller._session_state.complete_login(generation,
+                    LoginSession("11", "next-user", "OtherValue_1379", verified=True))
+                controller._tool_run_failed("duty_sheet", "勤務表登打", "原始失敗 " + original_secret, notify=False)
+                package = next((root / "issue_reports").glob("*.zip"))
+                with zipfile.ZipFile(package) as archive:
+                    for entry in archive.infolist():
+                        self.assertNotIn(original_secret, archive.read(entry).decode("utf-8"))
+                self.assertNotIn(original_secret, controller._send_operational_event.call_args.kwargs["error"])
+                self.assertNotIn("duty_sheet", controller._tool_run_secrets)
+                controller._tool_run_started("duty_sheet", "勤務表登打")
+                controller._tool_run_finished("duty_sheet", "勤務表登打", "完成。", notify=False)
+                self.assertNotIn("duty_sheet", controller._tool_run_secrets)
+            finally:
+                controller.shutdown()
+
+    def test_civilpower_failure_event_and_package_keep_frozen_context_and_specific_code(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=OperationalSyncService(root))
+            controller._send_operational_event = Mock()
+            controller._start_operational_sync = Mock()
+            try:
+                controller.civilpowerController.run_context = {
+                    "target_date": "2026-11-01", "time_text": "08:00", "action": "到勤"}
+                controller._tool_run_started("civilpower", "民力系統")
+                controller.civilpowerController.run_context["target_date"] = "2026-11-02"
+                controller.civilpowerController._failure_code = "civilpower_sso_timeout"
+                controller.civilpowerController._failure_stage = "civilpower_open"
+                controller._tool_run_failed("civilpower", "民力系統", "民力系統入口驗證逾時。", notify=False)
+                event = controller._send_operational_event.call_args.kwargs
+                self.assertEqual(event["snapshot"]["target_date"], "2026-11-01")
+                self.assertEqual(event["snapshot"]["time_text"], "08:00")
+                self.assertEqual(event["snapshot"]["action"], "到勤")
+                self.assertEqual(event["snapshot"]["error_code"], "civilpower_sso_timeout")
+                self.assertEqual(event["snapshot"]["failure_stage"], "civilpower_open")
+                with zipfile.ZipFile(next((root / "issue_reports").glob("*.zip"))) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual(manifest["target_date"], "1151101")
+                self.assertEqual(manifest["error_code"], "civilpower_sso_timeout")
+                self.assertEqual(manifest["action_kind"], "civilpower")
+            finally:
+                controller.shutdown()
+
+    def test_tool_package_redacts_actual_worker_request_when_pending_session_changes(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.duty_sheet_service import DutySheetExecutionError
+        from app_core.operational_sync_service import OperationalSyncService
+        from app_core.session import LoginSession
+        from PySide6.QtTest import QTest
+        from qt_app.controllers.app_controller import AppController
+
+        class FixtureDutySheetService:
+            def validate(self, request):
+                return request
+
+            def confirmation_summary(self, _request):
+                return "fixture confirmation"
+
+            def execute(self, request, **_kwargs):
+                raise DutySheetExecutionError("自動化失敗：" + request.password, failure_stage="login")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                duty_sheet_service=FixtureDutySheetService(), diagnostics_service=DiagnosticsService(root),
+                operational_sync_service=OperationalSyncService(root))
+            controller._send_operational_event = Mock()
+            controller._start_operational_sync = Mock()
+            controller._tray_controller.notify = Mock()
+            old_secret = "FixtureValue_4216"
+            try:
+                controller._session_state.session = LoginSession("10", "old-fixture", old_secret, verified=True)
+                controller.dutySheetController.prepareRun("fixture.xlsm", "2026/11/01", "a", "b", "c", "d", False)
+                controller._session_state.session = LoginSession("20", "new-fixture", "NextValue_7819", verified=True)
+                controller.dutySheetController.confirmRun()
+                for _ in range(100):
+                    if not controller.dutySheetController.isRunning:
+                        break
+                    QTest.qWait(20)
+                self.assertFalse(controller.dutySheetController.isRunning)
+                with zipfile.ZipFile(next((root / "issue_reports").glob("*.zip"))) as archive:
+                    for entry in archive.infolist():
+                        self.assertNotIn(old_secret, archive.read(entry).decode("utf-8"))
+                self.assertNotIn(old_secret, controller._send_operational_event.call_args.kwargs["error"])
+                self.assertNotIn("duty_sheet", controller._tool_run_secrets)
+            finally:
+                controller.shutdown()
+
     def test_submission_and_manual_problem_packages_are_durably_queued_without_network_on_ui_thread(self):
         from app_core.credential_repository import CredentialRepository
         from app_core.diagnostics_service import DiagnosticsService

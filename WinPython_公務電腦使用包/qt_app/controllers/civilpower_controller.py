@@ -16,6 +16,7 @@ class _CivilpowerJob(QThread):
         self.service = service
         self.request = request
         self.failure_stage = "unknown"
+        self.failure_code = "unknown"
 
     def run(self):
         try:
@@ -24,6 +25,7 @@ class _CivilpowerJob(QThread):
             self.result.emit(result)
         except CivilpowerError as exc:
             self.failure_stage = exc.failure_stage
+            self.failure_code = exc.error_code
             self.failed.emit(str(exc))
         except Exception:
             self.failed.emit("民力作業未完成，請確認連線與網站狀態。")
@@ -57,7 +59,9 @@ class CivilpowerController(QObject):
         self._date = ""
         self._time = ""
         self._failure_stage = "unknown"
+        self._failure_code = "unknown"
         self.run_actor = {}
+        self.run_context = {}
 
     @Property(bool, notify=stateChanged)
     def isRunning(self):
@@ -78,6 +82,10 @@ class CivilpowerController(QObject):
     @Property(str, notify=stateChanged)
     def failureStage(self):
         return self._failure_stage
+
+    @Property(str, notify=stateChanged)
+    def failureCode(self):
+        return self._failure_code
 
     @Property(str, notify=stateChanged)
     def rosterStatus(self):
@@ -155,8 +163,10 @@ class CivilpowerController(QObject):
         self._summary = ""
         self._status = "準備登入民力系統…"
         self._failure_stage = "unknown"
+        self._failure_code = "unknown"
         self.run_actor = {"actor_no": request.actor_no, "user_id": request.user_id,
                           "display_name": request.actor_name}
+        self.run_context = {"target_date": request.date_text, "time_text": request.time_text, "action": request.action}
         self.runStarted.emit()
         self._start_job(request)
 
@@ -204,6 +214,7 @@ class CivilpowerController(QObject):
     @Slot(str)
     def _run_failed(self, message):
         self._failure_stage = getattr(self._job, "failure_stage", "unknown")
+        self._failure_code = getattr(self._job, "failure_code", "unknown")
         self.runFailed.emit(message)
         self._error(message)
 

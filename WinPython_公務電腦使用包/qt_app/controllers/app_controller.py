@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication
 from app_core.credential_repository import CredentialRepository
 from app_core.credential_sync_service import CredentialSyncService
 from app_core.daily_vehicle_service import DailyVehicleService
-from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot
+from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot, redact_diagnostic_text
 from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
 from app_core.duty_submission_service import (
     UNRETURNED_RETURN_QUERY_STARTED_STATUS,
@@ -160,6 +160,7 @@ class AppController(QObject):
         self._tool_run_actors: dict[str, dict[str, str]] = {}
         self._tool_run_contexts: dict[str, dict[str, str]] = {}
         self._tool_run_sessions: dict[str, tuple[int, str]] = {}
+        self._tool_run_secrets: dict[str, tuple[str, ...]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
         self._duty_controller = DutyController(
@@ -2725,6 +2726,18 @@ class AppController(QObject):
         self._tool_run_sessions[tool_name] = (
             self._session_state.generation, str(session.user_id or "") if session else ""
         )
+        self._tool_run_secrets[tool_name] = (session.password,) if session and session.password else ()
+        tool_controller = {"duty_sheet": self._duty_sheet_controller,
+                           "rest_time": self._rest_monthly_controller,
+                           "monthly_base": self._rest_monthly_controller,
+                           "daily_vehicle": self._daily_vehicle_controller}.get(tool_name)
+        if tool_controller is not None:
+            worker_pair = tool_controller._workers.get(tool_controller._request_id)
+            request = getattr(worker_pair[1], "request", None) if worker_pair else None
+            request_secret = getattr(request, "password", "")
+            if isinstance(request_secret, str) and request_secret:
+                self._tool_run_secrets[tool_name] = tuple(dict.fromkeys(
+                    (*self._tool_run_secrets[tool_name], request_secret)))
         self._tool_run_actors[tool_name] = {
             "actor_no": str(session.actor_no or "") if session else self._session_controller.actorNo,
             "user_id": str(session.user_id or "") if session else self._session_controller.userId,
@@ -2768,6 +2781,8 @@ class AppController(QObject):
             }
         elif tool_name == "daily_vehicle":
             run_context = self._daily_vehicle_controller.run_context
+        elif tool_name == "civilpower":
+            run_context = dict(getattr(self._civilpower_controller, "run_context", {}))
         self._tool_run_contexts[tool_name] = run_context
         snapshot.update(run_context)
         if self._automatic_tool_record and self._automatic_tool_record["tool_id"] == tool_name:
@@ -2801,6 +2816,7 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         self._tool_run_sessions.pop(tool_name, None)
+        self._tool_run_secrets.pop(tool_name, None)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
         if tool_name == "daily_vehicle" and not run_context:
@@ -2855,6 +2871,8 @@ class AppController(QObject):
             return
         active_run = self._active_tool_runs.pop(tool_name, None)
         run_session = self._tool_run_sessions.pop(tool_name, None)
+        run_secrets = self._tool_run_secrets.pop(tool_name, ())
+        message = redact_diagnostic_text(message, run_secrets)
         run_actor = self._tool_run_actors.pop(tool_name, {})
         run_context = self._tool_run_contexts.pop(tool_name, {})
         if tool_name == "daily_vehicle" and not run_context:
@@ -2882,12 +2900,15 @@ class AppController(QObject):
             snapshot["failure_stage"] = failure_stage
         failure_detail = self._failure_detail_for_tool(tool_name)
         if failure_detail:
-            snapshot["failure_detail"] = failure_detail
+            snapshot["failure_detail"] = redact_diagnostic_text(failure_detail, run_secrets)
         controller = {"duty_sheet": self._duty_sheet_controller,
                       "rest_time": self._rest_monthly_controller,
-                      "monthly_base": self._rest_monthly_controller}.get(tool_name)
+                      "monthly_base": self._rest_monthly_controller,
+                      "civilpower": self._civilpower_controller}.get(tool_name)
         failure_code = str(getattr(controller, "failureCode", "unknown") or "unknown")
-        if failure_code == "invalid_credentials":
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", failure_code):
+            failure_code = "unknown"
+        if failure_code not in {"unknown", "unknown_error"}:
             snapshot["error_code"] = failure_code
         if mode:
             snapshot["mode"] = mode
@@ -2903,10 +2924,42 @@ class AppController(QObject):
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
+        if (active_run is not None and not self._read_only_acceptance
+                and not allow_during_shutdown and not self._worker_admissions_closed):
+            try:
+                package_path = self._diagnostics_service.export(DiagnosticSnapshot(
+                    duty_status=message,
+                    target_date=self._diagnostic_target_date(run_context.get("target_date")),
+                    session_actor=str(run_actor.get("actor_no") or ""),
+                    action_key=run_id, action_kind=tool_name, trigger_type="tool_finish",
+                    error_code=failure_code if failure_code not in {"unknown", "unknown_error"}
+                    else failure_stage or "unknown_error",
+                ), secrets=run_secrets)
+                if self._queue_diagnostic_package(package_path):
+                    self._diagnostics_status = "工具問題包已保存本機並排入 NAS 上傳。"
+                    self.diagnosticsChanged.emit()
+            except Exception as exc:
+                self._operational_sync_service.record_unhandled_failure("diagnostic_drain", exc)
+                self._diagnostics_status = "工具問題包建立失敗，已保留原有執行結果。"
+                self.diagnosticsChanged.emit()
         session = self._session_state.session
         if (active_run is not None and failure_code == "invalid_credentials" and session is not None
                 and run_session == (self._session_state.generation, session.user_id)):
             self._credentials_rejected(message)
+
+    @staticmethod
+    def _diagnostic_target_date(value: object) -> str:
+        """Use only the frozen run's valid date when selecting diagnostic files."""
+        text = str(value or "").strip()
+        try:
+            if re.fullmatch(r"\d{7}", text):
+                target = date(int(text[:3]) + 1911, int(text[3:5]), int(text[5:]))
+            else:
+                target = date.fromisoformat(text.replace("/", "-"))
+            year = target.year - 1911
+            return f"{year:03d}{target.month:02d}{target.day:02d}" if 0 < year < 1000 else ""
+        except (TypeError, ValueError):
+            return ""
 
     def _finalize_active_tool_runs_for_shutdown(self) -> None:
         for tool_name, (tool_label, mode, _run_id) in tuple(self._active_tool_runs.items()):

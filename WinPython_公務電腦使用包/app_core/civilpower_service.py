@@ -13,14 +13,36 @@ from uuid import uuid4
 
 
 HOME_UNIT = "大園救護分隊"
+CIVILPOWER_LOGIN_MESSAGES = {
+    "oa_ocr_unavailable": "民力入口網驗證碼辨識元件未就緒，未送出登入。",
+    "oa_captcha_not_ready": "民力入口網驗證碼圖片尚未完整載入，未送出登入。",
+    "oa_captcha_unrecognized": "民力入口網驗證碼未能辨識，未送出登入。",
+    "oa_captcha_ocr_failed": "民力入口網驗證碼辨識失敗，未送出登入。",
+    "oa_captcha_rejected": "民力入口網判定驗證碼不正確，已停止自動重送登入。",
+    "oa_credentials_rejected": "民力入口網拒絕本次值班人員的帳號密碼，已停止登入，請確認入口網帳密。",
+    "oa_login_page_failed": "民力入口網登入頁載入失敗，請確認網站與連線。",
+    "oa_login_form_timeout": "民力入口網登入表單載入逾時，未完成登入。",
+    "oa_login_verification_timeout": "民力入口網登入送出後驗證逾時，結果尚未確認，已停止自動重送。",
+    "oa_password_warning_blocked": "入口網密碼到期提醒未能關閉，尚未確認登入成功。",
+    "oa_password_change_required": "入口網密碼須更新，請手動變更密碼後重新登入。",
+    "oa_account_locked": "入口網帳號已鎖定或停用，已停止登入，請人工確認。",
+    "oa_login_unconfirmed": "民力入口網登入結果尚未確認，已停止自動重送。",
+    "oa_password_expired": "入口網密碼已到停用時間，請更新後重新登入。",
+    "oa_login_guard_unavailable": "入口網登入保護紀錄無法確認，未送出登入。",
+    "oa_session_expired": "入口網作業逾時，已停止本次民力登入。",
+    "oa_login_failed": "民力入口網登入未完成，已停止自動重送，請確認網站狀態。",
+    "civilpower_sso_timeout": "入口網登入已成功，但開啟民力系統逾時，未重新送出帳密。",
+    "civilpower_sso_failed": "入口網登入已成功，但民力系統尚未開啟，未重新送出帳密。",
+}
 
 
 class CivilpowerError(RuntimeError):
     """User-facing error without credentials or raw browser diagnostics."""
 
-    def __init__(self, message: str, *, failure_stage: str = "unknown"):
+    def __init__(self, message: str, *, failure_stage: str = "unknown", error_code: str = "unknown"):
         super().__init__(message)
         self.failure_stage = failure_stage
+        self.error_code = error_code if isinstance(error_code, str) and error_code in CIVILPOWER_LOGIN_MESSAGES else "unknown"
 
 
 @dataclass(frozen=True)
