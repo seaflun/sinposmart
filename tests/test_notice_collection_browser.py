@@ -93,6 +93,62 @@ class FakeDriver:
 
 
 class NoticeBrowserTests(unittest.TestCase):
+    def test_navigation_diagnostic_identifies_step_and_allowlisted_failure_without_raw_text(self):
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+        from app_core.notice_collection_service import NoticeCollectionError
+        cases = (
+            (TimeoutException("private-password https://private.invalid/?token=x"), "TimeoutException", "", True),
+            (WebDriverException("net::ERR_NAME_NOT_RESOLVED https://private.invalid/?token=x"),
+             "WebDriverException", "ERR_NAME_NOT_RESOLVED", False),
+            (RuntimeError("net::ERR_PRIVATE_PASSWORD private-password"), "other", "", False),
+        )
+        for step in ("get", "refresh"):
+            for failure, kind, net_code, timeout in cases:
+                with self.subTest(step=step, kind=kind):
+                    driver = FakeDriver()
+                    setattr(driver, "on_" + step, Mock(side_effect=failure))
+                    with self.assertRaises(NoticeCollectionError) as caught:
+                        self.browser(driver).scan_unread("private-password")
+                    self.assertEqual(caught.exception.code, "list_navigation_failed")
+                    context = caught.exception.page_context
+                    self.assertEqual(context["navigation_step"], step)
+                    self.assertEqual(context["exception_type"], kind)
+                    self.assertEqual(context["net_error_code"], net_code)
+                    self.assertEqual(context["page_load_timeout"], timeout)
+                    raw = json.dumps(context)
+                    for secret in ("private-password", "private.invalid", "token=x", "ERR_PRIVATE_PASSWORD"):
+                        self.assertNotIn(secret, raw)
+                    self.assertEqual(driver.quit_calls, 0)
+                    self.assertEqual(driver.async_calls, [])
+
+    def test_third_failed_collection_closes_driver_and_next_round_builds_one_replacement(self):
+        from datetime import datetime
+        from selenium.common.exceptions import TimeoutException
+        from app_core.notice_collection_browser import NoticeBrowser
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        first, replacement = FakeDriver(), FakeDriver()
+        first.get = Mock(side_effect=TimeoutException("synthetic timeout"))
+        def set_replacement_filter(driver):
+            driver.pages = [snapshot(readFilter=2, dateFrom="115-10-29", dateTo="115-10-31")
+                            if "is_read=2" in driver.current_url else snapshot()]
+        replacement.on_get = set_replacement_filter
+        factory, login = Mock(side_effect=[first, replacement]), Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            browser = NoticeBrowser(Path(directory), driver_factory=factory, login_runner=login, login_guard=False)
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            guard = service.login_guard
+            for index in range(3):
+                with self.assertRaises(NoticeCollectionError):
+                    service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+                factory.assert_called_once()
+                self.assertEqual(first.get.call_count, index + 1)
+                self.assertEqual(first.quit_calls, int(index == 2))
+            self.assertEqual(service.collect("synthetic-password", datetime(2026, 10, 31, 10, 9)).status, "success")
+            self.assertEqual(factory.call_count, 2)
+            self.assertEqual(replacement.quit_calls, 0)
+            self.assertIs(service.login_guard, guard)
+            login.assert_not_called()
+
     def test_list_timeout_identifies_blocked_checks_without_private_page_data(self):
         from app_core.notice_collection_service import NoticeCollectionError
         driver = FakeDriver([snapshot([notice("private-id")], filtered=False, ajaxActive=1,

@@ -12837,6 +12837,63 @@ ApplicationWindow {
             finally:
                 controller.shutdown()
 
+    def test_notice_problem_package_export_failure_is_visible_without_repeating_collection(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = OperationalSyncService(root)
+            diagnostics = DiagnosticsService(root)
+            diagnostics.export = Mock(side_effect=ValueError("private-password cookie=private-session"))
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=diagnostics, operational_sync_service=sync)
+            controller._start_operational_sync = Mock()
+            report = {"state": "failed", "run_id": "notice-export-failure", "calendar_day": "2026-10-31",
+                      "reported_at": "2026-10-31T09:00:30+08:00", "part_index": 0,
+                      "error_code": "list_navigation_failed", "message": "通報列表重新整理失敗，請確認連線。"}
+            try:
+                controller._notice_collection_report_ready(report)
+                status_text = sync.status_path.read_text(encoding="utf-8")
+                self.assertEqual(json.loads(status_text)["diagnostic"]["state"], "failed")
+                self.assertIn("問題包建立失敗", controller.diagnosticsStatus)
+                self.assertNotIn("private-password", status_text + controller.diagnosticsStatus)
+                self.assertNotIn("private-session", status_text + controller.diagnosticsStatus)
+                self.assertEqual(len(sync.pending_path.read_text(encoding="utf-8").splitlines()), 1)
+                self.assertEqual(controller._start_operational_sync.call_args_list, [unittest.mock.call("event_drain")])
+                diagnostics.export.assert_called_once()
+            finally:
+                controller.shutdown()
+
+    def test_notice_problem_package_queue_failure_keeps_local_zip_and_reports_safe_status(self):
+        from app_core.credential_repository import CredentialRepository
+        from app_core.diagnostics_service import DiagnosticsService
+        from app_core.operational_sync_service import OperationalSyncService
+        from qt_app.controllers.app_controller import AppController
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = OperationalSyncService(root)
+            sync.queue_diagnostic_package = Mock(side_effect=OSError("private-password"))
+            controller = AppController(repository=CredentialRepository(root / "saved.json", "SinpoSmart", None),
+                diagnostics_service=DiagnosticsService(root), operational_sync_service=sync)
+            controller._start_operational_sync = Mock()
+            report = {"state": "failed", "run_id": "notice-queue-failure", "calendar_day": "2026-10-31",
+                      "reported_at": "2026-10-31T09:00:30+08:00", "part_index": 0,
+                      "error_code": "list_navigation_failed", "message": "通報列表重新整理失敗，請確認連線。"}
+            try:
+                controller._notice_collection_report_ready(report)
+                self.assertEqual(len(list((root / "issue_reports").glob("*.zip"))), 1)
+                status_text = sync.status_path.read_text(encoding="utf-8")
+                self.assertEqual(json.loads(status_text)["diagnostic"]["state"], "failed")
+                self.assertIn("尚未排入", controller.diagnosticsStatus)
+                self.assertNotIn("private-password", status_text + controller.diagnosticsStatus)
+                self.assertEqual(controller._start_operational_sync.call_args_list, [unittest.mock.call("event_drain")])
+            finally:
+                controller.shutdown()
+
     def test_submission_and_manual_problem_packages_are_durably_queued_without_network_on_ui_thread(self):
         from app_core.credential_repository import CredentialRepository
         from app_core.diagnostics_service import DiagnosticsService
@@ -20052,6 +20109,7 @@ if return_code != 0 or loaded:
                 return Path("issue-package.zip")
 
         controller = AppController(diagnostics_service=FakeDiagnosticsService())
+        controller._queue_diagnostic_package = lambda _package: False
         notifications: list[tuple[str, str]] = []
         presented_statuses: list[str] = []
         controller._tray_controller.notify = lambda title, message: notifications.append((title, message))

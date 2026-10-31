@@ -615,8 +615,11 @@ class AppController(QObject):
             return False
         try:
             queue(package_path)
-        except Exception:
-            return False  # The local ZIP remains available even if admission fails.
+        except Exception as exc:
+            self._operational_sync_service.record_unhandled_failure("diagnostic_drain", exc)
+            self._diagnostics_status = "問題包已保存本機，尚未排入 NAS 上傳。"
+            self.diagnosticsChanged.emit()
+            return False
         self._start_operational_sync("diagnostic_drain")
         return True
 
@@ -3102,9 +3105,13 @@ class AppController(QObject):
                     action_key=str(report.get("run_id") or ""), action_kind="notice_collection", trigger_type=trigger_type,
                     error_code=str(report.get("error_code") or report.get("error_stage") or "unknown_error"),
                 ))
-                self._queue_diagnostic_package(package_path)
-            except Exception:
-                pass  # Reporting a notice failure must never repeat its write or read marker.
+                if self._queue_diagnostic_package(package_path):
+                    self._diagnostics_status = "通報問題包已保存本機並排入 NAS 上傳。"
+                    self.diagnosticsChanged.emit()
+            except Exception as exc:
+                self._operational_sync_service.record_unhandled_failure("diagnostic_drain", exc)
+                self._diagnostics_status = "通報問題包建立失敗，已保留原有收取紀錄。"
+                self.diagnosticsChanged.emit()
 
     def _send_operational_event(self, record_type: str, **fields) -> None:
         if self._read_only_acceptance:

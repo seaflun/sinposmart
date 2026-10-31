@@ -31,6 +31,16 @@ NOTICE_BROWSER_STARTUP_CODES = {
     "driver_service_start": "browser_driver_service_timeout", "session_create": "browser_session_create_timeout",
     "startup_unknown": "browser_startup_timeout",
 }
+NOTICE_NAVIGATION_EXCEPTION_TYPES = frozenset({
+    "TimeoutException", "WebDriverException", "TimeoutError", "ConnectionError", "OSError", "other",
+})
+NOTICE_NAVIGATION_NET_ERROR_CODES = frozenset({
+    "ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_ABORTED", "ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_CHANGED", "ERR_NETWORK_ACCESS_DENIED", "ERR_ADDRESS_UNREACHABLE", "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED", "ERR_SSL_PROTOCOL_ERROR", "ERR_CERT_AUTHORITY_INVALID", "ERR_CERT_DATE_INVALID",
+    "ERR_CERT_COMMON_NAME_INVALID", "ERR_EMPTY_RESPONSE", "ERR_HTTP_RESPONSE_CODE_FAILURE", "ERR_ABORTED",
+})
 NOTICE_ERROR_CODES = frozenset({
     *NOTICE_BROWSER_STARTUP_CODES.values(),
     "browser_start_failed", "browser_window_closed", "snapshot_failed", "snapshot_invalid",
@@ -480,6 +490,7 @@ class NoticeCollectionService:
         self._state_error = False
         self.last_result: NoticeCollectionResult | None = None
         self._collection_stage = "scan"
+        self._consecutive_scan_browser_failures = 0
         self._confirmed_for_read: set[str] = set()
         self._marked_for_read: set[str] = set()
         self._pending_read_for_attempt: set[str] = set()
@@ -580,7 +591,11 @@ class NoticeCollectionService:
         )
 
     def collect(self, password: str, received_at: datetime, cancel=None, *, responsibility=None) -> NoticeCollectionResult:
-        self.login_guard.require_allowed(self._now())
+        try:
+            self.login_guard.require_allowed(self._now())
+        except Exception:
+            self._consecutive_scan_browser_failures = 0
+            raise
         received_at = _local_time(received_at)
         self._responsibility = _frozen_responsibility(responsibility, received_at)
         before = set(self._state["collected"])
@@ -602,9 +617,11 @@ class NoticeCollectionService:
             if result.signing_pending_count and result.status == "success":
                 result.status, result.error_stage, result.error_code = "partial", "write", "recipient_unconfirmed"
                 result.message = f"已入表；{result.signing_pending_count} 則簽收人員待人工確認。"
+            self._consecutive_scan_browser_failures = 0
             return result
         except Exception as exc:
             self._save_failure_diagnostic("collect:" + self._collection_stage, exc, secrets=(password,))
+            self._finish_failed_browser_scan(exc)
             result = self.last_result
             result.written_keys = sorted(set(result.written_keys) | (set(self._state["collected"]) - before))
             result.status = ("uncertain" if self._state["pending"] else
@@ -620,6 +637,27 @@ class NoticeCollectionService:
                     if self._state["confirmed"].get(key, {}).get("read_state") != "confirmed"}
                 result.pending_read_count = len(self._pending_read_for_attempt | self._pending_read_keys(received_at))
             raise
+
+    def _finish_failed_browser_scan(self, error: BaseException) -> None:
+        """Recycle only after three failed rounds; retry on the existing schedule."""
+        code = _safe_notice_error_code(getattr(error, "code", ""))
+        recoverable = (self._collection_stage == "scan" and isinstance(error, NoticeCollectionError)
+                       and code in {"list_navigation_failed", "list_wait_timeout"})
+        if self._collection_stage == "scan" and code == "origin_mismatch":
+            context = getattr(error, "page_context", {})
+            origin = context.get("origin_class") if isinstance(context, dict) else None
+            url = context.get("url_class") if isinstance(context, dict) else None
+            recoverable = (isinstance(origin, str) and isinstance(url, str)
+                           and ((origin in {"browser_error", "opaque"} and url in {"expected", "browser_error", "blank"})
+                                or origin == "unknown" and url in {"browser_error", "blank"}))
+        self._consecutive_scan_browser_failures = self._consecutive_scan_browser_failures + 1 if recoverable else 0
+        if self._consecutive_scan_browser_failures < 3:
+            return
+        self._consecutive_scan_browser_failures = 0
+        try:
+            self.close()
+        except Exception:
+            pass  # Browser cleanup cannot replace the failure or change stored receipts.
 
     def _reconcile_recent(self, password: str, now: datetime, cancel) -> None:
         """Keep already-read publications separate from automatic write receipts."""
@@ -1104,11 +1142,17 @@ class NoticeCollectionService:
                     value = context.get(key)
                     if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", value):
                         safe_context[key] = value
+                for key, allowed in (("navigation_step", {"get", "refresh"}),
+                                     ("exception_type", NOTICE_NAVIGATION_EXCEPTION_TYPES),
+                                     ("net_error_code", NOTICE_NAVIGATION_NET_ERROR_CODES | {""})):
+                    value = context.get(key)
+                    if isinstance(value, str) and value in allowed:
+                        safe_context[key] = value
                 for key in ("expected_page", "expected_filter", "page", "pages", "total", "row_count",
                             "date_rows", "read_filter"):
                     if key in context and (context[key] is None or type(context[key]) is int and 0 <= context[key] <= 10_000_000):
                         safe_context[key] = context[key]
-                for key in ("loading", "filtered", "ajax_active", "account_confirmed", "date_range_confirmed",
+                for key in ("loading", "filtered", "ajax_active", "account_confirmed", "date_range_confirmed", "page_load_timeout",
                             "keys_complete", "keys_unique", "page_changed"):
                     if key in context and (context[key] is None or type(context[key]) is bool):
                         safe_context[key] = context[key]

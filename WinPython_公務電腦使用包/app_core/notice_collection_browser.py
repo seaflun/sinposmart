@@ -11,13 +11,15 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 
-from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException, TimeoutException
 from selenium.webdriver.common.by import By
 
 from app_core.login_verifier import LoginVerificationError, OASessionExpiredError, OA_LOGIN_FAILURE_MESSAGES
 from app_core.notice_collection_service import (
     FIXED_NOTICE_ACCOUNT,
     NOTICE_BROWSER_STARTUP_CODES,
+    NOTICE_NAVIGATION_EXCEPTION_TYPES,
+    NOTICE_NAVIGATION_NET_ERROR_CODES,
     NoticeCollectionError,
     NoticeLoginRequired,
     NoticeLoginGuard,
@@ -289,17 +291,28 @@ class NoticeBrowser:
             query = {"action": "bulletin_list", "is_read": 2, "list_condition": "all",
                      "start_date": date_range[0], "end_date": date_range[1], "orderby": "start_date"}
             url = OA_ORIGIN + "/module_page.php?module=bulletin#bulletin/bulletin.php?" + urlencode(query)
+        navigation_step = "get"
         try:
             self._driver.get(url)
             # The fragment route can retain an earlier document, including an
             # empty unread list. Reload before accepting metadata or readback.
+            navigation_step = "refresh"
             self._driver.refresh()
         except (InvalidSessionIdException, NoSuchWindowException):
             self.close()
             raise NoticeCollectionError("通報專用視窗已關閉，下輪將重新開啟。", code="browser_window_closed") from None
-        except Exception:
-            raise self._page_failure("通報列表重新整理失敗，請確認連線。", "list_navigation_failed",
-                                     checks={"navigation": False}) from None
+        except Exception as exc:
+            error = self._page_failure("通報列表重新整理失敗，請確認連線。", "list_navigation_failed",
+                                       checks={"navigation": False})
+            exception_type = type(exc).__name__
+            net_codes = re.findall(r"\bnet::(ERR_[A-Z0-9_]+)\b", str(exc))
+            error.page_context.update(
+                navigation_step=navigation_step,
+                exception_type=exception_type if exception_type in NOTICE_NAVIGATION_EXCEPTION_TYPES else "other",
+                net_error_code=next((code for code in net_codes if code in NOTICE_NAVIGATION_NET_ERROR_CODES), ""),
+                page_load_timeout=isinstance(exc, (TimeoutException, TimeoutError)),
+            )
+            raise error from None
         state = self._wait_page(1, None, cancel, read_filter=read_filter, date_range=date_range)
         pages, total = state["pages"], state["total"]
         if pages > self._max_pages:

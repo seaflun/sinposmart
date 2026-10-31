@@ -152,6 +152,130 @@ class NoticeLoginProtectionTests(unittest.TestCase):
 
 
 class NoticeCollectionTests(unittest.TestCase):
+    def test_three_consecutive_scan_failures_close_browser_without_retry_or_changing_receipts(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        browser = FakeBrowser()
+        browser.scan_unread = Mock(side_effect=NoticeCollectionError("safe", code="list_navigation_failed"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = NoticeCollectionService(root, browser=browser, poster=Mock())
+            service._state["collected"]["1"] = datetime(2026, 10, 30, 10).isoformat()
+            service._state["confirmed"]["1"] = {"subject": "原紀錄", "read_state": "pending"}
+            before = json.loads(json.dumps(service._state))
+            guard = service.login_guard
+            for index in range(3):
+                with self.assertRaises(NoticeCollectionError):
+                    service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+                self.assertEqual(browser.events.count("close"), int(index == 2))
+                self.assertEqual(browser.scan_unread.call_count, index + 1)
+                self.assertEqual(service._state, before)
+                self.assertIs(service.login_guard, guard)
+            service._poster.assert_not_called()
+            diagnostic = json.loads((root / "runtime_outputs/browser/notice_collection_failure.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(diagnostic["failures"]), 3)
+            self.assertEqual(service.last_result.error_code, "list_navigation_failed")
+
+    def test_complete_collection_breaks_scan_failure_streak(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        failure = NoticeCollectionError("safe", code="list_wait_timeout")
+        browser = FakeBrowser()
+        browser.scan_unread = Mock(side_effect=[failure, failure, [], failure, failure, failure])
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            for index in range(6):
+                at = datetime(2026, 10, 31, 10, index * 3)
+                if index == 2:
+                    self.assertEqual(service.collect("synthetic-password", at).status, "success")
+                else:
+                    with self.assertRaises(NoticeCollectionError):
+                        service.collect("synthetic-password", at)
+                self.assertEqual(browser.events.count("close"), int(index == 5))
+
+    def test_recent_scan_failures_count_whole_rounds_instead_of_resetting_after_unread_scan(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        browser = FakeBrowser()
+        browser.scan_recent = Mock(side_effect=NoticeCollectionError("safe", code="list_wait_timeout"))
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            for index in range(3):
+                with self.assertRaises(NoticeCollectionError):
+                    service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+                self.assertEqual(browser.events.count("close"), int(index == 2))
+                self.assertEqual(browser.events.count("scan"), index + 1)
+                self.assertEqual(browser.scan_recent.call_count, index + 1)
+
+    def test_other_failures_interrupt_streak_and_never_restart_login(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService, NoticeLoginRequired
+        for other in ("oa_credentials_rejected", "oa_captcha_rejected", "account_mismatch", "origin_mismatch"):
+            with self.subTest(other=other), tempfile.TemporaryDirectory() as directory:
+                failure = NoticeCollectionError("safe", code="list_wait_timeout")
+                middle = (NoticeLoginRequired("safe", code=other) if other.startswith("oa_")
+                          else NoticeCollectionError("safe", code=other))
+                if other == "origin_mismatch":
+                    middle.page_context = {"origin_class": "other", "url_class": "other"}
+                browser = FakeBrowser()
+                browser.scan_unread = Mock(side_effect=[failure, failure, middle, failure, failure, failure])
+                service = NoticeCollectionService(Path(directory), browser=browser)
+                for index in range(6):
+                    with self.assertRaises(NoticeCollectionError):
+                        service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+                    self.assertEqual(browser.events.count("close"), int(index == 5))
+                    self.assertEqual(browser.scan_unread.call_count, index + 1)
+
+    def test_only_recoverable_origin_errors_can_reset_after_three_scans(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        for origin, url, expected in (("opaque", "blank", 1), ("opaque", "expected", 1),
+                                      ("browser_error", "browser_error", 1), ("unknown", "blank", 1),
+                                      ("other", "other", 0), ("opaque", "other", 0), ("other", "blank", 0),
+                                      ([], "blank", 0), ("opaque", {}, 0)):
+            with self.subTest(origin=origin, url=url), tempfile.TemporaryDirectory() as directory:
+                failure = NoticeCollectionError("safe", code="origin_mismatch")
+                failure.page_context = {"origin_class": origin, "url_class": url}
+                browser = FakeBrowser()
+                browser.scan_unread = Mock(side_effect=failure)
+                service = NoticeCollectionService(Path(directory), browser=browser)
+                for index in range(3):
+                    with self.assertRaises(NoticeCollectionError):
+                        service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+                self.assertEqual(browser.events.count("close"), expected)
+                self.assertEqual(browser.scan_unread.call_count, 3)
+
+    def test_non_scan_failures_do_not_trigger_browser_reset(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            browser = FakeBrowser()
+            service = NoticeCollectionService(Path(directory), browser=browser)
+            def fail_after_scan(*_args):
+                service._collection_stage = "mark_read"
+                raise NoticeCollectionError("safe", code="list_navigation_failed")
+            service._collect = Mock(side_effect=fail_after_scan)
+            for index in range(3):
+                with self.assertRaises(NoticeCollectionError):
+                    service.collect("synthetic-password", datetime(2026, 10, 31, 10, index * 3))
+            self.assertNotIn("close", browser.events)
+
+    def test_navigation_failure_diagnostic_accepts_only_safe_classification_fields(self):
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeCollectionService
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = NoticeCollectionService(root)
+            error = NoticeCollectionError("safe", code="list_navigation_failed")
+            error.page_context = {"navigation_step": "refresh", "exception_type": "WebDriverException",
+                "net_error_code": "ERR_NAME_NOT_RESOLVED", "page_load_timeout": False,
+                "raw": "private-password https://private.invalid/?token=x"}
+            service._save_failure_diagnostic("collect:scan", error, secrets=("private-password",))
+            context = json.loads((root / "runtime_outputs/browser/notice_collection_failure.json").read_text(encoding="utf-8"))["failures"][0]["context"]
+            self.assertEqual(context, {"navigation_step": "refresh", "exception_type": "WebDriverException",
+                "net_error_code": "ERR_NAME_NOT_RESOLVED", "page_load_timeout": False})
+            error.page_context.update(navigation_step="private-password", exception_type="PrivateSecret",
+                                      net_error_code="ERR_PRIVATE_PASSWORD", page_load_timeout="secret")
+            service._save_failure_diagnostic("collect:scan", error, secrets=("private-password",))
+            body = (root / "runtime_outputs/browser/notice_collection_failure.json").read_text(encoding="utf-8")
+            latest = json.loads(body)["failures"][-1].get("context", {})
+            self.assertEqual(latest, {})
+            for secret in ("private-password", "private.invalid", "PrivateSecret", "ERR_PRIVATE_PASSWORD"):
+                self.assertNotIn(secret, body)
+
     def test_positive_recent_read_evidence_repairs_pending_without_recounting(self):
         from app_core.notice_collection_service import NoticeCollectionService, TAIPEI
         at = datetime(2026, 10, 29, 12, tzinfo=TAIPEI)
