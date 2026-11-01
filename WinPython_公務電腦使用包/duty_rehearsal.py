@@ -1189,6 +1189,47 @@ def fill_work_log_form_for_test(
 
 # Entry log automation
 
+ENTRY_FORM_CONFIRM_SCRIPT = r"""
+const values = arguments[0];
+const controls = Array.from(document.querySelectorAll('input, select, textarea'));
+const uniqueControl = ref => {
+  if (!ref) return null;
+  const matches = controls.filter(control => ref.id ? control.id === ref.id : ref.name && control.name === ref.name);
+  return matches.length === 1 ? matches[0] : null;
+};
+const writtenControl = (ids, written) => {
+  const refs = (written || []).filter(ref => ids.includes(ref.id));
+  return refs.length === 1 ? uniqueControl(refs[0]) : null;
+};
+const date = writtenControl(['_txtDATE', '_txtDate', '_txtTaskDate', '_txtSDATE', '_txtSdate'], values.fill_controls);
+const hour = writtenControl(['_selTIMEH', '_selSTIMEH', '_selTimeH', '_selHH', '_selHOUR'], values.fill_controls);
+const minute = writtenControl(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.fill_controls);
+const direction = uniqueControl(values);
+const actualValue = String(direction?.value || '').trim();
+const actualText = String(direction?.options?.[direction.selectedIndex]?.text || '').trim();
+const directionMatches = direction?.tagName.toLowerCase() === 'select' && actualValue === values.value && actualText === values.text;
+const dateValue = String(date?.value || '').trim().replace(/[\/\-\s]/g, '');
+const dateMatches = Boolean(date && /^\d{7}$/.test(dateValue) && dateValue === values.date);
+const timeMatches = (control, wanted, limit) => {
+  const current = String(control?.value ?? '').trim();
+  const optionText = String(control?.options?.[control.selectedIndex]?.text || '').trim();
+  return Boolean(control && /^\d{1,2}$/.test(current) && Number(current) <= limit && Number(current) === Number(wanted) && optionText !== '請選擇');
+};
+const hourMatches = timeMatches(hour, values.hour, 23), minuteMatches = timeMatches(minute, values.minute, 59);
+const reasonRefs = values.reason_controls || [];
+const reason = reasonRefs.length === 1 ? uniqueControl(reasonRefs[0]) : null;
+const normalizeReason = value => String(value || '').replace(/\r\n/g, '\n').trim();
+const reasonMatches = !values.reason || Boolean(reason && normalizeReason(reason.value) === normalizeReason(values.reason));
+return {confirmed: Boolean(directionMatches && dateMatches && hourMatches && minuteMatches && reasonMatches),
+  id: direction?.id || '', value: actualValue, text: actualText,
+  fields: {date: dateMatches, hour: hourMatches, minute: minuteMatches, direction: Boolean(directionMatches), reason: reasonMatches}};
+"""
+
+
+class EntryLogFormValidationError(RuntimeError):
+    diagnostic_category = "entry_form_incomplete"
+
+
 def fill_entry_log_form_for_test(
     driver: webdriver.Chrome,
     action: dict[str, Any],
@@ -1200,6 +1241,9 @@ def fill_entry_log_form_for_test(
     """Fill the entry-log form. Save only when explicitly requested."""
 
     fields = action.get("fields", {})
+    direction = fields.get("出或入", "")
+    if not isinstance(direction, str) or direction not in ENTRY_OUTIN_VALUE_MAP:
+        raise EntryLogFormValidationError("出入方向未指定或不正確，未送出。")
     time_value = fields.get("系統寫入時間", fields.get("登打時間", action.get("time", "00:00")))
     hour, minute = time_value.split(":", 1)
     target_no = str(action.get("target", ""))
@@ -1388,8 +1432,8 @@ def fill_entry_log_form_for_test(
           used.add(key);
           const actualText = selectedOptionText(el);
           const confirmed = (
-            (wantedValue && String(el.value || '').trim() === wantedValue) ||
-            (wantedText && actualText === wantedText)
+            wantedValue && String(el.value || '').trim() === wantedValue &&
+            wantedText && actualText === wantedText
           );
           result.outin = {
             id: el.id || '',
@@ -1513,6 +1557,36 @@ def fill_entry_log_form_for_test(
     )
     time.sleep(1)
 
+    if not isinstance(fill_result, dict) or {"date", "hour", "minute"}.intersection(fill_result.get("missing", [])):
+        raise EntryLogFormValidationError("登載日期或時間欄位尚未完成，未送出。")
+    if not isinstance(reason_result, dict) or (
+        fields.get("領用事由及地點") and "reason" in reason_result.get("missing", [])
+    ):
+        raise EntryLogFormValidationError("登載原因欄位尚未完成，未送出。")
+    if (
+        not isinstance(outin_result, dict)
+        or outin_result.get("missing")
+        or not isinstance(outin_result.get("outin"), dict)
+        or outin_result["outin"].get("confirmed") is not True
+    ):
+        raise EntryLogFormValidationError("出入方向尚未確認，未送出。")
+    outin_confirmation = driver.execute_script(
+        ENTRY_FORM_CONFIRM_SCRIPT,
+        {
+            "id": outin_result["outin"].get("id", ""),
+            "name": outin_result["outin"].get("name", ""),
+            "value": ENTRY_OUTIN_VALUE_MAP[direction],
+            "text": direction,
+            "date": target_roc_date,
+            "hour": hour,
+            "minute": minute,
+            "reason": fields.get("領用事由及地點", ""),
+            "fill_controls": fill_result.get("set", []),
+            "reason_controls": reason_result.get("set", []),
+        },
+    )
+    if not isinstance(outin_confirmation, dict) or outin_confirmation.get("confirmed") is not True:
+        raise EntryLogFormValidationError("儲存前出入方向、日期、時間或原因已變更或無法確認，未送出。")
     if save and before_save is not None:
         before_save()
     save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}
@@ -1524,6 +1598,7 @@ def fill_entry_log_form_for_test(
         "insert": insert_result,
         "fill": fill_result,
         "outin": outin_result,
+        "outin_confirmation": outin_confirmation,
         "reason": reason_result,
         "people": people_result,
         "save": save_result,
@@ -2244,6 +2319,88 @@ def _row_query_datetime(value: str) -> datetime | None:
         return None
 
 
+class EntryQueryRows(list[list[str]]):
+    """List-compatible entry rows with serializable, aligned reader evidence."""
+
+    def __init__(self, rows: list[list[str]], entry_metadata: list[dict[str, Any]]):
+        super().__init__(rows)
+        self.entry_metadata = entry_metadata
+
+    def extend(self, rows: list[list[str]]) -> None:
+        metadata = getattr(rows, "entry_metadata", None)
+        self.entry_metadata.extend(metadata if isinstance(metadata, list) else [{"_invalid": True} for _row in rows])
+        super().extend(rows)
+
+
+ENTRY_QUERY_ROWS_SCRIPT = r"""
+const labels = ['', '時間', '所屬單位', '勤務項目', '人員', '職稱', '出或入', '是否歸還', '首次登打時間'];
+const text = cell => String(cell?.innerText || '').replace(/\u00a0/g, ' ').trim();
+const compact = value => String(value || '').replace(/\s+/g, '');
+const directCells = row => Array.from(row?.children || []).filter(cell => /^(?:TD|TH)$/.test(cell.tagName));
+const isoTime = value => {
+  const match = String(value || '').trim().match(/^(\d{3})\/?(\d{2})\/?(\d{2})\s+(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]) + 1911, month = Number(match[2]), day = Number(match[3]);
+  const hour = Number(match[4]), minute = Number(match[5]);
+  const checked = new Date(year, month - 1, day, hour, minute);
+  if (checked.getFullYear() !== year || checked.getMonth() !== month - 1 || checked.getDate() !== day || hour > 23 || minute > 59) return null;
+  return `${year}-${match[2]}-${match[3]}T${String(hour).padStart(2, '0')}:${match[5]}`;
+};
+const stripe = row => ['mdsTRStyle1', 'mdsTRStyle2'].filter(value => row?.classList?.contains(value));
+const escapePattern = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const handlerMatches = (cell, name, key) => {
+  if (!key) return false;
+  const handlers = Array.from(cell?.querySelectorAll('[onclick]') || []).map(node => String(node.getAttribute('onclick') || '').trim());
+  const named = handlers.filter(value => new RegExp('^' + name + '\\s*\\(').test(value));
+  return named.length === 1 && new RegExp('^' + name + '\\s*\\(\\s*[\'\"]' + escapePattern(key) + '\\(').test(named[0]);
+};
+const candidates = Array.from(document.querySelectorAll('table.table_list1')).map(table => {
+  const nodes = Array.from(table.querySelectorAll('tr')).filter(row => row.closest('table') === table);
+  const headers = nodes.filter(row => {
+    const values = directCells(row).map(cell => compact(text(cell)));
+    return values.length === labels.length && labels.every((value, index) => values[index] === value);
+  });
+  return {table, nodes, headers};
+}).filter(item => item.headers.length === 1);
+const noRecords = /QUY-500\s*[:：]\s*查無資料/.test(document.body?.innerText || '');
+const result = {rows: [], tableValid: candidates.length === 1, readyState: document.readyState,
+  pendingQueries: Number(window.jQuery?.active || 0), noRecords};
+if (candidates.length === 1) {
+  const {nodes, headers} = candidates[0];
+  for (const row of nodes) {
+    if (row === headers[0]) continue;
+    const cells = directCells(row), stripes = stripe(row);
+    if (cells.length !== 9 || stripes.length !== 1) continue;
+    const checkboxes = Array.from(row.querySelectorAll('input[type="checkbox"]')).filter(node => node.id === '_chkData' && node.name === '_chkData');
+    const key = checkboxes.length === 1 ? String(checkboxes[0].value || '') : '';
+    const validMain = cells.every(cell => cell.tagName === 'TD' && Number(cell.rowSpan || 1) === 1 && Number(cell.colSpan || 1) === 1)
+      && row.parentElement?.tagName === 'TBODY' && checkboxes.length === 1 && Boolean(key);
+    const values = cells.map(text), detail = row.nextElementSibling, detailCells = directCells(detail);
+    const sameParent = detail?.parentElement === row.parentElement;
+    const detailStripes = stripe(detail);
+    const validDetailShape = detailCells.length === 7 && detailCells.every((cell, index) => cell.tagName === 'TD'
+      && Number(cell.rowSpan || 1) === 1 && Number(cell.colSpan || 1) === (index === 0 ? 3 : 1));
+    const sameStripe = detailStripes.length === 1 && detailStripes[0] === stripes[0];
+    const validBinding = validMain && sameParent && sameStripe && validDetailShape
+      && handlerMatches(detailCells[6], 'changeButton', key) && handlerMatches(detailCells[6], 'copyButton', key);
+    const category = values[3], mainCells = values.slice(1);
+    if (!category) mainCells.splice(2, 1);
+    const detailValues = validBinding ? detailCells.map(text) : [];
+    const reason = validBinding ? detailValues[0] : '';
+    const recordAt = isoTime(values[1]), systemWrittenAt = values[8] ? isoTime(values[8]) : null;
+    result.rows.push({cells: mainCells.concat(detailValues), metadata: {
+      schema: 'entry-log-v1', primary_index: category ? 3 : 2, direction_index: category ? 5 : 4,
+      primary_name: values[4], direction: values[6], category, record_at: recordAt,
+      system_written_at: systemWrittenAt, record_time_valid: Boolean(recordAt),
+      system_written_valid: !values[8] || Boolean(systemWrittenAt), structure_valid: validMain,
+      detail_present: Boolean(validBinding), detail_status: validBinding ? (reason ? 'present' : 'empty') : 'unconfirmed', reason
+    }});
+  }
+}
+return result;
+"""
+
+
 def query_visible_table(
     driver: webdriver.Chrome,
     ap_name: str,
@@ -2330,33 +2487,7 @@ def query_visible_table(
             return [row for row in raw_rows if len(row) >= 8 and row_in_query_range(row)]
 
         def entry_page_ready(current_driver):
-            snapshot = current_driver.execute_script(
-                r"""
-                const nodes = Array.from(document.querySelectorAll('tr')).filter(tr => !tr.querySelector('table'));
-                const datePattern = /\d{3}\/?\d{2}\/?\d{2}\s+\d{1,2}:\d{2}/;
-                let anchor = null, remaining = 0, parent = null;
-                const rows = nodes.map((tr, index) => {
-                  const children = Array.from(tr.children);
-                  const cells = children.map(td => (td.innerText || td.value || '').trim()).filter(Boolean);
-                  let continuation_of = null;
-                  if (datePattern.test(cells[0] || '')) {
-                    anchor = index;
-                    remaining = Math.min(100, Math.max(1, ...children.map(td => Number(td.rowSpan) || 1)) - 1);
-                    parent = tr.parentElement;
-                  } else {
-                    const recordSignal = cells.some(text => datePattern.test(text) ||
-                      /^(?:出|入|值班|值退|返隊)(?:\s|[／/|：:]|$)/.test(text) || /^\d{1,3}(?:番|\s+)[^\d]/.test(text));
-                    if (remaining > 0 && tr.parentElement === parent && !recordSignal) {
-                      continuation_of = anchor;
-                      remaining -= 1;
-                    } else { anchor = null; remaining = 0; parent = null; }
-                  }
-                  return {cells, continuation_of};
-                });
-                return {rows, readyState: document.readyState, pendingQueries: Number(window.jQuery?.active || 0),
-                  noRecords: /QUY-500\s*[:：]\s*查無資料/.test(document.body?.innerText || '')};
-                """
-            )
+            snapshot = current_driver.execute_script(ENTRY_QUERY_ROWS_SCRIPT)
             # Older callers' synthetic row lists carry no DOM continuation proof.
             snapshot = {"rows": snapshot} if isinstance(snapshot, list) else snapshot
             if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list)
@@ -2365,8 +2496,10 @@ def query_visible_table(
             raw = snapshot["rows"]
             dated = any(isinstance(cells := item.get("cells") if isinstance(item, dict) else item, list)
                         and len(cells) >= 6 and _row_query_datetime(str(cells[0])) is not None for item in raw)
+            structured = any(isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+                             and item["metadata"].get("schema") == "entry-log-v1" for item in raw)
             no_records = snapshot.get("noRecords") is True
-            if dated == no_records:
+            if (dated or structured) == no_records or (snapshot.get("tableValid") is False and not no_records):
                 return False  # Neither an unready empty grid nor contradictory QUY-500 proves a result.
             return {"rows": raw}
 
@@ -2375,22 +2508,23 @@ def query_visible_table(
         except TimeoutException as error:
             raise TimeoutException("出入查詢資料列尚未就緒，且沒有明確查無資料結果，已停止比對。") from error
         page_rows: list[list[str]] = []
-        anchor = None
-        for index, item in enumerate(raw_rows):
+        page_metadata: list[dict[str, Any]] = []
+        structured_page = False
+        for item in raw_rows:
             row = item.get("cells", []) if isinstance(item, dict) else item
             if not isinstance(row, list):
-                anchor = None
                 continue
-            if len(row) >= 6 and row_in_query_range(row):
+            metadata = item.get("metadata") if isinstance(item, dict) else None
+            if isinstance(metadata, dict) and metadata.get("schema") == "entry-log-v1":
+                structured_page = True
+                if _row_query_datetime(str(row[0])) is not None and not row_in_query_range(row):
+                    continue
                 page_rows.append(list(row))
-                anchor = index
-            elif (isinstance(item, dict) and type(item.get("continuation_of")) is int
-                    and item["continuation_of"] == anchor and page_rows
-                    and not any(_row_query_datetime(str(value)) is not None for value in row)):
-                page_rows[-1].extend(row)
-            else:
-                anchor = None
-        return page_rows
+                page_metadata.append(metadata)
+            elif len(row) >= 6 and row_in_query_range(row):
+                page_rows.append(list(row))
+                page_metadata.append({"_invalid": True})
+        return EntryQueryRows(page_rows, page_metadata) if structured_page else page_rows
 
     rows = capture_visible_page()
     pages = case_query_pages(driver)
@@ -4285,6 +4419,8 @@ def main() -> int:
                 "visible_work_rows": work_rows,
                 "visible_entry_rows": entry_rows,
             }
+            if getattr(entry_rows, "entry_metadata", None) is not None:
+                payload["visible_entry_metadata"] = entry_rows.entry_metadata
             with open(args.json_out, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             print(f"JSON 輸出: {args.json_out}")

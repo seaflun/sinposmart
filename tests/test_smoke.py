@@ -4796,7 +4796,8 @@ try {
                     wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
                 ), mock.patch.object(module, "step_batch_fill_duty") as fill_duty, mock.patch.object(
                     module, "step_navigate_to_task_table"
-                ), mock.patch.object(module, "super_js_execute", return_value=True), mock.patch.object(
+                ), mock.patch.multiple(module, step_open_mission_vehicle_settings=mock.Mock(return_value=True),
+                    step_select_vehicles_popup=mock.Mock()), mock.patch.object(module, "super_js_execute", return_value=True), mock.patch.object(
                     module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")
                 ) as fill_mission, mock.patch.object(module.time, "sleep"), mock.patch.object(module, "log_status"):
                     result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
@@ -4868,7 +4869,9 @@ try {
                     wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
                 ), mock.patch.object(
                     module, "step_batch_fill_duty"
-                ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
+                ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.multiple(
+                    module, step_open_mission_vehicle_settings=mock.Mock(return_value=True), step_select_vehicles_popup=mock.Mock()
+                ), mock.patch.object(
                     module, "super_js_execute", return_value=True
                 ), mock.patch.object(module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")) as fill_mission, mock.patch.object(
                     module.time, "sleep"
@@ -4992,7 +4995,9 @@ try {
             wait_for_duty_postback=mock.Mock(return_value={}), verify_saved_duty_fields=mock.Mock(return_value=True)
         ), mock.patch.object(
             module, "step_batch_fill_duty"
-        ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.object(
+        ) as fill_duty, mock.patch.object(module, "step_navigate_to_task_table"), mock.patch.multiple(
+            module, step_open_mission_vehicle_settings=mock.Mock(return_value=True), step_select_vehicles_popup=mock.Mock()
+        ), mock.patch.object(
             module, "super_js_execute", return_value=True
         ), mock.patch.object(module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")) as fill_mission, mock.patch.object(
             module.time, "sleep"
@@ -6193,6 +6198,44 @@ try {
                     self.assertEqual(rows[200][5], "work-200")
                     self.assertEqual(rows[200][4], "")
 
+    def test_entry_form_readback_checks_current_date_time_direction_and_reason(self):
+        module = duty_rehearsal_module()
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is required for the entry form readback contract")
+        controls = [
+            {"id": "_txtDATE", "tagName": "INPUT", "value": "115/11/01"},
+            {"id": "_selTIMEH", "tagName": "SELECT", "value": "08", "text": "08"},
+            {"id": "_selTIMEM", "tagName": "SELECT", "value": "15", "text": "15"},
+            {"id": "_selIsout", "tagName": "SELECT", "value": "O", "text": "出"},
+            {"id": "_areMemo", "tagName": "TEXTAREA", "value": "測試原因"},
+        ]
+        values = {"id": "_selIsout", "name": "_selIsout", "value": "O", "text": "出", "date": "1151101",
+                  "hour": "08", "minute": "15", "reason": "測試原因",
+                  "fill_controls": [{"id": value} for value in ("_txtDATE", "_selTIMEH", "_selTIMEM")],
+                  "reason_controls": [{"id": "_areMemo"}]}
+        harness = r'''
+const fixture=JSON.parse(process.argv[1]),script=JSON.parse(process.argv[2]);
+const controls=fixture.controls.map(row=>({...row,name:row.id,selectedIndex:0,options:row.tagName==='SELECT'?[{text:row.text}]:[]}));
+const document={querySelectorAll:()=>controls};
+const read=Function('document','return function(){'+script+'}')(document);
+process.stdout.write(JSON.stringify(read(fixture.values)));
+'''
+        for changed in (None, "date", "hour", "minute", "direction", "reason", "duplicate", "unwritten_reason"):
+            with self.subTest(changed=changed):
+                fixture = json.loads(json.dumps({"controls": controls, "values": values}))
+                if changed in ("date", "hour", "minute", "direction", "reason"):
+                    index = ("date", "hour", "minute", "direction", "reason").index(changed)
+                    fixture["controls"][index]["value"] = "unexpected"
+                elif changed == "duplicate":
+                    fixture["controls"].append(dict(fixture["controls"][3]))
+                elif changed == "unwritten_reason":
+                    fixture["values"]["reason_controls"] = []
+                result = subprocess.run([node, "-e", harness, json.dumps(fixture), json.dumps(module.ENTRY_FORM_CONFIRM_SCRIPT)],
+                    capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["confirmed"], changed is None)
+
     def _entry_query_fixture(self, responses, *, end_time="23:59", dom=False):
         module = duty_rehearsal_module()
         driver = mock.Mock()
@@ -6202,11 +6245,28 @@ try {
                 self.skipTest("Node is required for the entry row DOM contract")
             harness = r'''
 const fixture=JSON.parse(process.argv[1]), script=JSON.parse(process.argv[2]);
-const parents={};
-const rows=fixture.rows.map(row=>({parentElement:parents[row.group||'main']||(parents[row.group||'main']={}),
- querySelector:()=>null,children:row.cells.map(cell=>({innerText:typeof cell==='string'?cell:cell.text,
- rowSpan:typeof cell==='string'?1:(cell.rowSpan||1)}))}));
-const document={readyState:'complete',body:{innerText:fixture.text||'QUY-000 : 查詢完成'},querySelectorAll:()=>rows};
+const parents={},table={className:'table_list1'};
+const labels=['','時間','所屬單位','勤務項目','人員','職稱','出或入','是否歸還','首次登打時間'];
+function makeRow(row) {
+ const parent=parents[row.group||'main']||(parents[row.group||'main']={tagName:'TBODY',children:[]});
+ const tr={parentElement:parent,className:row.stripe||'',nextElementSibling:null};
+ tr.classList={contains:value=>tr.className.split(/\s+/).includes(value)};
+ tr.closest=selector=>selector==='table'?table:null;
+ tr.children=row.cells.map((cell,index)=>({tagName:'TD',innerText:typeof cell==='string'?cell:(cell.text||''),
+  rowSpan:typeof cell==='string'?1:(cell.rowSpan||1),colSpan:typeof cell==='string'?1:(cell.colSpan||1),
+  querySelectorAll:selector=>selector.includes('onclick')&&index===row.cells.length-1?
+   (row.handlers||[]).map(value=>({id:'_btnChoose1',getAttribute:()=>value})):[]}));
+ const checkbox=row.checkbox===undefined?null:{id:'_chkData',name:'_chkData',type:'checkbox',value:row.checkbox};
+ tr.querySelectorAll=selector=>selector.includes('checkbox')?(checkbox?[checkbox]:[]):[];
+ tr.querySelector=selector=>selector==='table'?null:(selector.includes('checkbox')?checkbox:null);
+ parent.children.push(tr);
+ return tr;
+}
+const header=makeRow({cells:labels}),rows=[header,...fixture.rows.map(makeRow)];
+for(const parent of Object.values(parents)) parent.children.forEach((row,i)=>row.nextElementSibling=parent.children[i+1]||null);
+table.querySelectorAll=selector=>selector==='tr'?rows:[];
+const document={readyState:'complete',body:{innerText:fixture.text||'QUY-000 : 查詢完成'},
+ querySelectorAll:selector=>selector==='table.table_list1'?[table]:rows};
 const result=Function('document','window',script)(document,{jQuery:{active:0}});
 process.stdout.write(JSON.stringify(result));
 '''
@@ -6247,21 +6307,61 @@ process.stdout.write(JSON.stringify(result));
                 rows, _ = self._entry_query_fixture([[departure, other]], end_time="12:00")
                 self.assertEqual(rows, [departure])
 
-    def test_entry_query_only_merges_dom_proven_continuations_without_another_record(self):
-        fixture = {"rows": [
-            {"cells": [{"text": "115/11/01 08:15", "rowSpan": 3}, "新坡分隊", "16 測試員", "隊員", "出", "救護"]},
-            {"cells": ["同一筆備註", "同一案件"]},
-            {"cells": ["115/10/31 18:00", "新坡分隊", "02 他人", "隊員", "入", "返隊"]},
-            {"cells": [{"text": "115/11/01 10:00", "rowSpan": 2}, "新坡分隊", "03 另一人", "隊員", "出", "救災"]},
-            {"cells": ["04 他人", "入", "返隊"]},
-        ]}
-        rows, _ = self._entry_query_fixture(fixture, end_time="12:00", dom=True)
+    @staticmethod
+    def _real_entry_dom_record(key="record-A", *, person="測試16", direction="出", reason="火災外勤",
+                               record_time="115/11/01 08:15", system_time="", category="", title="隊員"):
+        main = {"checkbox": key, "stripe": "mdsTRStyle1",
+                "cells": ["", record_time, "測試單位", category, person, title, direction, "否", system_time]}
+        detail = {"stripe": "mdsTRStyle1", "cells": [{"text": reason, "colSpan": 3}, "", "測試登記員", "", "", "", ""],
+                  "handlers": [f"changeButton('{key}(synthetic)')", f"copyButton('{key}(synthetic)')", "alert('delete disabled')"]}
+        return main, detail
+
+    def test_entry_query_binds_real_single_rowspan_main_and_detail_fields(self):
+        main, detail = self._real_entry_dom_record(system_time="115/11/01 09:03", title="")
+        rows, _ = self._entry_query_fixture({"rows": [main, detail]}, dom=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][:7], ["115/11/01 08:15", "測試單位", "測試16", "", "出", "否", "115/11/01 09:03"])
+        self.assertEqual(rows.entry_metadata[0]["reason"], "火災外勤")
+        self.assertTrue(rows.entry_metadata[0]["detail_present"])
+        self.assertEqual(rows.entry_metadata[0]["record_at"], "2026-11-01T08:15")
+        self.assertEqual(rows.entry_metadata[0]["system_written_at"], "2026-11-01T09:03")
+        self.assertNotIn("record-A", json.dumps(rows, ensure_ascii=False))
+        self.assertNotIn("record-A", json.dumps(rows.entry_metadata, ensure_ascii=False))
+
+    def test_entry_query_never_binds_foreign_handlers_stripes_or_bodies(self):
+        for change in ("foreign_change", "foreign_copy", "longer_prefix", "stripe", "body", "next_main"):
+            with self.subTest(change=change):
+                main, detail = self._real_entry_dom_record(key="short")
+                if change in ("foreign_change", "foreign_copy", "longer_prefix"):
+                    index = 1 if change == "foreign_copy" else 0
+                    function = "copyButton" if index else "changeButton"
+                    key = "short-longer" if change == "longer_prefix" else "other"
+                    detail["handlers"][index] = f"{function}('{key}(synthetic)')"
+                elif change == "stripe":
+                    detail["stripe"] = "mdsTRStyle2"
+                elif change == "body":
+                    detail["group"] = "another-body"
+                fixture = [main, detail]
+                if change == "next_main":
+                    another, _unused = self._real_entry_dom_record(key="another", person="測試17")
+                    fixture.insert(1, another)
+                rows, _ = self._entry_query_fixture({"rows": fixture}, dom=True)
+                self.assertFalse(rows.entry_metadata[0]["detail_present"])
+                self.assertNotIn("火災外勤", rows[0])
+
+    def test_entry_query_preserves_empty_details_invalid_time_and_row_scoped_buttons(self):
+        main, detail = self._real_entry_dom_record(reason="", category="值班(宿)", direction="值班", title="")
+        bad, bad_detail = self._real_entry_dom_record(key="B", person="測試17", record_time="invalid record time",
+                                                     system_time="115/11/01 11:00", reason="救護外勤")
+        rows, _ = self._entry_query_fixture({"rows": [main, detail, bad, bad_detail]}, dom=True)
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0][-2:], ["同一筆備註", "同一案件"])
-        self.assertEqual(len(rows[1]), 6)
-        separate = {"rows": [fixture["rows"][0], {"group": "other-table", "cells": ["其他表格備註"]}]}
-        rows, _ = self._entry_query_fixture(separate, end_time="12:00", dom=True)
-        self.assertEqual(len(rows[0]), 6)
+        self.assertEqual(rows.entry_metadata[0]["primary_index"], 3)
+        self.assertEqual(rows.entry_metadata[0]["direction_index"], 5)
+        self.assertTrue(rows.entry_metadata[0]["detail_present"])
+        self.assertEqual(rows.entry_metadata[0]["reason"], "")
+        self.assertEqual(rows.entry_metadata[1]["reason"], "救護外勤")
+        self.assertIsNone(rows.entry_metadata[1]["record_at"])
+        self.assertEqual(rows.entry_metadata[1]["system_written_at"], "2026-11-01T11:00")
 
     def test_entry_empty_result_requires_an_explicit_no_records_marker(self):
         module = duty_rehearsal_module()
@@ -8643,6 +8743,7 @@ process.stdout.write(JSON.stringify({result, state}));
                 "step_config_popups": {}, "wait_for_duty_result_grid": {"return_value": True},
                 "WebDriverWait": {"side_effect": lambda *_args, **_kwargs: self._wait(module)},
                 "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
+                "step_open_mission_vehicle_settings": {"return_value": True}, "step_select_vehicles_popup": {},
                 "step_fill_mission_cells": ({"side_effect": RuntimeError("offline mission failure")} if mission_error
                     else {"return_value": {"status": "saved", "verified": True}}), "verify_mission_cells": {"return_value": []},
                 "accept_pending_alerts": {"return_value": []}, "load_config": {"return_value": {"notification": {"enabled": False}}},
@@ -8722,26 +8823,38 @@ class DutyMissionVerificationTests(unittest.TestCase):
 const s=JSON.parse(process.argv[1]), script=JSON.parse(process.argv[2]), args=JSON.parse(process.argv[3]);
 let top;
 function render(extra=false){
- const form={id:'frm'}, elements={}, doc={readyState:s.loading?'loading':'complete'};
- const win={document:doc, frames:[], location:{href:s.origin||'https://dutymgt.tyfd.gov.tw/tyfd119/task'},
+ const form={id:'frm'}, elements={}, doc={readyState:s.loading?'loading':'complete',
+   title:s.wrong_page?'wap119.RPS201001 勤務分配表':'wap119.RPS201099 RPS201099 救災任務編組表'};
+ const win={document:doc, frames:[], location:{href:s.origin||'https://dutymgt.tyfd.gov.tw/tyfd119/ActionControlServlet'},
    Event:function(type){this.type=type;}, getComputedStyle:()=>({display:'block',visibility:'visible'})};
  function field(id,value){let v=value; const el={id,form,disabled:false,readOnly:false,
-  getAttribute:()=>null,getClientRects:()=>[1],dispatchEvent:()=>true,focus:()=>{}};
+  tagName:'INPUT',type:'text',getAttribute:()=>null,getClientRects:()=>[1],dispatchEvent:()=>true,focus:()=>{}};
   Object.defineProperty(el,'value',{get:()=>v,set:x=>{v=String(x);if(id==='_txtTaskDate')s.date=v;
    if(id.startsWith('_pln_')){s.writes++;s.values[id]=v;}}});
   elements[id]=el;return el;}
- field('_txtTaskDate',s.date);field('_btnOpenWinTaskCode','');field('_btnQuery','');
+ field('_txtTaskDate',s.date);const marker=field('_btnOpenWinTaskCode',s.vehicle_label||'勤務車輛設定');field('_btnQuery','');
+ marker.type='button';marker.click=()=>{s.vehicle_clicks=(s.vehicle_clicks||0)+1;};
+ if(s.vehicle_disabled)marker.disabled=true;
+ const markers=[marker];
+ if(s.duplicate_marker){const setup={...marker,value:'設定勤務項目',
+   click:()=>{s.setup_clicks=(s.setup_clicks||0)+1;}};
+   if(s.marker_other_form)setup.form={id:'other'};
+   if(s.reverse_markers)markers.unshift(setup);else markers.push(setup);}
+ if(s.duplicate_vehicle)markers.push({...marker,value:'勤務車輛設定'});
  if(!s.save_missing){const save=field('_btnSave','');save.disabled=!!s.save_disabled||!!(s.disable_after_save&&s.saves);save.click=()=>{
   s.saves++;if(!s.no_persist)s.saved={...s.values};
   if(!s.freeze_save){s.document++;s.token=null;s.fill_token=null;s.values={...s.saved};top=render();}
- };}
+ };if(s.save_hidden)save.getClientRects=()=>[];}
  elements._btnQuery.click=()=>{s.queries++;if(!s.freeze_query){s.document++;s.token=null;s.fill_token=null;
   s.values={...s.saved};if(s.wrong_query_date)s.date='1151031';top=render();}};
- if(s.wrong_page)field('_areMEMO','private duty memo');
+ if(s.wrong_page||s.memo_present){const memo=field('_areMEMO','private duty memo');memo.tagName='TEXTAREA';memo.getClientRects=()=>[];}
  for(const [id,value]of Object.entries(s.values))if(id!==s.missing&&!(s.late_ready&&s.reads<2)){
   const el=field(id,value);el.readOnly=!!s.readonly||!!(s.disable_after_save&&s.saves);}
+ doc.forms=s.extra_form?[form,{id:'other'}]:[form];form.ownerDocument=doc;
  doc.getElementById=id=>elements[id]||null;
- doc.querySelectorAll=selector=>{const m=selector.match(/^\[id="([^"]+)"\]$/);if(!m)return[];
+ doc.querySelectorAll=selector=>{if(selector==='form')return doc.forms;
+   const m=selector.match(/^\[id="([^"]+)"\]$/);if(!m)return[];
+   if(m[1]==='_btnOpenWinTaskCode')return markers;
   const el=elements[m[1]];return el?(s.duplicate_id===m[1]?[el,el]:[el]):[];};
  Object.defineProperty(doc,'__sinposmartMissionToken',{get:()=>s.token,set:v=>{s.token=v;}});
  Object.defineProperty(doc,'__sinposmartMissionFillToken',{get:()=>s.fill_token,set:v=>{s.fill_token=v;}});
@@ -8805,6 +8918,62 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
         self.assertEqual((state["saves"], state["queries"], state["document"]), (1, 1, 3))
         self.assertEqual(state["saved"], {"_pln_8_1": "1,2", "_pln_8_2": "3,4"})
 
+    def test_real_mission_page_allows_same_form_markers_and_hidden_shared_memo(self):
+        module, driver, state, wait = self._driver(duplicate_marker=True, memo_present=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            result = module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"},
+                                                   "1151101", wait=wait)
+        self.assertTrue(result["verified"])
+        self.assertEqual((state["saves"], state["queries"]), (1, 1))
+
+    def test_real_mission_page_can_navigate_while_the_save_button_is_hidden(self):
+        module, driver, state, wait = self._driver(duplicate_marker=True, memo_present=True,
+                                                  save_hidden=True, date="1151031")
+        execute = driver.execute_script.side_effect
+        driver.execute_script.side_effect = lambda script, *args: True if "function bClick(w)" in script else execute(script, *args)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "log_status"), mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            self.assertTrue(module.step_navigate_to_task_table(driver, wait, "1151101"))
+        self.assertEqual((state["queries"], state["writes"], state["saves"]), (1, 0, 0))
+
+    def test_mission_identity_rejections_are_distinct_from_origin_rejection(self):
+        cases = (({"wrong_page": True}, True, "module_mismatch"),
+                 ({"duplicate_marker": True, "marker_other_form": True}, True, "marker_form_mismatch"),
+                 ({"extra_form": True}, True, "form_not_unique"),
+                 ({"origin": "https://untrusted.example/task"}, False, "unauthorized_origin"))
+        for options, origin_ok, code in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(**options)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                        mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+                    with self.assertRaisesRegex(RuntimeError, "救災任務編組"):
+                        module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2"}, "1151101", wait=wait)
+                payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+                self.assertEqual((payload["origin_ok"], payload["rejection_code"]), (origin_ok, code))
+                self.assertEqual((state["writes"], state["saves"], state["queries"]), (0, 0, 0))
+
+    def test_mission_vehicle_settings_uses_the_unique_label_in_the_confirmed_form(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                module, driver, state, wait = self._driver(duplicate_marker=True, reverse_markers=reverse,
+                                                          memo_present=True, save_hidden=True)
+                self.assertTrue(module.step_open_mission_vehicle_settings(driver, "1151101"))
+                self.assertEqual((state.get("vehicle_clicks", 0), state.get("setup_clicks", 0)), (1, 0))
+                self.assertEqual((state["writes"], state["saves"], state["queries"]), (0, 0, 0))
+
+    def test_mission_vehicle_settings_rejects_ambiguous_or_wrong_forms_without_clicking(self):
+        for options in ({"duplicate_vehicle": True}, {"vehicle_disabled": True}, {"vehicle_label": "勤務車輛設定其他"},
+                        {"wrong_page": True}, {"date": "1151031"},
+                        {"duplicate_marker": True, "marker_other_form": True}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(**options)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+                    with self.assertRaisesRegex(RuntimeError, "導覽尚未確認"):
+                        module.step_open_mission_vehicle_settings(driver, "1151101")
+                self.assertEqual((state.get("vehicle_clicks", 0), state.get("setup_clicks", 0)), (0, 0))
+                self.assertEqual((state["writes"], state["saves"], state["queries"]), (0, 0, 0))
+
     def test_mission_navigation_requires_a_confirmed_menu_click(self):
         module = legacy_duty_sheet_module()
         driver, wait = mock.Mock(), mock.Mock()
@@ -8815,8 +8984,24 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                 module.step_navigate_to_task_table(driver, wait, "1151101")
             payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
             self.assertEqual(payload["failure_stage"], "vehicle_form_open")
+            self.assertEqual(payload["navigation_phase"], "menu_click")
+            self.assertEqual(payload["rejection_code"], "menu_item_unconfirmed")
             self.assertFalse(payload["save_attempted"])
         driver.execute_script.assert_called_once()
+
+    def test_mission_navigation_reports_the_rejected_form_validation_subphase(self):
+        module, driver, state, wait = self._driver(wrong_page=True, duplicate_marker=True, memo_present=True)
+        execute = driver.execute_script.side_effect
+        driver.execute_script.side_effect = lambda script, *args: True if "function bClick(w)" in script else execute(script, *args)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "log_status"):
+            with self.assertRaisesRegex(RuntimeError, "導覽尚未確認"):
+                module.step_navigate_to_task_table(driver, wait, "1151101")
+            payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+        self.assertEqual((payload["navigation_phase"], payload["rejection_code"]), ("query_ready", "module_mismatch"))
+        self.assertTrue(payload["origin_ok"])
+        self.assertTrue(payload["task_marker_found"])
+        self.assertEqual((state["queries"], state["writes"], state["saves"]), (0, 0, 0))
 
     def test_mission_navigation_queries_the_exact_date_and_waits_for_a_new_document(self):
         for frozen in (False, True):
@@ -8829,6 +9014,10 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                     if frozen:
                         with self.assertRaisesRegex(RuntimeError, "導覽尚未確認"):
                             module.step_navigate_to_task_table(driver, wait, "1151101")
+                        payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+                        self.assertEqual(payload["navigation_phase"], "initial_query_readback")
+                        self.assertEqual(payload["rejection_code"], "document_not_replaced")
+                        self.assertTrue(payload["origin_ok"])
                     else:
                         self.assertTrue(module.step_navigate_to_task_table(driver, wait, "1151101"))
                 self.assertEqual((state["date"], state["queries"], state["writes"], state["saves"]),
@@ -9010,6 +9199,7 @@ process.stdout.write(JSON.stringify(result));
                 "wait_for_duty_query_completion": {"side_effect": ["existing", "setup"]},
                 "preflight_duty_number_popup": {"return_value": "main"},
                 "wait_for_duty_result_grid": {"return_value": True}, "step_navigate_to_task_table": {},
+                "step_open_mission_vehicle_settings": {"return_value": True}, "step_select_vehicles_popup": {},
                 "start_duty_postback": {"return_value": "saved-token"},
                 "wait_for_duty_postback": {"return_value": {}}, "verify_saved_duty_fields": {"return_value": True},
                 "step_fill_mission_cells": {"side_effect": RuntimeError("offline-stop-before-save")},
@@ -9084,6 +9274,7 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
                 "start_duty_postback": {"return_value": "saved-token"},
                 "wait_for_duty_postback": {"return_value": {}}, "verify_saved_duty_fields": {"return_value": True},
                 "step_navigate_to_task_table": {}, "super_js_execute": {"return_value": True},
+                "step_open_mission_vehicle_settings": {"return_value": True}, "step_select_vehicles_popup": {},
                 "trainee_numbers_from_workbook": {"return_value": set()},
                 "expected_on_duty_numbers_from_daily_sheet": {"return_value": normal_staff},
                 "build_driver": {"side_effect": AssertionError("測試不得啟動真實瀏覽器")},

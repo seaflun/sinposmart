@@ -384,6 +384,8 @@ class ScheduleCaptureService:
                     automation.ENTRY_LOG_AP,
                     target_roc_date,
                 )
+                if getattr(payload["visible_entry_rows"], "entry_metadata", None) is not None:
+                    payload["visible_entry_metadata"] = payload["visible_entry_rows"].entry_metadata
                 comparison_data[target_roc_date] = payload
                 stage = f"write_output_{target_roc_date}"
                 self._write_json(

@@ -9,7 +9,19 @@ import re
 from datetime import datetime, timedelta
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+
+EXTERNAL_ASSIGNMENT_KEYWORDS = ("救護", "救災", "災害搶救", "火警", "火災", "外勤")
+
+
+class _EntryRowText(str):
+    """Keep reader evidence attached while legacy callers continue to consume text rows."""
+
+    def __new__(cls, value: str, metadata: Mapping[str, Any]):
+        instance = super().__new__(cls, value)
+        instance.entry_metadata = metadata
+        return instance
 
 
 # Normalization helpers
@@ -42,8 +54,8 @@ def names_for(staff: dict[str, dict[str, str]], numbers: list[str]) -> list[str]
 
 
 def _row_datetime(row: str) -> datetime | None:
-    match = re.search(
-        r"(?<!\d)(\d{3})/?(\d{2})/?(\d{2})(?:[ \t]*\n[ \t]*|[ \t]+)(\d{1,2}):(\d{2})",
+    match = re.match(
+        r"\s*(\d{3})/?(\d{2})/?(\d{2})(?:[ \t]*\n[ \t]*|[ \t]+)(\d{1,2}):(\d{2})",
         row,
     )
     if not match:
@@ -73,11 +85,22 @@ def flatten_rows(
     *,
     start_date: str | None = None,
     end_date: str | None = None,
+    entry_metadata: list[Mapping[str, Any]] | None = None,
 ) -> list[str]:
+    if entry_metadata is None:
+        entry_metadata = getattr(rows, "entry_metadata", None)
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     date_pattern = rf"(?:{re.escape(target_date)}|{re.escape(roc_slash)})"
     out = []
-    for row in rows:
+    for index, row in enumerate(rows):
+        metadata = getattr(row, "entry_metadata", None)
+        if entry_metadata is not None:
+            metadata = (
+                entry_metadata[index]
+                if isinstance(entry_metadata, list) and index < len(entry_metadata)
+                and isinstance(entry_metadata[index], Mapping)
+                else {"_invalid": True}
+            )
         if isinstance(row, str):
             text = row
         else:
@@ -100,12 +123,13 @@ def flatten_rows(
                 continue
             if end_date and row_date > end_date:
                 continue
-            out.append(normalized)
+            out.append(_EntryRowText(normalized, metadata) if metadata is not None else normalized)
             continue
         if re.match(rf"^{date_pattern}\s+\d{{1,2}}:\d{{2}}", normalized):
-            out.append(normalized)
+            out.append(_EntryRowText(normalized, metadata) if metadata is not None else normalized)
         elif re.match(rf"^{date_pattern}\s*\n\d{{1,2}}:\d{{2}}", normalized):
-            out.append(text.replace("\xa0", " "))
+            value = text.replace("\xa0", " ")
+            out.append(_EntryRowText(value, metadata) if metadata is not None else value)
     return out
 
 
@@ -124,24 +148,19 @@ def action_target_date(base_target_date: str, action: dict[str, Any]) -> str:
 
 
 def row_has_time(row: str, target_date: str, time_value: str, allow_near: bool = False, near_minutes: int = 5) -> bool:
-    roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
-    if f"{roc_slash} {time_value}" in row or f"{target_date}\n{time_value}" in row:
-        return True
     try:
         hour, minute = [int(part) for part in time_value.split(":", 1)]
-    except ValueError:
+    except (TypeError, ValueError):
+        return False
+    if not 0 <= hour < 24 or not 0 <= minute < 60:
         return False
     target_min = hour * 60 + minute
     actual_min = row_minutes(row, target_date)
+    if actual_min is None:
+        return False
     if actual_min == target_min:
         return True
-    if not allow_near:
-        return False
-    for match in re.finditer(rf"{re.escape(roc_slash)}\s+(\d{{1,2}}):(\d{{2}})", row):
-        actual_min = int(match.group(1)) * 60 + int(match.group(2))
-        if abs(actual_min - target_min) <= near_minutes:
-            return True
-    return False
+    return allow_near and abs(actual_min - target_min) <= near_minutes
 
 
 def row_minutes(row: str, target_date: str) -> int | None:
@@ -184,12 +203,106 @@ def row_cells(row: str) -> list[str]:
     return [clean(part) for part in row.split("|") if clean(part)]
 
 
+def entry_row_fields(row: str, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Read entry fields; explicit reader metadata takes precedence over legacy detail parsing."""
+
+    if metadata is None:
+        metadata = getattr(row, "entry_metadata", None)
+    raw_cells = [part.strip() for part in row.split("|")]
+    cells = [clean(part) for part in raw_cells]
+    primary_index = 3 if len(cells) > 2 and cells[2] in ("值班(宿)", "值班（宿）") else 2
+    directions = {"出", "入", "值班", "值退", "簽出", "外出", "簽入", "返隊", "到勤", "接班", "退班", "請選擇"}
+    direction_index = primary_index + 2
+    if len(cells) > primary_index + 1 and cells[primary_index + 1] in directions:
+        # Older normalized fixtures omit the title column, but retain the primary-person column.
+        direction_index = primary_index + 1
+    invalid_indices = False
+    if isinstance(metadata, Mapping) and metadata.get("schema") == "entry-log-v1":
+        supplied_primary, supplied_direction = metadata.get("primary_index"), metadata.get("direction_index")
+        if (type(supplied_primary) is int and supplied_primary in (2, 3)
+                and type(supplied_direction) is int and supplied_direction == supplied_primary + 2
+                and supplied_direction < len(cells)):
+            primary_index, direction_index = supplied_primary, supplied_direction
+        else:
+            invalid_indices = True
+    tail = raw_cells[direction_index + 1:]
+    system_written_at = None
+    dated_main = bool(tail and _row_datetime(tail[0]) is not None)
+    has_return_flag = False
+    while tail and (_row_datetime(tail[0]) is not None or clean(tail[0]) in ("是", "否")):
+        has_return_flag = has_return_flag or clean(tail[0]) in ("是", "否")
+        system_written_at = system_written_at or _row_datetime(tail[0])
+        tail = tail[1:]
+    if dated_main and has_return_flag and tail:
+        # This legacy main-row layout ends in its registrant, not a reason detail.
+        tail = tail[1:]
+    reason = tail[0] if tail else ""
+    labelled_reason = re.match(r"^(?:領用事由及地點|事由及地點)\s*[：:]\s*", reason)
+    if labelled_reason:
+        reason = reason[labelled_reason.end():]
+    explicit_reasons = {"到勤", "退勤", "休息", "休息返隊", "休息後退勤", "返隊", "值班", "值退", "防溺車巡", "防溺車巡返隊"}
+    reason_state = "missing" if not tail else "empty"
+    if reason:
+        reason_state = (
+            "present" if labelled_reason or clean(reason) in explicit_reasons
+            or any(keyword in reason for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS) else "unverified"
+        )
+    category = ""
+    evidence_conflict = invalid_indices
+    claimed_primary_name = ""
+    record_at = _row_datetime(row)
+    if metadata is not None:
+        if not isinstance(metadata, Mapping):
+            metadata = {"_invalid": True}
+        evidence_conflict = evidence_conflict or metadata.get("_invalid") is True or any(
+            metadata.get(key) is False for key in ("structure_valid", "record_time_valid", "system_written_valid")
+        )
+        detail_present = metadata.get("detail_present")
+        if detail_present is True:
+            reason = metadata.get("reason", "")
+            if not isinstance(reason, str):
+                reason, reason_state, evidence_conflict = "", "invalid", True
+            else:
+                reason_state = "present" if reason.strip() else "empty"
+        elif detail_present is False:
+            reason = ""
+            reason_state = "missing"
+        elif "detail_present" in metadata:
+            evidence_conflict = True
+        if metadata.get("direction") is not None:
+            evidence_conflict = evidence_conflict or not isinstance(metadata["direction"], str) or clean(metadata["direction"]) != (cells[direction_index] if len(cells) > direction_index else "")
+        if metadata.get("primary_name") is not None:
+            claimed_primary_name = clean(metadata["primary_name"]) if isinstance(metadata["primary_name"], str) else ""
+            evidence_conflict = evidence_conflict or not isinstance(metadata["primary_name"], str) or claimed_primary_name != (cells[primary_index] if len(cells) > primary_index else "")
+        if metadata.get("record_at") is not None:
+            try:
+                evidence_conflict = evidence_conflict or datetime.fromisoformat(metadata["record_at"]) != record_at
+            except (TypeError, ValueError):
+                evidence_conflict = True
+        if metadata.get("system_written_at") is not None:
+            try:
+                system_written_at = datetime.fromisoformat(metadata["system_written_at"])
+            except (TypeError, ValueError):
+                evidence_conflict = True
+        category = str(metadata.get("category", "") or "")
+    return {
+        "primary_name": cells[primary_index] if len(cells) > primary_index else "",
+        "direction": cells[direction_index] if len(cells) > direction_index else "",
+        "reason": reason,
+        "reason_state": reason_state,
+        "category": category,
+        "record_at": record_at.isoformat(timespec="minutes") if record_at is not None else None,
+        "system_written_at": system_written_at.isoformat(timespec="minutes") if system_written_at is not None else None,
+        "evidence_conflict": evidence_conflict,
+        "claimed_primary_name": claimed_primary_name,
+    }
+
+
 def row_has_primary_person(row: str, target_name: str) -> bool:
     if not target_name:
         return False
-    cells = row_cells(row)
-    normalized_target = clean(target_name)
-    return normalized_target in cells[2:5]
+    fields = entry_row_fields(row)
+    return not fields["evidence_conflict"] and fields["primary_name"] == clean(target_name)
 
 
 def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
@@ -208,13 +321,8 @@ def row_has_outin(row: str, outin: str, external_entry: bool = False) -> bool:
         checks.append("簽出")
     if external_entry and outin == "入":
         checks.append("簽入")
-    cells = row_cells(row)
-    if any(cell in checks for cell in cells):
-        return True
-    fallback_checks = [check for check in checks if len(check) > 1]
-    if outin == "入":
-        fallback_checks = [check for check in fallback_checks if check != "返隊"]
-    return any(check in row for check in fallback_checks)
+    fields = entry_row_fields(row)
+    return not fields["evidence_conflict"] and fields["direction"] in checks
 
 
 def is_handoff_entry(action: dict[str, Any]) -> bool:
@@ -272,6 +380,9 @@ def find_entry_matches(
     rest_entry = reason in ("休息", "休息返隊", "休息後退勤") or "休息" in str(action.get("source", ""))
     matches = []
     for row in rows:
+        row_fields = entry_row_fields(row)
+        if row_fields["evidence_conflict"]:
+            continue
         if target_name:
             if not row_has_primary_person(row, target_name):
                 continue
@@ -280,9 +391,9 @@ def find_entry_matches(
         if not row_has_outin(row, outin, external_entry=external_entry):
             continue
         if outin == "出" and reason in ("退勤", "休息後退勤"):
-            if not any(cell in ("退勤", "休息後退勤") for cell in row_cells(row)):
+            if clean(str(row_fields["reason"])) not in ("退勤", "休息後退勤"):
                 continue
-        if external_entry and reason and reason not in row:
+        if external_entry and reason and clean(reason) not in clean(str(row_fields["reason"])):
             continue
         if strict_time:
             if not row_has_time(row, target_date, system_time, allow_near=allow_near, near_minutes=near_minutes):
@@ -311,6 +422,8 @@ def find_arrival_entry_exists(
     roc_slash = f"{target_date[:3]}/{target_date[3:5]}/{target_date[5:7]}"
     matches = []
     for row in rows:
+        if entry_row_fields(row)["evidence_conflict"]:
+            continue
         if target_date not in row and roc_slash not in row:
             continue
         if target_name:
@@ -318,7 +431,7 @@ def find_arrival_entry_exists(
                 continue
         elif target_number and target_number not in row:
             continue
-        if row_has_outin(row, "入") and "到勤" in row:
+        if row_has_outin(row, "入") and "到勤" in str(entry_row_fields(row)["reason"]):
             matches.append(row)
     return matches
 
@@ -470,11 +583,13 @@ def find_open_external_assignment(
     for row in rows:
         if not row_has_primary_person(row, target_name):
             continue
-        has_external_keyword = any(
-            keyword in row for keyword in ("救護", "救災", "災害搶救", "火警", "火災", "外勤")
-        )
+        fields = entry_row_fields(row)
+        reason = str(fields["reason"] or "")
+        if fields["evidence_conflict"]:
+            continue
+        has_external_keyword = any(keyword in reason for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS)
         has_generic_return = (
-            row_has_outin(row, "入", external_entry=True) and "返隊" in row_cells(row)
+            row_has_outin(row, "入", external_entry=True) and clean(reason) == "返隊"
         )
         if not has_external_keyword and not has_generic_return:
             continue
@@ -491,7 +606,7 @@ def find_open_external_assignment(
         if not is_out and not row_has_outin(row, "入", external_entry=True):
             continue
         case_key = None
-        for cell in row.split("|"):
+        for cell in (reason,):
             match = re.fullmatch(
                 r"案件類別:(.+?)案發地點:(.+?)(?:梯次:(\d+))?",
                 clean(unescape(cell)).replace("：", ":"),
@@ -708,7 +823,8 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
         if comparison_file.exists():
             payload = json.loads(comparison_file.read_text(encoding="utf-8-sig"))
         comparison_sources[action_date] = {
-            "entry_rows": flatten_rows(payload.get("visible_entry_rows", data.get("visible_entry_rows", [])), action_date),
+            "entry_rows": flatten_rows(payload.get("visible_entry_rows", data.get("visible_entry_rows", [])), action_date,
+                                      entry_metadata=payload.get("visible_entry_metadata", data.get("visible_entry_metadata"))),
             "work_rows": flatten_rows(payload.get("visible_work_rows", data.get("visible_work_rows", [])), action_date),
         }
 

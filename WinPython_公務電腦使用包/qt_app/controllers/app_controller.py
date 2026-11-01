@@ -2025,15 +2025,33 @@ class AppController(QObject):
             entry_rows = payload.get("visible_entry_rows", [])
             work_rows = work_rows if isinstance(work_rows, list) else []
             entry_rows = entry_rows if isinstance(entry_rows, list) else []
-            comparison_days.append(
-                {
-                    "target_date": str(target_date),
-                    "work_count": len(work_rows),
-                    "entry_count": len(entry_rows),
-                    "work_rows": [str(row)[:260] for row in work_rows[:50]],
-                    "entry_rows": [str(row)[:260] for row in entry_rows[:50]],
-                }
-            )
+            comparison_day = {
+                "target_date": str(target_date),
+                "work_count": len(work_rows),
+                "entry_count": len(entry_rows),
+                "work_rows": [str(row)[:260] for row in work_rows[:50]],
+                "entry_rows": [str(row)[:260] for row in entry_rows[:50]],
+            }
+            if "visible_entry_metadata" in payload:
+                entry_metadata = payload["visible_entry_metadata"]
+                aligned = isinstance(entry_metadata, list) and len(entry_metadata) == len(entry_rows)
+                metadata_keys = (
+                    "schema", "primary_index", "direction_index", "primary_name", "direction",
+                    "category", "record_at", "system_written_at", "record_time_valid",
+                    "system_written_valid", "structure_valid", "detail_present", "detail_status",
+                    "reason", "_invalid",
+                )
+                comparison_day["entry_metadata"] = [
+                    {
+                        key: value
+                        for key, value in entry_metadata[index].items()
+                        if key in metadata_keys and (value is None or type(value) in (str, int, bool))
+                    }
+                    if aligned and isinstance(entry_metadata[index], Mapping)
+                    else {"_invalid": True}
+                    for index in range(min(len(entry_rows), 50))
+                ]
+            comparison_days.append(comparison_day)
         if comparison_days:
             self._send_operational_event(
                 "comparison_snapshot",

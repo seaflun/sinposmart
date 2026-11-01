@@ -3757,6 +3757,130 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     self.assertEqual(saved, [])
                     self.assertEqual(json.loads(result.result_path.read_text(encoding="utf-8"))["stage"], result.status)
 
+    def test_entry_form_rejects_invalid_direction_before_opening_the_form(self) -> None:
+        from contextlib import ExitStack
+        import duty_rehearsal as automation
+
+        for direction in ("", "請選擇", "外出"):
+            with self.subTest(direction=direction), ExitStack() as stack:
+                navigate = stack.enter_context(patch.object(automation, "ensure_ap", return_value=False))
+                stack.enter_context(patch.object(automation, "control_snapshot", return_value={}))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={"ok": True}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                stack.enter_context(patch.object(automation, "click_entry_insert_control"))
+                driver = SimpleNamespace(execute_script=Mock(return_value={"missing": []}))
+                with self.assertRaisesRegex(RuntimeError, "出入方向"):
+                    automation.fill_entry_log_form_for_test(
+                        driver, {"time": "11:00", "fields": {"出或入": direction}}, {}, "1151101", save=True,
+                    )
+                navigate.assert_not_called()
+                driver.execute_script.assert_not_called()
+
+    def test_record_time_does_not_match_the_system_write_timestamp(self) -> None:
+        from compare_rehearsal_records import find_entry_matches, flatten_rows, row_has_time
+
+        rows = flatten_rows([[
+            "115/11/01 08:15", "測試單位", "測試員", "隊員", "入", "115/11/01 11:00", "返隊",
+        ]], "1151101")
+        action = {"kind": "entry_log", "target": "16", "time": "11:00", "source": "外勤簽入",
+                  "fields": {"出或入": "入", "領用事由及地點": "返隊"}}
+        for allow_near in (False, True):
+            self.assertFalse(row_has_time(rows[0], "1151101", "11:00", allow_near=allow_near))
+            self.assertEqual(find_entry_matches(rows, "1151101", {"16": {"name": "測試員"}}, action,
+                                                allow_near=allow_near, near_minutes=5), [])
+        self.assertTrue(row_has_time(rows[0], "1151101", "08:15"))
+
+    def test_entry_save_verification_requires_the_explicit_direction_and_primary_person(self) -> None:
+        from app_core.duty_task_projection import compare_submission_action
+
+        staff = {"16": {"name": "測試16"}}
+        for reason in ("到勤", "返隊", "休息返隊"):
+            action = {"kind": "entry_log", "target": "16", "time": "08:15", "source": "外勤簽入",
+                      "fields": {"出或入": "入", "領用事由及地點": reason}}
+            data = {"target_date": "1151101", "today": {"staff": staff}, "actions": [action]}
+            for primary, direction, registrant in (("測試16", "請選擇", "其他人"), ("其他人", "入", "測試16")):
+                with self.subTest(reason=reason, primary=primary, direction=direction):
+                    row = ["115/11/01 08:15", "測試單位", primary, "隊員", direction, "否", reason, registrant]
+                    comparison = compare_submission_action(data, action, "1151101",
+                        {"visible_entry_rows": [row]}, verify_saved=True)
+                    self.assertNotEqual(comparison["group"], "done")
+            good = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "入", "否", reason, "其他人"]
+            self.assertEqual(compare_submission_action(data, action, "1151101",
+                {"visible_entry_rows": [good]}, verify_saved=True)["group"], "done")
+
+    def test_entry_form_does_not_save_unconfirmed_or_reset_direction(self) -> None:
+        from contextlib import ExitStack
+        import duty_rehearsal as automation
+
+        for selection, final_selection in (
+            ({"missing": ["outin"]}, {"confirmed": True}),
+            ({"missing": [], "outin": {"confirmed": False}}, {"confirmed": True}),
+            ({"missing": [], "outin": {"confirmed": True, "id": "_selIsout"}}, {"confirmed": False}),
+        ):
+            with self.subTest(selection=selection, final_selection=final_selection), ExitStack() as stack:
+                stack.enter_context(patch.object(automation, "ensure_ap", return_value=False))
+                stack.enter_context(patch.object(automation, "control_snapshot", return_value={}))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={"ok": True}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                save = stack.enter_context(patch.object(automation, "click_entry_insert_control"))
+                driver = SimpleNamespace(execute_script=Mock(side_effect=[
+                    True, {"missing": []}, selection, {"missing": []}, final_selection,
+                ]))
+                with self.assertRaisesRegex(RuntimeError, "出入方向"):
+                    automation.fill_entry_log_form_for_test(
+                        driver, {"time": "11:00", "target": "16", "fields": {"出或入": "出"}},
+                        {"16": {"name": "測試員"}}, "1151101", save=True,
+                    )
+                save.assert_not_called()
+
+    def test_entry_form_validation_has_an_explicit_safe_error(self) -> None:
+        import duty_rehearsal as automation
+        from app_core.duty_submission_service import DutySubmissionService
+
+        error = automation.EntryLogFormValidationError("synthetic raw detail")
+        message, code = DutySubmissionService._safe_error(error)
+        self.assertEqual(code, "entry_form_incomplete")
+        self.assertIn("未送出", message)
+        self.assertNotIn("synthetic", message)
+
+    def test_entry_form_does_not_save_missing_required_date_time_or_reason(self) -> None:
+        from contextlib import ExitStack
+        import duty_rehearsal as automation
+
+        for missing in ("date", "hour", "minute", "reason"):
+            with self.subTest(missing=missing), ExitStack() as stack:
+                stack.enter_context(patch.object(automation, "ensure_ap", return_value=False))
+                stack.enter_context(patch.object(automation, "control_snapshot", return_value={}))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={"ok": True}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                save = stack.enter_context(patch.object(automation, "click_entry_insert_control"))
+                driver = SimpleNamespace(execute_script=Mock(side_effect=[True,
+                    {"missing": [missing] if missing != "reason" else []},
+                    {"missing": [], "outin": {"confirmed": True, "id": "_selIsout"}},
+                    {"missing": ["reason"] if missing == "reason" else []}, {"confirmed": True}]))
+                with self.assertRaises(automation.EntryLogFormValidationError):
+                    automation.fill_entry_log_form_for_test(driver, {"time": "08:15", "target": "16",
+                        "fields": {"出或入": "出", "領用事由及地點": "火災外勤"}},
+                        {"16": {"name": "測試16"}}, "1151101", save=True)
+                save.assert_not_called()
+
+    def test_rest_and_arrival_fallbacks_reject_conflicting_reader_evidence(self) -> None:
+        from app_core.duty_task_projection import build_schedule_comparisons, compare_submission_action
+
+        for metadata in ({"structure_valid": False}, {"primary_name": "其他人"},
+                         {"direction": "出"}, {"_invalid": True}):
+            for reason in ("休息返隊", "到勤"):
+                with self.subTest(metadata=metadata, reason=reason):
+                    action = {"kind": "entry_log", "target": "16", "time": "08:15", "source": "到勤" if reason == "到勤" else "外勤簽入",
+                              "fields": {"出或入": "入", "領用事由及地點": reason}}
+                    data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+                    row_time = "09:15" if reason == "到勤" else "08:15"
+                    payload = {"visible_entry_rows": [[f"115/11/01 {row_time}", "測試單位", "測試16", "隊員", "入", "否", reason]],
+                               "visible_entry_metadata": [metadata]}
+                    comparison = (build_schedule_comparisons(data, [action], {"1151101": payload})[0] if reason == "到勤"
+                        else compare_submission_action(data, action, "1151101", payload, verify_saved=True))
+                    self.assertNotEqual(comparison["group"], "done")
+
     def test_real_form_helpers_stop_before_save_when_guard_rejects(self) -> None:
         from contextlib import ExitStack
         from unittest.mock import Mock
@@ -3772,10 +3896,12 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 stack.enter_context(patch.object(automation, "set_entry_people", return_value={"ok": True}))
                 stack.enter_context(patch.object(automation.time, "sleep"))
                 save = stack.enter_context(patch.object(automation, save_control))
-                driver = SimpleNamespace(execute_script=lambda script, *_args: True if "return Boolean" in script else {"missing": []})
+                driver = SimpleNamespace(execute_script=lambda script, *_args: True if script.lstrip().startswith("return Boolean(document") else {
+                    "missing": [], "confirmed": True, "outin": {"confirmed": True, "id": "_selIsout"},
+                })
                 guard = Mock(side_effect=RuntimeError("消防日已切換"))
                 with self.assertRaisesRegex(RuntimeError, "消防日已切換"):
-                    helper(driver, {"time": "07:55", "fields": {}}, {}, "1151001", save=True, before_save=guard)
+                    helper(driver, {"time": "07:55", "fields": {"出或入": "出"}}, {}, "1151001", save=True, before_save=guard)
                 guard.assert_called_once()
                 save.assert_not_called()
 
@@ -4343,7 +4469,7 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     nonlocal query_count
                     query_count += 1
                     return (
-                        [["115/08/07", submitted_time, "王小明", "入", "返隊"]]
+                        [["115/08/07", submitted_time, "測試單位", "王小明", "隊員", "入", "返隊"]]
                         if query_count > 1
                         else []
                     )
@@ -4404,8 +4530,8 @@ class DutySubmissionServiceTests(unittest.TestCase):
         )
 
         cases = {
-            "three_minutes_late": ["115/08/07", "18:03", "王小明", "入", "返隊"],
-            "other_person": ["115/08/07", "18:01", "王小華", "入", "返隊"],
+            "three_minutes_late": ["115/08/07", "18:03", "測試單位", "王小明", "隊員", "入", "返隊"],
+            "other_person": ["115/08/07", "18:01", "測試單位", "王小華", "隊員", "入", "返隊"],
         }
         for name, row in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
@@ -4991,6 +5117,150 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 result = service.execute(DutySubmissionRequest("fixture", "fixture", 0, data, trigger_type="recovery"))
                 self.assertEqual(result.status, "paused_external")
                 self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+
+    def _entry_evidence_fixture(self, directory, rows, *, metadata=None, known=None):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        if metadata is not None:
+            class QueryRows(list):
+                pass
+            rows = QueryRows(rows)
+            rows.entry_metadata = metadata
+        fill = Mock()
+        automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+            login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=lambda *_a, **_kw: rows,
+            fill_entry_log_form_for_test=fill)
+        service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+            now_factory=lambda: datetime(2026, 11, 1, 10))
+        action = {"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}
+        data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+        if known is not None:
+            data["_unreturned_return_known_departures"] = known
+        return service, DutySubmissionRequest("fixture", "fixture", 0, data), fill
+
+    def test_metadata_reason_is_shared_by_the_guard_and_external_matcher(self) -> None:
+        row = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否"]
+        metadata = [{"primary_name": "測試16", "direction": "出", "detail_present": True, "reason": "火災外勤"}]
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, fill = self._entry_evidence_fixture(directory, [row], metadata=metadata)
+            result = service.execute(request)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+            fill.assert_not_called()
+
+    def test_metadata_identity_conflict_is_checked_before_filtering_the_target(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+
+        row = ["115/11/01 08:15", "測試單位", "測試17", "隊員", "出", "否", "火災外勤"]
+        metadata = [{"primary_name": "測試16", "direction": "出", "detail_present": True, "reason": "火災外勤"}]
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, fill = self._entry_evidence_fixture(directory, [row], metadata=metadata)
+            with self.assertRaises(DutySubmissionExecutionError) as raised:
+                service.execute(request)
+            self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+            fill.assert_not_called()
+
+    def test_arrival_category_cannot_exempt_a_departure_without_details(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+
+        row = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否"]
+        metadata = [{"primary_name": "測試16", "direction": "出", "detail_present": False, "category": "到勤"}]
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, _fill = self._entry_evidence_fixture(directory, [row], metadata=metadata)
+            with self.assertRaises(DutySubmissionExecutionError) as raised:
+                service.execute(request)
+            self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+
+    def test_legacy_main_row_never_uses_the_registrant_as_its_reason(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+
+        for registrant in ("測試登記員", "返隊"):
+            with self.subTest(registrant=registrant), tempfile.TemporaryDirectory() as directory:
+                row = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "115/11/01 08:17", "否", registrant]
+                service, request, _fill = self._entry_evidence_fixture(directory, [row])
+                with self.assertRaises(DutySubmissionExecutionError) as raised:
+                    service.execute(request)
+                self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+
+    def test_reused_prewarm_keeps_cached_departure_when_details_disappear(self) -> None:
+        from dataclasses import replace
+
+        complete = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否", "火災外勤"]
+        incomplete = complete[:-1]
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, fill = self._entry_evidence_fixture(directory, [complete])
+            automation = service.module_loader()
+            query = Mock(side_effect=[[complete], [incomplete], []])
+            automation.query_visible_table = query
+            prewarm = replace(request, schedule_data={**request.schedule_data,
+                "_handoff_entry_prewarm": True, "_handoff_entry_prewarm_targets": ["16"]})
+            session = service.open_browser_session(prewarm)
+            self.addCleanup(service.close_browser_session, session)
+            self.assertEqual(session.known_open_departures, {"16": "2026-11-01T08:15"})
+            service.precheck_browser_session(prewarm, session)
+            self.assertEqual(session.known_open_departures, {"16": "2026-11-01T08:15"})
+            result = service.execute_with_browser_session(request, session)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+            self.assertEqual(query.call_count, 3)
+            fill.assert_not_called()
+
+    def test_invalid_session_departure_evidence_cannot_be_erased_by_an_empty_query(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+
+        for cached in (None, [], {"16": []}, {"16": {}}, {"16": None}):
+            with self.subTest(cached=cached), tempfile.TemporaryDirectory() as directory:
+                service, request, fill = self._entry_evidence_fixture(directory, [])
+                session = service.open_browser_session(request)
+                self.addCleanup(service.close_browser_session, session)
+                session.known_open_departures = cached
+                with self.assertRaises(DutySubmissionExecutionError) as raised:
+                    service.execute_with_browser_session(request, session)
+                self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+                fill.assert_not_called()
+
+    def test_incomplete_target_entry_evidence_cannot_become_handoff_ready(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+        )
+
+        for direction, tail in (("出", []), ("入", []), ("請選擇", ["返隊"])):
+            with self.subTest(direction=direction), tempfile.TemporaryDirectory() as directory:
+                rows = [["115/11/01 08:15", "測試單位", "測試16", "隊員", direction,
+                         "115/11/01 08:17", *tail]]
+                fill = Mock()
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                    login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=lambda *_a, **_kw: rows,
+                    fill_entry_log_form_for_test=fill)
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                    now_factory=lambda: datetime(2026, 11, 1, 10))
+                action = {"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}
+                data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+                with self.assertRaises(DutySubmissionExecutionError) as raised:
+                    service.execute(DutySubmissionRequest("fixture", "fixture", 0, data))
+                self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+                fill.assert_not_called()
+
+    def test_other_person_incomplete_rows_do_not_block_a_confirmed_target_return(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        rows = [
+            ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "115/11/01 08:17", "火災外勤"],
+            ["115/11/01 09:58", "測試單位", "測試16", "隊員", "入", "115/11/01 09:59", "返隊"],
+            ["115/11/01 08:30", "測試單位", "測試17", "隊員", "請選擇", "115/11/01 08:31"],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=lambda *_a, **_kw: rows)
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                now_factory=lambda: datetime(2026, 11, 1, 10))
+            action = {"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}
+            data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+            result = service.execute(DutySubmissionRequest("fixture", "fixture", 0, data))
+            self.assertEqual(result.status, "handoff_preflight_ready")
 
     def test_handoff_prewarm_queries_previous_day_but_due_rechecks_and_keeps_observed_departure(self):
         from datetime import datetime
@@ -8347,6 +8617,37 @@ class ScheduleRepositoryTests(unittest.TestCase):
 
 
 class ScheduleCaptureServiceTests(unittest.TestCase):
+    def test_entry_reader_metadata_survives_comparison_json_and_saved_record_matching(self) -> None:
+        from datetime import date
+        from app_core.duty_task_projection import compare_submission_action
+        from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
+        from duty_rehearsal import EntryQueryRows
+
+        def query(_driver, ap_name, target):
+            if ap_name == "work":
+                return []
+            record = f"{target[:3]}/{target[3:5]}/{target[5:7]} 08:15"
+            return EntryQueryRows([[record, "測試單位", "測試16", "隊員", "出", "否", ""]], [{
+                "schema": "entry-log-v1", "primary_index": 2, "direction_index": 4,
+                "primary_name": "測試16", "direction": "出", "category": "",
+                "detail_present": True, "detail_status": "present", "reason": "火災外勤",
+            }])
+        automation = SimpleNamespace(WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+            parse_roc_date=lambda _value: date(2026, 11, 1),
+            roc_date=lambda value: f"{value.year - 1911:03d}{value.month:02d}{value.day:02d}", query_visible_table=query)
+        with tempfile.TemporaryDirectory() as directory:
+            service = ScheduleCaptureService(Path(directory))
+            captured = service.capture_comparisons(ScheduleCaptureRequest("fixture", "fixture", "16", "1151101"),
+                _automation=automation, _driver=object())
+            for target, payload in captured.items():
+                saved = json.loads((Path(directory) / "runtime_outputs" / "comparison" /
+                    f"comparison_output_{target}.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["visible_entry_metadata"], payload["visible_entry_metadata"])
+                action = {"kind": "entry_log", "target": "16", "time": "08:15", "source": "外勤簽出",
+                          "fields": {"出或入": "出", "領用事由及地點": "火災外勤"}}
+                data = {"target_date": target, "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+                self.assertEqual(compare_submission_action(data, action, target, saved, verify_saved=True)["group"], "done")
+
     def test_rollover_capture_keeps_authenticated_outgoing_person_missing_from_today_sheet(self) -> None:
         from dataclasses import dataclass
         from datetime import date, datetime
@@ -26037,6 +26338,56 @@ if return_code != 0 or loaded:
                     with self.assertRaises(DutySubmissionExecutionError) as caught:
                         service._known_open_at(request, action)
                     self.assertEqual(caught.exception.error_code, "unreturned_evidence_invalid")
+
+    def test_comparison_snapshot_forwards_typed_entry_metadata_without_opaque_fields(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        events = []
+        controller = SimpleNamespace(_read_only_acceptance=False,
+            _send_operational_event=lambda kind, **fields: events.append((kind, fields)))
+        metadata = {"schema": "entry-log-v1", "primary_index": 2, "direction_index": 4,
+            "primary_name": "測試16", "direction": "出", "category": "", "record_at": "2026-11-01T08:15",
+            "system_written_at": None, "record_time_valid": True, "system_written_valid": True,
+            "structure_valid": True, "detail_present": True, "detail_status": "present", "reason": "測試原因" * 100,
+            "record_key": "OPAQUE_SYNTHETIC", "onclick": "private_handler()"}
+        snapshot = SimpleNamespace(data={}, schedule_data_by_date={}, comparison_data={"1151101": {
+            "visible_entry_rows": [["synthetic"] for _ in range(52)],
+            "visible_entry_metadata": [dict(metadata) for _ in range(52)],
+        }})
+        AppController._live_snapshot_captured(controller, snapshot)
+        day = events[0][1]["snapshot"]["days"][0]
+        self.assertEqual(len(day["entry_metadata"]), 50)
+        self.assertEqual(len(day["entry_metadata"]), len(day["entry_rows"]))
+        forwarded = day["entry_metadata"][0]
+        for key in set(metadata) - {"record_key", "onclick"}:
+            self.assertEqual(forwarded[key], metadata[key])
+        self.assertNotIn("record_key", forwarded)
+        self.assertNotIn("onclick", forwarded)
+        self.assertNotIn("OPAQUE_SYNTHETIC", json.dumps(day))
+
+    def test_comparison_snapshot_marks_invalid_metadata_instead_of_dropping_evidence(self) -> None:
+        from qt_app.controllers.app_controller import AppController
+
+        good = {"schema": "entry-log-v1", "detail_present": False, "detail_status": "unconfirmed"}
+        for include, metadata in ((False, None), (True, None), (True, {}), (True, []),
+                                  (True, [good]), (True, [good, None])):
+            with self.subTest(include=include, metadata=metadata):
+                events = []
+                controller = SimpleNamespace(_read_only_acceptance=False,
+                    _send_operational_event=lambda kind, **fields: events.append((kind, fields)))
+                payload = {"visible_entry_rows": [["row1"], ["row2"]]}
+                if include:
+                    payload["visible_entry_metadata"] = metadata
+                snapshot = SimpleNamespace(data={}, schedule_data_by_date={}, comparison_data={"1151101": payload})
+                AppController._live_snapshot_captured(controller, snapshot)
+                day = events[0][1]["snapshot"]["days"][0]
+                if not include:
+                    self.assertNotIn("entry_metadata", day)
+                elif isinstance(metadata, list) and len(metadata) == 2:
+                    self.assertEqual(day["entry_metadata"][0], good)
+                    self.assertEqual(day["entry_metadata"][1], {"_invalid": True})
+                else:
+                    self.assertEqual(day["entry_metadata"], [{"_invalid": True}, {"_invalid": True}])
 
     def test_unreturned_event_pending_does_not_claim_actual_handoff_completion(self):
         from qt_app.controllers.app_controller import AppController

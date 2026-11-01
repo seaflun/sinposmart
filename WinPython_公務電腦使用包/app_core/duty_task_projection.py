@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from compare_rehearsal_records import (
+    entry_row_fields,
     find_arrival_entry_exists,
     find_case_work_matches,
     find_entry_matches,
@@ -18,6 +19,8 @@ from compare_rehearsal_records import (
     flatten_rows,
     is_future_action,
     is_possible_handoff_adjustment,
+    row_has_outin,
+    row_has_primary_person,
     row_has_time,
 )
 
@@ -1011,9 +1014,10 @@ def _rest_entry_matches(
     return [
         row
         for row in entry_rows
-        if (not target_name or target_name in row)
-        and (not direction or direction in row)
-        and (not reason or any(value in row for value in acceptable_reasons))
+        if not entry_row_fields(row)["evidence_conflict"]
+        and target_name and row_has_primary_person(row, target_name)
+        and direction and row_has_outin(row, direction)
+        and (not reason or any(value in str(entry_row_fields(row)["reason"]) for value in acceptable_reasons))
         and row_has_time(row, action_date, system_time, allow_near=allow_near, near_minutes=near_minutes)
     ]
 
@@ -1081,7 +1085,8 @@ def compare_submission_action(
 
     if current_action.get("kind") == "entry_log":
         entry_source = comparison_data.get("visible_entry_rows", [])
-        entry_rows = flatten_rows(entry_source or [], action_date)
+        entry_rows = flatten_rows(entry_source or [], action_date,
+                                  entry_metadata=comparison_data.get("visible_entry_metadata"))
         fields = current_action.get("fields", {})
         reason = fields.get("領用事由及地點", "") if isinstance(fields, Mapping) else ""
         if reason in ("休息", "休息返隊"):
@@ -1144,7 +1149,8 @@ def build_schedule_comparisons(
         entry_source = comparison_data.get("visible_entry_rows", data.get("visible_entry_rows", []))
         work_source = comparison_data.get("visible_work_rows", data.get("visible_work_rows", []))
         comparison_cache[action_date] = {
-            "entry_rows": flatten_rows(entry_source or [], action_date),
+            "entry_rows": flatten_rows(entry_source or [], action_date,
+                                      entry_metadata=comparison_data.get("visible_entry_metadata", data.get("visible_entry_metadata"))),
             "work_rows": flatten_rows(work_source or [], action_date),
         }
 

@@ -25,6 +25,9 @@ from app_core.duty_task_projection import (
 )
 from app_core.schedule_repository import business_roc_date
 from compare_rehearsal_records import (
+    EXTERNAL_ASSIGNMENT_KEYWORDS,
+    clean,
+    entry_row_fields,
     find_open_external_assignment,
     flatten_rows,
     has_open_external_assignment,
@@ -186,16 +189,9 @@ class DutySubmissionService:
         actions = [dict(item) for item in data["actions"]]
         action = dict(actions[request.action_index])
         session_departures = getattr(browser_session, "known_open_departures", {})
-        if self._checks_open_assignment(action, request) and isinstance(session_departures, dict):
-            target = str(action.get("target", ""))
-            observed = session_departures.get(target)
-            if observed:
-                known = dict(data.get("_unreturned_return_known_departures") or {})
-                stored = known.get(target)
-                if not stored or (isinstance(stored, str) and observed > stored):
-                    known[target] = observed
-                request = replace(request, schedule_data={**data, "_unreturned_return_known_departures": known})
-                data = request.schedule_data
+        if self._checks_open_assignment(action, request):
+            request = self._with_session_departures(request, browser_session, [str(action.get("target", ""))])
+            data = request.schedule_data
         base_target_date = str(data["target_date"])
         action_date = action_target_roc_date(action, base_target_date)
         result_path = self._create_result_path(request, action)
@@ -678,6 +674,8 @@ class DutySubmissionService:
             checks = [{**anchor, "kind": "handoff_preflight", "target": target} for target in targets]
         if not checks:
             raise DutySubmissionExecutionError("交接預查無法確認接班人員，未執行登打。", "unreturned_evidence_invalid")
+        request = self._with_session_departures(request, session, [str(action["target"]) for action in checks])
+        data = request.schedule_data
         for action in checks:
             self._validate_return_identity(action_staff(data, action), action, self._known_open_at(request, action))
         action_date = action_target_roc_date(checks[0], str(data["target_date"]))
@@ -693,18 +691,13 @@ class DutySubmissionService:
         before = self._query_comparison(
             session.automation, session.driver, checks[0], action_date, query_range=query_range,
         )
-        rows = flatten_rows(
-            before.get("visible_entry_rows", []) or [], action_date,
-            start_date=query_range["start_roc_date"], end_date=query_range["end_roc_date"],
-        )
         for action in checks:
-            entry_at = find_open_external_assignment(
-                rows, action_date, action_staff(data, action), action,
-                current_at=self.now_factory(), start_at=query_range["start_at"], end_at=query_range["end_at"],
-                known_open_at=self._known_open_at(request, action),
+            details = self._open_assignment_pause_details(
+                action, action_target_roc_date(action, str(data["target_date"])), before,
+                action_staff(data, action), request, query_range=query_range,
             )
-            if entry_at:
-                session.known_open_departures[str(action["target"])] = entry_at
+            if details and details.get("unreturned_entry_at"):
+                session.known_open_departures[str(action["target"])] = details["unreturned_entry_at"]
 
     def execute_with_browser_session(
         self,
@@ -871,6 +864,19 @@ class DutySubmissionService:
             return None
         known_open_at = self._known_open_at(request, action)
         self._validate_return_identity(staff, action, known_open_at)
+        if self.open_assignment_checker is has_open_external_assignment:
+            issues = self._return_evidence_issues(comparison_data, staff, action, self.now_factory())
+            if issues:
+                if known_open_at is not None:
+                    return {
+                        "unreturned_entry_at": known_open_at.isoformat(timespec="minutes"),
+                        "evidence_state": "incomplete",
+                        "evidence_issues": ",".join(issues),
+                    }
+                raise DutySubmissionExecutionError(
+                    "返隊查核資料不足，出入方向或原因明細尚未確認，已停止自動登打。",
+                    "unreturned_evidence_invalid",
+                )
         now = self.now_factory()
         current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
         query_start_date = (
@@ -888,6 +894,7 @@ class DutySubmissionService:
             action_date,
             start_date=query_start_date,
             end_date=query_end_date,
+            entry_metadata=comparison_data.get("visible_entry_metadata"),
         )
         checker_kwargs: dict[str, Any] = {"current_minute": current_minute}
         if self.open_assignment_checker is has_open_external_assignment:
@@ -920,6 +927,82 @@ class DutySubmissionService:
             known_open_at=known_open_at,
         )
         return {"unreturned_entry_at": entry_at} if entry_at else {}
+
+    @staticmethod
+    def _return_evidence_issues(
+        comparison_data: Mapping[str, Any],
+        staff: Mapping[str, Mapping[str, Any]],
+        action: Mapping[str, Any],
+        current_at: datetime,
+    ) -> list[str]:
+        target_name = clean(str(staff.get(str(action.get("target", "")), {}).get("name", "") or ""))
+        if not target_name:
+            return []  # A known departure remains open even if its roster is unavailable.
+        metadata_rows = comparison_data.get("visible_entry_metadata")
+        issues: list[tuple[datetime, str]] = []
+        returns: list[datetime] = []
+        for index, raw in enumerate(comparison_data.get("visible_entry_rows", []) or []):
+            text = raw if isinstance(raw, str) else " | ".join(str(value) for value in raw)
+            normalized = flatten_rows([raw], "", start_date="0000000", end_date="9999999")
+            metadata = None
+            if metadata_rows is not None:
+                metadata = (
+                    metadata_rows[index]
+                    if isinstance(metadata_rows, list) and index < len(metadata_rows)
+                    and isinstance(metadata_rows[index], Mapping) else {"_invalid": True}
+                )
+            fields = entry_row_fields(normalized[0] if normalized else text, metadata=metadata)
+            if target_name not in (fields["primary_name"], fields["claimed_primary_name"]):
+                continue
+            row_at = datetime.fromisoformat(fields["record_at"]) if fields["record_at"] else current_at
+            if row_at > current_at:
+                continue
+            direction = fields["direction"]
+            if fields["evidence_conflict"] or not fields["record_at"]:
+                issues.append((row_at, "entry_metadata_invalid"))
+            elif direction in ("值班", "值退", "接班", "退班"):
+                continue
+            elif direction not in ("出", "入", "簽出", "外出", "簽入", "返隊", "到勤"):
+                issues.append((row_at, "entry_direction_unknown"))
+            elif fields["reason_state"] != "present" and not (
+                direction in ("入", "簽入", "到勤") and fields["category"] == "到勤"
+            ):
+                issues.append((row_at, "entry_reason_missing"))
+            elif direction in ("入", "簽入", "返隊", "到勤") and (
+                clean(str(fields["reason"] or "")) == "返隊"
+                or any(keyword in str(fields["reason"] or "") for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS)
+            ):
+                returns.append(row_at)
+        last_return = max(returns, default=datetime.min)
+        return sorted({code for row_at, code in issues if row_at >= last_return})
+
+    @staticmethod
+    def _with_session_departures(
+        request: DutySubmissionRequest,
+        session: DutySubmissionBrowserSession | None,
+        targets: list[str],
+    ) -> DutySubmissionRequest:
+        known = request.schedule_data.get("_unreturned_return_known_departures", {})
+        observed = getattr(session, "known_open_departures", {})
+        if not isinstance(observed, Mapping):
+            raise DutySubmissionExecutionError("預查出勤證據格式不正確，已停止自動登打。", "unreturned_evidence_invalid")
+        if not isinstance(known, Mapping):
+            return request  # Do not turn malformed stored evidence into an empty map.
+        merged = dict(known)
+        for target in targets:
+            if target not in observed:
+                continue
+            cached = observed.get(target)
+            if not isinstance(cached, str) or not cached.strip():
+                raise DutySubmissionExecutionError("預查出勤時間格式不正確，已停止自動登打。", "unreturned_evidence_invalid")
+            stored = merged.get(target)
+            if stored not in (None, "") and not isinstance(stored, str):
+                continue
+            if stored in (None, "") or cached > stored:
+                merged[target] = cached
+        if merged == dict(known):
+            return request
+        return replace(request, schedule_data={**request.schedule_data, "_unreturned_return_known_departures": merged})
 
     @staticmethod
     def _checks_open_assignment(action: Mapping[str, Any], request: DutySubmissionRequest) -> bool:
@@ -1163,7 +1246,10 @@ class DutySubmissionService:
                 query_kwargs,
                 query_started_callback=query_started_callback,
             )
-            return {"visible_entry_rows": rows, "visible_work_rows": []}
+            result = {"visible_entry_rows": rows, "visible_work_rows": []}
+            if getattr(rows, "entry_metadata", None) is not None:
+                result["visible_entry_metadata"] = rows.entry_metadata
+            return result
         rows = DutySubmissionService._query_visible_rows(
             automation,
             driver,
@@ -1343,6 +1429,8 @@ class DutySubmissionService:
         if getattr(exc, "error_code", "") == "invalid_credentials":
             return "帳號或密碼錯誤，已停止登入。", "invalid_credentials"
         category = str(getattr(exc, "diagnostic_category", "") or "")
+        if category == "entry_form_incomplete":
+            return "出入方向或表單欄位尚未確認，未送出；請檢查勤務系統表單。", "entry_form_incomplete"
         if category == "browser_session_open":
             return (
                 "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"

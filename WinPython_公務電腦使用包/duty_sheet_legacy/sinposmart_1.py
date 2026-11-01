@@ -1115,12 +1115,14 @@ def step_navigate_menu(driver, wait):
 
 def step_navigate_to_task_table(driver, wait, target_date=""):
     log_status("➡️ 正在開啟救災任務編組表...")
+    state = {"navigation_phase": "menu_frame", "rejection_code": "frame_unavailable"}
     try:
         driver.switch_to.default_content()
         wait.until(EC.frame_to_be_available_and_switch_to_it("ehrFrame"))
     except Exception:
-        raise _mission_failure("navigation", target_date, stage="vehicle_form_open") from None
+        raise _mission_failure("navigation", target_date, state, stage="vehicle_form_open") from None
 
+    state = {"navigation_phase": "menu_click", "rejection_code": "menu_item_unconfirmed"}
     try:
         clicked = driver.execute_script("""
         const url = new URL(window.top.location.href);
@@ -1142,10 +1144,11 @@ def step_navigate_to_task_table(driver, wait, target_date=""):
         return bClick(window.top);
         """)
     except Exception:
-        raise _mission_failure("navigation", target_date, stage="vehicle_form_open") from None
+        raise _mission_failure("navigation", target_date, state, stage="vehicle_form_open") from None
     if clicked is not True:
-        raise _mission_failure("navigation", target_date, stage="vehicle_form_open")
+        raise _mission_failure("navigation", target_date, state, stage="vehicle_form_open")
     state = {}
+    phase = "query_ready"
     try:
         if not re.fullmatch(r"\d{7}", str(target_date)):
             raise ValueError("invalid mission date")
@@ -1156,6 +1159,7 @@ def step_navigate_to_task_table(driver, wait, target_date=""):
             state = observed if isinstance(observed, dict) else {}
             return state.get("ready") is True
         wait.until(query_ready)
+        phase = "initial_query_start"
         token = str(time.monotonic_ns())
         try:
             started = driver.execute_script(_MISSION_FORM_JS, target_date, [], "prepare_query", token, {})
@@ -1164,11 +1168,31 @@ def step_navigate_to_task_table(driver, wait, target_date=""):
         if started is not True and started is not None:
             raise ValueError("mission query not started")
         accept_pending_alerts(driver, timeout=0.5)
+        phase = "initial_query_readback"
         def query_finished(candidate):
+            nonlocal state
             driver.switch_to.default_content()
             observed = driver.execute_script(_MISSION_FORM_JS, target_date, [], "read", token, {})
+            if isinstance(observed, dict):
+                state = observed
             return isinstance(observed, dict) and isinstance(observed.get("values"), dict)
         wait.until(query_finished)
+    except Exception:
+        raise _mission_failure("navigation", target_date, {**state, "navigation_phase": phase}, stage="vehicle_form_open") from None
+    return True
+
+
+def step_open_mission_vehicle_settings(driver, target_date):
+    state = {"navigation_phase": "vehicle_popup", "rejection_code": "vehicle_popup_unconfirmed"}
+    try:
+        if not re.fullmatch(r"\d{7}", str(target_date)):
+            raise ValueError("invalid mission date")
+        driver.switch_to.default_content()
+        observed = driver.execute_script(_MISSION_FORM_JS, target_date, [], "open_vehicles", "", {})
+        if isinstance(observed, dict):
+            state.update(observed)
+        if state.get("opened") is not True:
+            raise ValueError("mission vehicle popup not confirmed")
     except Exception:
         raise _mission_failure("navigation", target_date, state, stage="vehicle_form_open") from None
     return True
@@ -1963,7 +1987,9 @@ def verify_saved_duty_fields(driver, target_date, expected_fields, wait=None):
 _MISSION_FORM_JS = r"""
 const [expectedDate, fieldIds, mode, token, data] = arguments;
 const forms = [];
-let unsafe = false;
+let originOK = true, rejectionCode = '', markerFound = false;
+function reject(code) { if (!rejectionCode) rejectionCode = code; }
+function rejectOrigin(code) { originOK = false; rejectionCode = code; }
 function authorized(win) {
     const url = new URL(win.location.href);
     return url.origin === 'https://dutymgt.tyfd.gov.tw' && url.pathname.startsWith('/tyfd119/');
@@ -1973,22 +1999,26 @@ function collectMissionForm(win) {
         const doc = win.document;
         const markers = doc.querySelectorAll('[id="_btnOpenWinTaskCode"]');
         if (markers.length) {
-            const marker = markers[0], date = doc.getElementById('_txtTaskDate');
+            markerFound = true;
+            const date = doc.getElementById('_txtTaskDate');
             const query = doc.getElementById('_btnQuery'), save = doc.getElementById('_btnSave');
-            const form = marker.form;
-            if (!authorized(win) || markers.length !== 1 || doc.getElementById('_areMEMO') || !form ||
-                !date || date.form !== form || !query || query.form !== form ||
-                doc.querySelectorAll('[id="_txtTaskDate"]').length !== 1 ||
-                doc.querySelectorAll('[id="_btnQuery"]').length !== 1 ||
-                (save && doc.querySelectorAll('[id="_btnSave"]').length !== 1)) unsafe = true;
-            else forms.push({win, doc, form, date, query, save});
+            const form = date && date.form, documentForms = doc.querySelectorAll('form');
+            if (!authorized(win)) rejectOrigin('unauthorized_origin');
+            else if (!/(?:^|[^A-Za-z0-9_])RPS201099(?:$|[^A-Za-z0-9_])/i.test(doc.title || '')) reject('module_mismatch');
+            else if (!form || documentForms.length !== 1 || documentForms[0] !== form) reject('form_not_unique');
+            else if (Array.from(markers).some(marker => marker.form !== form)) reject('marker_form_mismatch');
+            else if (!date || doc.querySelectorAll('[id="_txtTaskDate"]').length !== 1) reject('date_not_unique');
+            else if (!query || query.form !== form || doc.querySelectorAll('[id="_btnQuery"]').length !== 1) reject('query_not_unique');
+            else if (save && (save.form !== form || doc.querySelectorAll('[id="_btnSave"]').length !== 1)) reject('save_not_unique');
+            else forms.push({win, doc, form, date, query, save, markers: Array.from(markers)});
         }
         for (let index = 0; index < win.frames.length; index++) collectMissionForm(win.frames[index]);
-    } catch (error) { unsafe = true; }
+    } catch (error) { rejectOrigin('frame_inaccessible'); }
 }
-try { if (!authorized(window.top)) unsafe = true; } catch (error) { unsafe = true; }
+try { if (!authorized(window.top)) rejectOrigin('unauthorized_origin'); } catch (error) { rejectOrigin('frame_inaccessible'); }
 collectMissionForm(window.top);
-const current = !unsafe && forms.length === 1 ? forms[0] : null;
+if (!rejectionCode && forms.length !== 1) reject(forms.length ? 'mission_form_not_unique' : 'mission_form_missing');
+const current = originOK && !rejectionCode && forms.length === 1 ? forms[0] : null;
 function available(el) {
     if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true' || !el.getClientRects().length) return false;
     const style = current.win.getComputedStyle(el);
@@ -2001,7 +2031,7 @@ for (const id of fieldIds) {
         missing.push(id);
     else targets[id] = elements[0];
 }
-const state = {origin_ok: !unsafe, form_count: forms.length, task_marker_found: forms.length > 0,
+const state = {origin_ok: originOK, rejection_code: rejectionCode, form_count: forms.length, task_marker_found: markerFound,
     expected_count: fieldIds.length, found_count: Object.keys(targets).length, missing_ids: missing,
     fields_writable: !missing.length && fieldIds.every(id => !targets[id].disabled && !targets[id].readOnly),
     document_ready: !!current && current.doc.readyState === 'complete',
@@ -2013,6 +2043,15 @@ const readReady = current && state.document_ready && state.date_matches && !miss
 const ready = readReady && state.fields_writable && state.save_ready;
 const queryReady = current && state.document_ready && state.query_ready;
 if (mode === 'query_ready') return {...state, ready: !!queryReady};
+if (mode === 'open_vehicles') {
+    if (!readReady) return {...state, opened: false};
+    const buttons = current.markers.filter(button => button.tagName === 'INPUT' &&
+        String(button.type).toLowerCase() === 'button' && String(button.value).trim() === '勤務車輛設定');
+    if (buttons.length !== 1) return {...state, opened: false, rejection_code: 'vehicle_button_not_unique'};
+    if (!available(buttons[0])) return {...state, opened: false, rejection_code: 'vehicle_button_unavailable'};
+    buttons[0].click();
+    return {...state, opened: true};
+}
 if (mode === 'prepare_query') {
     if (!queryReady) return false;
     current.date.value = expectedDate;
@@ -2023,8 +2062,8 @@ if (mode === 'prepare_query') {
 }
 if (mode === 'inspect') return {...state, ready: !!ready};
 if (mode === 'read') {
-    if (!readReady) return false;
-    if (current.doc.__sinposmartMissionToken === token) return false;
+    if (!readReady) return state;
+    if (current.doc.__sinposmartMissionToken === token) return {...state, rejection_code: 'document_not_replaced'};
     const values = {};
     for (const id of fieldIds) values[id] = String(targets[id].value || '');
     return {values, ...state};
@@ -2071,6 +2110,16 @@ def _mission_failure(reason, target_date, state=None, *, save_attempted=False, s
     for key in ("form_count", "expected_count", "found_count"):
         if type(state.get(key)) is int and 0 <= state[key] <= 1000:
             payload[key] = state[key]
+    if state.get("rejection_code") in {
+            "unauthorized_origin", "frame_inaccessible", "module_mismatch", "form_not_unique",
+            "marker_form_mismatch", "date_not_unique", "query_not_unique", "save_not_unique",
+            "mission_form_not_unique", "mission_form_missing", "document_not_replaced",
+            "frame_unavailable", "menu_item_unconfirmed", "vehicle_popup_unconfirmed",
+            "vehicle_button_not_unique", "vehicle_button_unavailable"}:
+        payload["rejection_code"] = state["rejection_code"]
+    if state.get("navigation_phase") in {"menu_frame", "menu_click", "query_ready",
+            "initial_query_start", "initial_query_readback", "vehicle_popup"}:
+        payload["navigation_phase"] = state["navigation_phase"]
     missing = state.get("missing_ids", [])
     payload["missing_ids"] = [value for value in (missing[:200] if isinstance(missing, list) else [])
                               if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", value)]
@@ -2492,9 +2541,8 @@ def start_automation(
             report_stage("vehicle_form_open")
             step_navigate_to_task_table(driver, wait, target_date)
             
-            js_click_car = "function findAndClickBtn(win, id) { var btn = win.document.getElementById(id); if (btn) { btn.click(); return true; } for (var i = 0; i < win.frames.length; i++) { try { if (findAndClickBtn(win.frames[i], id)) return true; } catch(e) {} } return false; } return findAndClickBtn(window.top, '_btnOpenWinTaskCode');"
-            if driver.execute_script(js_click_car):
-                step_select_vehicles_popup(driver, wait, driver.current_window_handle, cars_config)
+            step_open_mission_vehicle_settings(driver, target_date)
+            step_select_vehicles_popup(driver, wait, driver.current_window_handle, cars_config)
             
             log_status("➡️ 等待救災任務編組表載入...")
             driver.switch_to.default_content()
