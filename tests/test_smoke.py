@@ -6255,9 +6255,10 @@ function makeRow(row) {
  tr.children=row.cells.map((cell,index)=>({tagName:'TD',innerText:typeof cell==='string'?cell:(cell.text||''),
   rowSpan:typeof cell==='string'?1:(cell.rowSpan||1),colSpan:typeof cell==='string'?1:(cell.colSpan||1),
   querySelectorAll:selector=>selector.includes('onclick')&&index===row.cells.length-1?
-   (row.handlers||[]).map(value=>({id:'_btnChoose1',getAttribute:()=>value})):[]}));
+   (row.handlers||[]).map(value=>({id:'_btnChoose1',getAttribute:()=>value})):
+   (selector==='input'&&index===0?(row.first_inputs||[]):[])}));
  const checkbox=row.checkbox===undefined?null:{id:'_chkData',name:'_chkData',type:'checkbox',value:row.checkbox};
- tr.querySelectorAll=selector=>selector.includes('checkbox')?(checkbox?[checkbox]:[]):[];
+ tr.querySelectorAll=selector=>selector.includes('checkbox')?[...(checkbox?[checkbox]:[]),...(row.first_inputs||[]).filter(value=>value.type==='checkbox')]:[];
  tr.querySelector=selector=>selector==='table'?null:(selector.includes('checkbox')?checkbox:null);
  parent.children.push(tr);
  return tr;
@@ -6362,6 +6363,74 @@ process.stdout.write(JSON.stringify(result));
         self.assertEqual(rows.entry_metadata[1]["reason"], "救護外勤")
         self.assertIsNone(rows.entry_metadata[1]["record_at"])
         self.assertEqual(rows.entry_metadata[1]["system_written_at"], "2026-11-01T11:00")
+
+    def _signed_entry_dom_record(self, *, direction="出", reason="火災外勤\n第二段", person_value="測試16"):
+        main, detail = self._real_entry_dom_record(direction=direction, reason=reason)
+        main.pop("checkbox")
+        detail["cells"][3] = "測試核章員"
+        fields = [""] * 24
+        fields[0], fields[3], fields[5] = "synthetic-record", person_value, direction
+        fields[7] = reason.replace("\n", "<br />")
+        fields[11:14] = ["1151101", "08", "15"]
+        payload = "(^w^)".join(fields)
+        detail["handlers"] = [f"changeButton('{payload}')", f"copyButton('{payload}')"]
+        return main, detail, fields
+
+    def test_signed_entry_query_accepts_only_literal_verified_readonly_rows(self):
+        for person_value in ("測試16", "synthetic-identity,測試16"):
+            for direction in ("出", "入", "值班", "值退", "開始", "結束", "請選擇"):
+                with self.subTest(direction=direction, person_value=person_value):
+                    main, detail, _fields = self._signed_entry_dom_record(direction=direction, person_value=person_value)
+                    rows, _ = self._entry_query_fixture({"rows": [main, detail]}, dom=True)
+                    self.assertTrue(rows.entry_metadata[0]["structure_valid"])
+                    self.assertTrue(rows.entry_metadata[0]["detail_present"])
+                    self.assertEqual(rows.entry_metadata[0]["reason"], "火災外勤\n第二段")
+                    serialized = json.dumps({"rows": rows, "metadata": rows.entry_metadata}, ensure_ascii=False)
+                    self.assertNotIn("synthetic-record", serialized)
+                    self.assertNotIn("synthetic-identity", serialized)
+
+    def test_signed_entry_query_rejects_ambiguous_identity_or_unproven_literals(self):
+        for changed in ("signer", "payload_pair", "name", "pure_other", "pure_prefix", "pure_suffix", "empty_name", "multiple_names", "direction_code", "reason", "date", "hour", "minute",
+                        "field_count", "empty_key", "trailing_code", "dynamic_argument", "duplicate", "escaped_literal",
+                        "record_time", "hidden_input", "unknown_checkbox", "wrong_checkbox", "stripe", "body"):
+            with self.subTest(changed=changed):
+                main, detail, fields = self._signed_entry_dom_record()
+                if changed == "signer":
+                    detail["cells"][3] = ""
+                elif changed in ("name", "pure_other", "pure_prefix", "pure_suffix", "empty_name", "multiple_names", "direction_code", "reason", "date", "hour", "minute", "empty_key"):
+                    index = {"name": 3, "pure_other": 3, "pure_prefix": 3, "pure_suffix": 3, "empty_name": 3, "multiple_names": 3,
+                             "direction_code": 5, "reason": 7, "date": 11, "hour": 12, "minute": 13, "empty_key": 0}[changed]
+                    fields[index] = {"name": "synthetic-identity,其他人", "pure_other": "其他人", "pure_prefix": "前測試16", "pure_suffix": "測試16後",
+                                     "empty_name": "", "multiple_names": "one,測試16,two,其他人", "direction_code": "O",
+                                     "empty_key": ""}.get(changed, "mismatch")
+                    payload = "(^w^)".join(fields)
+                    detail["handlers"] = [f"changeButton('{payload}')", f"copyButton('{payload}')"]
+                elif changed == "payload_pair":
+                    detail["handlers"][1] = detail["handlers"][1].replace("synthetic-record", "different-record")
+                elif changed == "field_count":
+                    payload = "(^w^)".join(fields[:-1])
+                    detail["handlers"] = [f"changeButton('{payload}')", f"copyButton('{payload}')"]
+                elif changed == "trailing_code":
+                    detail["handlers"][0] += ";alert('not literal')"
+                elif changed == "dynamic_argument":
+                    detail["handlers"][0] = "changeButton(window.payload)"
+                elif changed == "duplicate":
+                    detail["handlers"].append(detail["handlers"][0])
+                elif changed == "escaped_literal":
+                    detail["handlers"] = [value.replace("第二段", "second\\'part") for value in detail["handlers"]]
+                elif changed == "record_time":
+                    main["cells"][1], main["cells"][8] = "invalid record time", "115/11/01 08:15"
+                elif changed in ("hidden_input", "unknown_checkbox"):
+                    main["first_inputs"] = [{"type": "hidden" if changed == "hidden_input" else "checkbox", "id": "unknown", "value": "synthetic"}]
+                elif changed == "wrong_checkbox":
+                    main["checkbox"] = "different-record"
+                elif changed == "stripe":
+                    detail["stripe"] = "mdsTRStyle2"
+                elif changed == "body":
+                    detail["group"] = "another-body"
+                rows, _ = self._entry_query_fixture({"rows": [main, detail]}, dom=True)
+                self.assertEqual(rows.entry_metadata[0]["structure_valid"], changed == "wrong_checkbox")
+                self.assertFalse(rows.entry_metadata[0]["detail_present"])
 
     def test_entry_empty_result_requires_an_explicit_no_records_marker(self):
         module = duty_rehearsal_module()

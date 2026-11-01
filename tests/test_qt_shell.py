@@ -5139,6 +5139,101 @@ class DutySubmissionServiceTests(unittest.TestCase):
             data["_unreturned_return_known_departures"] = known
         return service, DutySubmissionRequest("fixture", "fixture", 0, data), fill
 
+    @staticmethod
+    def _necessary_work_entry(person="測試16", direction="開始", reason="自主訓練", category="必要性工作"):
+        row = ["115/11/01 09:00", "測試單位"]
+        if category:
+            row.append(category)
+        row.extend([person, "隊員", direction, "否", "", reason])
+        metadata = {"schema": "entry-log-v1", "primary_index": 3 if category else 2,
+            "direction_index": 5 if category else 4, "primary_name": person, "direction": direction,
+            "category": category, "detail_present": True, "detail_status": "present", "reason": reason,
+            "structure_valid": True, "record_time_valid": True, "system_written_valid": True}
+        return row, metadata
+
+    def test_necessary_work_start_and_end_are_neutral_for_one_or_multiple_people(self) -> None:
+        from dataclasses import replace
+
+        for people in (("16",), ("16", "17")):
+            for category in ("必要性工作", "必要 性工作"):
+                with self.subTest(people=people, category=category), tempfile.TemporaryDirectory() as directory:
+                    entries = [self._necessary_work_entry(person=f"測試{person}", direction=direction, category=category)
+                               for person in people for direction in ("開始", "結束")]
+                    rows, metadata = [pair[0] for pair in entries], [pair[1] for pair in entries]
+                    service, request, fill = self._entry_evidence_fixture(directory, rows, metadata=metadata)
+                    for target in people:
+                        data = {**request.schedule_data, "today": {"staff": {person: {"name": f"測試{person}"} for person in people}},
+                            "actions": [{**request.schedule_data["actions"][0], "target": target}]}
+                        result = service.execute(replace(request, schedule_data=data))
+                        self.assertEqual(result.status, "handoff_preflight_ready")
+                    fill.assert_not_called()
+
+    def test_necessary_work_neutral_events_do_not_clear_known_or_earlier_incomplete_evidence(self) -> None:
+        neutral, metadata = self._necessary_work_entry(direction="結束", reason="返隊")
+        known = {"16": "2026-11-01T08:15"}
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, _fill = self._entry_evidence_fixture(directory, [neutral], metadata=[metadata], known=known)
+            result = service.execute(request)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(result.comparison["unreturned_entry_at"], known["16"])
+            self.assertNotEqual(result.comparison.get("evidence_state"), "incomplete")
+
+        bad = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否", ""]
+        bad_metadata = {"primary_name": "測試16", "direction": "出", "detail_present": False}
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, _fill = self._entry_evidence_fixture(directory, [bad, neutral],
+                metadata=[bad_metadata, metadata], known=known)
+            result = service.execute(request)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(result.comparison["unreturned_entry_at"], known["16"])
+            self.assertEqual(result.comparison["evidence_state"], "incomplete")
+            self.assertEqual(result.comparison["evidence_issues"], "entry_reason_missing")
+
+    def test_necessary_work_neutral_rule_does_not_exempt_bad_data_or_other_categories(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+
+        for changed in ("missing_reason", "empty_reason", "metadata", "identity", "time", "other_category", "category_prefix", "other_direction"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                row, metadata = self._necessary_work_entry()
+                if changed == "missing_reason":
+                    metadata["detail_present"] = False
+                elif changed == "empty_reason":
+                    metadata["reason"] = ""
+                elif changed == "metadata":
+                    metadata["structure_valid"] = False
+                elif changed == "identity":
+                    metadata["primary_name"] = "其他人"
+                elif changed == "time":
+                    row[0] = "invalid record time"
+                elif changed in ("other_category", "category_prefix"):
+                    row[2] = metadata["category"] = "在隊訓練" if changed == "other_category" else "一般必要性工作"
+                elif changed == "other_direction":
+                    row[5] = metadata["direction"] = "開始勤務"
+                service, request, fill = self._entry_evidence_fixture(directory, [row], metadata=[metadata])
+                with self.assertRaises(DutySubmissionExecutionError) as raised:
+                    service.execute(request)
+                self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+                fill.assert_not_called()
+
+    def test_schema_entry_category_must_match_the_visible_column(self) -> None:
+        from app_core.duty_submission_service import DutySubmissionExecutionError
+        from compare_rehearsal_records import entry_row_fields
+
+        for visible, claimed in (("在隊訓練", "必要性工作"), ("", "必要性工作"), ("必要性工作", ""),
+                                 ("必要性工作", None), ("必要性工作", True), ("必要性工作", []), ("必要性工作", {})):
+            with self.subTest(visible=visible, claimed=claimed), tempfile.TemporaryDirectory() as directory:
+                row, metadata = self._necessary_work_entry(category=visible)
+                metadata["category"] = claimed
+                self.assertTrue(entry_row_fields(" | ".join(row), metadata=metadata)["evidence_conflict"])
+                service, request, fill = self._entry_evidence_fixture(directory, [row], metadata=[metadata])
+                with self.assertRaises(DutySubmissionExecutionError) as raised:
+                    service.execute(request)
+                self.assertEqual(raised.exception.error_code, "unreturned_evidence_invalid")
+                fill.assert_not_called()
+
+        row = "115/11/01 08:15 | 測試單位 | 測試16 | 隊員 | 出 | 否 | 火災外勤"
+        self.assertFalse(entry_row_fields(row, metadata={"category": "legacy category"})["evidence_conflict"])
+
     def test_metadata_reason_is_shared_by_the_guard_and_external_matcher(self) -> None:
         row = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否"]
         metadata = [{"primary_name": "測試16", "direction": "出", "detail_present": True, "reason": "火災外勤"}]

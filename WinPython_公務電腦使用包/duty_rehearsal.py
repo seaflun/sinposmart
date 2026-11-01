@@ -2354,6 +2354,31 @@ const handlerMatches = (cell, name, key) => {
   const named = handlers.filter(value => new RegExp('^' + name + '\\s*\\(').test(value));
   return named.length === 1 && new RegExp('^' + name + '\\s*\\(\\s*[\'\"]' + escapePattern(key) + '\\(').test(named[0]);
 };
+const literalPayload = (cell, name) => {
+  const handlers = Array.from(cell?.querySelectorAll('[onclick]') || []).map(node => String(node.getAttribute('onclick') || '').trim());
+  const named = handlers.filter(value => new RegExp('^' + name + '\\s*\\(').test(value));
+  if (named.length !== 1) return null;
+  const call = named[0].match(/^(changeButton|copyButton)\s*\(\s*(?:'([^'\\\r\n\u2028\u2029]*)'|"([^"\\\r\n\u2028\u2029]*)")\s*\)\s*;?\s*$/);
+  if (!call || call[1] !== name) return null;
+  return call[2] !== undefined ? call[2] : call[3];
+};
+const signedDetailsMatch = (values, detailCells) => {
+  if (!compact(text(detailCells[3]))) return false;
+  const changed = literalPayload(detailCells[6], 'changeButton');
+  const copied = literalPayload(detailCells[6], 'copyButton');
+  if (changed === null || changed !== copied) return false;
+  const fields = changed.split('(^w^)');
+  if (fields.length !== 24 || !fields[0].trim()) return false;
+  const comma = fields[3].indexOf(',');
+  if (comma >= 0 && fields[3].indexOf(',', comma + 1) >= 0) return false;
+  const name = comma < 0 ? fields[3] : fields[3].slice(comma + 1);
+  if (!compact(name) || compact(name) !== compact(values[4]) || compact(fields[5]) !== compact(values[6])) return false;
+  if (!/^\d{1,2}$/.test(fields[12]) || !/^\d{1,2}$/.test(fields[13])) return false;
+  const recordAt = isoTime(values[1]);
+  const serializedAt = isoTime(`${fields[11]} ${fields[12].padStart(2, '0')}:${fields[13].padStart(2, '0')}`);
+  if (!recordAt || serializedAt !== recordAt) return false;
+  return compact(fields[7].replace(/<br\s*\/?>/gi, ' ')) === compact(text(detailCells[0]));
+};
 const candidates = Array.from(document.querySelectorAll('table.table_list1')).map(table => {
   const nodes = Array.from(table.querySelectorAll('tr')).filter(row => row.closest('table') === table);
   const headers = nodes.filter(row => {
@@ -2371,18 +2396,25 @@ if (candidates.length === 1) {
     if (row === headers[0]) continue;
     const cells = directCells(row), stripes = stripe(row);
     if (cells.length !== 9 || stripes.length !== 1) continue;
-    const checkboxes = Array.from(row.querySelectorAll('input[type="checkbox"]')).filter(node => node.id === '_chkData' && node.name === '_chkData');
+    const allCheckboxes = Array.from(row.querySelectorAll('input[type="checkbox"]'));
+    const checkboxes = allCheckboxes.filter(node => node.id === '_chkData' && node.name === '_chkData');
     const key = checkboxes.length === 1 ? String(checkboxes[0].value || '') : '';
-    const validMain = cells.every(cell => cell.tagName === 'TD' && Number(cell.rowSpan || 1) === 1 && Number(cell.colSpan || 1) === 1)
-      && row.parentElement?.tagName === 'TBODY' && checkboxes.length === 1 && Boolean(key);
+    const validMainShape = cells.every(cell => cell.tagName === 'TD' && Number(cell.rowSpan || 1) === 1 && Number(cell.colSpan || 1) === 1)
+      && row.parentElement?.tagName === 'TBODY';
+    const validCheckboxMain = validMainShape && checkboxes.length === 1 && Boolean(key);
     const values = cells.map(text), detail = row.nextElementSibling, detailCells = directCells(detail);
     const sameParent = detail?.parentElement === row.parentElement;
     const detailStripes = stripe(detail);
     const validDetailShape = detailCells.length === 7 && detailCells.every((cell, index) => cell.tagName === 'TD'
       && Number(cell.rowSpan || 1) === 1 && Number(cell.colSpan || 1) === (index === 0 ? 3 : 1));
     const sameStripe = detailStripes.length === 1 && detailStripes[0] === stripes[0];
-    const validBinding = validMain && sameParent && sameStripe && validDetailShape
+    const pairedShape = sameParent && sameStripe && validDetailShape;
+    const checkboxBinding = validCheckboxMain && pairedShape
       && handlerMatches(detailCells[6], 'changeButton', key) && handlerMatches(detailCells[6], 'copyButton', key);
+    const signedBinding = validMainShape && allCheckboxes.length === 0 && cells[0].querySelectorAll('input').length === 0
+      && pairedShape && signedDetailsMatch(values, detailCells);
+    const validMain = validCheckboxMain || signedBinding;
+    const validBinding = checkboxBinding || signedBinding;
     const category = values[3], mainCells = values.slice(1);
     if (!category) mainCells.splice(2, 1);
     const detailValues = validBinding ? detailCells.map(text) : [];

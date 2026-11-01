@@ -284,6 +284,11 @@ def entry_row_fields(row: str, *, metadata: Mapping[str, Any] | None = None) -> 
                 system_written_at = datetime.fromisoformat(metadata["system_written_at"])
             except (TypeError, ValueError):
                 evidence_conflict = True
+        if metadata.get("schema") == "entry-log-v1":
+            raw_category = cells[2] if primary_index == 3 else ""
+            declared_category = metadata.get("category")
+            if not isinstance(declared_category, str) or clean(declared_category) != raw_category:
+                evidence_conflict = True
         category = str(metadata.get("category", "") or "")
     return {
         "primary_name": cells[primary_index] if len(cells) > primary_index else "",

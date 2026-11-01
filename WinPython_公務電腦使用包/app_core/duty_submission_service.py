@@ -962,6 +962,10 @@ class DutySubmissionService:
                 issues.append((row_at, "entry_metadata_invalid"))
             elif direction in ("值班", "值退", "接班", "退班"):
                 continue
+            elif clean(fields["category"]) == "必要性工作" and direction in ("開始", "結束"):
+                if fields["reason_state"] != "present":
+                    issues.append((row_at, "entry_reason_missing"))
+                continue  # Neutral work activity is never evidence of a physical return.
             elif direction not in ("出", "入", "簽出", "外出", "簽入", "返隊", "到勤"):
                 issues.append((row_at, "entry_direction_unknown"))
             elif fields["reason_state"] != "present" and not (
