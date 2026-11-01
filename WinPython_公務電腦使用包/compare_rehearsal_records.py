@@ -448,10 +448,11 @@ def find_open_external_assignment(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     time_order_warnings: list[str] | None = None,
+    known_open_at: datetime | None = None,
 ) -> str | None:
     target_name = staff.get(str(action.get("target", "")), {}).get("name", "")
     if not target_name:
-        return None
+        return known_open_at.isoformat(timespec="minutes") if known_open_at is not None else None
     if current_at is None:
         effective_minute = current_minute if current_minute is not None else action_minutes(action)
         if effective_minute is None:
@@ -514,7 +515,7 @@ def find_open_external_assignment(
             closed_departures.add((departure, case_key))
         elif case_key[-1] and returned < departure:
             closed_departures.add((departure, case_key))
-            if time_order_warnings is not None:
+            if time_order_warnings is not None and known_open_at != departure:
                 time_order_warnings.append(
                     f"出入時間異常（梯次 {case_key[-1]}）："
                     f"入 {returned:%m/%d %H:%M}／出 {departure:%m/%d %H:%M}，已視為返隊。"
@@ -534,6 +535,15 @@ def find_open_external_assignment(
         returned, _ = next(iter(returns))
         if returned == departure:
             closed_departures.add((departure, case_key))
+    if known_open_at is not None and not any(
+        row_at == known_open_at and is_out and (row_at, case_key) not in closed_departures
+        for row_at, is_out, case_key in events
+    ):
+        # A missing query row cannot erase an already-observed departure. An
+        # already-closed same-minute case cannot identify the original case from
+        # its timestamp alone. Keep this seed until a later valid return or an
+        # explicit manual confirmation; equal-minute returns precede this seed.
+        events.append((known_open_at, True, None))
     active_at: datetime | None = None
     # At equal minute precision, unmatched departures must remain open.
     for row_at, is_active, case_key in sorted(events, key=lambda item: (item[0], item[1])):
@@ -557,6 +567,7 @@ def has_open_external_assignment(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     time_order_warnings: list[str] | None = None,
+    known_open_at: datetime | None = None,
 ) -> bool:
     return (
         find_open_external_assignment(
@@ -569,6 +580,7 @@ def has_open_external_assignment(
             start_at=start_at,
             end_at=end_at,
             time_order_warnings=time_order_warnings,
+            known_open_at=known_open_at,
         )
         is not None
     )

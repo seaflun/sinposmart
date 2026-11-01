@@ -1554,11 +1554,19 @@ class DutyController(QObject):
         action = self._actions[action_index]
         if action.get("kind") != "entry_log" or action.get("source") != "值班交接":
             return None
+        incoming_actions = self._handoff_incoming_actions(
+            [self._actions[index] for index in self._handoff_group_indices(action_index)]
+        )
         return self._submission_request(
             user_id,
             password,
             action_index,
-            self._schedule_data,
+            {
+                **self._schedule_data,
+                "_handoff_entry_prewarm": True,
+                "_handoff_entry_prewarm_targets": [str(item.get("target") or "") for item in incoming_actions],
+                "_handoff_entry_prewarm_actions": incoming_actions,
+            },
             trigger_type="due",
         )
 
@@ -1935,6 +1943,7 @@ class DutyController(QObject):
                 schedule_data["target_date"] = target_date
                 schedule_data["actions"] = [preflight]
                 schedule_data["_unreturned_return_query_start_at"] = self._unreturned_query_start_at(record)
+                schedule_data["_unreturned_return_known_departures"] = self._unreturned_known_departures(record, incoming)
                 action_index = 0
             else:
                 schedule_actions = [dict(action) for action in self._actions]
@@ -2134,7 +2143,14 @@ class DutyController(QObject):
         completion_key: str = "",
         *,
         trigger_type: str = "recovery",
+        comparison: Mapping[str, Any] | None = None,
     ) -> bool:
+        if status == "paused_external" and isinstance(comparison, Mapping):
+            self._unreturned_return_queue.remember_departure(
+                queue_id,
+                str(action.get("target") or ""),
+                str(comparison.get("unreturned_entry_at") or ""),
+            )
         record, resolved = self._unreturned_return_queue.complete_action(
             queue_id,
             action,
@@ -2274,6 +2290,7 @@ class DutyController(QObject):
                 self._schedule_data,
                 owner_actor_no=self._actor_no,
                 unreturned_entry_at=unreturned_entry_at,
+                unreturned_actor_no=str(self._actions[action_index].get("target") or ""),
             )
             self._external_return_queue_ids_by_action_index[action_index] = str(record["queue_id"])
             self._retry_after[action_index] = datetime.now() + timedelta(minutes=5)
@@ -3100,6 +3117,7 @@ class DutyController(QObject):
             schedule_data["_unreturned_return_queue_id"] = queue_id
             schedule_data["_unreturned_return_component_key"] = action_completion_key(original_action)
             schedule_data["_unreturned_return_query_start_at"] = self._unreturned_query_start_at(record)
+            schedule_data["_unreturned_return_known_departures"] = self._unreturned_known_departures(record, action)
             requests.append(
                 self._submission_request(
                     user_id,
@@ -3114,9 +3132,20 @@ class DutyController(QObject):
 
     @staticmethod
     def _unreturned_query_start_at(record: Mapping[str, Any]) -> str:
-        saved_entry_at = str(record.get("unreturned_entry_at") or "").strip()
-        if saved_entry_at:
-            return saved_entry_at
+        departures = record.get("known_departures", {})
+        candidates = [str(record.get("unreturned_entry_at") or "").strip()]
+        if isinstance(departures, Mapping):
+            candidates.extend(str(value or "").strip() for value in departures.values())
+        valid_dates: list[datetime] = []
+        for value in candidates:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                valid_dates.append(parsed)
+        if valid_dates:
+            return min(valid_dates).isoformat(timespec="seconds")
         source_target_date = str(record.get("source_target_date") or "").strip()
         if len(source_target_date) != 7 or not source_target_date.isdigit():
             return ""
@@ -3129,6 +3158,28 @@ class DutyController(QObject):
         except ValueError:
             return ""
         return source_at.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _unreturned_known_departures(record: Mapping[str, Any], action: Mapping[str, Any]) -> dict[str, str] | None:
+        target = str(action.get("target") or "").strip()
+        departures = record.get("known_departures", {})
+        if "known_departures" in record:
+            if not isinstance(departures, Mapping):
+                return None
+            if target not in departures:
+                return {}
+            entry_at = departures[target]
+            return {target: entry_at} if isinstance(entry_at, str) and entry_at.strip() else None
+        if record.get("bridge_history"):
+            return {}
+        saved_entry_at = str(record.get("unreturned_entry_at") or "").strip()
+        if not saved_entry_at:
+            return {}
+        actions = UnreturnedReturnQueue.record_actions(record)
+        if record.get("record_type") == "handoff_group":
+            actions = DutyController._handoff_incoming_actions(actions)
+        targets = {str(item.get("target") or "").strip() for item in actions}
+        return {target: saved_entry_at} if target and targets == {target} else {}
 
     def handoff_group_submission_requests(
         self,
@@ -3193,13 +3244,23 @@ class DutyController(QObject):
             return False
         group_id = str(request.schedule_data.get("_handoff_preflight_group_id") or "")
         state = self._handoff_preflight_groups.get(group_id)
-        if state is None or state.get("paused"):
+        if state is None:
             return False
         component_key = str(request.schedule_data.get("_handoff_preflight_component_key") or "")
+        pending_keys = set(state.get("pending_keys", set()))
+        if component_key not in pending_keys:
+            return False
+        queue_id = str(state.get("queue_id") or "")
+        if queue_id and request.trigger_type in ("due", "recovery"):
+            action = request.schedule_data["actions"][request.action_index]
+            self._unreturned_return_queue.forget_departure(queue_id, str(action.get("target") or ""))
+        if state.get("paused"):
+            pending_keys.discard(component_key)
+            state["pending_keys"] = pending_keys
+            return False
         source_index = self._unique_action_indices_by_key().get(component_key)
         if source_index is not None:
             self._submitting_indices.discard(source_index)
-        pending_keys = set(state.get("pending_keys", set()))
         pending_keys.discard(component_key)
         state["pending_keys"] = pending_keys
         if not pending_keys:
@@ -3255,7 +3316,10 @@ class DutyController(QObject):
             if isinstance(comparison, Mapping)
             else ""
         )
+        action = request.schedule_data["actions"][request.action_index]
+        blocked_actor_no = str(action.get("target") or "").strip()
         if queue_id:
+            self._unreturned_return_queue.remember_departure(queue_id, blocked_actor_no, unreturned_entry_at)
             record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
         else:
             record, created = self._unreturned_return_queue.pause_group(
@@ -3263,6 +3327,7 @@ class DutyController(QObject):
                 self._schedule_data,
                 owner_actor_no=self._actor_no,
                 unreturned_entry_at=unreturned_entry_at,
+                unreturned_actor_no=blocked_actor_no,
             )
             queue_id = str(record.get("queue_id") or "")
             if created:

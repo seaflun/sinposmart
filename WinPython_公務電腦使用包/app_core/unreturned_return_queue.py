@@ -79,6 +79,7 @@ class UnreturnedReturnQueue:
         owner_actor_no: str,
         now: datetime | None = None,
         unreturned_entry_at: str = "",
+        unreturned_actor_no: str = "",
     ) -> tuple[dict[str, Any], bool]:
         """Store one paused action once and return whether it was newly created."""
 
@@ -86,6 +87,7 @@ class UnreturnedReturnQueue:
         completion_key = action_completion_key(action)
         source_target_date = str(schedule_data.get("target_date") or "").strip()
         normalized_entry_at = str(unreturned_entry_at or "").strip()
+        blocked_actor_no = str(unreturned_actor_no or action.get("target") or "").strip()
         existing = next(
             (
                 record
@@ -96,9 +98,7 @@ class UnreturnedReturnQueue:
             None,
         )
         if existing is not None:
-            if normalized_entry_at and not existing.get("unreturned_entry_at"):
-                existing["unreturned_entry_at"] = normalized_entry_at
-                self._write_records()
+            self.remember_departure(str(existing["queue_id"]), blocked_actor_no, normalized_entry_at)
             return dict(existing), False
         queue_id = uuid4().hex
         record = {
@@ -107,6 +107,8 @@ class UnreturnedReturnQueue:
             "completion_key": completion_key,
             "source_target_date": source_target_date,
             "unreturned_entry_at": normalized_entry_at,
+            "blocked_actor_no": blocked_actor_no,
+            "known_departures": {blocked_actor_no: normalized_entry_at} if blocked_actor_no and normalized_entry_at else {},
             "action": self._json_mapping(action),
             "schedule_context": self._schedule_context(schedule_data),
             "origin_actor_no": str(owner_actor_no or "").strip(),
@@ -129,6 +131,7 @@ class UnreturnedReturnQueue:
         owner_actor_no: str,
         now: datetime | None = None,
         unreturned_entry_at: str = "",
+        unreturned_actor_no: str = "",
     ) -> tuple[dict[str, Any], bool]:
         """Store one handoff group so every related item pauses and retries together."""
 
@@ -139,6 +142,7 @@ class UnreturnedReturnQueue:
         completion_keys = [action_completion_key(action) for action in group_actions]
         source_target_date = str(schedule_data.get("target_date") or "").strip()
         normalized_entry_at = str(unreturned_entry_at or "").strip()
+        blocked_actor_no = str(unreturned_actor_no or "").strip()
         existing = next(
             (
                 record
@@ -150,9 +154,7 @@ class UnreturnedReturnQueue:
             None,
         )
         if existing is not None:
-            if normalized_entry_at and not existing.get("unreturned_entry_at"):
-                existing["unreturned_entry_at"] = normalized_entry_at
-                self._write_records()
+            self.remember_departure(str(existing["queue_id"]), blocked_actor_no, normalized_entry_at)
             return dict(existing), False
         queue_id = uuid4().hex
         record = {
@@ -163,6 +165,8 @@ class UnreturnedReturnQueue:
             "completed_statuses": {},
             "source_target_date": source_target_date,
             "unreturned_entry_at": normalized_entry_at,
+            "blocked_actor_no": blocked_actor_no,
+            "known_departures": {blocked_actor_no: normalized_entry_at} if blocked_actor_no and normalized_entry_at else {},
             "actions": group_actions,
             "schedule_context": self._schedule_context(schedule_data),
             "origin_actor_no": str(owner_actor_no or "").strip(),
@@ -176,6 +180,46 @@ class UnreturnedReturnQueue:
         self._records[queue_id] = record
         self._write_records()
         return dict(record), True
+
+    def remember_departure(self, queue_id: str, actor_no: str, entry_at: str) -> dict[str, Any] | None:
+        """Keep observed departures attached to the checked person across retries."""
+
+        record = self._records.get(str(queue_id or ""))
+        if record is None:
+            return None
+        actor_no = str(actor_no or "").strip()
+        entry_at = str(entry_at or "").strip()
+        if actor_no and entry_at:
+            departures = dict(record.get("known_departures", {}))
+            departures[actor_no] = entry_at
+            record["known_departures"] = departures
+            record["blocked_actor_no"] = actor_no
+        if entry_at and not record.get("unreturned_entry_at"):
+            record["unreturned_entry_at"] = entry_at
+        self._write_records()
+        return dict(record)
+
+    def forget_departure(self, queue_id: str, actor_no: str) -> None:
+        """Clear only the checked person's departure after a verified return check."""
+
+        record = self._records.get(str(queue_id or ""))
+        if record is None:
+            return
+        actor_no = str(actor_no or "").strip()
+        if "known_departures" not in record:
+            actions = self.record_actions(record)
+            if record.get("record_type") == "handoff_group":
+                actions = [action for action in actions if isinstance(action.get("fields"), Mapping)
+                           and action["fields"].get("出或入") == "值班"]
+            if record.get("bridge_history") or {str(action.get("target") or "") for action in actions} != {actor_no}:
+                return
+        departures = dict(record.get("known_departures", {}))
+        departures.pop(actor_no, None)
+        record["known_departures"] = departures
+        record["unreturned_entry_at"] = min(departures.values(), default="")
+        if str(record.get("blocked_actor_no") or "") == actor_no:
+            record["blocked_actor_no"] = next(iter(departures), "")
+        self._write_records()
 
     @staticmethod
     def record_actions(record: Mapping[str, Any]) -> list[dict[str, Any]]:

@@ -2322,12 +2322,20 @@ class AppController(QObject):
                 "source_target_date",
                 "origin_actor_no",
                 "last_owner_actor_no",
+                "blocked_actor_no",
+                "unreturned_entry_at",
                 "first_paused_at",
                 "last_attempt_at",
                 "next_retry_at",
                 "expires_at",
             )
         }
+        known_departures = record.get("known_departures", {})
+        snapshot["known_departures"] = (
+            {str(actor_no): str(entry_at) for actor_no, entry_at in known_departures.items()}
+            if isinstance(known_departures, Mapping)
+            else {}
+        )
         snapshot["retry_interval_minutes"] = int(record.get("retry_interval_minutes") or 0)
         if record.get("record_type") in {"handoff_group", "bridge_history"}:
             bridge_history = [
@@ -2337,6 +2345,7 @@ class AppController(QObject):
             ]
             latest_bridge = bridge_history[-1] if bridge_history else {}
             snapshot["handoff"] = {
+                "completion_confirmed": status == "resolved",
                 "original_handoff_time": str(outgoing.get("time") or ""),
                 "outgoing_person": operational_person_label(
                     str(outgoing.get("target") or outgoing.get("actor") or ""),
@@ -2349,7 +2358,7 @@ class AppController(QObject):
                 "actual_incoming_person": operational_person_label(
                     str(incoming.get("target") or "") if incoming else "",
                     staff or self._operational_staff,
-                ),
+                ) if status == "resolved" else "",
                 "bridge_at": str(latest_bridge.get("bridged_at") or ""),
                 "skipped_scheduled_people": "、".join(
                     operational_person_label(
@@ -2362,6 +2371,7 @@ class AppController(QObject):
                         str(actor_no or ""), staff or self._operational_staff
                     )
                     for actor_no in latest_bridge.get("incoming_actor_nos", [])
+                    if status == "resolved"
                 ),
             }
         self._send_operational_event(
@@ -2545,6 +2555,7 @@ class AppController(QObject):
                 result.status,
                 component_key,
                 trigger_type=request.trigger_type,
+                comparison=result.comparison,
             )
         elif not is_handoff_preflight and not queue_id:
             result_applied = self._duty_controller.handle_submission_request_result(

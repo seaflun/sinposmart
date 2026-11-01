@@ -368,9 +368,10 @@ class DutyEntryQueueWorker(QObject):
         *,
         preserve_incompatible_session: bool = False,
     ) -> None:
-        if (self._stop_requested.is_set() or self._has_compatible_session(request)
+        if (self._stop_requested.is_set()
                 or self._rejected_credentials_session == (request.session_generation, request.user_id)):
             return
+        compatible = self._has_compatible_session(request)
         session = self._browser_session
         if (
             preserve_incompatible_session
@@ -378,9 +379,15 @@ class DutyEntryQueueWorker(QObject):
             and (session.user_id != request.user_id or session.visible != request.visible)
         ):
             return
-        self._close_browser_session()
+        if not compatible:
+            self._close_browser_session()
         try:
-            self._browser_session = self._service.open_browser_session(request)
+            if compatible:
+                precheck = getattr(self._service, "precheck_browser_session", None)
+                if callable(precheck):
+                    precheck(request, session)
+            else:
+                self._browser_session = self._service.open_browser_session(request)
         except DutySubmissionExecutionError as exc:
             self._close_browser_session()
             if exc.error_code == "invalid_credentials":

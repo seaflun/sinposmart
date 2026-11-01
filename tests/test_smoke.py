@@ -6039,7 +6039,7 @@ try {
 
     def test_visible_table_accepts_search_button_with_date_range_fields(self) -> None:
         module = duty_rehearsal_module()
-        driver = mock.Mock(execute_script=mock.Mock(return_value=[]))
+        driver = mock.Mock(execute_script=mock.Mock(return_value={"rows": [], "noRecords": True}))
 
         with mock.patch.object(module, "open_ap"), mock.patch.object(
             module, "wait_for_any_form_control", return_value=True
@@ -6193,6 +6193,102 @@ try {
                     self.assertEqual(rows[200][5], "work-200")
                     self.assertEqual(rows[200][4], "")
 
+    def _entry_query_fixture(self, responses, *, end_time="23:59", dom=False):
+        module = duty_rehearsal_module()
+        driver = mock.Mock()
+        if dom:
+            node = shutil.which("node")
+            if node is None:
+                self.skipTest("Node is required for the entry row DOM contract")
+            harness = r'''
+const fixture=JSON.parse(process.argv[1]), script=JSON.parse(process.argv[2]);
+const parents={};
+const rows=fixture.rows.map(row=>({parentElement:parents[row.group||'main']||(parents[row.group||'main']={}),
+ querySelector:()=>null,children:row.cells.map(cell=>({innerText:typeof cell==='string'?cell:cell.text,
+ rowSpan:typeof cell==='string'?1:(cell.rowSpan||1)}))}));
+const document={readyState:'complete',body:{innerText:fixture.text||'QUY-000 : 查詢完成'},querySelectorAll:()=>rows};
+const result=Function('document','window',script)(document,{jQuery:{active:0}});
+process.stdout.write(JSON.stringify(result));
+'''
+            def execute(script, *_args):
+                result = subprocess.run([node, "-e", harness, json.dumps(responses), json.dumps(script)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            driver.execute_script.side_effect = execute
+        else:
+            driver.execute_script.side_effect = responses
+        class ImmediateWait:
+            def __init__(self, candidate, *_args, **_kwargs):
+                self.driver = candidate
+            def until(self, condition):
+                for _ in range(4):
+                    result = condition(self.driver)
+                    if result:
+                        return result
+                raise module.TimeoutException("entry fixture not ready")
+        with ExitStack() as stack:
+            for name, options in {
+                "open_ap": {}, "wait_for_any_form_control": {"return_value": True},
+                "suppress_window_open_for_background_query": {}, "js_set": {"return_value": True},
+                "js_click": {"return_value": True}, "arm_query_completion_tracking": {"return_value": 1.0},
+                "wait_for_query_completion": {}, "case_query_pages": {"return_value": []},
+                "WebDriverWait": {"side_effect": ImmediateWait},
+            }.items():
+                stack.enter_context(mock.patch.object(module, name, **options))
+            return module.query_visible_table(driver, module.ENTRY_LOG_AP, "1151101", end_time=end_time), driver
+
+    def test_entry_query_never_appends_a_foreign_return_outside_the_query_range(self):
+        departure = ["115/11/01 08:15", "新坡分隊", "16 測試員", "隊員", "出", "救護"]
+        for other in (["115/10/31 18:00", "新坡分隊", "02 他人", "隊員", "入", "返隊"],
+                      ["115/11/01 13:00", "新坡分隊", "03 他人", "隊員", "入", "返隊"],
+                      ["04 他人", "入", "返隊"]):
+            with self.subTest(other=other):
+                rows, _ = self._entry_query_fixture([[departure, other]], end_time="12:00")
+                self.assertEqual(rows, [departure])
+
+    def test_entry_query_only_merges_dom_proven_continuations_without_another_record(self):
+        fixture = {"rows": [
+            {"cells": [{"text": "115/11/01 08:15", "rowSpan": 3}, "新坡分隊", "16 測試員", "隊員", "出", "救護"]},
+            {"cells": ["同一筆備註", "同一案件"]},
+            {"cells": ["115/10/31 18:00", "新坡分隊", "02 他人", "隊員", "入", "返隊"]},
+            {"cells": [{"text": "115/11/01 10:00", "rowSpan": 2}, "新坡分隊", "03 另一人", "隊員", "出", "救災"]},
+            {"cells": ["04 他人", "入", "返隊"]},
+        ]}
+        rows, _ = self._entry_query_fixture(fixture, end_time="12:00", dom=True)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][-2:], ["同一筆備註", "同一案件"])
+        self.assertEqual(len(rows[1]), 6)
+        separate = {"rows": [fixture["rows"][0], {"group": "other-table", "cells": ["其他表格備註"]}]}
+        rows, _ = self._entry_query_fixture(separate, end_time="12:00", dom=True)
+        self.assertEqual(len(rows[0]), 6)
+
+    def test_entry_empty_result_requires_an_explicit_no_records_marker(self):
+        module = duty_rehearsal_module()
+        empty = {"rows": [], "readyState": "complete", "pendingQueries": 0, "noRecords": False}
+        with self.assertRaises(module.TimeoutException):
+            self._entry_query_fixture([empty] * 4)
+        with self.assertRaises(module.TimeoutException):
+            self._entry_query_fixture({"rows": [], "text": "QUY-000 : 查詢完成"}, dom=True)
+        rows, _ = self._entry_query_fixture([{**empty, "noRecords": True}])
+        self.assertEqual(rows, [])
+        rows, _ = self._entry_query_fixture({"rows": [], "text": "QUY-500 : 查無資料"}, dom=True)
+        self.assertEqual(rows, [])
+
+    def test_entry_transient_empty_grid_waits_for_the_actual_records(self):
+        empty = {"rows": [], "readyState": "complete", "pendingQueries": 0, "noRecords": False}
+        departure = ["115/11/01 08:15", "新坡分隊", "16 測試員", "隊員", "出", "救護"]
+        rows, driver = self._entry_query_fixture([empty, empty, {**empty, "rows": [departure]}])
+        self.assertEqual(rows, [departure])
+        self.assertEqual(driver.execute_script.call_count, 3)
+
+    def test_entry_no_records_marker_still_waits_for_document_and_ajax_completion(self):
+        empty = {"rows": [], "readyState": "complete", "pendingQueries": 0, "noRecords": True}
+        rows, driver = self._entry_query_fixture([{**empty, "readyState": "loading"},
+                                                 {**empty, "pendingQueries": 1}, empty])
+        self.assertEqual(rows, [])
+        self.assertEqual(driver.execute_script.call_count, 3)
+
     def test_duty_sheet_waits_for_fresh_rows_before_labelling_target_date(self) -> None:
         module = duty_rehearsal_module()
 
@@ -6303,6 +6399,7 @@ try {
         set_value.assert_any_call(mock.ANY, "_selETIMEH", "00")
         set_value.assert_any_call(mock.ANY, "_selETIMEM", "15")
         self.assertEqual([row[0] for row in rows], ["115/08/13 23:50", "115/08/14 00:15"])
+        self.assertEqual([len(row) for row in rows], [6, 6])
 
     def test_external_assignment_state_orders_rows_by_absolute_datetime(self) -> None:
         module = package_module("compare_rehearsal_records")
@@ -6996,7 +7093,7 @@ try {
             def execute_script(script: str) -> dict[str, float] | list[object]:
                 if "performance.timeOrigin" in script:
                     return {"timeOrigin": 100.0}
-                return []
+                return {"rows": [], "noRecords": True}
 
         with mock.patch.object(module, "open_ap"), \
              mock.patch.object(module, "wait_for_any_form_control", return_value=True), \
@@ -7021,7 +7118,7 @@ try {
             def execute_script(script: str) -> dict[str, float] | list[object]:
                 if "performance.timeOrigin" in script:
                     return {"timeOrigin": 100.0}
-                return []
+                return {"rows": [], "noRecords": True}
 
         def click(_driver, button_id: str) -> bool:
             clicked.append(button_id)

@@ -3937,6 +3937,7 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     "target_date": "1150807",
                     "actions": [action],
                     "_unreturned_return_queue_id": "queue-1",
+                    "today": {"staff": {"10": {"name": "測試10"}}},
                 },
                 trigger_type="recovery",
                 save=False,
@@ -4895,6 +4896,183 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 self.assertEqual(filled_fields[0]["工作時間"], original["fields"]["工作時間"])
                 self.assertEqual(filled_fields[0]["處理情形"], expected_status)
 
+    def test_return_check_queries_previous_day_and_extends_for_the_checked_person(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        service = DutySubmissionService(Path("fixture"), now_factory=lambda: datetime(2026, 11, 1, 10))
+        for kind, reason in (("handoff_preflight", "值班"), ("entry_log", "退勤"), ("entry_log", "休息後退勤")):
+            for trigger in ("due", "recovery"):
+                action = {"kind": kind, "target": "16", "time": "10:00", "fields": {"領用事由及地點": reason}}
+                request = DutySubmissionRequest("fixture", "fixture", 0, {"target_date": "1151101", "actions": [action]}, trigger_type=trigger)
+                window = service._query_range(request, action, "1151101")
+                self.assertIsNotNone(window)
+                self.assertEqual((window["start_roc_date"], window["start_time"], window["end_roc_date"], window["end_time"]),
+                                 ("1151031", "00:00", "1151101", "10:00"))
+                request.schedule_data["_unreturned_return_known_departures"] = {"16": "2026-10-28T23:50", "9": "2026-10-20T01:00"}
+                self.assertEqual(service._query_range(request, action, "1151101")["start_roc_date"], "1151028")
+
+    def test_cross_day_return_preflight_keeps_yesterday_departure_open_until_return(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        departure = ["115/10/31 23:50", "新坡分隊", "測試16", "隊員", "出", "案件類別：火災 案發地點：測試路1號"]
+        returned = ["115/11/01 09:58", "新坡分隊", "測試16", "隊員", "入", "返隊"]
+        for rows, expected in (([departure], "paused_external"), ([departure, returned], "handoff_preflight_ready")):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                fill = Mock()
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                    login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=lambda *_a, **_kw: rows,
+                    fill_entry_log_form_for_test=fill, fill_work_log_form_for_test=fill)
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation, now_factory=lambda: datetime(2026, 11, 1, 10))
+                action = {"kind": "handoff_preflight", "time": "10:00", "target": "16", "source": "值班交接",
+                          "fields": {"出或入": "值班", "領用事由及地點": "值班"}}
+                data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}}, "actions": [action]}
+                result = service.execute(DutySubmissionRequest("fixture", "fixture", 0, data))
+                self.assertEqual(result.status, expected)
+                if expected == "handoff_preflight_ready":
+                    self.assertNotIn("已返隊", result.message)
+                fill.assert_not_called()
+
+    def test_known_departure_survives_missing_rows_and_same_minute_unrelated_return(self):
+        from datetime import datetime
+        from compare_rehearsal_records import find_open_external_assignment, flatten_rows
+        known = datetime(2026, 11, 1, 8, 15)
+        staff, action = {"16": {"name": "測試16"}}, {"target": "16", "time": "10:00"}
+        reason = "案件類別：火災 案發地點：測試路1號 梯次：2"
+        departure = ["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "出", reason]
+        for rows, expected in (
+            ([], "2026-11-01T08:15"),
+            ([["115/11/01 09:00", "新坡分隊", "另一人", "隊員", "入", "返隊"]], "2026-11-01T08:15"),
+            ([["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "入", "返隊"]], "2026-11-01T08:15"),
+            ([["115/11/01 08:16", "新坡分隊", "測試16", "隊員", "入", "返隊"]], None),
+            ([departure, ["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "入", reason]], "2026-11-01T08:15"),
+            ([departure, ["115/11/01 08:10", "新坡分隊", "測試16", "隊員", "入", reason]], "2026-11-01T08:15"),
+        ):
+            with self.subTest(expected=expected, rows=rows):
+                result = find_open_external_assignment(flatten_rows(rows, "1151101"), "1151101", staff, action,
+                    current_at=datetime(2026, 11, 1, 10), known_open_at=known)
+                self.assertEqual(result, expected)
+
+    def test_timestamp_known_departure_cannot_be_cleared_by_another_same_minute_case_pair(self):
+        from datetime import datetime
+        from compare_rehearsal_records import find_open_external_assignment, flatten_rows
+        staff, action = {"16": {"name": "測試16"}}, {"target": "16", "time": "10:00"}
+        reason_a = "案件類別：火災 案發地點：測試甲路1號 梯次：2"
+        reason_b = "案件類別：火災 案發地點：測試乙路2號 梯次：3"
+        departure_a = ["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "出", reason_a]
+        departure_b = ["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "出", reason_b]
+        return_b = ["115/11/01 08:15", "新坡分隊", "測試16", "隊員", "入", reason_b]
+        now = datetime(2026, 11, 1, 10)
+        first = find_open_external_assignment(flatten_rows([departure_a, departure_b, return_b], "1151101"),
+                                             "1151101", staff, action, current_at=now)
+        self.assertEqual(first, "2026-11-01T08:15")
+        known = datetime.fromisoformat(first)
+        second = find_open_external_assignment(flatten_rows([departure_b, return_b], "1151101"),
+            "1151101", staff, action, current_at=now, known_open_at=known)
+        self.assertEqual(second, first, "timestamp-only evidence cannot identify the missing original case")
+        later_return = ["115/11/01 08:16", "新坡分隊", "測試16", "隊員", "入", "返隊"]
+        self.assertIsNone(find_open_external_assignment(flatten_rows([departure_b, return_b, later_return], "1151101"),
+            "1151101", staff, action, current_at=now, known_open_at=known))
+        for returned_at in ("08:15", "08:10"):
+            incoming = [f"115/11/01 {returned_at}", "新坡分隊", "測試16", "隊員", "入", reason_b]
+            self.assertIsNone(find_open_external_assignment(flatten_rows([departure_b, incoming], "1151101"),
+                "1151101", staff, action, current_at=now))
+
+    def test_known_preflight_cannot_clear_from_empty_or_other_person_rows(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        for rows in ([], [["115/11/01 09:00", "新坡分隊", "另一人", "隊員", "入", "返隊"]]):
+            with tempfile.TemporaryDirectory() as directory:
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                    login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=lambda *_a, **_kw: rows)
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation, now_factory=lambda: datetime(2026, 11, 1, 10))
+                data = {"target_date": "1151101", "today": {"staff": {"16": {"name": "測試16"}}},
+                        "_unreturned_return_known_departures": {"16": "2026-11-01T08:15"},
+                        "actions": [{"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}]}
+                result = service.execute(DutySubmissionRequest("fixture", "fixture", 0, data, trigger_type="recovery"))
+                self.assertEqual(result.status, "paused_external")
+                self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+
+    def test_handoff_prewarm_queries_previous_day_but_due_rechecks_and_keeps_observed_departure(self):
+        from datetime import datetime
+        from dataclasses import replace
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        with tempfile.TemporaryDirectory() as directory:
+            current = [datetime(2026, 11, 1, 9, 59)]
+            query = Mock(side_effect=[[["115/10/31 23:50", "新坡分隊", "測試16", "隊員", "出", "火災外勤"]], [], []])
+            fill = Mock()
+            automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=query,
+                fill_entry_log_form_for_test=fill, fill_work_log_form_for_test=fill)
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation, now_factory=lambda: current[0])
+            outgoing = {"kind": "entry_log", "target": "9", "time": "10:00", "source": "值班交接",
+                        "fields": {"出或入": "值退", "領用事由及地點": "退勤"}}
+            request = DutySubmissionRequest("fixture", "fixture", 0, {"target_date": "1151101", "actions": [outgoing],
+                "today": {"staff": {"9": {"name": "測試9"}, "16": {"name": "測試16"}, "6": {"name": "測試6"}}},
+                "_handoff_entry_prewarm": True, "_handoff_entry_prewarm_targets": ["16"]})
+            session = service.open_browser_session(request)
+            self.assertEqual(query.call_count, 1)
+            self.assertEqual(query.call_args.kwargs["start_roc_date"], "1151031")
+            self.assertEqual(session.known_open_departures, {"16": "2026-10-31T23:50"})
+            current[0] = datetime(2026, 11, 1, 10)
+            data = {key: value for key, value in request.schedule_data.items() if not key.startswith("_handoff_entry_prewarm")}
+            preflight = {"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}
+            data["actions"] = [preflight]
+            result = service.execute_with_browser_session(replace(request, schedule_data=data), session)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(query.call_count, 2)
+            data["actions"] = [{**preflight, "target": "6"}]
+            bridge = service.execute_with_browser_session(replace(request, schedule_data=data), session)
+            self.assertEqual(bridge.status, "handoff_preflight_ready")
+            self.assertEqual(query.call_count, 3)
+            fill.assert_not_called()
+
+    def test_handoff_prewarm_keeps_the_real_incoming_personnel_date(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        query = Mock(return_value=[["115/10/31 23:50", "新坡分隊", "新16", "隊員", "出", "火災外勤"]])
+        automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+            login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=query)
+        service = DutySubmissionService(Path("fixture"), module_loader=lambda: automation,
+                                       now_factory=lambda: datetime(2026, 11, 1, 7, 59))
+        outgoing = {"kind": "entry_log", "target": "9", "time": "08:00", "source": "值班交接",
+                    "staff_roc_date": "1151031", "submit_target_date": "1151101", "fields": {"出或入": "值退"}}
+        incoming = {"kind": "entry_log", "target": "16", "time": "08:00", "source": "值班交接",
+                    "staff_roc_date": "1151101", "submit_target_date": "1151101", "fields": {"出或入": "值班"}}
+        data = {"target_date": "1151031", "actions": [outgoing, incoming],
+                "today": {"roc_date": "1151031", "staff_complete": True, "staff": {"9": {"name": "原9"}, "16": {"name": "舊16"}}},
+                "tomorrow": {"roc_date": "1151101", "staff_complete": True, "staff": {"16": {"name": "新16"}}},
+                "_handoff_entry_prewarm": True, "_handoff_entry_prewarm_targets": ["16"],
+                "_handoff_entry_prewarm_actions": [incoming]}
+        session = service.open_browser_session(DutySubmissionRequest("fixture", "fixture", 0, data))
+        self.assertEqual(session.known_open_departures, {"16": "2026-10-31T23:50"})
+        self.assertEqual(query.call_args.args[2], "1151101")
+
+    def test_missing_return_personnel_never_becomes_ready_and_keeps_known_departure(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService, DutySubmissionExecutionError
+        for prewarm in (False, True):
+            with self.subTest(prewarm=prewarm), tempfile.TemporaryDirectory() as directory:
+                query = Mock(return_value=[["115/11/01 08:15", "新坡分隊", "實際16", "隊員", "出", "火災外勤"]])
+                fill = Mock()
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=lambda **_kw: object(),
+                    login=lambda *_a: None, quit_driver=lambda *_a: None, query_visible_table=query,
+                    fill_entry_log_form_for_test=fill, fill_work_log_form_for_test=fill)
+                service = DutySubmissionService(Path(directory), module_loader=lambda: automation, now_factory=lambda: datetime(2026, 11, 1, 10))
+                data = {"target_date": "1151101", "today": {"staff": {}},
+                        "actions": [{"kind": "handoff_preflight", "target": "16", "time": "10:00", "fields": {"出或入": "值班"}}]}
+                if prewarm:
+                    data.update(_handoff_entry_prewarm=True, _handoff_entry_prewarm_targets=["16"])
+                request = DutySubmissionRequest("fixture", "fixture", 0, data)
+                with self.assertRaises(DutySubmissionExecutionError) as caught:
+                    (service.open_browser_session if prewarm else service.execute)(request)
+                self.assertEqual(caught.exception.error_code, "unreturned_evidence_invalid")
+                fill.assert_not_called()
+                if not prewarm:
+                    data["_unreturned_return_known_departures"] = {"16": "2026-11-01T08:15"}
+                    result = service.execute(request)
+                    self.assertEqual(result.status, "paused_external")
+                    self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+
     def test_due_off_duty_action_pauses_when_external_assignment_is_open(self) -> None:
         from datetime import datetime
 
@@ -5496,6 +5674,26 @@ class DutySubmissionServiceTests(unittest.TestCase):
                 [item["queue_id"] for item in restarted.expire_due(now=datetime(2026, 7, 30, 2, 0))],
                 [record["queue_id"]],
             )
+
+    def test_handoff_queue_keeps_departures_by_checked_person_after_restart(self):
+        from datetime import datetime
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        with tempfile.TemporaryDirectory() as directory:
+            actions = [
+                {"kind": "entry_log", "time": "10:00", "actor": "9", "target": target,
+                 "source": "值班交接", "fields": {"出或入": outin}}
+                for target, outin in (("9", "值退"), ("16", "值班"))
+            ]
+            queue = UnreturnedReturnQueue(Path(directory))
+            record, _ = queue.pause_group(actions, {"target_date": "1151101"}, owner_actor_no="9",
+                unreturned_actor_no="16", unreturned_entry_at="2026-11-01T08:15")
+            self.assertEqual(record["known_departures"], {"16": "2026-11-01T08:15"})
+            self.assertEqual(record["blocked_actor_no"], "16")
+            queue.remember_departure(record["queue_id"], "17", "2026-10-30T23:50")
+            reopened = UnreturnedReturnQueue(Path(directory)).get(record["queue_id"])
+            self.assertEqual(reopened["known_departures"], {"16": "2026-11-01T08:15", "17": "2026-10-30T23:50"})
+            from qt_app.controllers.duty_controller import DutyController
+            self.assertEqual(datetime.fromisoformat(DutyController._unreturned_query_start_at(reopened)), datetime(2026, 10, 30, 23, 50))
 
     def test_handoff_group_queue_resolves_only_after_every_component_succeeds(self) -> None:
         from app_core.unreturned_return_queue import UnreturnedReturnQueue
@@ -19261,6 +19459,45 @@ if return_code != 0 or loaded:
             release_first_entry.set()
             controller.shutdown()
 
+    def test_compatible_entry_worker_runs_real_service_prewarm_without_relogging(self):
+        from datetime import datetime
+        from dataclasses import replace
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+        with tempfile.TemporaryDirectory() as directory:
+            current = [datetime(2026, 11, 1, 9, 58)]
+            query = Mock(side_effect=[[["115/10/31 23:50", "新坡分隊", "測試16", "隊員", "出", "火災外勤"]], []])
+            build, login, fill = Mock(return_value=object()), Mock(), Mock()
+            automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work", build_driver=build,
+                login=login, quit_driver=Mock(), query_visible_table=query,
+                fill_entry_log_form_for_test=fill, fill_work_log_form_for_test=fill)
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation, now_factory=lambda: current[0])
+            worker = DutyEntryQueueWorker(service, now_factory=lambda: current[0])
+            outgoing = {"kind": "entry_log", "target": "9", "time": "10:00", "source": "值班交接", "fields": {"出或入": "值退"}}
+            incoming = {"kind": "entry_log", "target": "16", "time": "10:00", "source": "值班交接", "fields": {"出或入": "值班"}}
+            data = {"target_date": "1151101", "actions": [outgoing, incoming],
+                    "today": {"staff": {"9": {"name": "測試9"}, "16": {"name": "測試16"}}}}
+            request = DutySubmissionRequest("fixture", "fixture", 0, data)
+            try:
+                worker._prewarm_browser_session(request)
+                self.assertEqual(query.call_count, 0)
+                current[0] = datetime(2026, 11, 1, 9, 59)
+                warmed = replace(request, schedule_data={**data, "_handoff_entry_prewarm": True,
+                    "_handoff_entry_prewarm_targets": ["16"], "_handoff_entry_prewarm_actions": [incoming]})
+                worker._prewarm_browser_session(warmed)
+                self.assertEqual(query.call_count, 1)
+                self.assertEqual(worker._browser_session.known_open_departures, {"16": "2026-10-31T23:50"})
+                current[0] = datetime(2026, 11, 1, 10)
+                preflight = {**incoming, "kind": "handoff_preflight"}
+                result = worker._execute(1, replace(request, schedule_data={**data, "actions": [preflight]}))
+                self.assertEqual(result.status, "paused_external")
+                self.assertEqual(query.call_count, 2)
+                build.assert_called_once()
+                login.assert_called_once()
+                fill.assert_not_called()
+            finally:
+                worker._close_browser_session()
+
     def test_prewarm_credentials_rejection_reports_once_and_blocks_the_rejected_session(self) -> None:
         from dataclasses import replace
         from PySide6.QtTest import QSignalSpy
@@ -19665,10 +19902,12 @@ if return_code != 0 or loaded:
             self.assertIsNotNone(request)
             self.assertEqual(request.action_index, 0)
             self.assertEqual(request.schedule_data["actions"][0]["kind"], "entry_log")
+            self.assertIs(request.schedule_data.get("_handoff_entry_prewarm"), True)
             work_request = controller.handoff_work_prewarm_request("user10", "secret", 2)
             self.assertIsNotNone(work_request)
             self.assertEqual(work_request.action_index, 2)
             self.assertEqual(work_request.schedule_data["actions"][2]["kind"], "work_log")
+            self.assertNotIn("_handoff_entry_prewarm", work_request.schedule_data)
         finally:
             controller.shutdown()
 
@@ -24752,7 +24991,7 @@ if return_code != 0 or loaded:
             self.assertEqual(queued_action["submit_target_date"], "1150807")
             self.assertEqual(
                 request.schedule_data["_unreturned_return_query_start_at"],
-                "2026-08-06T23:50",
+                "2026-08-06T23:50:00",
             )
             self.assertTrue(
                 controller.handle_external_return_queue_result(
@@ -25655,6 +25894,174 @@ if return_code != 0 or loaded:
         actual_actions = [request.schedule_data["actions"][request.action_index] for request in actual_requests]
         self.assertEqual(actual_actions[1]["target"], "9")
         self.assertTrue(all(action["submit_target_date"] == "1150808" for action in actual_actions))
+
+    def test_handoff_pause_tracks_incoming_departure_and_recovery_remembers_it(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_session_context(1, "fixture")
+            controller.set_actor_no("9")
+            actions = [{"kind": "entry_log", "time": "10:00", "actor": "9", "target": target,
+                        "source": "值班交接", "fields": {"出或入": outin}}
+                       for target, outin in (("9", "值退"), ("16", "值班"))]
+            controller.replace_schedule_data({"target_date": "1151101", "actions": actions,
+                                             "today": {"staff": {"9": {}, "16": {}}}})
+            request = controller._handoff_preflight_requests("fixture", "fixture", actions,
+                group_id="fixture-group", group_indices=(0, 1), trigger_type="due", submit_at=datetime(2026, 11, 1, 10))[0]
+            controller.handle_handoff_preflight_paused(request, {"unreturned_entry_at": "2026-11-01T08:15"})
+            record = queue.active_records()[0]
+            self.assertEqual(record["blocked_actor_no"], "16")
+            self.assertEqual(record["known_departures"], {"16": "2026-11-01T08:15"})
+            recovery = controller.recovery_submission_requests("fixture", "fixture", record,
+                submit_at=datetime(2026, 11, 1, 10, 5))[0]
+            self.assertEqual(recovery.schedule_data["_unreturned_return_known_departures"], {"16": "2026-11-01T08:15"})
+            controller.handle_handoff_preflight_paused(recovery, {"unreturned_entry_at": "2026-11-01T09:15"})
+            self.assertEqual(queue.get(record["queue_id"])["known_departures"], {"16": "2026-11-01T09:15"})
+
+    def test_single_return_recovery_pause_persists_the_new_departure(self):
+        from app_core.duty_task_projection import action_completion_key
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            action = {"kind": "entry_log", "time": "10:00", "target": "16",
+                      "fields": {"出或入": "出", "領用事由及地點": "退勤"}}
+            record, _ = queue.pause(action, {"target_date": "1151101"}, owner_actor_no="9")
+            controller = DutyController(unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_actor_no("9")
+            controller.handle_external_return_queue_result(record["queue_id"], action, "paused_external",
+                action_completion_key(action), comparison={"unreturned_entry_at": "2026-11-01T08:15"})
+            reopened = UnreturnedReturnQueue(Path(directory)).get(record["queue_id"])
+            self.assertEqual(reopened["known_departures"], {"16": "2026-11-01T08:15"})
+            self.assertEqual(reopened["blocked_actor_no"], "16")
+
+    def test_known_departure_scope_never_moves_a_legacy_time_to_another_incoming_person(self):
+        from qt_app.controllers.duty_controller import DutyController
+        outgoing = {"kind": "entry_log", "target": "9", "fields": {"出或入": "值退"}}
+        incoming = {"kind": "entry_log", "target": "16", "fields": {"出或入": "值班"}}
+        base = {"record_type": "handoff_group", "actions": [outgoing, incoming], "unreturned_entry_at": "2026-11-01T08:15"}
+        self.assertEqual(DutyController._unreturned_known_departures(base, incoming), {"16": "2026-11-01T08:15"})
+        self.assertEqual(DutyController._unreturned_known_departures(base, outgoing), {})
+        multiple = {**base, "actions": [outgoing, incoming, {**incoming, "target": "17"}]}
+        self.assertEqual(DutyController._unreturned_known_departures(multiple, incoming), {})
+        bridged = {**base, "actions": [outgoing, {**incoming, "target": "6"}], "bridge_history": [{"incoming_actor_nos": ["6"]}]}
+        self.assertEqual(DutyController._unreturned_known_departures(bridged, {**incoming, "target": "6"}), {})
+        explicit = {**bridged, "known_departures": {"16": "2026-11-01T08:15", "6": "2026-11-01T09:15"}}
+        self.assertEqual(DutyController._unreturned_known_departures(explicit, {**incoming, "target": "6"}), {"6": "2026-11-01T09:15"})
+
+    def test_handoff_ready_for_one_person_forgets_only_that_known_departure(self):
+        from datetime import datetime
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            actions = [{"kind": "entry_log", "time": "10:00", "actor": "9", "target": target,
+                        "source": "值班交接", "fields": {"出或入": outin}}
+                       for target, outin in (("9", "值退"), ("16", "值班"), ("17", "值班"))]
+            data = {"target_date": "1151101", "actions": actions, "today": {"staff": {"9": {}, "16": {}, "17": {}}}}
+            record, _ = queue.pause_group(actions, data, owner_actor_no="9", unreturned_actor_no="16",
+                                           unreturned_entry_at="2026-11-01T08:15")
+            queue.remember_departure(record["queue_id"], "17", "2026-11-01T08:20")
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_session_context(1, "fixture")
+            controller.set_actor_no("9")
+            controller.replace_schedule_data(data)
+            requests = controller.recovery_submission_requests("fixture", "fixture", queue.get(record["queue_id"]),
+                submit_at=datetime(2026, 11, 1, 10, 5))
+            by_target = {request.schedule_data["actions"][request.action_index]["target"]: request for request in requests}
+            controller.handle_handoff_preflight_ready(by_target["16"])
+            self.assertEqual(queue.get(record["queue_id"])["known_departures"], {"17": "2026-11-01T08:20"})
+            controller.handle_handoff_preflight_paused(by_target["17"], {"unreturned_entry_at": "2026-11-01T08:20"})
+            reopened = UnreturnedReturnQueue(Path(directory)).get(record["queue_id"])
+            self.assertEqual(reopened["known_departures"], {"17": "2026-11-01T08:20"})
+            retried = controller.recovery_submission_requests("fixture", "fixture", reopened,
+                submit_at=datetime(2026, 11, 1, 10, 10))
+            scoped = {request.schedule_data["actions"][request.action_index]["target"]:
+                      request.schedule_data["_unreturned_return_known_departures"] for request in retried}
+            self.assertEqual(scoped, {"16": {}, "17": {"17": "2026-11-01T08:20"}})
+
+            queue.remember_departure(record["queue_id"], "16", "2026-11-01T08:15")
+            requests = controller.recovery_submission_requests("fixture", "fixture", queue.get(record["queue_id"]),
+                submit_at=datetime(2026, 11, 1, 10, 15))
+            by_target = {request.schedule_data["actions"][request.action_index]["target"]: request for request in requests}
+            controller.handle_handoff_preflight_paused(by_target["17"], {"unreturned_entry_at": "2026-11-01T08:20"})
+            self.assertFalse(controller.handle_handoff_preflight_ready(by_target["16"]))
+            reopened = UnreturnedReturnQueue(Path(directory)).get(record["queue_id"])
+            self.assertEqual(reopened["known_departures"], {"17": "2026-11-01T08:20"})
+
+    def test_legacy_departure_can_only_be_forgotten_for_its_unique_person(self):
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            actions = [{"kind": "entry_log", "time": "10:00", "actor": "9", "target": target,
+                        "source": "值班交接", "fields": {"出或入": outin}}
+                       for target, outin in (("9", "值退"), ("16", "值班"))]
+            record, _ = queue.pause_group(actions, {"target_date": "1151101", "actions": actions},
+                owner_actor_no="9", unreturned_actor_no="16", unreturned_entry_at="2026-11-01T08:15")
+            records = json.loads(queue.path.read_text(encoding="utf-8"))
+            records[0].pop("known_departures")
+            queue.path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+            queue = UnreturnedReturnQueue(Path(directory))
+            queue.forget_departure(record["queue_id"], "6")
+            self.assertEqual(queue.get(record["queue_id"])["unreturned_entry_at"], "2026-11-01T08:15")
+            self.assertNotIn("known_departures", queue.get(record["queue_id"]))
+            queue.forget_departure(record["queue_id"], "16")
+            self.assertEqual(queue.get(record["queue_id"])["unreturned_entry_at"], "")
+            self.assertEqual(queue.get(record["queue_id"])["known_departures"], {})
+
+    def test_empty_new_known_map_never_falls_back_to_legacy_departure(self):
+        from qt_app.controllers.duty_controller import DutyController
+        action = {"kind": "entry_log", "target": "16", "fields": {"出或入": "值班"}}
+        for record in ({"action": action}, {"record_type": "handoff_group", "actions": [action]}):
+            legacy = {**record, "unreturned_entry_at": "2026-11-01T08:15"}
+            self.assertEqual(DutyController._unreturned_known_departures(legacy, action), {"16": "2026-11-01T08:15"})
+            for departures in ({}, {"17": "2026-11-01T08:20"}):
+                self.assertEqual(DutyController._unreturned_known_departures({**legacy, "known_departures": departures}, action), {})
+            from app_core.duty_submission_service import DutySubmissionService, DutySubmissionRequest, DutySubmissionExecutionError
+            from datetime import datetime
+            with tempfile.TemporaryDirectory() as directory:
+                service = DutySubmissionService(Path(directory), now_factory=lambda: datetime(2026, 11, 1, 10))
+                for invalid in (None, [], "invalid", {"16": None}, {"16": ""}, {"16": 0}, {"16": "invalid"}):
+                    known = DutyController._unreturned_known_departures({**legacy, "known_departures": invalid}, action)
+                    request = DutySubmissionRequest("user", "secret", 0, {
+                        "target_date": "1151101", "actions": [action], "_unreturned_return_known_departures": known,
+                    })
+                    with self.assertRaises(DutySubmissionExecutionError) as caught:
+                        service._known_open_at(request, action)
+                    self.assertEqual(caught.exception.error_code, "unreturned_evidence_invalid")
+
+    def test_unreturned_event_pending_does_not_claim_actual_handoff_completion(self):
+        from qt_app.controllers.app_controller import AppController
+        class FakeController:
+            _operational_staff = {}
+            def __init__(self):
+                self.events = []
+            def _send_operational_event(self, kind, **fields):
+                self.events.append((kind, fields))
+        record = {"record_type": "handoff_group", "blocked_actor_no": "16", "unreturned_entry_at": "2026-11-01T08:15",
+                  "known_departures": {"16": "2026-11-01T08:15"}, "actions": [
+                      {"kind": "entry_log", "time": "10:00", "target": "9", "fields": {"出或入": "值退"}},
+                      {"kind": "entry_log", "time": "10:00", "target": "16", "fields": {"出或入": "值班"}}],
+                  "bridge_history": [{"incoming_actor_nos": ["16"]}],
+                  "schedule_context": {"today": {"staff": {"9": {"name": "測試9"}, "16": {"name": "測試16"}}}}}
+        for status in ("pending", "retrying", "resolved"):
+            controller = FakeController()
+            AppController._publish_unreturned_return_event(controller, {"status": status, "record": record})
+            snapshot = controller.events[0][1]["snapshot"]
+            self.assertEqual(snapshot["blocked_actor_no"], "16")
+            self.assertEqual(snapshot["known_departures"], record["known_departures"])
+            handoff = snapshot["handoff"]
+            self.assertEqual(handoff["completion_confirmed"], status == "resolved")
+            self.assertEqual(bool(handoff["actual_incoming_person"]), status == "resolved")
+            self.assertEqual(bool(handoff["actual_incoming_people"]), status == "resolved")
 
     def test_handoff_preflight_defers_early_checkout_until_group_is_queued(self) -> None:
         from datetime import datetime as RealDateTime

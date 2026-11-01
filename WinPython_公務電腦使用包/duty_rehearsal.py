@@ -2329,26 +2329,67 @@ def query_visible_table(
             )
             return [row for row in raw_rows if len(row) >= 8 and row_in_query_range(row)]
 
-        raw_rows = driver.execute_script(
-            """
-            return Array.from(document.querySelectorAll('tr')).map(tr =>
-              Array.from(tr.children).map(td => (td.innerText || td.value || '').trim()).filter(Boolean)
-            ).filter(row => row.length);
-            """
-        )
+        def entry_page_ready(current_driver):
+            snapshot = current_driver.execute_script(
+                r"""
+                const nodes = Array.from(document.querySelectorAll('tr')).filter(tr => !tr.querySelector('table'));
+                const datePattern = /\d{3}\/?\d{2}\/?\d{2}\s+\d{1,2}:\d{2}/;
+                let anchor = null, remaining = 0, parent = null;
+                const rows = nodes.map((tr, index) => {
+                  const children = Array.from(tr.children);
+                  const cells = children.map(td => (td.innerText || td.value || '').trim()).filter(Boolean);
+                  let continuation_of = null;
+                  if (datePattern.test(cells[0] || '')) {
+                    anchor = index;
+                    remaining = Math.min(100, Math.max(1, ...children.map(td => Number(td.rowSpan) || 1)) - 1);
+                    parent = tr.parentElement;
+                  } else {
+                    const recordSignal = cells.some(text => datePattern.test(text) ||
+                      /^(?:出|入|值班|值退|返隊)(?:\s|[／/|：:]|$)/.test(text) || /^\d{1,3}(?:番|\s+)[^\d]/.test(text));
+                    if (remaining > 0 && tr.parentElement === parent && !recordSignal) {
+                      continuation_of = anchor;
+                      remaining -= 1;
+                    } else { anchor = null; remaining = 0; parent = null; }
+                  }
+                  return {cells, continuation_of};
+                });
+                return {rows, readyState: document.readyState, pendingQueries: Number(window.jQuery?.active || 0),
+                  noRecords: /QUY-500\s*[:：]\s*查無資料/.test(document.body?.innerText || '')};
+                """
+            )
+            # Older callers' synthetic row lists carry no DOM continuation proof.
+            snapshot = {"rows": snapshot} if isinstance(snapshot, list) else snapshot
+            if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list)
+                    or snapshot.get("readyState", "complete") != "complete" or snapshot.get("pendingQueries", 0)):
+                return False
+            raw = snapshot["rows"]
+            dated = any(isinstance(cells := item.get("cells") if isinstance(item, dict) else item, list)
+                        and len(cells) >= 6 and _row_query_datetime(str(cells[0])) is not None for item in raw)
+            no_records = snapshot.get("noRecords") is True
+            if dated == no_records:
+                return False  # Neither an unready empty grid nor contradictory QUY-500 proves a result.
+            return {"rows": raw}
+
+        try:
+            raw_rows = WebDriverWait(driver, 8, poll_frequency=0.25).until(entry_page_ready)["rows"]
+        except TimeoutException as error:
+            raise TimeoutException("出入查詢資料列尚未就緒，且沒有明確查無資料結果，已停止比對。") from error
         page_rows: list[list[str]] = []
-        index = 0
-        while index < len(raw_rows):
-            row = raw_rows[index]
+        anchor = None
+        for index, item in enumerate(raw_rows):
+            row = item.get("cells", []) if isinstance(item, dict) else item
+            if not isinstance(row, list):
+                anchor = None
+                continue
             if len(row) >= 6 and row_in_query_range(row):
-                combined = list(row)
-                if index + 1 < len(raw_rows):
-                    next_row = raw_rows[index + 1]
-                    if next_row and not row_in_query_range(next_row):
-                        combined.extend(next_row)
-                        index += 1
-                page_rows.append(combined)
-            index += 1
+                page_rows.append(list(row))
+                anchor = index
+            elif (isinstance(item, dict) and type(item.get("continuation_of")) is int
+                    and item["continuation_of"] == anchor and page_rows
+                    and not any(_row_query_datetime(str(value)) is not None for value in row)):
+                page_rows[-1].extend(row)
+            else:
+                anchor = None
         return page_rows
 
     rows = capture_visible_page()

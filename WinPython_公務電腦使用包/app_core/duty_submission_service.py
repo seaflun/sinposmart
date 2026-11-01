@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 from inspect import signature
@@ -93,6 +93,7 @@ class DutySubmissionBrowserSession:
     user_id: str
     visible: bool
     last_activity_at: datetime
+    known_open_departures: dict[str, str] = field(default_factory=dict)
 
 
 def load_automation_module() -> ModuleType:
@@ -184,6 +185,17 @@ class DutySubmissionService:
         data = request.schedule_data
         actions = [dict(item) for item in data["actions"]]
         action = dict(actions[request.action_index])
+        session_departures = getattr(browser_session, "known_open_departures", {})
+        if self._checks_open_assignment(action, request) and isinstance(session_departures, dict):
+            target = str(action.get("target", ""))
+            observed = session_departures.get(target)
+            if observed:
+                known = dict(data.get("_unreturned_return_known_departures") or {})
+                stored = known.get(target)
+                if not stored or (isinstance(stored, str) and observed > stored):
+                    known[target] = observed
+                request = replace(request, schedule_data={**data, "_unreturned_return_known_departures": known})
+                data = request.schedule_data
         base_target_date = str(data["target_date"])
         action_date = action_target_roc_date(action, base_target_date)
         result_path = self._create_result_path(request, action)
@@ -256,6 +268,12 @@ class DutySubmissionService:
                 query_range=query_range,
                 time_order_warnings=time_order_warnings,
             )
+            if self._checks_open_assignment(action, request) and isinstance(session_departures, dict):
+                target = str(action.get("target", ""))
+                if pause_details is None:
+                    session_departures.pop(target, None)
+                elif pause_details.get("unreturned_entry_at"):
+                    session_departures[target] = pause_details["unreturned_entry_at"]
             if status_callback:
                 for warning in time_order_warnings:
                     status_callback(warning)
@@ -271,7 +289,7 @@ class DutySubmissionService:
                     action,
                     result_path,
                     "paused_external",
-                    "人員尚未返隊，已暫停退勤登打。",
+                    "尚未取得明確返隊確認，已暫停自動登打。",
                     pause_comparison,
                     time_order_warnings=time_order_warnings,
                 )
@@ -281,8 +299,8 @@ class DutySubmissionService:
                     action,
                     result_path,
                     "handoff_preflight_ready",
-                    "接班人員已返隊，可登打值退、值班與交接工作。",
-                    {"compare": "接班人員已返隊", "group": "ready", "matched": []},
+                    "返隊檢查通過，可登打值退、值班與交接工作。",
+                    {"compare": "返隊檢查通過", "group": "ready", "matched": []},
                     time_order_warnings=time_order_warnings,
                 )
             comparison = self._comparison_for_action(
@@ -580,14 +598,17 @@ class DutySubmissionService:
             else:
                 driver = automation.build_driver(headless=not request.visible)
                 initialize_browser(driver)
-            opened = True
-            return DutySubmissionBrowserSession(
+            session = DutySubmissionBrowserSession(
                 automation=automation,
                 driver=driver,
                 user_id=request.user_id,
                 visible=request.visible,
                 last_activity_at=self.now_factory(),
             )
+            if request.schedule_data.get("_handoff_entry_prewarm") is True:
+                self.precheck_browser_session(request, session, status_callback=status_callback)
+            opened = True
+            return session
         except DutySubmissionValidationError:
             raise
         except DutySubmissionExecutionError:
@@ -612,6 +633,78 @@ class DutySubmissionService:
             session.automation.quit_driver(session.driver)
         except Exception:
             pass
+
+    def precheck_browser_session(
+        self,
+        request: DutySubmissionRequest,
+        session: DutySubmissionBrowserSession,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Refresh handoff evidence in an existing browser without logging in or saving."""
+        request = self.validate(request)
+        if request.user_id != session.user_id or request.visible != session.visible:
+            raise DutySubmissionValidationError("交接預查瀏覽器登入身分與任務不一致。")
+        if request.schedule_data.get("_handoff_entry_prewarm") is True:
+            self._prewarm_return_check(request, session, status_callback=status_callback)
+
+    def _prewarm_return_check(
+        self,
+        request: DutySubmissionRequest,
+        session: DutySubmissionBrowserSession,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        data = request.schedule_data
+        anchor = data["actions"][request.action_index]
+        incoming_actions = data.get("_handoff_entry_prewarm_actions")
+        if isinstance(incoming_actions, list) and incoming_actions:
+            checks = [
+                {**item, "kind": "handoff_preflight"}
+                for item in incoming_actions
+                if isinstance(item, Mapping)
+                and item.get("kind") == "entry_log"
+                and isinstance(item.get("fields"), Mapping)
+                and item["fields"].get("出或入") == "值班"
+                and str(item.get("target", "")).isdigit()
+            ]
+            if len(checks) != len(incoming_actions):
+                raise DutySubmissionExecutionError("交接預查接班資料不完整，未執行登打。", "unreturned_evidence_invalid")
+        else:
+            targets = data.get("_handoff_entry_prewarm_targets")
+            if not isinstance(targets, (list, tuple)) or not targets:
+                targets = [str(anchor.get("target", ""))]
+            targets = list(dict.fromkeys(str(target) for target in targets if str(target).isdigit()))
+            checks = [{**anchor, "kind": "handoff_preflight", "target": target} for target in targets]
+        if not checks:
+            raise DutySubmissionExecutionError("交接預查無法確認接班人員，未執行登打。", "unreturned_evidence_invalid")
+        for action in checks:
+            self._validate_return_identity(action_staff(data, action), action, self._known_open_at(request, action))
+        action_date = action_target_roc_date(checks[0], str(data["target_date"]))
+        ranges = [
+            self._query_range(request, action, action_target_roc_date(action, str(data["target_date"])))
+            for action in checks
+        ]
+        if any(window is None for window in ranges):
+            raise DutySubmissionExecutionError("交接預查日期範圍無法確認，未執行登打。", "unreturned_evidence_invalid")
+        query_range = min(ranges, key=lambda window: window["start_at"])
+        if status_callback:
+            status_callback("正在預查前一日與當日的接班人員出入紀錄…")
+        before = self._query_comparison(
+            session.automation, session.driver, checks[0], action_date, query_range=query_range,
+        )
+        rows = flatten_rows(
+            before.get("visible_entry_rows", []) or [], action_date,
+            start_date=query_range["start_roc_date"], end_date=query_range["end_roc_date"],
+        )
+        for action in checks:
+            entry_at = find_open_external_assignment(
+                rows, action_date, action_staff(data, action), action,
+                current_at=self.now_factory(), start_at=query_range["start_at"], end_at=query_range["end_at"],
+                known_open_at=self._known_open_at(request, action),
+            )
+            if entry_at:
+                session.known_open_departures[str(action["target"])] = entry_at
 
     def execute_with_browser_session(
         self,
@@ -774,17 +867,10 @@ class DutySubmissionService:
         query_range: Mapping[str, Any] | None = None,
         time_order_warnings: list[str] | None = None,
     ) -> dict[str, str] | None:
-        if request.trigger_type not in ("due", "recovery"):
+        if not self._checks_open_assignment(action, request):
             return None
-        fields = action.get("fields", {})
-        if not isinstance(fields, Mapping):
-            return None
-        if action.get("kind") == "handoff_preflight":
-            pass
-        elif action.get("kind") == "entry_log" and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤"):
-            pass
-        else:
-            return None
+        known_open_at = self._known_open_at(request, action)
+        self._validate_return_identity(staff, action, known_open_at)
         now = self.now_factory()
         current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
         query_start_date = (
@@ -811,6 +897,7 @@ class DutySubmissionService:
                     "start_at": query_range.get("start_at") if query_range else None,
                     "end_at": query_range.get("end_at") if query_range else None,
                     "time_order_warnings": time_order_warnings,
+                    "known_open_at": known_open_at,
                 }
             )
         if not self.open_assignment_checker(
@@ -830,8 +917,50 @@ class DutySubmissionService:
             current_at=now if query_range or current_minute is not None else None,
             start_at=query_range.get("start_at") if query_range else None,
             end_at=query_range.get("end_at") if query_range else None,
+            known_open_at=known_open_at,
         )
         return {"unreturned_entry_at": entry_at} if entry_at else {}
+
+    @staticmethod
+    def _checks_open_assignment(action: Mapping[str, Any], request: DutySubmissionRequest) -> bool:
+        fields = action.get("fields", {})
+        return request.trigger_type in ("due", "recovery") and isinstance(fields, Mapping) and (
+            action.get("kind") == "handoff_preflight" or (
+                action.get("kind") == "entry_log"
+                and fields.get("領用事由及地點", "") in ("退勤", "休息後退勤")
+            )
+        )
+
+    def _validate_return_identity(
+        self,
+        staff: Mapping[str, Mapping[str, Any]],
+        action: Mapping[str, Any],
+        known_open_at: datetime | None,
+    ) -> None:
+        name = staff.get(str(action.get("target", "")), {}).get("name", "")
+        if self.open_assignment_checker is has_open_external_assignment and known_open_at is None and not (
+            isinstance(name, str) and name.strip()
+        ):
+            raise DutySubmissionExecutionError(
+                "返隊檢查無法確認人員名冊，已停止自動登打。", "unreturned_evidence_invalid",
+            )
+
+    def _known_open_at(self, request: DutySubmissionRequest, action: Mapping[str, Any]) -> datetime | None:
+        known = request.schedule_data.get("_unreturned_return_known_departures", {})
+        if not isinstance(known, Mapping):
+            raise DutySubmissionExecutionError("未返隊出勤資料格式不正確，已停止自動登打。", "unreturned_evidence_invalid")
+        raw = known.get(str(action.get("target", "")))
+        if raw in (None, ""):
+            return None
+        try:
+            if not isinstance(raw, str):
+                raise ValueError()
+            known_at = datetime.fromisoformat(raw)
+            if known_at > self.now_factory():
+                raise ValueError()
+            return known_at.replace(second=0, microsecond=0)
+        except (TypeError, ValueError):
+            raise DutySubmissionExecutionError("未返隊出勤時間無法確認，已停止自動登打。", "unreturned_evidence_invalid") from None
 
     def _should_pause_for_open_assignment(
         self,
@@ -904,6 +1033,33 @@ class DutySubmissionService:
         action_date: str,
     ) -> dict[str, Any] | None:
         raw_start = str(request.schedule_data.get("_unreturned_return_query_start_at", "") or "").strip()
+        if self._checks_open_assignment(action, request):
+            now = self.now_factory()
+            try:
+                start_at = datetime(
+                    int(action_date[:3]) + 1911, int(action_date[3:5]), int(action_date[5:7]),
+                ) - timedelta(days=1)
+                earlier = [self._known_open_at(request, action)]
+                if raw_start:
+                    try:
+                        earlier.append(datetime.fromisoformat(raw_start))
+                    except ValueError:
+                        pass
+                for candidate in earlier:
+                    if candidate is not None and candidate <= now:
+                        start_at = min(start_at, candidate.replace(hour=0, minute=0, second=0, microsecond=0))
+                if start_at > now:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise DutySubmissionExecutionError("返隊查詢日期範圍無法確認，已停止自動登打。", "unreturned_evidence_invalid") from None
+            return {
+                "start_at": start_at,
+                "start_roc_date": self._roc_date(start_at.date()),
+                "start_time": "00:00",
+                "end_at": now,
+                "end_roc_date": self._roc_date(now.date()),
+                "end_time": now.strftime("%H:%M"),
+            }
         if raw_start:
             try:
                 start_at = datetime.fromisoformat(raw_start)
