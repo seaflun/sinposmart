@@ -2200,8 +2200,14 @@ class DutyController(QObject):
         completion_key: str = "",
         *,
         trigger_type: str = "recovery",
+        error_code: str = "",
     ) -> bool:
-        record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
+        if error_code == "entry_form_incomplete" and action is not None:
+            record, _resolved = self._unreturned_return_queue.complete_action(
+                queue_id, action, "review_required", completion_key=completion_key,
+            )
+        else:
+            record = self._unreturned_return_queue.defer(queue_id, self._actor_no)
         action_index = self._queue_component_action_index(queue_id, action, completion_key)
         if action_index is not None and message:
             self._task_errors[action_index] = str(message).strip()
@@ -2319,7 +2325,12 @@ class DutyController(QObject):
                 self.reloginRequired.emit(message)
             return
         if 0 <= action_index < len(self._actions):
-            self._retry_after[action_index] = datetime.now() + timedelta(minutes=1)
+            if error_code == "entry_form_incomplete":
+                self._blocked_indices.add(action_index)
+                self._retry_after.pop(action_index, None)
+                self._comparisons[action_index] = {"compare": "人工確認", "group": "review", "matched": []}
+            else:
+                self._retry_after[action_index] = datetime.now() + timedelta(minutes=1)
             self._task_errors[action_index] = str(message).strip()
         self._schedule_status = message
         self._refresh_projection()

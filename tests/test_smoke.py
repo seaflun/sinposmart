@@ -6209,9 +6209,12 @@ try {
             {"id": "_selTIMEM", "tagName": "SELECT", "value": "15", "text": "15"},
             {"id": "_selIsout", "tagName": "SELECT", "value": "O", "text": "出"},
             {"id": "_areMemo", "tagName": "TEXTAREA", "value": "測試原因"},
+            {"id": "_hidManId", "tagName": "INPUT", "value": "fixture-person"},
+            {"id": "_areMan", "tagName": "TEXTAREA", "value": "測試員"},
         ]
         values = {"id": "_selIsout", "name": "_selIsout", "value": "O", "text": "出", "date": "1151101",
                   "hour": "08", "minute": "15", "reason": "測試原因",
+                  "person_id": "fixture-person", "person_name": "測試員",
                   "fill_controls": [{"id": value} for value in ("_txtDATE", "_selTIMEH", "_selTIMEM")],
                   "reason_controls": [{"id": "_areMemo"}]}
         harness = r'''
@@ -6221,7 +6224,7 @@ const document={querySelectorAll:()=>controls};
 const read=Function('document','return function(){'+script+'}')(document);
 process.stdout.write(JSON.stringify(read(fixture.values)));
 '''
-        for changed in (None, "date", "hour", "minute", "direction", "reason", "duplicate", "unwritten_reason"):
+        for changed in (None, "date", "hour", "minute", "direction", "reason", "duplicate", "unwritten_reason", "people_id", "people_name"):
             with self.subTest(changed=changed):
                 fixture = json.loads(json.dumps({"controls": controls, "values": values}))
                 if changed in ("date", "hour", "minute", "direction", "reason"):
@@ -6231,6 +6234,8 @@ process.stdout.write(JSON.stringify(read(fixture.values)));
                     fixture["controls"].append(dict(fixture["controls"][3]))
                 elif changed == "unwritten_reason":
                     fixture["values"]["reason_controls"] = []
+                elif changed in ("people_id", "people_name"):
+                    fixture["controls"][5 if changed == "people_id" else 6]["value"] = "unexpected"
                 result = subprocess.run([node, "-e", harness, json.dumps(fixture), json.dumps(module.ENTRY_FORM_CONFIRM_SCRIPT)],
                     capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)

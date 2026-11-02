@@ -334,6 +334,7 @@ class UnreturnedReturnQueue:
             if record.get("record_type") in ("single", "handoff_group")
             and not record.get("cancelled_at")
             if record.get("queue_id") not in self._inflight_ids
+            and "review_required" not in dict(record.get("pending_statuses", {})).values()
             and self._parse_timestamp(record.get("next_retry_at")) <= current
         ]
         if not candidates:

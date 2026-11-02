@@ -3833,6 +3833,132 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     )
                 save.assert_not_called()
 
+    def _entry_form_dom_fixture(self, *, direction="入", reason="到勤", legacy_select=True, reset=""):
+        import shutil
+        import duty_rehearsal as automation
+
+        node = shutil.which("node")
+        if node is None:
+            self.fail("Node is required to execute the actual entry form JavaScript")
+        controls = [
+            {"id": "_txtDATE", "tagName": "INPUT", "value": ""},
+            {"id": "_selTIMEH", "tagName": "SELECT", "options": [{"value": h, "text": h} for h in ("07", "08")]},
+            {"id": "_selTIMEM", "tagName": "SELECT", "options": [{"value": m, "text": m} for m in ("00", "05", "55")]},
+            {"id": "_hidManId", "tagName": "INPUT", "value": "fixture-person"},
+            {"id": "_areMan", "tagName": "TEXTAREA", "value": "測試員"},
+            {"id": "_txtMan", "tagName": "INPUT", "value": ""},
+            {"id": "_selIsout", "tagName": "SELECT", "options": [
+                {"value": value, "text": text} for text, value in automation.ENTRY_OUTIN_VALUE_MAP.items()]},
+            {"id": "_areMemo", "tagName": "TEXTAREA", "value": ""},
+            {"id": "_txtRadiokind", "tagName": "INPUT", "value": ""},
+            {"id": "_selIsback", "tagName": "SELECT", "options": [{"value": "Y", "text": "是"}, {"value": "N", "text": "否"}]},
+        ]
+        if legacy_select:
+            controls.append({"id": "_selMan", "tagName": "SELECT", "options": [
+                {"value": "fixture-person,rank-code", "text": "測試員"}]})
+        harness = r'''
+const state=JSON.parse(process.argv[1]), script=JSON.parse(process.argv[2]), args=JSON.parse(process.argv[3]);
+const controls=state.map(row=>({...row,name:row.id,options:row.options||[],_value:row.value||'',
+ dispatchEvent(event){if(this.id==='_selIsout'&&event.type==='change'){
+  const memo=controls.find(c=>c.id==='_areMemo'); memo.value={I2:'值班',I3:'值退'}[this.value]||'';
+ }}}));
+for(const c of controls)Object.defineProperties(c,{
+ value:{get(){return this._value},set(value){this._value=String(value)}},
+ selectedIndex:{get(){return this.options.findIndex(o=>o.value===this._value)}}});
+const document={getElementById:id=>controls.find(c=>c.id===id),querySelectorAll:s=>s==='tr'?[]:controls};
+const result=Function('document','Event','return function(){'+script+'}')(document,function(type){this.type=type})(...args);
+process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagName:c.tagName,value:c.value,options:c.options}))}));
+'''
+
+        def execute(script, *args):
+            if script == automation.ENTRY_FORM_CONFIRM_SCRIPT and reset:
+                changes = {"people_id": ("_hidManId", "other-person"), "people_name": ("_areMan", "其他員"),
+                           "extra_person": ("_hidManId", "fixture-person,other-person"),
+                           "radio": ("_txtRadiokind", ""), "returned": ("_selIsback", "")}
+                control_id, value = changes[reset]
+                next(c for c in controls if c["id"] == control_id)["value"] = value
+            process = subprocess.run([node, "-e", harness, json.dumps(controls), json.dumps(script), json.dumps(args)],
+                                     capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            response = json.loads(process.stdout)
+            controls[:] = response["state"]
+            return response["result"]
+
+        action = {"kind": "entry_log", "target": "24", "time": "07:55" if reason == "到勤" else "08:05",
+                  "fields": {"出或入": direction, "領用事由及地點": reason,
+                             "手提無線電編號": "手24", "是否歸還": "是" if direction == "出" else ""}}
+        if direction in ("值班", "值退"):
+            action["time"] = "08:00"
+        return SimpleNamespace(execute_script=execute), action, controls
+
+    def test_entry_form_uses_picker_person_for_all_four_directions(self) -> None:
+        from contextlib import ExitStack
+        from itertools import product
+        import duty_rehearsal as automation
+
+        directions = (("入", "到勤"), ("出", "退勤"), ("值班", "值班"), ("值退", "值退"))
+        for (direction, reason), legacy_select, has_user_id, write in product(directions, (True, False), (True, False), (True, False)):
+            with self.subTest(direction=direction, legacy_select=legacy_select, has_user_id=has_user_id, save=write), ExitStack() as stack:
+                driver, action, controls = self._entry_form_dom_fixture(direction=direction, reason=reason, legacy_select=legacy_select)
+                stack.enter_context(patch.object(automation, "ensure_ap", return_value=False))
+                stack.enter_context(patch.object(automation, "control_snapshot", return_value={}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={
+                    "ok": True, "selected": [{"value": "fixture-person,測試員"}],
+                    "hidManId": "fixture-person", "areMan": "測試員", "method": "popup"}))
+                save = stack.enter_context(patch.object(automation, "click_entry_insert_control", return_value={"ok": True}))
+                before_save = Mock()
+                person = {"name": "測試員", **({"user_id": "fixture-person"} if has_user_id else {})}
+                result = automation.fill_entry_log_form_for_test(driver, action,
+                    {"24": person}, "1151102", save=write, before_save=before_save)
+                if write:
+                    save.assert_called_once()
+                    before_save.assert_called_once()
+                else:
+                    save.assert_not_called()
+                    before_save.assert_not_called()
+                self.assertTrue(result["outin_confirmation"]["fields"]["people"])
+                self.assertEqual(next(c["value"] for c in controls if c["id"] == "_selIsout"), automation.ENTRY_OUTIN_VALUE_MAP[direction])
+
+    def test_entry_form_rechecks_person_and_optional_fields_before_save(self) -> None:
+        from contextlib import ExitStack
+        import duty_rehearsal as automation
+
+        for reset in ("people_id", "people_name", "extra_person", "radio", "returned"):
+            with self.subTest(reset=reset), ExitStack() as stack:
+                driver, action, _controls = self._entry_form_dom_fixture(direction="出", reason="退勤", reset=reset)
+                stack.enter_context(patch.object(automation, "ensure_ap", return_value=False))
+                stack.enter_context(patch.object(automation, "control_snapshot", return_value={}))
+                stack.enter_context(patch.object(automation.time, "sleep"))
+                stack.enter_context(patch.object(automation, "set_entry_people", return_value={
+                    "ok": True, "selected": [{"value": "fixture-person,測試員"}], "hidManId": "fixture-person"}))
+                save = stack.enter_context(patch.object(automation, "click_entry_insert_control"))
+                with self.assertRaises(automation.EntryLogFormValidationError) as caught:
+                    automation.fill_entry_log_form_for_test(driver, action,
+                        {"24": {"name": "測試員", "user_id": "fixture-person"}}, "1151102", save=True)
+                field = reset if reset in ("radio", "returned") else "people"
+                self.assertIs(caught.exception.field_checks[field], False)
+                save.assert_not_called()
+
+    def test_entry_form_failure_records_only_named_boolean_field_checks(self) -> None:
+        import duty_rehearsal as automation
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = DutySubmissionService(root)
+            action = {"kind": "entry_log", "target": "24", "time": "07:55"}
+            request = DutySubmissionRequest("fixture-user", "fixture-secret", 0, {"actions": [action]})
+            error = automation.EntryLogFormValidationError("raw fixture-secret", field_checks={"people": False, "direction": True})
+            service._write_failure(request, action, root / "result.json", error)
+            payload = json.loads((root / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["form_validation"], {"people": False, "direction": True})
+            message, code = service._safe_error(error)
+            self.assertEqual(code, "entry_form_incomplete")
+            self.assertIn("人員", message)
+            self.assertNotIn("出入方向", message)
+            self.assertNotIn("fixture-secret", json.dumps(payload) + message)
+
     def test_entry_form_validation_has_an_explicit_safe_error(self) -> None:
         import duty_rehearsal as automation
         from app_core.duty_submission_service import DutySubmissionService
@@ -5998,6 +6124,27 @@ class DutySubmissionServiceTests(unittest.TestCase):
             self.assertEqual(restarted.make_active_records_due(), [])
             self.assertEqual(restarted.expire_due(now=now + timedelta(days=1)), [])
             self.assertFalse(restarted.pause(action, schedule, owner_actor_no="10")[1])
+
+    def test_return_queue_does_not_automatically_retry_a_form_review_after_restart(self) -> None:
+        from datetime import datetime, timedelta
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+
+        for grouped in (False, True):
+            with self.subTest(grouped=grouped), tempfile.TemporaryDirectory() as directory:
+                now = datetime(2026, 11, 2, 8, 0)
+                action = {"kind": "entry_log", "target": "14", "time": "08:05", "fields": {"出或入": "出"}}
+                queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now)
+                if grouped:
+                    record, _ = queue.pause_group([action], {"target_date": "1151102"}, owner_actor_no="7")
+                else:
+                    record, _ = queue.pause(action, {"target_date": "1151102"}, owner_actor_no="7")
+                queue.complete_action(record["queue_id"], action, "review_required")
+                restarted = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now + timedelta(hours=1))
+                restarted.make_active_records_due(now=now + timedelta(hours=1))
+                self.assertIsNone(restarted.claim_due("12"))
+                self.assertIsNotNone(restarted.claim_manual(record["queue_id"], "12"))
+                _record, resolved = restarted.complete_action(record["queue_id"], action, "submitted")
+                self.assertTrue(resolved)
 
     def test_unreturned_return_queue_keeps_fixed_expiry_and_changes_handoff_interval(self) -> None:
         from datetime import datetime
@@ -25251,6 +25398,44 @@ if return_code != 0 or loaded:
             [controller._external_return_queue_ids_by_action_index[0]],
         )
         self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_entry_form_failure_stops_only_the_affected_task_automatic_retry(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        controller = DutyController()
+        controller.set_actor_no("12")
+        actions = [{"kind": "entry_log", "actor": "12", "target": target, "time": "07:55",
+                    "source": "到勤", "fields": {"出或入": "入", "領用事由及地點": "到勤"}} for target in ("24", "26")]
+        controller.replace_schedule_data({"target_date": "1151102", "actions": actions},
+                                         comparisons={0: {"group": "todo"}, 1: {"group": "todo"}})
+        controller.handle_submission_failure(0, "人員欄位未確認，未送出", "entry_form_incomplete")
+        self.assertEqual(controller._comparisons[0]["group"], "review")
+        self.assertIn(0, controller._blocked_indices)
+        self.assertNotIn(1, controller._blocked_indices)
+        self.assertNotIn(0, controller._retry_after)
+        controller.handle_submission_failure(1, "網頁等待逾時", "timeout")
+        self.assertIn(1, controller._retry_after)
+
+    def test_return_recovery_form_failure_is_persisted_as_review(self) -> None:
+        from datetime import datetime, timedelta
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime(2026, 11, 2, 8, 0)
+            queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now)
+            controller = DutyController(unreturned_return_queue=queue)
+            controller.set_actor_no("12")
+            action = {"kind": "entry_log", "time": "08:05", "actor": "7", "target": "14",
+                      "source": "退勤", "fields": {"出或入": "出", "領用事由及地點": "退勤"}}
+            controller.replace_schedule_data({"target_date": "1151102", "actions": [action]})
+            controller.handle_submission_result(0, "paused_external", "尚未返隊", "")
+            queue_id = controller._external_return_queue_ids_by_action_index[0]
+            controller.handle_external_return_queue_failure(queue_id, action, "人員未確認，未送出",
+                                                           error_code="entry_form_incomplete")
+            self.assertEqual(controller._comparisons[0]["recovery_status"], "review_required")
+            restarted = UnreturnedReturnQueue(Path(directory), now_factory=lambda: now + timedelta(hours=1))
+            self.assertIsNone(restarted.claim_due("12"))
 
     def test_return_recovery_review_status_survives_refresh_and_restart(self) -> None:
         from app_core.duty_task_projection import audit_status_text

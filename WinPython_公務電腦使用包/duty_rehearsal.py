@@ -1220,14 +1220,37 @@ const reasonRefs = values.reason_controls || [];
 const reason = reasonRefs.length === 1 ? uniqueControl(reasonRefs[0]) : null;
 const normalizeReason = value => String(value || '').replace(/\r\n/g, '\n').trim();
 const reasonMatches = !values.reason || Boolean(reason && normalizeReason(reason.value) === normalizeReason(values.reason));
-return {confirmed: Boolean(directionMatches && dateMatches && hourMatches && minuteMatches && reasonMatches),
+const personIds = String(uniqueControl({id: '_hidManId'})?.value || '').split(',').map(value => value.trim()).filter(Boolean);
+const personNames = String(uniqueControl({id: '_areMan'})?.value || '').split(/[,、;\r\n]+/).map(value => value.trim()).filter(Boolean);
+const peopleMatches = Boolean(values.person_id && values.person_name && personIds.length === 1 &&
+  personIds[0] === values.person_id && personNames.length === 1 && personNames[0] === values.person_name);
+const radio = writtenControl(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.selection_controls);
+const radioMatches = !values.radio || Boolean(radio && String(radio.value || '').trim() === values.radio);
+const returned = writtenControl(['_selIsback', '_selReturn', '_selIsReturn', '_txtReturn'], values.selection_controls);
+const returnedText = String(returned?.options?.[returned.selectedIndex]?.text || '').trim();
+const returnedMatches = !values.returned || Boolean(returned &&
+  (String(returned.value || '').trim() === values.returned || returnedText === values.returned));
+const fields = {date: dateMatches, hour: hourMatches, minute: minuteMatches, direction: Boolean(directionMatches),
+  reason: reasonMatches, people: peopleMatches, radio: radioMatches, returned: returnedMatches};
+return {confirmed: Object.values(fields).every(Boolean),
   id: direction?.id || '', value: actualValue, text: actualText,
-  fields: {date: dateMatches, hour: hourMatches, minute: minuteMatches, direction: Boolean(directionMatches), reason: reasonMatches}};
+  fields};
 """
 
 
 class EntryLogFormValidationError(RuntimeError):
     diagnostic_category = "entry_form_incomplete"
+    field_labels = {"date": "日期", "hour": "小時", "minute": "分鐘", "people": "人員",
+                    "direction": "出入種類", "reason": "事由", "radio": "無線電編號", "returned": "歸還狀態"}
+
+    def __init__(self, message: str, *, field_checks: dict[str, bool] | None = None) -> None:
+        super().__init__(message)
+        self.field_checks = {key: value is True for key, value in (field_checks or {}).items() if key in self.field_labels}
+        failed = "、".join(label for key, label in self.field_labels.items() if self.field_checks.get(key) is False)
+        self.safe_message = (
+            f"出入表單「{failed}」未確認，未送出；已停止此筆自動重試。" if failed
+            else "出入表單未完成確認，未送出；已停止此筆自動重試。"
+        )
 
 
 def fill_entry_log_form_for_test(
@@ -1243,7 +1266,7 @@ def fill_entry_log_form_for_test(
     fields = action.get("fields", {})
     direction = fields.get("出或入", "")
     if not isinstance(direction, str) or direction not in ENTRY_OUTIN_VALUE_MAP:
-        raise EntryLogFormValidationError("出入方向未指定或不正確，未送出。")
+        raise EntryLogFormValidationError("出入方向未指定或不正確，未送出。", field_checks={"direction": False})
     time_value = fields.get("系統寫入時間", fields.get("登打時間", action.get("time", "00:00")))
     hour, minute = time_value.split(":", 1)
     target_no = str(action.get("target", ""))
@@ -1346,13 +1369,11 @@ def fill_entry_log_form_for_test(
     time.sleep(1)
     people_result = set_entry_people(driver, [person], fallback_popup=True)
     if not people_result.get("ok"):
-        raise RuntimeError("entry people selection failed: " + json.dumps(people_result, ensure_ascii=False))
+        raise EntryLogFormValidationError("登載人員尚未確認，未送出。", field_checks={"people": False})
     selected_people = people_result.get("selected") or []
     selected_person = selected_people[0] or {} if selected_people else {}
     selected_value = str(selected_person.get("value", ""))
     selected_user_id = str(selected_person.get("id", "")).strip() or selected_value.split(",", 1)[0].strip() or people_result.get("hidManId", "")
-    selected_title = str(selected_person.get("title", "")).strip()
-    selected_man_value = selected_value or ",".join(part for part in (selected_user_id, selected_title) if part)
     outin_result = driver.execute_script(
         """
         const values = arguments[0];
@@ -1480,10 +1501,7 @@ def fill_entry_log_form_for_test(
           return false;
         }
 
-        if (!byIds(['_selMan'], values.man)) result.missing.push('man');
-        byIds(['_txtMan'], values.man_name);
-        if (values.title) byIds(['_selTitle'], values.title);
-        if (values.title_text) byIds(['_txtTitle'], values.title_text);
+        // New records use the picker fields _hidManId / _areMan; _selMan is for editing.
         if (values.outin || values.outin_value) {
           const outinSet = byOutinIds(['_selIsout', '_selOutIn', '_selIO', '_selOutin', '_selINOUT']) ||
             byNearbyOutin('出或入') || byOutinSignature();
@@ -1494,14 +1512,10 @@ def fill_entry_log_form_for_test(
           }
         }
         if (values.radio && !byIds(['_txtRadiokind', '_txtRadio', '_txtRadioNo', '_txtWireless'], values.radio) && !byNearbyText('手提無線電編號', values.radio) && !byNearbyText('無線電', values.radio)) result.missing.push('radio');
-        if (values.returned && !byIds(['_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
+        if (values.returned && !byIds(['_selIsback', '_selReturn', '_selIsReturn', '_txtReturn'], values.returned) && !byOptionText(values.returned) && !byNearbyText('是否歸還', values.returned)) result.missing.push('returned');
         return result;
         """,
         {
-            "man": selected_man_value,
-            "man_name": person["name"],
-            "title": selected_title,
-            "title_text": "",
             "outin": fields.get("出或入", ""),
             "outin_text": fields.get("出或入", ""),
             "outin_value": ENTRY_OUTIN_VALUE_MAP.get(fields.get("出或入", ""), ""),
@@ -1558,18 +1572,23 @@ def fill_entry_log_form_for_test(
     time.sleep(1)
 
     if not isinstance(fill_result, dict) or {"date", "hour", "minute"}.intersection(fill_result.get("missing", [])):
-        raise EntryLogFormValidationError("登載日期或時間欄位尚未完成，未送出。")
+        raise EntryLogFormValidationError("登載日期或時間欄位尚未完成，未送出。", field_checks={
+            key: isinstance(fill_result, dict) and key not in fill_result.get("missing", []) for key in ("date", "hour", "minute")})
     if not isinstance(reason_result, dict) or (
         fields.get("領用事由及地點") and "reason" in reason_result.get("missing", [])
     ):
-        raise EntryLogFormValidationError("登載原因欄位尚未完成，未送出。")
+        raise EntryLogFormValidationError("登載原因欄位尚未完成，未送出。", field_checks={"reason": False})
     if (
         not isinstance(outin_result, dict)
         or outin_result.get("missing")
         or not isinstance(outin_result.get("outin"), dict)
         or outin_result["outin"].get("confirmed") is not True
     ):
-        raise EntryLogFormValidationError("出入方向尚未確認，未送出。")
+        missing = outin_result.get("missing", []) if isinstance(outin_result, dict) else []
+        raise EntryLogFormValidationError("出入方向或表單欄位尚未確認，未送出。", field_checks={
+            "direction": isinstance(outin_result, dict) and isinstance(outin_result.get("outin"), dict)
+                         and outin_result["outin"].get("confirmed") is True,
+            "radio": "radio" not in missing, "returned": "returned" not in missing})
     outin_confirmation = driver.execute_script(
         ENTRY_FORM_CONFIRM_SCRIPT,
         {
@@ -1581,12 +1600,18 @@ def fill_entry_log_form_for_test(
             "hour": hour,
             "minute": minute,
             "reason": fields.get("領用事由及地點", ""),
+            "person_id": str(person["id"] or selected_user_id).strip(),
+            "person_name": person["name"],
+            "radio": fields.get("手提無線電編號", ""),
+            "returned": fields.get("是否歸還", ""),
+            "selection_controls": outin_result.get("set", []),
             "fill_controls": fill_result.get("set", []),
             "reason_controls": reason_result.get("set", []),
         },
     )
     if not isinstance(outin_confirmation, dict) or outin_confirmation.get("confirmed") is not True:
-        raise EntryLogFormValidationError("儲存前出入方向、日期、時間或原因已變更或無法確認，未送出。")
+        checks = outin_confirmation.get("fields", {}) if isinstance(outin_confirmation, dict) else {}
+        raise EntryLogFormValidationError("儲存前出入方向或表單欄位已變更或無法確認，未送出。", field_checks=checks)
     if save and before_save is not None:
         before_save()
     save_result = click_entry_insert_control(driver) if save else {"ok": False, "skipped": True}

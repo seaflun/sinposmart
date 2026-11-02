@@ -2674,6 +2674,7 @@ class AppController(QObject):
                 message,
                 component_key,
                 trigger_type=request.trigger_type,
+                error_code=error_code,
             )
             if error_code == "login_failed":
                 self._duty_controller.disable_auto_execution()

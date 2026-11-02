@@ -1415,6 +1415,7 @@ class DutySubmissionService:
             {
                 "stage": "failed",
                 "exception": diagnostic_exception(error, (request.password,)),
+                "form_validation": dict(getattr(error, "field_checks", {})),
                 "action_index": request.action_index,
                 "action": dict(action),
                 "trigger_type": request.trigger_type,
@@ -1434,7 +1435,7 @@ class DutySubmissionService:
             return "帳號或密碼錯誤，已停止登入。", "invalid_credentials"
         category = str(getattr(exc, "diagnostic_category", "") or "")
         if category == "entry_form_incomplete":
-            return "出入方向或表單欄位尚未確認，未送出；請檢查勤務系統表單。", "entry_form_incomplete"
+            return getattr(exc, "safe_message", "出入表單未完成確認，未送出；已停止此筆自動重試。"), "entry_form_incomplete"
         if category == "browser_session_open":
             return (
                 "SinpoSmart 專用瀏覽器在登入或開啟勤務頁面時中斷，已使用新的工作階段重試。"
