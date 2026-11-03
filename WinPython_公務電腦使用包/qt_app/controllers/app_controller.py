@@ -2299,6 +2299,8 @@ class AppController(QObject):
             return
         trigger_type = str(event.get("trigger_type") or "recovery")
         status = str(event.get("status") or "pending")
+        if status == "pending" and "review_required" in dict(record.get("pending_statuses", {})).values():
+            status = "review_required"
         actions = [
             dict(item)
             for item in record.get("actions", [])

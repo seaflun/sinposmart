@@ -34,6 +34,11 @@ from compare_rehearsal_records import (
 )
 
 
+AUTOMATIC_RETRY_REVIEW_CODES = frozenset({
+    "entry_form_incomplete", "unreturned_evidence_invalid", "entry_save_unconfirmed",
+})
+
+
 class DutySubmissionValidationError(ValueError):
     """A safe request-validation message for Qt controllers."""
 
@@ -378,7 +383,7 @@ class DutySubmissionService:
             def before_save() -> None:
                 if self.is_stale_due_request(request):
                     raise _StaleDutyScheduleError()
-                if request.save and action.get("kind") == "work_log":
+                if request.save and action.get("kind") in {"work_log", "entry_log"}:
                     self._work_save_state(action, action_date, "pending")
 
             if self.is_stale_due_request(request):
@@ -402,7 +407,7 @@ class DutySubmissionService:
                     {"group": "filled", "matched": [], "form_result": form_result},
                     time_order_warnings=time_order_warnings,
                 )
-            if action.get("kind") == "work_log":
+            if action.get("kind") in {"work_log", "entry_log"}:
                 self._work_save_state(action, action_date, "pending")
 
             try:
@@ -440,8 +445,9 @@ class DutySubmissionService:
                              "form_result": {key: form_result[key] for key in ("save", "fill", "people") if key in form_result}},
                             time_order_warnings=time_order_warnings,
                         )
-                    raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料。")
-                if action.get("kind") == "work_log":
+                    raise DutySubmissionExecutionError("登打後未在勤務系統查到已送出資料，已停止此筆自動重試。",
+                                                       "entry_save_unconfirmed")
+                if action.get("kind") in {"work_log", "entry_log"}:
                     self._work_save_state(action, action_date, "confirmed")
                 verified = {**verified, "form_result": form_result}
                 return self._finish(
@@ -470,7 +476,7 @@ class DutySubmissionService:
                 )
                 if reconciled is None:
                     raise
-                if action.get("kind") == "work_log":
+                if action.get("kind") in {"work_log", "entry_log"}:
                     self._work_save_state(action, action_date, "confirmed")
                 reconciled = {**reconciled, "form_result": form_result}
                 return self._finish(
@@ -511,11 +517,12 @@ class DutySubmissionService:
     def _work_save_state(
         self, action: Mapping[str, Any], action_date: str, stage: str | None = None,
     ) -> str:
-        if action.get("kind") != "work_log":
+        if action.get("kind") not in {"work_log", "entry_log"}:
             return ""
         key = f"{action_date}:{action_completion_key(action)}"
         digest = sha256(key.encode("utf-8")).hexdigest()
-        path = self.package_root / "runtime_outputs" / "work_submission_holds" / f"{digest}.json"
+        folder = "entry_submission_holds" if action.get("kind") == "entry_log" else "work_submission_holds"
+        path = self.package_root / "runtime_outputs" / folder / f"{digest}.json"
         if stage is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             pending = path.with_suffix(".tmp")

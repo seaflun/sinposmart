@@ -2039,7 +2039,7 @@ const state = {origin_ok: originOK, rejection_code: rejectionCode, form_count: f
     save_found: !!current && !!current.save && current.save.form === current.form,
     save_ready: !!current && !!current.save && current.save.form === current.form && available(current.save),
     query_ready: !!current && available(current.query)};
-const readReady = current && state.document_ready && state.date_matches && !missing.length && state.query_ready;
+const readReady = current && state.document_ready && state.date_matches && !missing.length;
 const ready = readReady && state.fields_writable && state.save_ready;
 const queryReady = current && state.document_ready && state.query_ready;
 if (mode === 'query_ready') return {...state, ready: !!queryReady};
@@ -2080,7 +2080,7 @@ if (mode === 'fill') {
     return {ready: true, ...state};
 }
 if (mode === 'save' || mode === 'query') {
-    if (mode === 'save' ? !ready : !readReady) return false;
+    if (mode === 'save' ? !ready : !(readReady && state.query_ready)) return false;
     if (mode === 'save' && (current.doc.__sinposmartMissionFillToken !== token ||
         fieldIds.some(id => String(targets[id].value) !== String(data[id])))) return false;
     current.doc.__sinposmartMissionToken = token;

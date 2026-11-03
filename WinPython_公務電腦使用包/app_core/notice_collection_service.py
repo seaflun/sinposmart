@@ -225,6 +225,98 @@ def _local_time(value: datetime) -> datetime:
 
 def confirmed_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *,
                                     live=False, previous=None, actual_handoff_times=None,
+                                    verified_handoff_keys=None, official_comparison_data=None) -> dict:
+    """Prefer the latest complete official pair, including verified temporary handoffs."""
+    planned = _planned_notice_responsibility(data, comparisons, executed, now, live=live, previous=previous,
+        actual_handoff_times=actual_handoff_times, verified_handoff_keys=verified_handoff_keys)
+    if not live or not isinstance(official_comparison_data, dict) or not isinstance(data, dict) or not data:
+        return planned
+    official, at = _official_notice_responsibility(data, official_comparison_data, now)
+    planned_at = datetime.fromisoformat(planned["handoffSlotAt"]) if planned.get("status") == "confirmed" else None
+    if at is None or planned_at is not None and planned_at > at:
+        return planned
+    from app_core.duty_task_projection import action_datetime
+    for index, action in enumerate(data.get("actions", [])):
+        comparison = comparisons.get(index, {})
+        if action.get("source") == "值班交接" and (comparison.get("cancelled") or comparison.get("group") == "review"):
+            try:
+                if _local_time(action_datetime(action, data["target_date"])) >= at:
+                    return {"schema_version": 1, "status": "unknown", "capturedAt": _local_time(now).isoformat()}
+            except (ValueError, TypeError, KeyError):
+                return planned
+    if (official.get("status") == "confirmed" and planned_at == at
+            and official.get("actorNo") == planned.get("actorNo")):
+        return planned
+    return official
+
+
+def _official_notice_responsibility(data: dict, official_data: dict, now: datetime) -> tuple[dict, datetime | None]:
+    from app_core.duty_task_projection import action_staff
+    from compare_rehearsal_records import entry_row_fields, flatten_rows
+
+    now = _local_time(now)
+    unknown = {"schema_version": 1, "status": "unknown", "capturedAt": now.isoformat()}
+    staff = action_staff(data, {})
+    names = {}
+    for number, member in staff.items():
+        if isinstance(member.get("name"), str):
+            names.setdefault(member["name"], []).append(number)
+    groups = {}
+    for day, payload in official_data.items():
+        if not re.fullmatch(r"\d{7}", str(day)) or not isinstance(payload, dict):
+            continue
+        if "visible_entry_metadata" not in payload:
+            continue  # Legacy exact-pair verification remains available; it cannot certify an adjusted handoff.
+        rows, metadata = payload.get("visible_entry_rows"), payload.get("visible_entry_metadata")
+        if not isinstance(rows, list) or not isinstance(metadata, list) or len(rows) != len(metadata):
+            return unknown, now
+        for row, evidence in zip(rows, metadata):
+            if not isinstance(evidence, dict) or evidence.get("schema") != "entry-log-v1":
+                return unknown, now
+            if evidence.get("direction") not in {"值班", "值退"}:
+                continue
+            try:
+                at = _local_time(datetime.fromisoformat(evidence["record_at"]))
+            except (ValueError, TypeError, KeyError):
+                return unknown, now
+            if not now - timedelta(hours=24) <= at <= now:
+                continue
+            entries = groups.setdefault(at, [])
+            flattened = flatten_rows([row], day, entry_metadata=[evidence])
+            parsed = entry_row_fields(flattened[0]) if len(flattened) == 1 else {}
+            numbers = names.get(parsed.get("primary_name"), [])
+            try:
+                written = _local_time(datetime.fromisoformat(evidence["system_written_at"]))
+            except (ValueError, TypeError, KeyError):
+                written = None
+            if (evidence.get("schema") != "entry-log-v1" or parsed.get("evidence_conflict", True)
+                    or any(evidence.get(key) is not True for key in
+                           ("record_time_valid", "system_written_valid", "structure_valid", "detail_present"))
+                    or parsed.get("reason") != evidence["direction"] or len(numbers) != 1
+                    or written is None or written > now):
+                entries.append(None)
+            else:
+                entries.append((evidence["direction"], numbers[0]))
+    if not groups:
+        return unknown, None
+    at = max(groups)
+    entries = groups[at]
+    distinct = set(entries)
+    incoming = {item[1] for item in distinct if item is not None and item[0] == "值班"}
+    outgoing = {item[1] for item in distinct if item is not None and item[0] == "值退"}
+    if None in distinct or len(incoming) != 1 or len(outgoing) != 1 or incoming == outgoing:
+        return unknown, at
+    actor = next(iter(outgoing))
+    actions = [{"kind": "entry_log", "source": "值班交接", "actor": actor, "target": number,
+                "time": at.strftime("%H:%M"), "fields": {"出或入": direction},
+                "duplicate_key": f"official:{at.isoformat()}:{direction}:{number}"}
+               for direction, number in sorted(distinct)]
+    official = {"target_date": f"{at.year - 1911:03d}{at:%m%d}", "actions": actions, "today": {"staff": staff}}
+    return _planned_notice_responsibility(official, {i: {"group": "done"} for i in range(2)}, set(), now, live=True), at
+
+
+def _planned_notice_responsibility(data: dict, comparisons: dict, executed: set, now: datetime, *,
+                                    live=False, previous=None, actual_handoff_times=None,
                                     verified_handoff_keys=None) -> dict:
     """Use completed official handoffs; a scheduled boundary never transfers ownership."""
     from app_core.duty_task_projection import action_datetime, action_completion_key, action_staff, action_time_value, parse_roc_date

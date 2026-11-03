@@ -742,6 +742,44 @@ class NoticeCollectionTests(unittest.TestCase):
                                             next_check=datetime(2026, 10, 21, 10, 3))[0]
             self.assertNotIn("observed_duty_key", str(report))
 
+    def test_official_adjusted_handoff_can_confirm_recipient_without_guessing_schedule(self):
+        from app_core.notice_collection_service import confirmed_notice_responsibility
+
+        data = self._handoff_responsibility_fixture()
+        data["today"]["staff"]["4"] = {"name": "臨時值班丙", "role": "小隊長"}
+        rows, metadata = [], []
+        for name, direction in (("臨時值班丙", "值退"), ("接班乙", "值班")):
+            rows.append(["115/10/27 10:00", "新坡分隊", "值班(宿)", name, "隊員", direction,
+                         "", "115/10/27 10:01", direction])
+            metadata.append({"schema": "entry-log-v1", "primary_name": name, "direction": direction,
+                             "category": "值班(宿)", "reason": direction, "record_time_valid": True,
+                             "system_written_valid": True, "structure_valid": True, "detail_present": True,
+                             "primary_index": 3, "direction_index": 5,
+                             "record_at": "2026-10-27T10:00", "system_written_at": "2026-10-27T10:01"})
+        official = {"1151027": {"visible_entry_rows": rows, "visible_entry_metadata": metadata}}
+        resolve = lambda value, **kw: confirmed_notice_responsibility(data,
+            {0: {"group": "todo"}, 1: {"group": "near"}}, set(), datetime(2026, 10, 27, 10, 5),
+            live=True, official_comparison_data=value, **kw)
+        proof = resolve(official)
+        self.assertEqual((proof["status"], proof["actorNo"], proof["handoffSlotAt"]),
+                         ("confirmed", "25", "2026-10-27T10:00:00+08:00"))
+        self.assertEqual(resolve(official, previous=proof)["evidenceKey"], proof["evidenceKey"])
+        self.assertEqual(resolve({"1151027": {"visible_entry_rows": rows[1:],
+            "visible_entry_metadata": metadata[1:]}})["status"], "unknown")
+        for bad_metadata in ([{**metadata[0], "structure_valid": False}, metadata[1]],
+                             [metadata[0], {**metadata[1], "direction": "值退"}]):
+            with self.subTest(metadata=bad_metadata):
+                self.assertEqual(resolve({"1151027": {"visible_entry_rows": rows,
+                    "visible_entry_metadata": bad_metadata}})["status"], "unknown")
+        ambiguous = json.loads(json.dumps(official))
+        ambiguous["1151027"]["visible_entry_rows"].append([
+            "115/10/27 10:00", "新坡分隊", "值班(宿)", "原班甲", "隊員", "值班", "", "115/10/27 10:01", "值班"])
+        ambiguous["1151027"]["visible_entry_metadata"].append({**metadata[1], "primary_name": "原班甲"})
+        self.assertEqual(resolve(ambiguous)["status"], "unknown")
+        malformed = {"1151027": {"visible_entry_rows": rows, "visible_entry_metadata": []}}
+        self.assertEqual(confirmed_notice_responsibility(data, {0: {"group": "done"}, 1: {"group": "done"}},
+            set(), datetime(2026, 10, 27, 10, 5), live=True, official_comparison_data=malformed)["status"], "unknown")
+
     def test_responsibility_follows_confirmed_handoff_instead_of_the_clock(self):
         from app_core.notice_collection_service import confirmed_notice_responsibility
         actions = []

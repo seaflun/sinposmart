@@ -36,7 +36,7 @@ from app_core.duty_task_projection import (
     target_short_label,
 )
 from app_core.schedule_repository import ScheduleRepository, ScheduleSnapshot, business_roc_date
-from app_core.duty_submission_service import DutySubmissionRequest
+from app_core.duty_submission_service import AUTOMATIC_RETRY_REVIEW_CODES, DutySubmissionRequest
 from app_core.unreturned_return_queue import UnreturnedReturnQueue
 from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
 from qt_app.models.duty_task_model import DutyTaskListModel
@@ -129,6 +129,7 @@ class DutyController(QObject):
         self._staff: dict[str, dict[str, Any]] = {}
         self._comparisons: dict[int, dict[str, Any]] = {}
         self._notice_live_comparisons = False
+        self._notice_official_comparison_data: dict = {}
         self._notice_verified_handoff_keys: set[str] = set()
         self._notice_last_responsibility = self._load_notice_responsibility()
         self._audit_kind_filter = "全部"
@@ -1245,7 +1246,8 @@ class DutyController(QObject):
             {} if self._preview_loaded else self._schedule_data,
             self._comparisons, self._executed_indices, now, live=self._notice_live_comparisons,
             previous=previous, actual_handoff_times=self._actual_handoff_times,
-            verified_handoff_keys=self._notice_verified_handoff_keys)
+            verified_handoff_keys=self._notice_verified_handoff_keys,
+            official_comparison_data=self._notice_official_comparison_data)
         if proof.get("status") == "confirmed":
             self._notice_last_responsibility = proof
             if not previous or any(previous.get(key) != value for key, value in proof.items() if key != "capturedAt"):
@@ -1824,7 +1826,7 @@ class DutyController(QObject):
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
         """Replace missed handoff arrivals with the current scheduled duty group."""
 
-        if record.get("completed_keys"):
+        if record.get("completed_keys") or record.get("handoff_attempt_at"):
             return None
         original_incoming = self._handoff_incoming_actions(actions)
         if not original_incoming:
@@ -2079,7 +2081,7 @@ class DutyController(QObject):
     ) -> list[DutySubmissionRequest]:
         current = submit_at or datetime.now()
         if record.get("record_type") == "handoff_group":
-            actions = self._unreturned_return_queue.incomplete_actions(record)
+            actions = self._unreturned_return_queue.record_actions(record)
             bridge = self._recovery_cross_shift_bridge(record, actions, current)
             bridge_actions, bridge_metadata = bridge if bridge is not None else (actions, None)
             group_id = "queue:" + str(record.get("queue_id") or "")
@@ -2202,7 +2204,7 @@ class DutyController(QObject):
         trigger_type: str = "recovery",
         error_code: str = "",
     ) -> bool:
-        if error_code == "entry_form_incomplete" and action is not None:
+        if error_code in AUTOMATIC_RETRY_REVIEW_CODES and action is not None:
             record, _resolved = self._unreturned_return_queue.complete_action(
                 queue_id, action, "review_required", completion_key=completion_key,
             )
@@ -2325,7 +2327,7 @@ class DutyController(QObject):
                 self.reloginRequired.emit(message)
             return
         if 0 <= action_index < len(self._actions):
-            if error_code == "entry_form_incomplete":
+            if error_code in AUTOMATIC_RETRY_REVIEW_CODES:
                 self._blocked_indices.add(action_index)
                 self._retry_after.pop(action_index, None)
                 self._comparisons[action_index] = {"compare": "人工確認", "group": "review", "matched": []}
@@ -2566,6 +2568,7 @@ class DutyController(QObject):
         ]
         self._actions = scheduled_actions + case_work_actions
         self._schedule_data = dict(data)
+        self._notice_official_comparison_data = dict(comparison_data or {})
         self._schedule_data["actions"] = self._actions
         self._staff = {
             str(number): dict(info)
@@ -3117,9 +3120,12 @@ class DutyController(QObject):
     ) -> list[DutySubmissionRequest]:
         queue_id = str(record.get("queue_id") or "")
         requests: list[DutySubmissionRequest] = []
+        if record.get("record_type") == "handoff_group":
+            record = self._unreturned_return_queue.begin_handoff_attempt(queue_id, submit_at) or record
+        attempted_at = self._parse_actual_handoff_time(record.get("handoff_attempt_at"))
         for original_action in self._unreturned_return_queue.incomplete_actions(record):
             handoff_at = self._parse_actual_handoff_time(original_action.get("_bridge_handoff_at"))
-            action = self._stamped_submission_action(original_action, handoff_at or submit_at)
+            action = self._stamped_submission_action(original_action, handoff_at or attempted_at or submit_at)
             if action is None:
                 continue
             schedule_data = dict(record.get("schedule_context", {}))
@@ -3371,11 +3377,19 @@ class DutyController(QObject):
             return
         queue_id = str(state.get("queue_id") or "")
         if queue_id:
-            self.handle_external_return_queue_failure(queue_id)
+            component_key = str(request.schedule_data.get("_handoff_preflight_component_key") or "")
+            action = next((item for item in state.get("actions", [])
+                           if action_completion_key(item) == component_key), None)
+            self.handle_external_return_queue_failure(queue_id, action, message, component_key, error_code=error_code)
             return
         for index in self._handoff_state_indices(state):
             self._submitting_indices.discard(index)
-            self._retry_after[index] = datetime.now() + timedelta(minutes=1)
+            if error_code in AUTOMATIC_RETRY_REVIEW_CODES:
+                self._blocked_indices.add(index)
+                self._retry_after.pop(index, None)
+                self._comparisons[index] = {"compare": "人工確認", "group": "review", "matched": []}
+            else:
+                self._retry_after[index] = datetime.now() + timedelta(minutes=1)
         self._schedule_status = message
         self._refresh_projection()
         if error_code == "invalid_credentials":
@@ -3920,6 +3934,7 @@ class DutyController(QObject):
             }
         )
         self._comparisons = comparisons
+        self._notice_official_comparison_data = dict(payload)
         self._notice_live_comparisons = True
         self.notice_responsibility(datetime.now())
         self._schedule_status = "已更新已登打比對資料。"

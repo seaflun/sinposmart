@@ -8907,6 +8907,7 @@ function render(extra=false){
    if(id.startsWith('_pln_')){s.writes++;s.values[id]=v;}}});
   elements[id]=el;return el;}
  field('_txtTaskDate',s.date);const marker=field('_btnOpenWinTaskCode',s.vehicle_label||'勤務車輛設定');field('_btnQuery','');
+ if(s.query_disabled_after_query&&s.queries)elements._btnQuery.disabled=true;
  marker.type='button';marker.click=()=>{s.vehicle_clicks=(s.vehicle_clicks||0)+1;};
  if(s.vehicle_disabled)marker.disabled=true;
  const markers=[marker];
@@ -9047,6 +9048,18 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                         module.step_open_mission_vehicle_settings(driver, "1151101")
                 self.assertEqual((state.get("vehicle_clicks", 0), state.get("setup_clicks", 0)), (0, 0))
                 self.assertEqual((state["writes"], state["saves"], state["queries"]), (0, 0, 0))
+
+    def test_mission_fresh_readback_allows_disabled_query_without_enabling_save(self):
+        module, driver, state, wait = self._driver(query_disabled_after_query=True, save_disabled=True)
+        execute = driver.execute_script.side_effect
+        driver.execute_script.side_effect = lambda script, *args: True if "function bClick(w)" in script else execute(script, *args)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "log_status"), mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            self.assertTrue(module.step_navigate_to_task_table(driver, wait, "1151101"))
+            self.assertTrue(module.step_open_mission_vehicle_settings(driver, "1151101"))
+            with self.assertRaises(RuntimeError):
+                module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2"}, "1151101", wait=wait)
+        self.assertEqual((state["queries"], state["saves"], state["writes"]), (1, 0, 0))
 
     def test_mission_navigation_requires_a_confirmed_menu_click(self):
         module = legacy_duty_sheet_module()

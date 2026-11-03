@@ -283,6 +283,15 @@ class UnreturnedReturnQueue:
         self._write_records()
         return dict(record), False
 
+    def begin_handoff_attempt(self, queue_id: str, at: datetime) -> dict[str, Any] | None:
+        """Freeze one actual handoff time before any component may be submitted."""
+
+        record = self._records.get(str(queue_id or ""))
+        if record is not None and record.get("record_type") == "handoff_group" and not record.get("handoff_attempt_at"):
+            record["handoff_attempt_at"] = self._timestamp(at)
+            self._write_records()
+        return dict(record) if record is not None else None
+
     def bridge_handoff_group(
         self,
         queue_id: str,
@@ -313,6 +322,7 @@ class UnreturnedReturnQueue:
                 "skipped_actor_nos": [str(actor_no or "").strip() for actor_no in skipped_actor_nos],
                 "incoming_actor_nos": [str(actor_no or "").strip() for actor_no in incoming_actor_nos],
                 "skipped_action_keys": [str(key or "").strip() for key in skipped_action_keys],
+                "known_departures": dict(record.get("known_departures", {})),
             }
         )
         record["actions"] = bridge_actions
@@ -321,6 +331,12 @@ class UnreturnedReturnQueue:
         record["completed_statuses"] = {}
         record["schedule_context"] = self._schedule_context(schedule_data)
         record["bridge_history"] = history
+        incoming = {str(actor_no) for actor_no in incoming_actor_nos}
+        record["known_departures"] = {key: value for key, value in dict(record.get("known_departures", {})).items()
+                                      if key in incoming}
+        record["blocked_actor_no"] = next(iter(record["known_departures"]), "")
+        record["unreturned_entry_at"] = min(record["known_departures"].values(), default="")
+        record.pop("handoff_attempt_at", None)
         self._write_records()
         return dict(record)
 

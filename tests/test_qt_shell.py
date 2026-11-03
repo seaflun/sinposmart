@@ -3510,6 +3510,42 @@ class DutySubmissionServiceTests(unittest.TestCase):
                         automation.fill_work_log_form_for_test(driver, action, data["today"]["staff"], "1151007", save=True)
                     save.assert_not_called()
 
+    def test_unconfirmed_entry_save_survives_restart_and_reconciles_without_resending(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for lost_reply in (False, True):
+            with self.subTest(lost_reply=lost_reply), tempfile.TemporaryDirectory() as directory:
+                rows, saves = [], []
+                def fill(_driver, _action, _staff, _date, save, before_save=None):
+                    if before_save:
+                        before_save()
+                    saves.append(save)
+                    if lost_reply:
+                        raise TimeoutError("response lost after save")
+                    return {"save": {"ok": True}}
+                automation = SimpleNamespace(WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                    build_driver=lambda **_kw: object(), login=lambda *_args: None,
+                    query_visible_table=lambda *_args, **_kw: rows, fill_entry_log_form_for_test=fill,
+                    quit_driver=lambda *_args: None)
+                action = {"kind": "entry_log", "actor": "7", "target": "7", "time": "08:00",
+                          "source": "值班交接", "duplicate_key": "entry:fixture:8:值班:7",
+                          "fields": {"出或入": "值班", "領用事由及地點": "值班"}}
+                data = {"target_date": "1151103", "actions": [action], "today": {"staff": {"7": {"name": "測試甲"}}}}
+                request = DutySubmissionRequest("fixture", "secret", 0, data)
+                def service():
+                    return DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                        now_factory=lambda: datetime(2026, 11, 3, 8, 1), sleeper=lambda _s: None)
+                for _restart in range(2):
+                    result = service().execute(request)
+                    self.assertEqual(result.status, "review_required")
+                    self.assertEqual(result.comparison["confirmation_state"], "saved_not_verified")
+                self.assertEqual(saves, [True])
+                rows.append(["115/11/03 08:00", "新坡分隊", "值班(宿)", "測試甲", "隊員", "值班",
+                             "", "115/11/03 08:00", "值班"])
+                self.assertEqual(service().execute(request).status, "skipped_duplicate")
+                self.assertEqual(saves, [True])
+
     def test_unconfirmed_work_save_survives_restart_without_resending(self) -> None:
         from datetime import datetime
         from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
@@ -4708,10 +4744,9 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
                     ],
                 }
 
-                with self.assertRaisesRegex(DutySubmissionExecutionError, "未在勤務系統查到已送出資料"):
-                    service.execute(
-                        DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual")
-                    )
+                result = service.execute(DutySubmissionRequest("user10", "secret", 0, data, trigger_type="manual"))
+                self.assertEqual(result.status, "review_required")
+                self.assertEqual(result.comparison["confirmation_state"], "saved_not_verified")
 
                 self.assertEqual(fills, [True])
                 self.assertEqual(waits, [1.0, 1.0])
@@ -25398,6 +25433,132 @@ if return_code != 0 or loaded:
             [controller._external_return_queue_ids_by_action_index[0]],
         )
         self.assertEqual(controller.selectedTaskCount, 0)
+
+    def test_partial_handoff_recovery_rechecks_completed_incoming_and_keeps_first_time(self) -> None:
+        from datetime import datetime, timedelta
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as directory:
+            at = datetime(2026, 11, 3, 21, 20)
+            actions = [{"kind": "entry_log", "source": "值班交接", "actor": "4", "target": target,
+                        "time": "20:00", "duplicate_key": f"entry:2026-11-03:20:{kind}:{target}",
+                        "fields": {"出或入": kind}} for kind, target in (("值退", "4"), ("值班", "18"))]
+            actions.append({"kind": "work_log", "source": "值班交接", "actor": "4", "target": "4",
+                            "time": "20:00", "duplicate_key": "work:2026-11-03:20:值班交接:4",
+                            "fields": {"處理情形": "一、時間:18-20"}})
+            data = {"target_date": "1151103", "actions": actions}
+            queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: at)
+            record, _ = queue.pause_group(actions, data, owner_actor_no="4", now=at)
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_actor_no("4")
+            controller.replace_schedule_data(data)
+            preflight = controller.recovery_submission_requests("fixture", "secret", record, submit_at=at)[0]
+            self.assertTrue(controller.handle_handoff_preflight_ready(preflight))
+            first = controller.handoff_group_submission_requests("fixture", "secret", preflight, submit_at=at)
+            incoming = next(r for r in first if r.schedule_data["actions"][0].get("target") == "18")
+            controller.handle_external_return_queue_result(record["queue_id"], incoming.schedule_data["actions"][0],
+                "submitted", incoming.schedule_data["_unreturned_return_component_key"])
+            restored_queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: at + timedelta(minutes=10))
+            restored = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=restored_queue)
+            self.addCleanup(restored.shutdown)
+            restored.set_actor_no("4")
+            restored.replace_schedule_data(data)
+            retry = restored.recovery_submission_requests("fixture", "secret", restored_queue.get(record["queue_id"]),
+                                                         submit_at=at + timedelta(minutes=10))
+            self.assertEqual(len(retry), 1)
+            self.assertTrue(restored.handle_handoff_preflight_ready(retry[0]))
+            remaining = restored.handoff_group_submission_requests("fixture", "secret", retry[0],
+                                                                   submit_at=at + timedelta(minutes=10))
+            self.assertEqual(len(remaining), 2)
+            self.assertEqual({r.schedule_data["actions"][0]["time"] for r in remaining}, {"21:20"})
+
+    def test_unsafe_evidence_and_unconfirmed_save_stop_automatic_retry(self) -> None:
+        from qt_app.controllers.duty_controller import DutyController
+
+        for code in ("unreturned_evidence_invalid", "entry_save_unconfirmed"):
+            with self.subTest(code=code):
+                controller = DutyController()
+                self.addCleanup(controller.shutdown)
+                controller.set_actor_no("12")
+                controller.replace_schedule_data({"target_date": "1151103", "actions": [{
+                    "kind": "entry_log", "actor": "12", "target": "5", "time": "06:00",
+                    "source": "休息後退勤", "fields": {"出或入": "出", "領用事由及地點": "休息後退勤"}}]})
+                controller.handle_submission_failure(0, "待查核", code)
+                self.assertEqual(controller._comparisons[0]["group"], "review")
+                self.assertIn(0, controller._blocked_indices)
+                self.assertNotIn(0, controller._retry_after)
+
+    def test_started_handoff_does_not_retarget_another_shift_before_result_is_known(self) -> None:
+        from datetime import datetime
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            actions = [{"kind": "entry_log", "source": "值班交接", "actor": actor, "target": target,
+                        "time": time_text, "duplicate_key": f"{time_text}:{kind}:{target}", "fields": {"出或入": kind}}
+                       for time_text, actor, incoming in (("10:00", "12", "26"), ("12:00", "26", "23"))
+                       for kind, target in (("值退", actor), ("值班", incoming))]
+            data = {"target_date": "1151102", "actions": actions}
+            record, _ = queue.pause_group(actions[:2], data, owner_actor_no="12")
+            record = queue.begin_handoff_attempt(record["queue_id"], datetime(2026, 11, 2, 10, 30))
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_actor_no("12")
+            controller.replace_schedule_data(data)
+            request = controller.recovery_submission_requests("fixture", "secret", record,
+                                                            submit_at=datetime(2026, 11, 2, 12, 5))[0]
+            self.assertEqual(request.schedule_data["actions"][request.action_index]["target"], "26")
+
+    def test_bridge_keeps_skipped_departure_in_history_without_blocking_new_group(self) -> None:
+        from datetime import datetime
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+
+        with tempfile.TemporaryDirectory() as directory:
+            queue = UnreturnedReturnQueue(Path(directory))
+            actions = [{"kind": "entry_log", "source": "值班交接", "actor": "12", "target": target,
+                        "time": "10:00", "duplicate_key": f"{kind}:{target}", "fields": {"出或入": kind}}
+                       for kind, target in (("值退", "12"), ("值班", "26"))]
+            data = {"target_date": "1151102", "actions": actions}
+            record, _ = queue.pause_group(actions, data, owner_actor_no="12", unreturned_actor_no="26",
+                                          unreturned_entry_at="2026-11-02T08:15")
+            bridged = queue.bridge_handoff_group(record["queue_id"],
+                [actions[0], {**actions[1], "target": "23", "duplicate_key": "值班:23"}], data,
+                bridge_at=datetime(2026, 11, 2, 12), skipped_actor_nos=["26"], incoming_actor_nos=["23"],
+                skipped_action_keys=["值班:26"])
+            self.assertEqual(bridged["known_departures"], {})
+            self.assertEqual(bridged["blocked_actor_no"], "")
+            self.assertEqual(bridged["bridge_history"][-1]["known_departures"], {"26": "2026-11-02T08:15"})
+
+    def test_handoff_evidence_failure_keeps_queue_in_review_across_login_and_restart(self) -> None:
+        from datetime import datetime, timedelta
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from app_core.schedule_repository import ScheduleRepository
+        from qt_app.controllers.duty_controller import DutyController
+
+        with tempfile.TemporaryDirectory() as directory:
+            at = datetime(2026, 11, 3, 21, 20)
+            queue = UnreturnedReturnQueue(Path(directory), now_factory=lambda: at)
+            actions = [{"kind": "entry_log", "source": "值班交接", "actor": "4", "target": target,
+                        "time": "20:00", "duplicate_key": f"{kind}:{target}", "fields": {"出或入": kind}}
+                       for kind, target in (("值退", "4"), ("值班", "18"))]
+            data = {"target_date": "1151103", "actions": actions}
+            record, _ = queue.pause_group(actions, data, owner_actor_no="4", now=at)
+            controller = DutyController(repository=ScheduleRepository(Path(directory)), unreturned_return_queue=queue)
+            self.addCleanup(controller.shutdown)
+            controller.set_actor_no("4")
+            controller.replace_schedule_data(data)
+            request = controller.recovery_submission_requests("fixture", "secret", record, submit_at=at)[0]
+            controller.handle_handoff_preflight_failure(request, "返隊資料不足", "unreturned_evidence_invalid")
+            restored = UnreturnedReturnQueue(Path(directory), now_factory=lambda: at + timedelta(minutes=20))
+            restored.make_active_records_due()
+            self.assertIsNone(restored.claim_due("18"))
+            self.assertEqual(list(restored.get(record["queue_id"])["pending_statuses"].values()), ["review_required"])
+            self.assertIsNotNone(restored.claim_manual(record["queue_id"], "18"))
 
     def test_entry_form_failure_stops_only_the_affected_task_automatic_retry(self) -> None:
         from qt_app.controllers.duty_controller import DutyController
