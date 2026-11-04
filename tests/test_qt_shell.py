@@ -6296,10 +6296,12 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
             events: list[str] = []
             query_count = 0
 
-            def query_visible_table(_driver, _ap_name, _date):
+            def query_visible_table(_driver, _ap_name, _date, **query_range):
                 nonlocal query_count
                 query_count += 1
-                return [["115/08/07", "08:05", "-", "測試員", "出", "退勤"]] if query_count > 1 else []
+                if query_count > 1 and query_range.get("end_time", "23:59") >= "08:05":
+                    return [["115/08/07", "08:05", "-", "測試員", "出", "退勤"]]
+                return []
 
             automation = SimpleNamespace(
                 ENTRY_LOG_AP="entry",
@@ -6345,6 +6347,93 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
 
             self.assertEqual(result.status, "submitted")
             self.assertEqual(events, ["driver:True", "login", "fill:08:05:True", "quit"])
+
+    def test_early_checkout_finds_saved_write_time_across_restarts_without_resending(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        for trigger in ("due", "recovery"):
+            for previous_sheet, preexisting, lost_reply in ((False, False, False), (True, False, False),
+                                                         (True, True, False), (True, False, True)):
+                with self.subTest(trigger=trigger, previous_sheet=previous_sheet, preexisting=preexisting,
+                                  lost_reply=lost_reply), tempfile.TemporaryDirectory() as directory:
+                    clock = [datetime(2026, 11, 4, 8)]
+                    saved_row = ["115/11/04 08:05", "新坡分隊", "測試員", "隊員", "出", "是",
+                                 "115/11/04 08:00", "退勤"]
+                    rows = [saved_row] if preexisting else []
+                    saves, queries = [], []
+
+                    def query(_driver, _ap, _date, **window):
+                        queries.append(dict(window))
+                        return [row for row in rows if window.get("end_time", "23:59") >= row[0][-5:]]
+
+                    def fill(_driver, _action, _staff, target_date, save, before_save):
+                        before_save()
+                        saves.append((target_date, save))
+                        rows.append(saved_row)
+                        if lost_reply:
+                            raise TimeoutError("response lost after save")
+                        return {"save": {"ok": True}}
+
+                    automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                        build_driver=lambda **_kw: object(), login=lambda *_a: None, quit_driver=lambda *_a: None,
+                        query_visible_table=query, fill_entry_log_form_for_test=fill)
+                    action = {"kind": "entry_log", "time": "08:00", "actor": "9", "target": "2",
+                              "source": "昨日在勤且今日未在勤", "date_offset": int(previous_sheet),
+                              "duplicate_key": "entry:2026-11-04:805:out:2:退勤",
+                              "fields": {"登打時間": "08:00", "系統寫入時間": "08:05", "出或入": "出",
+                                         "領用事由及地點": "退勤"}}
+                    data = {"target_date": "1151103" if previous_sheet else "1151104", "actions": [action],
+                            "today": {"staff": {"2": {"name": "測試員"}}}}
+                    request = DutySubmissionRequest("fixture", "fixture", 0, data, trigger_type=trigger)
+                    for minute in (0, 1, 2, 4, 5):
+                        clock[0] = datetime(2026, 11, 4, 8, minute)
+                        service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                            now_factory=lambda: clock[0], sleeper=lambda _s: None)
+                        result = service.execute(request)
+                        expected = "skipped_duplicate" if preexisting or minute else (
+                            "review_required" if lost_reply else "submitted")
+                        self.assertEqual(result.status, expected)
+                    self.assertEqual(saves, [] if preexisting else [("1151104", True)])
+                    self.assertTrue(all(window["end_roc_date"] == "1151104" and window["end_time"] >= "08:05"
+                                        for window in queries))
+
+    def test_early_checkout_does_not_treat_future_return_as_current_return(self) -> None:
+        from datetime import datetime
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [datetime(2026, 11, 4, 8)]
+            rows = [["115/11/04 07:43", "新坡分隊", "測試員", "隊員", "出", "案件類別：火災 案發地點：測試路1號"],
+                    ["115/11/04 08:04", "新坡分隊", "測試員", "隊員", "入", "返隊"]]
+            saves = []
+
+            def query(_driver, _ap, _date, **window):
+                return [row for row in rows if window.get("end_time", "23:59") >= row[0][-5:]]
+
+            def fill(_driver, _action, _staff, _date, save, before_save):
+                before_save()
+                saves.append(save)
+                rows.append(["115/11/04 08:05", "新坡分隊", "測試員", "隊員", "出", "退勤"])
+                return {"save": {"ok": True}}
+
+            automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                build_driver=lambda **_kw: object(), login=lambda *_a: None, quit_driver=lambda *_a: None,
+                query_visible_table=query, fill_entry_log_form_for_test=fill)
+            action = {"kind": "entry_log", "time": "08:00", "target": "2", "source": "昨日在勤且今日未在勤",
+                      "fields": {"登打時間": "08:00", "系統寫入時間": "08:05", "出或入": "出", "領用事由及地點": "退勤"}}
+            data = {"target_date": "1151104", "actions": [action], "today": {"staff": {"2": {"name": "測試員"}}},
+                    "_unreturned_return_known_departures": {"2": "2026-11-04T07:43"}}
+            service = DutySubmissionService(Path(directory), module_loader=lambda: automation,
+                now_factory=lambda: clock[0], sleeper=lambda _s: None)
+            request = DutySubmissionRequest("fixture", "fixture", 0, data)
+            paused = service.execute(request)
+            self.assertEqual(paused.status, "paused_external")
+            self.assertEqual(paused.comparison["unreturned_entry_at"], "2026-11-04T07:43")
+            self.assertEqual(saves, [])
+            clock[0] = datetime(2026, 11, 4, 8, 4)
+            self.assertEqual(service.execute(request).status, "submitted")
+            self.assertEqual(saves, [True])
 
     def test_due_previous_sheet_checkout_survives_rollover_and_verifies_saved_0805(self) -> None:
         from datetime import datetime

@@ -238,7 +238,18 @@ class DutySubmissionService:
             actions[request.action_index] = action
             comparison_source = dict(data)
             comparison_source["actions"] = actions
-            query_range = self._query_range(request, action, action_date)
+            return_query_range = self._query_range(request, action, action_date)
+            query_range = return_query_range
+            if query_range and self._allows_scheduled_checkout_preflight(action, action_date):
+                # Early checkout is saved with its scheduled write time; return evidence still stops at now.
+                write_minutes = self._clock_minutes(action["fields"]["系統寫入時間"])
+                write_at = query_range["end_at"].replace(
+                    hour=write_minutes // 60, minute=write_minutes % 60, second=0, microsecond=0,
+                )
+                query_range = {
+                    **query_range, "end_at": write_at,
+                    "end_roc_date": action_date, "end_time": write_at.strftime("%H:%M"),
+                }
             if status_callback:
                 status_callback("正在進行送出前防重複檢查…")
             query_started_callback = None
@@ -266,7 +277,7 @@ class DutySubmissionService:
                 before,
                 staff,
                 request,
-                query_range=query_range,
+                query_range=return_query_range,
                 time_order_warnings=time_order_warnings,
             )
             if self._checks_open_assignment(action, request) and isinstance(session_departures, dict):
