@@ -681,6 +681,7 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: dutySheetDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !dutySheetDialog.controller.isRunning
+                     && dutySheetDialog.hostWindow.backend.sessionController.actorNo.trim().length > 0
                      && !dutySheetDialog.hostWindow.backend.readOnlyAcceptance
             onClicked: {
                 if (!dutySheetDialog.hostWindow.backend.readOnlyAcceptance) {

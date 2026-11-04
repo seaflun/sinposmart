@@ -106,6 +106,7 @@ ToolSidePanel {
             text: monthlyBaseDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !monthlyBaseDialog.controller.isRunning
                       && monthlyBaseDialog.controller.monthlySourceReady
+                      && monthlyBaseDialog.hostWindow.backend.sessionController.actorNo.trim().length > 0
                       && !monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance
             onClicked: {
                 if (!monthlyBaseDialog.hostWindow.backend.readOnlyAcceptance) {

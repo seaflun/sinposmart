@@ -13493,6 +13493,64 @@ class QtShellTests(unittest.TestCase):
                 engine.deleteLater()
                 self._flush_qt_deferred_deletes()
 
+    def test_qml_tool_run_buttons_wait_for_background_actor_resolution(self) -> None:
+        from PySide6.QtCore import QObject
+        from app_core.credential_repository import CredentialRepository
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+        from qt_app.main import create_engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = AppController(
+                repository=CredentialRepository(Path(directory) / "accounts.json", "test", None),
+                schedule_repository=ScheduleRepository(Path(directory)),
+                offline_fixture_acceptance=True,
+            )
+            # Exercise the live QML bindings while the tool controllers remain offline and read-only.
+            controller._read_only_acceptance = False
+            controller._session_state.session = LoginSession("", "fixture", "fixture", verified=True,
+                                                             actor_name="測試值班員")
+            monthly = controller.restMonthlyController
+            monthly._monthly_source_ready = True
+            monthly._roc_year, monthly._monthly_month = 115, "11"
+            controller.civilpowerController._roster_loaded({
+                "members": [{"member_id": "fixture", "label": "測試義消"}],
+                "cached": False, "last_success_at": "2026-11-04T08:00:00",
+            })
+            engine = create_engine(controller)
+            root = engine.rootObjects()[0]
+            try:
+                member = root.findChild(QObject, "civilpowerMemberCombo")
+                self.assertTrue(member.setProperty("currentIndex", 0))
+                names = ("dutySheetRunButton", "dailyVehicleRunButton", "restTimeRunButton",
+                         "monthlyBaseRunButton", "civilpowerSubmitButton")
+                buttons = [root.findChild(QObject, name) for name in names]
+                for name, button in zip(names, buttons):
+                    with self.subTest(button=name, state="querying"):
+                        self.assertIsNotNone(button)
+                        self.assertFalse(button.isEnabled())
+                        self.assertEqual(button.property("visualFillColor"), button.property("disabledFillColor"))
+                self.assertTrue(controller.sessionController.resolve_actor_no("10", "測試值班員"))
+                for name, button in zip(names, buttons):
+                    with self.subTest(button=name, state="resolved"):
+                        self.assertTrue(button.isEnabled())
+                        self.assertNotEqual(button.property("visualFillColor"), button.property("disabledFillColor"))
+                duty, civilpower = buttons[0], buttons[-1]
+                self.assertEqual(civilpower.property("text"), "確認登打")
+                self.assertEqual(civilpower.implicitHeight(), duty.implicitHeight())
+                self.assertEqual(civilpower.property("font").pixelSize(), duty.property("font").pixelSize())
+                member.setProperty("currentIndex", -1)
+                self.assertFalse(civilpower.isEnabled())
+                monthly._monthly_source_ready = False
+                monthly.stateChanged.emit()
+                self.assertFalse(buttons[3].isEnabled())
+            finally:
+                root.hide()
+                controller.shutdown()
+                engine.deleteLater()
+                self._flush_qt_deferred_deletes()
+
     def test_qml_manual_duty_run_keeps_saved_personnel_snapshot_through_real_worker(self):
         from datetime import datetime
         from PySide6.QtCore import QObject, QMetaObject, Qt, QUrl

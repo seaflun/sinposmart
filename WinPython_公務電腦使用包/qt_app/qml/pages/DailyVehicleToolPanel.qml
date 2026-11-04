@@ -54,6 +54,7 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: dailyVehicleDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !dailyVehicleDialog.controller.isRunning
+                     && dailyVehicleDialog.hostWindow.backend.sessionController.actorNo.trim().length > 0
                      && !dailyVehicleDialog.hostWindow.backend.readOnlyAcceptance
             onClicked: {
                 if (!dailyVehicleDialog.hostWindow.backend.readOnlyAcceptance) {

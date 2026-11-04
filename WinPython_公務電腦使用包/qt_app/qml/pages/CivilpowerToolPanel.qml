@@ -157,12 +157,12 @@ ToolSidePanel {
             text: panel.controller.statusText
             onDetailsRequested: function(message) { panel.hostWindow.showErrorDetails("民力系統", message) }
         }
-        AppleButton {
+        ToolRunButton {
             objectName: "civilpowerSubmitButton"
             Layout.fillWidth: true
             text: panel.controller.isRunning ? "處理中…" : "確認登打"
-            tone: "primary"
             enabled: panel.editable && memberCombo.currentIndex >= 0
+                     && panel.hostWindow.backend.sessionController.actorNo.trim().length > 0
             onClicked: panel.controller.prepareRun(dateField.text, timeField.text,
                 String(memberCombo.currentValue || ""), actionCombo.currentText)
         }

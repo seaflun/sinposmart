@@ -102,6 +102,7 @@ ToolSidePanel {
             Layout.fillWidth: true
             text: restTimeDialog.controller.isRunning ? "啟動中..." : "啟動登打"
             enabled: !restTimeDialog.controller.isRunning
+                     && restTimeDialog.hostWindow.backend.sessionController.actorNo.trim().length > 0
                      && !restTimeDialog.hostWindow.backend.readOnlyAcceptance
             onClicked: {
                 if (!restTimeDialog.hostWindow.backend.readOnlyAcceptance) {
