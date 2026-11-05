@@ -216,7 +216,11 @@ def _login_page_probe(driver: Any) -> dict:
 
 
 def _login_failure_code(error: Exception, *, page_text: str = '') -> str:
+    from duty_rehearsal import is_duty_session_expired
+
     text = str(error or '')
+    if getattr(error, 'error_code', '') == 'session_expired' or is_duty_session_expired(text + '\n' + page_text):
+        return 'session_expired'
     network_error = re.search(r'\bnet::(ERR_[A-Z0-9_]+)\b', text, re.I)
     if not network_error and re.search(
         r'無法連上這個網站|無法存取這個網站|(?:你|您)的連線不是私人連線|'
@@ -249,7 +253,7 @@ def _login_failure_code(error: Exception, *, page_text: str = '') -> str:
 
 def capture_login_diagnostic(
     driver: Any, reason: str, *, user_id: str = '', password: str = '',
-    stage: str = 'login', reason_code: str = 'login_failed',
+    stage: str = 'login', reason_code: str = 'login_failed', capture_screenshot: bool = True,
 ) -> dict:
     """Best-effort, bounded failure evidence; never expose raw HTML or input values."""
     secrets = tuple({variant for secret in (user_id, password) if secret
@@ -280,7 +284,7 @@ def capture_login_diagnostic(
             diagnostic[key] = _safe_login_text(value, secrets, limit)
         except Exception:
             pass
-    if not top_level:
+    if not top_level or not capture_screenshot:
         return diagnostic
     try:
         redaction = driver.execute_script(LOGIN_DIAGNOSTIC_REDACT_SCRIPT, list(secrets))
@@ -584,12 +588,20 @@ def verify_duty_authentication(driver: Any) -> None:
     """Require a server-protected page before trusting saved identity or lookup warnings."""
     from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.support.ui import WebDriverWait
-    from duty_rehearsal import DUTY_TABLE_AP, open_ap
+    from duty_rehearsal import DUTY_TABLE_AP, DutySessionExpiredError, is_duty_session_expired, open_ap
 
     open_ap(driver, DUTY_TABLE_AP)
+
+    def authenticated(current: Any) -> bool:
+        if current.execute_script(AUTHENTICATED_DUTY_PAGE_SCRIPT) is True:
+            return True
+        if is_duty_session_expired(_login_page_probe(current).get('page_text', '')):
+            raise DutySessionExpiredError()
+        return False
+
     try:
         WebDriverWait(driver, 15, poll_frequency=0.25).until(
-            lambda current: current.execute_script(AUTHENTICATED_DUTY_PAGE_SCRIPT) is True
+            authenticated
         )
     except TimeoutException:
         raise LoginVerificationError(
@@ -790,18 +802,20 @@ class LoginVerifier:
     ) -> LoginResult:
         driver = None
         failure_diagnostic = None
+        login_response = None
         detected_actor_no, actor_name = "", ""
         identity_error = None
         try:
             from duty_rehearsal import retry_duty_browser_session_open
 
             def create_browser() -> Any:
-                nonlocal failure_diagnostic
+                nonlocal failure_diagnostic, login_response
                 failure_diagnostic = None
+                login_response = None
                 return self.driver_factory(self.options_factory())
 
             def initialize_browser(candidate: Any) -> None:
-                nonlocal failure_diagnostic, detected_actor_no, actor_name, identity_error
+                nonlocal failure_diagnostic, login_response, detected_actor_no, actor_name, identity_error
                 detected_actor_no, actor_name, identity_error = "", "", None
                 failure_stage = 'login'
                 configuring = True
@@ -810,6 +824,11 @@ class LoginVerifier:
                     configuring = False
                     self.login_function(candidate, user_id, password)
                     failure_stage = 'post_login'
+                    response = capture_login_diagnostic(
+                        candidate, '', user_id=user_id, password=password,
+                        stage=failure_stage, capture_screenshot=False,
+                    )
+                    login_response = {key: response[key] for key in ('page_url', 'page_title', 'page_text', 'captured_at')}
                     probe = _login_page_probe(candidate)
                     fields = probe.get('password_fields', 0)
                     fields = fields if isinstance(fields, int) else 0
@@ -902,6 +921,10 @@ class LoginVerifier:
                 failure_diagnostic['reason_code'] = 'browser_start_failed'
                 exc.login_diagnostic = failure_diagnostic
                 raise
+            if login_response is not None:
+                failure_diagnostic['login_response'] = login_response
+            if failure_diagnostic['reason_code'] == 'session_expired':
+                failure_diagnostic['reason'] = '勤務網站登入狀態已失效，請重新登入網站。'
             raise LoginVerificationError(
                 failure_diagnostic['reason'], login_diagnostic=failure_diagnostic,
                 reason_code=failure_diagnostic['reason_code'],

@@ -319,7 +319,7 @@ class DutyEntryQueueWorker(QObject):
         except DutySubmissionExecutionError as exc:
             if exc.error_code == "invalid_credentials":
                 self._rejected_credentials_session = (request.session_generation, request.user_id)
-            session_expired = exc.error_code == "login_failed" and had_compatible_session
+            session_expired = exc.error_code in {"login_failed", "session_expired"} and had_compatible_session
             if exc.error_code != "browser_startup" and not session_expired:
                 self._close_browser_session()
                 raise

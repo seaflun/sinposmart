@@ -354,6 +354,7 @@ class AppController(QObject):
         self._duty_controller.autoLogoutRequested.connect(self._auto_logout)
         self._duty_controller.reloginRequired.connect(self._force_logout)
         self._duty_controller.credentialsRejected.connect(self._credentials_rejected)
+        self._duty_controller.sessionExpired.connect(self._website_session_expired)
         self._duty_controller.manualSubmissionRequested.connect(self._enqueue_manual_tasks)
         self._duty_controller.manualWaitingScheduled.connect(self._register_background_manual_waiting)
         self._duty_controller.manualWaitingCancelled.connect(self._cancel_background_manual_waiting)
@@ -2658,6 +2659,8 @@ class AppController(QObject):
                 self._force_logout(message)
             elif credentials_rejected:
                 self._credentials_rejected(message)
+            elif error_code == "session_expired" and self._duty_controller.request_matches_current_session(request):
+                self._website_session_expired(message)
             return
         queue_id = self._external_return_queue_id(request)
         action = self._submission_action(request)
@@ -2749,6 +2752,8 @@ class AppController(QObject):
         self.diagnosticsChanged.emit()
         if credentials_rejected:
             self._credentials_rejected(message)
+        elif error_code == "session_expired" and request_is_current:
+            self._website_session_expired(message)
 
     def _tool_run_started(self, tool_name: str, tool_label: str, *, mode: str = "") -> None:
         run_id = uuid4().hex
@@ -3528,6 +3533,27 @@ class AppController(QObject):
     def _prewarm_failed(self, request: DutySubmissionRequest, message: str, error_code: str) -> None:
         if error_code == "invalid_credentials" and self._duty_controller.request_matches_current_session(request):
             self._credentials_rejected(message)
+        elif error_code == "session_expired" and self._duty_controller.request_matches_current_session(request):
+            self._website_session_expired(message)
+
+    @Slot(str)
+    def _website_session_expired(self, _message: str) -> None:
+        session = self._session_state.session
+        if session is None or not session.verified or self._logout_pending:
+            return
+        message = "勤務網站登入狀態已失效，請重新登入網站。"
+        self._send_operational_event(
+            "login_expired", status="failed", trigger_type="login", error=message,
+            snapshot={"error_code": "session_expired"},
+        )
+        self._pending_auto_login_actor_no = ""
+        self._clear_auto_login_marker()
+        self._duty_controller.disable_auto_execution()
+        self._duty_execution_controller.set_automatic_execution_enabled(False)
+        self._duty_execution_controller.close_entry_session(force=True)
+        self._tray_controller.notify("SinpoSmart", message)
+        self._begin_session_logout(message)
+        self._tray_controller.showWindow()
 
     @Slot(str)
     def _credentials_rejected(self, _message: str) -> None:

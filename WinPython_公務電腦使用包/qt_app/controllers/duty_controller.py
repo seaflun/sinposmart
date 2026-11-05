@@ -58,6 +58,7 @@ class DutyController(QObject):
     autoLogoutRequested = Signal(str)
     reloginRequired = Signal(str)
     credentialsRejected = Signal(str)
+    sessionExpired = Signal(str)
     manualSubmissionConfirmationRequested = Signal()
     externalReturnManualSubmissionConfirmationRequested = Signal()
     manualSubmissionRequested = Signal(object)
@@ -2316,13 +2317,16 @@ class DutyController(QObject):
     @Slot(int, str, str)
     def handle_submission_failure(self, action_index: int, message: str, error_code: str) -> None:
         self._submitting_indices.discard(action_index)
-        if error_code in {"login_failed", "invalid_credentials"}:
+        if error_code in {"login_failed", "invalid_credentials", "session_expired"}:
             self._retry_after.clear()
             self._schedule_status = message
             self._refresh_projection()
             self.errorOccurred.emit(message)
             if error_code == "invalid_credentials":
                 self.credentialsRejected.emit(message)
+            elif error_code == "session_expired":
+                self.disable_auto_execution()
+                self.sessionExpired.emit(message)
             else:
                 self.reloginRequired.emit(message)
             return
@@ -3395,13 +3399,16 @@ class DutyController(QObject):
         if error_code == "invalid_credentials":
             self.disable_auto_execution()
         self._refresh_due_tasks(force_emit=True)
-        if error_code in {"login_failed", "invalid_credentials"}:
+        if error_code in {"login_failed", "invalid_credentials", "session_expired"}:
             login_failure_message = (
                 f"交接預檢登入失敗，尚未執行正式交接：{message}"
             )
             self.errorOccurred.emit(login_failure_message)
             if error_code == "invalid_credentials":
                 self.credentialsRejected.emit(login_failure_message)
+            elif error_code == "session_expired":
+                self.disable_auto_execution()
+                self.sessionExpired.emit(login_failure_message)
             else:
                 self.reloginRequired.emit(login_failure_message)
 
@@ -3957,6 +3964,10 @@ class DutyController(QObject):
             self.disable_auto_execution()
             self.errorOccurred.emit(message)
             self.credentialsRejected.emit(message)
+        elif error_code in {"session_expired", "comparison_session_expired"}:
+            self.disable_auto_execution()
+            self.errorOccurred.emit(message)
+            self.sessionExpired.emit(message)
         elif error_code in {"login_failed", "comparison_login_failed"}:
             self.errorOccurred.emit(message)
             self.reloginRequired.emit(message)
@@ -4010,7 +4021,8 @@ class DutyController(QObject):
         self._schedule_status = message
         self.scheduleChanged.emit()
         credentials_rejected = error_code in {"invalid_credentials", "comparison_invalid_credentials"}
-        is_login_failure = error_code in {"login_failed", "comparison_login_failed"} or credentials_rejected
+        session_expired = error_code in {"session_expired", "comparison_session_expired"}
+        is_login_failure = error_code in {"login_failed", "comparison_login_failed"} or credentials_rejected or session_expired
         if comparison_failure and not is_login_failure:
             self.comparisonWarningOccurred.emit(message)
         else:
@@ -4020,6 +4032,9 @@ class DutyController(QObject):
         if is_login_failure:
             if credentials_rejected:
                 self.credentialsRejected.emit(message)
+            elif session_expired:
+                self.disable_auto_execution()
+                self.sessionExpired.emit(message)
             else:
                 self.reloginRequired.emit(message)
             return

@@ -519,6 +519,10 @@ class ScheduleCaptureService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        from duty_rehearsal import is_duty_session_expired
+
+        if getattr(exc, "error_code", "") == "session_expired" or is_duty_session_expired(str(exc)):
+            return "勤務網站登入狀態已失效，請重新登入網站。", "session_expired"
         if getattr(exc, "error_code", "") == "invalid_credentials":
             return "帳號或密碼錯誤，已停止登入。", "invalid_credentials"
         category = str(getattr(exc, "diagnostic_category", "") or "")

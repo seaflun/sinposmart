@@ -609,6 +609,50 @@ class SessionStateTests(unittest.TestCase):
 
 
 class LoginVerifierTests(unittest.TestCase):
+    def test_missing_token_keeps_login_response_and_never_retries_credentials(self):
+        from app_core.login_verifier import LoginVerificationError, LoginVerifier
+
+        driver = self.DiagnosticDriver(text="登入回應已收到", password_fields=0, authenticated=False)
+        driver.title = "登入回應 user10 secret"
+        original_get = driver.get
+
+        def protected_page(url):
+            original_get(url)
+            driver.title = "不好意思,您已經被登出系統,請關掉視窗重新登入(沒有token)"
+            driver.text = driver.title
+
+        driver.get = protected_page
+        login = Mock()
+        verifier = LoginVerifier(
+            options_factory=object, driver_factory=lambda _: driver,
+            configure_driver=lambda _: None, login_function=login,
+            driver_cleanup=lambda _: None, session_open_diagnostics=False,
+        )
+        with (patch("selenium.webdriver.support.ui.WebDriverWait", side_effect=self.authentication_wait_once),
+              self.assertRaises(LoginVerificationError) as caught):
+            verifier.verify(typed_actor_no="16", user_id="user10", password="secret",
+                            actor_no_from_user_id=lambda _: "16", actor_no_from_name=lambda _: "16", staff={})
+        self.assertEqual(caught.exception.reason_code, "session_expired")
+        self.assertIn("重新登入網站", str(caught.exception))
+        evidence = caught.exception.login_diagnostic
+        self.assertIn("沒有token", evidence["page_text"])
+        self.assertIn("登入回應已收到", evidence["login_response"]["page_text"])
+        for value in ("user10", "secret", "private", "user:pass"):
+            self.assertNotIn(value, json.dumps(evidence, ensure_ascii=False))
+        self.assertEqual(driver.events, ["redact", "screenshot"])
+        login.assert_called_once()
+
+    def test_opening_expired_protected_page_stops_before_query_or_save(self):
+        from duty_rehearsal import open_ap
+
+        driver = SimpleNamespace(
+            get=Mock(), title="不好意思,您已經被登出系統,請關掉視窗重新登入(沒有token)",
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            open_ap(driver, "wap119.RPS105020")
+        self.assertEqual(caught.exception.error_code, "session_expired")
+        self.assertIn("重新登入網站", str(caught.exception))
+
     @classmethod
     def _execute_redaction_fixture(cls, *, extra_texts=None, row_extra_texts=None, secrets=None, fail_style=False):
         from PySide6.QtQml import QJSEngine
@@ -1208,7 +1252,7 @@ const NodeFilter = {SHOW_TEXT:4};
                         staff={"10": {"name": "測試員"}},
                     )
                 identity_lookup.assert_called_once()
-                self.assertEqual(caught.exception.reason_code, "authentication_unverified")
+                self.assertEqual(caught.exception.reason_code, "session_expired")
                 diagnostic = caught.exception.login_diagnostic
                 self.assertEqual(diagnostic["stage"], "post_login")
                 self.assertEqual(diagnostic["capture_status"], "captured")
@@ -3354,6 +3398,128 @@ class DutySubmissionServiceTests(unittest.TestCase):
             body = json.dumps(result)
             for secret in ("session-secret", "private-token", "private-session"):
                 self.assertNotIn(secret, body)
+
+    def test_missing_token_uses_existing_session_relogin_once(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionResult, DutySubmissionService,
+        )
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        request = DutySubmissionRequest("fixture-user", "fixture-password", 0,
+                                        {"target_date": "1151105", "actions": [{"kind": "entry_log"}]})
+        message, code = DutySubmissionService._safe_error(
+            RuntimeError("不好意思,您已經被登出系統,請關掉視窗重新登入(沒有token)"),
+        )
+        self.assertEqual(code, "session_expired")
+        now = datetime(2026, 11, 5, 16)
+        old = SimpleNamespace(user_id=request.user_id, visible=False, last_activity_at=now)
+        new = SimpleNamespace(user_id=request.user_id, visible=False, last_activity_at=now)
+        result = DutySubmissionResult(0, "submitted", "done", Path("fixture.json"), {})
+        for retry_fails in (False, True):
+            with self.subTest(retry_fails=retry_fails):
+                error = DutySubmissionExecutionError(message, code)
+                service = SimpleNamespace(
+                    open_browser_session=Mock(return_value=new), close_browser_session=Mock(),
+                    execute_with_browser_session=Mock(side_effect=[error, error if retry_fails else result]),
+                )
+                worker = DutyEntryQueueWorker(service, now_factory=lambda: now)
+                worker._browser_session = old
+                if retry_fails:
+                    with self.assertRaises(DutySubmissionExecutionError):
+                        worker._execute(1, request)
+                else:
+                    self.assertIs(worker._execute(1, request), result)
+                service.open_browser_session.assert_called_once()
+                self.assertEqual(service.execute_with_browser_session.call_count, 2)
+                worker._close_browser_session()
+
+    def test_return_check_failure_preserves_current_query_and_exact_issue(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import (
+            DutySubmissionBrowserSession, DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+        )
+        from duty_rehearsal import EntryQueryRows
+
+        now = datetime(2026, 11, 5, 8, 0, 58)
+        action = {"kind": "handoff_preflight", "time": "08:00", "actor": "8", "target": "26", "fields": {}}
+        data = {"target_date": "1151105", "today": {"staff": {"26": {"name": "測試人員"}}}, "actions": [action]}
+        base = {"schema": "entry-log-v1", "primary_index": 2, "direction_index": 4,
+                "primary_name": "測試人員", "direction": "出", "category": "",
+                "record_at": "2026-11-05T07:30", "record_time_valid": True,
+                "system_written_at": None, "system_written_valid": True,
+                "structure_valid": True, "detail_present": True, "reason": "外勤"}
+        for expected, changes in (
+            ("entry_metadata_invalid", {"structure_valid": False}),
+            ("entry_direction_unknown", {"direction": "請選擇"}),
+            ("entry_reason_missing", {"detail_present": False, "reason": ""}),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                meta = {**base, **changes}
+                rows = EntryQueryRows([["115/11/05 07:30", "新坡分隊", "測試人員", "隊員", meta["direction"],
+                                        "否", "", "外勤"]], [meta])
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                                             query_visible_table=Mock(return_value=rows))
+                session = DutySubmissionBrowserSession(automation, object(), "fixture-user", False, now)
+                service = DutySubmissionService(Path(directory), now_factory=lambda: now)
+                request = DutySubmissionRequest("fixture-user", "fixture-password", 0, data)
+                with (patch.object(service, "_refresh_action_before_submit", return_value=action),
+                      self.assertRaises(DutySubmissionExecutionError) as caught):
+                    service.execute_with_browser_session(request, session)
+                payload = json.loads(caught.exception.result_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["error_code"], "unreturned_evidence_invalid")
+                evidence = payload["return_check"]
+                self.assertEqual(evidence["target_no"], "26")
+                self.assertEqual(evidence["checked_at"], now.isoformat(timespec="seconds"))
+                self.assertEqual(evidence["query_range"]["start_roc_date"], "1151104")
+                self.assertEqual(evidence["issues"], [expected])
+                self.assertEqual(evidence["rows"][0]["row_index"], 0)
+                self.assertEqual(evidence["rows"][0]["record_at"], "2026-11-05T07:30")
+                self.assertNotIn("fixture-password", json.dumps(payload))
+                automation.query_visible_table.assert_called_once()
+                from app_core.diagnostics_service import DiagnosticSnapshot, DiagnosticsService
+                report = DiagnosticsService(Path(directory)).export(
+                    DiagnosticSnapshot(target_date="1151105", result_ref=caught.exception.result_path.name),
+                    secrets=(request.user_id, request.password),
+                )
+                with zipfile.ZipFile(report) as archive:
+                    saved = json.loads(archive.read("runtime_outputs/form_tests/" + caught.exception.result_path.name))
+                self.assertEqual(saved["return_check"], evidence)
+                self.assertNotIn("fixture-password", json.dumps(saved))
+
+    def test_confirmed_return_clears_older_bad_direction_without_ignoring_newer_issue(self):
+        from datetime import datetime
+        from app_core.duty_submission_service import (
+            DutySubmissionBrowserSession, DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+        )
+        from duty_rehearsal import EntryQueryRows
+
+        now = datetime(2026, 11, 5, 8)
+        action = {"kind": "handoff_preflight", "time": "08:00", "target": "21", "fields": {}}
+        data = {"target_date": "1151105", "today": {"staff": {"21": {"name": "測試人員"}}}, "actions": [action]}
+        for bad_time, should_fail in (("07:00", False), ("07:45", True)):
+            with self.subTest(bad_time=bad_time), tempfile.TemporaryDirectory() as directory:
+                rows, metadata = [], []
+                for clock, direction, reason in ((bad_time, "請選擇", "外勤"), ("07:30", "入", "返隊")):
+                    rows.append([f"115/11/05 {clock}", "新坡分隊", "測試人員", "隊員", direction, "是", "", reason])
+                    metadata.append({"schema": "entry-log-v1", "primary_index": 2, "direction_index": 4,
+                                     "primary_name": "測試人員", "direction": direction, "category": "",
+                                     "record_at": f"2026-11-05T{clock}", "record_time_valid": True,
+                                     "system_written_valid": True, "structure_valid": True,
+                                     "detail_present": True, "reason": reason})
+                automation = SimpleNamespace(ENTRY_LOG_AP="entry", WORK_LOG_AP="work",
+                                             query_visible_table=Mock(return_value=EntryQueryRows(rows, metadata)))
+                session = DutySubmissionBrowserSession(automation, object(), "fixture-user", False, now)
+                request = DutySubmissionRequest("fixture-user", "fixture-password", 0, data)
+                service = DutySubmissionService(Path(directory), now_factory=lambda: now)
+                with patch.object(service, "_refresh_action_before_submit", return_value=action):
+                    if should_fail:
+                        with self.assertRaises(DutySubmissionExecutionError) as caught:
+                            service.execute_with_browser_session(request, session)
+                        self.assertEqual(caught.exception.return_check["issues"], ["entry_direction_unknown"])
+                    else:
+                        result = service.execute_with_browser_session(request, session)
+                        self.assertEqual(result.status, "handoff_preflight_ready")
 
     @staticmethod
     def _training_readback_fixture():
@@ -28743,6 +28909,42 @@ if return_code != 0 or loaded:
         self.assertEqual(actual_actions[1]["fields"]["系統寫入時間"], "10:00")
         self.assertEqual(actual_actions[2]["fields"]["工作時間"], "10:00")
 
+    def test_website_session_expiry_returns_to_login_without_exiting_gui(self) -> None:
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController
+
+        controller = AppController(read_only_acceptance=True)
+        controller.dutyController.load_current_schedule = lambda: None
+        controller.dutyController.refresh_live_schedule = lambda *_a, **_k: None
+        controller.trayController.notify = Mock()
+        controller._send_operational_event = Mock()
+        attempt = controller._session_state.begin_login()
+        controller._session_state.complete_login(attempt, LoginSession("16", "fixture-user", "fixture-password", verified=True))
+        controller.sessionController.sessionChanged.emit()
+        try:
+            controller._pending_auto_login_actor_no = "16"
+            from app_core.duty_submission_service import DutySubmissionRequest
+            stale = DutySubmissionRequest("previous-user", "fixture-password", 0,
+                                          {"target_date": "1151105", "actions": []})
+            controller._prewarm_failed(stale, "舊使用者的登入失效", "session_expired")
+            self.assertTrue(controller.sessionController.isLoggedIn)
+            controller.dutyController.handle_submission_failure(
+                0, "勤務網站登入狀態已失效，請重新登入網站。", "session_expired",
+            )
+            self.assertFalse(controller.sessionController.isLoggedIn)
+            self.assertFalse(controller.sessionController._shutdown_admission)
+            self.assertFalse(controller.trayController.quitRequested)
+            self.assertEqual(controller.loginFailureMessage, "")
+            self.assertEqual(controller._pending_auto_login_actor_no, "")
+            self.assertFalse(controller.dutyController._auto_execution_enabled)
+            controller.trayController.notify.assert_called_once()
+            expired = [call for call in controller._send_operational_event.call_args_list if call.args[0] == "login_expired"]
+            self.assertEqual(len(expired), 1)
+            fields = expired[0].kwargs
+            self.assertEqual(fields["snapshot"]["error_code"], "session_expired")
+        finally:
+            controller.shutdown()
+
     def test_login_failure_requires_acknowledgement_without_changing_normal_logout(self) -> None:
         from app_core.session import LoginSession
         from qt_app.controllers.app_controller import AppController
@@ -31248,7 +31450,7 @@ if return_code != 0 or loaded:
                         patch.object(controller, "_start_credential_sync") as sync,
                     ):
                         controller.login("user10", password, True, login_method=method)
-                        for _ in range(100):
+                        for _ in range(500):
                             if not controller.hasRunningLoginWorkers:
                                 break
                             QTest.qWait(10)
@@ -31259,7 +31461,7 @@ if return_code != 0 or loaded:
                         self.assertEqual(controller.displayName, "")
                         self.assertEqual(controller.loginStatusTone, "error")
                         self.assertEqual(failures.count(), 1)
-                        self.assertEqual(diagnostics[0]["reason_code"], "authentication_unverified")
+                        self.assertEqual(diagnostics[0]["reason_code"], "session_expired")
                         login.assert_called_once_with(driver, "user10", password or "stale-password")
                         repository.save.assert_not_called()
                         sync.assert_not_called()

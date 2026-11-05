@@ -331,6 +331,8 @@ def open_ap(driver: webdriver.Chrome, ap_name: str) -> None:
         f"&pushButton=load&nextAPname={ap_name}&_txtFirstEntry=TRUE"
     )
     driver.get(url)
+    if is_duty_session_expired(str(getattr(driver, "title", "") or "")):
+        raise DutySessionExpiredError()
 
 
 def ensure_ap(driver: webdriver.Chrome, ap_name: str) -> bool:
@@ -1761,6 +1763,20 @@ def inspect_entry_log_format(
 
 # Login and query readers
 
+def is_duty_session_expired(text: str) -> bool:
+    """Recognize the duty site's explicit session rejection, never credential values."""
+    return bool(re.search(r"(?:沒有|缺少)\s*token|您(?:已經|已)被登出系統", str(text), re.I))
+
+
+class DutySessionExpiredError(RuntimeError):
+    """The protected website did not accept the current browser session."""
+
+    error_code = "session_expired"
+
+    def __init__(self) -> None:
+        super().__init__("勤務網站登入狀態已失效，請重新登入網站。")
+
+
 class DutyCredentialsRejectedError(RuntimeError):
     """Explicit duty-login rejection without retaining submitted credentials."""
 
@@ -1810,6 +1826,8 @@ def login(driver: webdriver.Chrome, user_id: str, password: str) -> None:
         """
     )
     for _ in range(20):
+        if is_duty_session_expired(str(getattr(driver, "title", "") or "")):
+            raise DutySessionExpiredError()
         error = detect_login_error(driver)
         if error:
             if not re.search(r"驗證碼|認證碼|captcha|verification\s*code|net::ERR_", error, re.I) and re.search(

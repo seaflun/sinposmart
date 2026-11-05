@@ -14,7 +14,7 @@ from time import sleep
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
-from app_core.diagnostics_service import diagnostic_exception
+from app_core.diagnostics_service import diagnostic_exception, sanitize_diagnostic_value
 from app_core.duty_task_projection import (
     action_completion_key,
     action_staff,
@@ -55,10 +55,13 @@ class DutySubmissionExecutionError(RuntimeError):
         message: str,
         error_code: str = "unknown_error",
         result_path: Path | None = None,
+        *,
+        return_check: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
         self.result_path = result_path
+        self.return_check = dict(return_check or {})
 
 
 RECENT_HANDOFF_SCHEDULE_SNAPSHOT_MAX_AGE = timedelta(minutes=2)
@@ -883,8 +886,21 @@ class DutySubmissionService:
         known_open_at = self._known_open_at(request, action)
         self._validate_return_identity(staff, action, known_open_at)
         if self.open_assignment_checker is has_open_external_assignment:
-            issues = self._return_evidence_issues(comparison_data, staff, action, self.now_factory())
+            checked_at = self.now_factory()
+            issue_rows: list[dict[str, Any]] = []
+            issues = self._return_evidence_issues(comparison_data, staff, action, checked_at, details=issue_rows)
             if issues:
+                evidence = {
+                    "target_no": str(action.get("target", "")),
+                    "checked_at": checked_at.isoformat(timespec="seconds"),
+                    "query_range": {key: str(query_range[key]) for key in (
+                        "start_roc_date", "start_time", "end_roc_date", "end_time",
+                    ) if query_range and key in query_range},
+                    "row_count": len(comparison_data.get("visible_entry_rows", []) or []),
+                    "metadata_count": (len(comparison_data["visible_entry_metadata"])
+                                       if isinstance(comparison_data.get("visible_entry_metadata"), list) else 0),
+                    "issues": issues, "rows": issue_rows[:20], "omitted_issue_rows": max(0, len(issue_rows) - 20),
+                }
                 if known_open_at is not None:
                     return {
                         "unreturned_entry_at": known_open_at.isoformat(timespec="minutes"),
@@ -894,6 +910,7 @@ class DutySubmissionService:
                 raise DutySubmissionExecutionError(
                     "返隊查核資料不足，出入方向或原因明細尚未確認，已停止自動登打。",
                     "unreturned_evidence_invalid",
+                    return_check=evidence,
                 )
         now = self.now_factory()
         current_minute = now.hour * 60 + now.minute if action_date == self._roc_date(now.date()) else None
@@ -952,12 +969,14 @@ class DutySubmissionService:
         staff: Mapping[str, Mapping[str, Any]],
         action: Mapping[str, Any],
         current_at: datetime,
+        *,
+        details: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         target_name = clean(str(staff.get(str(action.get("target", "")), {}).get("name", "") or ""))
         if not target_name:
             return []  # A known departure remains open even if its roster is unavailable.
         metadata_rows = comparison_data.get("visible_entry_metadata")
-        issues: list[tuple[datetime, str]] = []
+        issues: list[tuple[datetime, str, dict[str, Any]]] = []
         returns: list[datetime] = []
         for index, raw in enumerate(comparison_data.get("visible_entry_rows", []) or []):
             text = raw if isinstance(raw, str) else " | ".join(str(value) for value in raw)
@@ -976,27 +995,43 @@ class DutySubmissionService:
             if row_at > current_at:
                 continue
             direction = fields["direction"]
+            code = ""
             if fields["evidence_conflict"] or not fields["record_at"]:
-                issues.append((row_at, "entry_metadata_invalid"))
+                code = "entry_metadata_invalid"
             elif direction in ("值班", "值退", "接班", "退班"):
                 continue
             elif clean(fields["category"]) == "必要性工作" and direction in ("開始", "結束"):
                 if fields["reason_state"] != "present":
-                    issues.append((row_at, "entry_reason_missing"))
-                continue  # Neutral work activity is never evidence of a physical return.
+                    code = "entry_reason_missing"
+                # Neutral work activity is never evidence of a physical return.
             elif direction not in ("出", "入", "簽出", "外出", "簽入", "返隊", "到勤"):
-                issues.append((row_at, "entry_direction_unknown"))
+                code = "entry_direction_unknown"
             elif fields["reason_state"] != "present" and not (
                 direction in ("入", "簽入", "到勤") and fields["category"] == "到勤"
             ):
-                issues.append((row_at, "entry_reason_missing"))
+                code = "entry_reason_missing"
             elif direction in ("入", "簽入", "返隊", "到勤") and (
                 clean(str(fields["reason"] or "")) == "返隊"
                 or any(keyword in str(fields["reason"] or "") for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS)
             ):
                 returns.append(row_at)
+            if code:
+                reader = metadata if isinstance(metadata, Mapping) else {}
+                issues.append((row_at, code, {
+                    "row_index": index, "issue": code, "record_at": fields["record_at"],
+                    "direction": direction, "category": fields["category"], "reason_state": fields["reason_state"],
+                    "evidence_conflict": fields["evidence_conflict"], "metadata_present": metadata is not None,
+                    "reader": {key: reader[key] for key in (
+                        "_invalid", "structure_valid", "record_time_valid", "system_written_valid", "detail_present",
+                        "detail_status", "primary_index", "direction_index", "record_at", "direction", "category",
+                    ) if key in reader},
+                    "reader_name_matches": reader.get("primary_name") == fields["primary_name"] if metadata is not None else None,
+                }))
         last_return = max(returns, default=datetime.min)
-        return sorted({code for row_at, code in issues if row_at >= last_return})
+        active = [(code, detail) for row_at, code, detail in issues if row_at >= last_return]
+        if details is not None:
+            details.extend(detail for _code, detail in active)
+        return sorted({code for code, _detail in active})
 
     @staticmethod
     def _with_session_departures(
@@ -1434,6 +1469,9 @@ class DutySubmissionService:
                 "stage": "failed",
                 "exception": diagnostic_exception(error, (request.password,)),
                 "form_validation": dict(getattr(error, "field_checks", {})),
+                "error_code": str(getattr(error, "error_code", "") or ""),
+                "return_check": sanitize_diagnostic_value(getattr(error, "return_check", {}),
+                                                          (request.user_id, request.password)),
                 "action_index": request.action_index,
                 "action": dict(action),
                 "trigger_type": request.trigger_type,
@@ -1449,6 +1487,10 @@ class DutySubmissionService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        from duty_rehearsal import is_duty_session_expired
+
+        if getattr(exc, "error_code", "") == "session_expired" or is_duty_session_expired(str(exc)):
+            return "勤務網站登入狀態已失效，請重新登入網站。", "session_expired"
         if getattr(exc, "error_code", "") == "invalid_credentials":
             return "帳號或密碼錯誤，已停止登入。", "invalid_credentials"
         category = str(getattr(exc, "diagnostic_category", "") or "")
