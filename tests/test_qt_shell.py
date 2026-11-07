@@ -19139,6 +19139,70 @@ if return_code != 0 or loaded:
             self.assertEqual(changes, ["1151003"])
             self.assertFalse(controller._auto_execution_enabled)
 
+    def test_planned_0800_checkout_uses_final_actor_and_blocks_fire_day_rollover(self) -> None:
+        from dataclasses import asdict
+        from datetime import datetime as RealDateTime
+        from PySide6.QtCore import QDateTime
+        import duty_rehearsal as planner
+        from app_core.schedule_repository import ScheduleRepository
+        from app_core.unreturned_return_queue import UnreturnedReturnQueue
+        from qt_app.controllers.duty_controller import DutyController
+
+        class Clock(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 7, 8, 0)
+
+        yesterday = planner.DutySheet(
+            roc_date="1151106",
+            rows=[
+                planner.DutyRow("22-24", {"值班": ["27"], "救護": ["5", "18"]}),
+                planner.DutyRow("06-08", {"值班": ["18"], "救護": ["5", "27"]}),
+            ],
+            summary={"在勤": ["5", "18", "27"]},
+        )
+        today = planner.DutySheet(
+            roc_date="1151107", rows=[planner.DutyRow("08-10", {"值班": ["6"]})],
+            summary={"在勤": ["6"]},
+        )
+        actions = [asdict(action) for action in planner.planned_actions(
+            yesterday, None, [], planner.parse_roc_date(yesterday.roc_date), [], today,
+        ) if action.source == "昨日在勤且今日未在勤" and action.target == "5"]
+        self.assertEqual(len(actions), 1)
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "qt_app.controllers.duty_controller.datetime", Clock,
+        ), patch("app_core.duty_task_projection.datetime", Clock):
+            controller = DutyController(
+                repository=ScheduleRepository(Path(directory)),
+                unreturned_return_queue=UnreturnedReturnQueue(Path(directory)),
+            )
+            try:
+                controller.set_actor_no("18")
+                controller.set_session_context(1, "test-user")
+                controller._observed_fire_day = yesterday.roc_date
+                controller.replace_schedule_data({"target_date": yesterday.roc_date, "actions": actions})
+                controller.enable_auto_execution()
+                self.assertTrue(controller.has_pending_fire_day_closing_tasks())
+                changes = []
+                controller.fireDayChanged.connect(changes.append)
+                with patch("qt_app.controllers.duty_controller.business_roc_date", return_value=today.roc_date), patch(
+                    "qt_app.controllers.duty_controller.QDateTime",
+                ) as qt_clock:
+                    qt_clock.currentDateTime.return_value = QDateTime(2026, 11, 7, 8, 0, 0)
+                    controller._update_clock()
+                    self.assertEqual(changes, [])
+                    requests = controller.due_submission_requests("test-user", "test-password", controller._due_task_indices)
+                    self.assertEqual([request.action_index for request in requests], [0])
+                    controller.mark_submission_enqueued(0)
+                    self.assertTrue(controller.has_pending_fire_day_closing_tasks())
+                    controller.handle_submission_request_result(requests[0], "submitted", "完成", "result.json")
+                    self.assertFalse(controller.has_pending_fire_day_closing_tasks())
+                    qt_clock.currentDateTime.return_value = QDateTime(2026, 11, 7, 8, 0, 1)
+                    controller._update_clock()
+                    self.assertEqual(changes, [today.roc_date])
+            finally:
+                controller.shutdown()
+
     def test_rollover_paused_checkout_is_preserved_in_recovery_before_fire_day_switch(self) -> None:
         from datetime import datetime as RealDateTime
         from PySide6.QtCore import QDateTime

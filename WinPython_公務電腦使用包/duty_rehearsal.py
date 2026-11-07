@@ -3363,7 +3363,7 @@ def planned_actions(
             at = 8
             minute = 0
             reason = "退勤"
-            actor = (people_at(yesterday, 22, "值班") or prev_slot_duty(today, yesterday, 8) or [""])[0]
+            actor = entry_actor_at(today, yesterday, at, minute)
         actions.append(
             PlannedAction(
                 kind="entry_log",

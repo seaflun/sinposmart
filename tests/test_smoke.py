@@ -5683,6 +5683,50 @@ try {
             [("06:00", "8", "出", "休息後退勤", 1, "休息後退勤")],
         )
 
+    def test_0800_checkout_uses_final_duty_actor_in_both_fire_day_plans(self) -> None:
+        module = duty_rehearsal_module()
+        today = module.DutySheet(
+            roc_date="1151107",
+            rows=[module.DutyRow("08-10", {"值班": ["6"]})],
+            summary={"在勤": ["6"]},
+        )
+        for closing_slot in ("06-08", "07-08"):
+            yesterday = module.DutySheet(
+                roc_date="1151106",
+                rows=[
+                    module.DutyRow("22-24", {"值班": ["27"], "救護": ["5", "18"]}),
+                    module.DutyRow(closing_slot, {"值班": ["18"], "救護": ["5", "27"]}),
+                ],
+                summary={"在勤": ["5", "18", "27"]},
+            )
+            for preview in (True, False):
+                with self.subTest(closing_slot=closing_slot, preview=preview):
+                    if preview:
+                        actions = module.planned_actions(
+                            yesterday, None, [], module.parse_roc_date(yesterday.roc_date), [], today,
+                        )
+                    else:
+                        actions = module.planned_actions(
+                            today, yesterday, [], module.parse_roc_date(today.roc_date), [], None,
+                        )
+                    checkouts = [
+                        action for action in actions
+                        if action.source == "昨日在勤且今日未在勤" and action.target == "5"
+                        and action.fields.get("領用事由及地點") == "退勤"
+                    ]
+                    self.assertEqual(
+                        [(action.actor, action.time, action.fields["系統寫入時間"], action.date_offset)
+                         for action in checkouts],
+                        [("18", "08:00", "08:05", int(preview))],
+                    )
+                    handoffs = [
+                        action for action in actions
+                        if action.source == "值班交接" and action.time == "08:00"
+                        and action.date_offset == int(preview)
+                    ]
+                    self.assertTrue(handoffs)
+                    self.assertEqual({action.actor for action in handoffs}, {"18"})
+
     def test_continuous_0408_rest_checkout_suppresses_0800_checkout(self) -> None:
         module = duty_rehearsal_module()
         yesterday = module.DutySheet(
