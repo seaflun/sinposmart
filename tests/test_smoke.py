@@ -2697,7 +2697,7 @@ try {
 
         self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
 
-    def test_daily_sheet_preflight_requires_commander_in_each_merged_time_slot(self) -> None:
+    def test_daily_sheet_preflight_accepts_blank_commander_when_everyone_is_assigned(self) -> None:
         module = legacy_duty_sheet_module()
         for commander in (None, " \t\n\u3000", 0, "0"):
             with self.subTest(commander=commander):
@@ -2711,13 +2711,13 @@ try {
                     sheet.cell(row, 3, "16")
                     sheet.cell(row, 4, "28,1")
                     sheet.cell(row, 8, "2")
+                for row in (12, 13):
+                    sheet.cell(row, 4).value = "28,1,2"
                 sheet.cell(12, 8).value = commander
                 sheet.merge_cells("H12:H13")
                 with mock.patch.object(module, "expected_on_duty_numbers", return_value=["16", "28", "1", "2"]):
                     issues = module.validate_daily_sheet_assignments(workbook, sheet, 24, set())
-                self.assertEqual(len(issues), 2)
-                self.assertTrue(any("10-11" in issue and "【指揮官未排】" in issue for issue in issues))
-                self.assertTrue(any("11-12" in issue and "【指揮官未排】" in issue for issue in issues))
+                self.assertEqual(issues, [])
 
     def test_daily_sheet_preflight_counts_merged_assignments_for_each_time_slot(self) -> None:
         module = legacy_duty_sheet_module()
@@ -4837,6 +4837,8 @@ try {
                     for column, value in {2: f"{hour:02d}-{(hour + 1) % 24:02d}", 3: "20,18", 4: "31,19",
                         5: "30,21", 6: "16,7", 7: "28,24", 11: "8,9,10,11,12", 12: "29", 15: "3,22", 16: "1,2"}.items():
                         sheet.cell(row, column, value)
+                sheet.cell(10, 4).value = "31,19,2"
+                sheet.cell(10, 16).value = None
                 if source == "roster":
                     roster = workbook.create_sheet("輪休基準表")
                     params = workbook.create_sheet("班別參數")
@@ -4875,18 +4877,22 @@ try {
                     module, "super_js_execute", return_value=True
                 ), mock.patch.object(module, "step_fill_mission_cells", side_effect=RuntimeError("offline-stop-before-save")) as fill_mission, mock.patch.object(
                     module.time, "sleep"
-                ), mock.patch.object(module, "log_status"):
+                ), mock.patch.object(module, "log_status") as log:
                     result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
                         error_callback=error, show_dialogs=False)
                 self.assertFalse(result)
                 error.assert_called_once_with("offline-stop-before-save")
                 self.assertEqual(configure.call_args.args[3], 2)
                 self.assertEqual(preflight.call_args.args[2], normal_staff)
+                self.assertTrue(any("08-09" in call.args[0] and "指揮官欄空白" in call.args[0]
+                                    for call in log.call_args_list))
                 duty_map = fill_duty.call_args.args[1]
                 mission_map = fill_mission.call_args.args[1]
                 for hour in range(24):
+                    external = "31,2" if hour == 8 else "31"
+                    standby = "10,11,12" if hour == 8 else "10,11,12,2"
                     self.assertEqual([duty_map[f"_pln_{hour}_{column}"] for column in range(1, 7)],
-                        ["20", "31", "16,28,24", "8,9", "10,11,12,2", "30"])
+                        ["20", external, "16,28,24", "8,9", standby, "30"])
                     self.assertEqual(mission_map[f"_pln_{hour}_6"], "16,28,24")
                 for payload in (duty_map, mission_map):
                     assigned = {number for key, value in payload.items() if key.startswith("_pln_")
@@ -4896,35 +4902,39 @@ try {
                 self.assertEqual(sheet.cell(10, 15).value, "3,22")
                 build_driver.assert_not_called()
 
-    def test_duty_sheet_off_duty_commander_stops_before_browser_or_capture(self) -> None:
+    def test_duty_sheet_without_eligible_daily_commander_stops_before_browser_or_capture(self) -> None:
         module = legacy_duty_sheet_module()
-        workbook = module.openpyxl.Workbook()
-        sheet = workbook.active
-        sheet.title = "23號"
-        for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
-            sheet.cell(5, column, label)
-        sheet.cell(6, 13, "指揮官")
-        sheet.cell(22, 16, "備勤")
-        sheet.cell(22, 17, "20")
-        for row in range(10, 34):
-            hour = (row - 2) % 24
-            sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
-            sheet.cell(row, 3, "20")
-            sheet.cell(row, 13, "1")
-        error = mock.Mock()
-        with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
-            module, "ThreadPoolExecutor", side_effect=AssertionError("測試不得啟動截圖")
-        ) as executor, mock.patch.object(module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")) as build_driver, mock.patch.object(
-            module, "log_status"
-        ):
-            result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
-                error_callback=error, show_dialogs=False)
-        self.assertFalse(result)
-        self.assertIn("【指揮官未排】", error.call_args.args[0])
-        executor.assert_not_called()
-        build_driver.assert_not_called()
+        for commander in (None, "1", "22"):
+            with self.subTest(commander=commander):
+                workbook = module.openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "23號"
+                for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+                    sheet.cell(5, column, label)
+                sheet.cell(6, 13, "指揮官")
+                sheet.cell(22, 16, "備勤")
+                sheet.cell(22, 17, "20,21,22,23")
+                for row in range(10, 34):
+                    hour = (row - 2) % 24
+                    sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
+                    sheet.cell(row, 3, "20")
+                    sheet.cell(row, 10, "21,23" if commander == "22" else "21,22,23")
+                    sheet.cell(row, 13, commander)
+                error = mock.Mock()
+                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+                    module, "ThreadPoolExecutor", side_effect=AssertionError("測試不得啟動截圖")
+                ) as executor, mock.patch.object(
+                    module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")
+                ) as build_driver, mock.patch.object(module, "log_status"):
+                    result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
+                        error_callback=error, show_dialogs=False)
+                self.assertFalse(result)
+                self.assertIn("全日無合格的指揮官番號", error.call_args.args[0])
+                self.assertNotIn("【漏排】", error.call_args.args[0])
+                executor.assert_not_called()
+                build_driver.assert_not_called()
 
-    def test_duty_sheet_commander_moved_to_ambulance_stops_before_browser_or_capture(self) -> None:
+    def test_duty_sheet_still_blocks_short_mission_ambulance_2_with_blank_commander(self) -> None:
         module = legacy_duty_sheet_module()
         for commander in (None, " \t\n\u3000", 0, "0"):
             with self.subTest(commander=commander):
@@ -4955,8 +4965,8 @@ try {
                     result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
                         error_callback=error, show_dialogs=False)
                 self.assertFalse(result)
-                self.assertIn("10-11：【指揮官未排】", error.call_args.args[0])
-                self.assertIn("11-12：【指揮官未排】", error.call_args.args[0])
+                self.assertIn("10-11：救災任務編組表救護2車", error.call_args.args[0])
+                self.assertNotIn("【指揮官未排】", error.call_args.args[0])
                 self.assertNotIn("【漏排】", error.call_args.args[0])
                 executor.assert_not_called()
                 capture.assert_not_called()

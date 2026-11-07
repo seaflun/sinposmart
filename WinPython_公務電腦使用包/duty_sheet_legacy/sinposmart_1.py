@@ -343,7 +343,7 @@ def expected_on_duty_numbers(workbook, sheet, day_int, excluded_numbers):
     return expected_on_duty_numbers_from_daily_sheet(sheet, excluded_numbers)
 
 def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers):
-    """檢查每日勤務表是否有指揮官未排、同時段重複排班或漏排。"""
+    """檢查每日勤務表是否有公式錯誤、同時段重複排班或漏排。"""
     issues = []
     start_col = find_header_column(sheet, 5, "值班")
     end_col = find_header_column(sheet, 6, "指揮官")
@@ -372,8 +372,6 @@ def validate_daily_sheet_assignments(workbook, sheet, day_int, excluded_numbers)
 
         missing = [person for person in expected if person not in seen]
         row_errors = []
-        if not clean_to_list_excluding(get_merged_val(sheet, row, end_col), excluded_numbers):
-            row_errors.append("【指揮官未排】")
         if formula_errors:
             row_errors.append(f"【公式錯誤】{','.join(formula_errors)}")
         if duplicates:
@@ -2326,9 +2324,14 @@ def start_automation(
             log_status(f"ℹ️ 依 Excel 正常上班名單略過非上班番號（含停休）：{', '.join(ordered_non_working)}")
 
     cmd_all = []
+    blank_commander_slots = []
     for r in range(10, 34):
         val = get_merged_val(sheet, r, ex_map["指揮官"])
-        cmd_all.extend([int(x) for x in clean_to_list_excluding(val, excluded_numbers) if 1 <= int(x) <= 5])
+        commanders = clean_to_list_excluding(val, excluded_numbers)
+        if not commanders:
+            slot = str(sheet.cell(row=r, column=ex_map["時間"]).value or "").strip()
+            blank_commander_slots.append(slot or f"第 {r} 列")
+        cmd_all.extend(int(number) for number in commanders if 1 <= int(number) <= 5)
     daily_commander = min(cmd_all) if cmd_all else ""
 
     out_names, out_excel_cols = [], []
@@ -2348,6 +2351,8 @@ def start_automation(
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
     report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
+    if not daily_commander:
+        preflight_issues.append(f"{sheet.title}：全日無合格的指揮官番號（正常上班的 1–5 番），無法設定勤務番號維護。")
     if num_out > 5:
         preflight_issues.append(f"{sheet.title}：外勤項目超過 5 項，無法對應勤務設定第 2–6 欄，已停止登打。")
     if not daily_standby_numbers:
@@ -2373,6 +2378,9 @@ def start_automation(
         wb.close()
         _runtime_status_callback = previous_status_callback
         return False
+    if blank_commander_slots:
+        slots = "、".join(blank_commander_slots)
+        log_status(f"⚠️ 指揮官欄空白或番號已排除的時段為 {slots}，依原班表登打。")
     log_status("✅ 勤務表檢查通過，未發現重複或漏排")
     duty_annotation = build_duty_annotation(
         duty_leader_numbers(wb, sheet, day_int, excluded_numbers), personnel_deductions
