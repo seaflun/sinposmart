@@ -11180,9 +11180,19 @@ class UpdateControllerTests(unittest.TestCase):
                 "request_id": request_id, "package_dir": str(root), "status": "failed",
                 "remote_version": "2026.10.20.0200",
                 "detail": "private raw text must not be sent",
-                "close_failure": {"code": "gui_exit_timeout", "expected_pid": 1234,
-                                  "observed_count": 0, "waited_ms": 60001,
-                                  "exception_type": "", "detail": "private nested text must not be sent"},
+                "close_failure": {
+                    "code": "gui_identity_invalid", "expected_pid": 0,
+                    "observed_count": 2, "waited_ms": 0, "exception_type": "",
+                    "detail": "private nested text must not be sent",
+                    "observed_processes": [
+                        {"pid": 1234, "parent_pid": 2468, "image": "pythonw.exe",
+                         "entrypoint": "duty_gui.pyw", "command_line": "private raw command"},
+                        {"pid": 3456, "parent_pid": 1234, "image": "other",
+                         "entrypoint": "duty_gui.py"},
+                        {"pid": 12345, "parent_pid": 0, "image": "private.exe",
+                         "entrypoint": "duty_gui.pyw"},
+                    ],
+                },
             }), encoding="utf-8")
             controller = UpdateProgressController(root / "update_package.ps1", root,
                                                   request_id=request_id, heartbeat_enabled=True,
@@ -11203,11 +11213,12 @@ class UpdateControllerTests(unittest.TestCase):
                     self.assertEqual(report["request_id"], request_id)
                     self.assertEqual(report["status"], "failed")
                     self.assertEqual(report["exit_code"], 1)
-                    self.assertIn("gui_exit_timeout", report["detail"])
-                    self.assertIn("1234", report["detail"])
-                    self.assertIn("60001", report["detail"])
+                    self.assertIn("gui_identity_invalid", report["detail"])
+                    self.assertIn("1234/2468 pythonw.exe duty_gui.pyw", report["detail"])
+                    self.assertIn("3456/1234 other duty_gui.py", report["detail"])
+                    self.assertNotIn("12345", report["detail"])
                     self.assertNotIn("private", report["detail"])
-                    self.assertIn("等待舊 GUI 自然退出逾時", controller.updateView["detail"])
+                    self.assertIn("原 GUI 身分或數量不符合更新條件", controller.updateView["detail"])
                     self.assertNotIn("PID=", controller.updateView["detail"])
                     controller.process_finished(1)
                     self.assertEqual(send.call_count, 1)
@@ -18229,6 +18240,41 @@ ApplicationWindow {
         finally:
             first.close()
             QLocalServer.removeServer(server_name)
+
+    @unittest.skipUnless(os.name == "nt", "Windows named pipe contract")
+    def test_second_gui_cannot_start_until_the_first_process_has_exited(self) -> None:
+        child_source = """
+import sys
+from PySide6.QtCore import QCoreApplication
+from qt_app.main import create_instance_server
+
+app = QCoreApplication([])
+server = create_instance_server(sys.argv[1])
+assert server is not None
+server.close()
+print("pipe closed", flush=True)
+sys.stdin.readline()
+"""
+        return_code, output = run_isolated_python(fr"""
+import subprocess
+import sys
+from uuid import uuid4
+from PySide6.QtCore import QCoreApplication
+from qt_app.main import create_instance_server
+
+app = QCoreApplication([])
+name = f"SinpoSmart.InstanceLifetime.{{uuid4().hex}}"
+with subprocess.Popen([sys.executable, "-c", {child_source!r}, name],
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE) as first:
+    try:
+        assert first.stdout.readline().strip() == b"pipe closed"
+        assert create_instance_server(name) is None, "second GUI started while the first PID was alive"
+    finally:
+        first.communicate(input=b"\n", timeout=10)
+assert first.returncode == 0
+assert create_instance_server(name) is not None, "process exit did not release the claim"
+""")
+        self.assertEqual(return_code, 0, output)
 
     def test_windowed_entry_runs_full_qt_startup_and_clean_shutdown(self) -> None:
         from qt_app.main import STARTUP_SMOKE_ARG

@@ -1547,6 +1547,10 @@ class PackageSmokeTests(unittest.TestCase):
         source = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("function Wait-UpdateLogoutEvent", source)
         helper = source[source.index("function Wait-UpdateLogoutEvent"):source.index("function Stop-RunningDutyGui")]
+        diagnostic_helpers = (
+            source[source.index("function Get-DutyGuiEntrypointToken"):source.index("function Test-IsPossiblePackageDutyGuiProcess")]
+            + source[source.index("function Set-GuiCloseFailure"):source.index("function Invoke-HiddenProcess")]
+        )
         for responses, identities, timeout, expected, calls in (
             (["busy", "busy", "ready"], [123, 123, 123], 300, "ready", 3),
             (["busy"], [123], 0, "busy_timeout", 1),
@@ -1560,6 +1564,7 @@ class PackageSmokeTests(unittest.TestCase):
                 result = run_powershell_contract(f"""
 $ErrorActionPreference = 'Stop'
 {helper}
+{diagnostic_helpers}
 $script:responses = @({replies})
 $script:identities = @({pids})
 $script:calls = 0
@@ -1567,13 +1572,21 @@ $script:queries = 0
 function Send-UpdateLogoutEvent {{ $script:calls++; return $script:responses[$script:calls - 1] }}
 function Get-RunningDutyGuiProcesses {{
     $script:queries++
-    return @([pscustomobject]@{{ ProcessId = $script:identities[$script:queries - 1] }})
+    return @([pscustomobject]@{{
+        ProcessId = $script:identities[$script:queries - 1]; ParentProcessId = 99
+        Name = 'pythonw.exe'; CommandLine = 'pythonw.exe duty_gui.pyw'
+    }})
 }}
 function Test-IsQtDutyGuiProcess {{ return $true }}
 function Write-UpdateProgress {{ }}
 function Start-Sleep {{ }}
 $result = Wait-UpdateLogoutEvent -ExpectedProcessId 123 -TimeoutSeconds {timeout}
 if ($result -ne '{expected}' -or $script:calls -ne {calls}) {{ throw "Unexpected result: $result, calls: $script:calls" }}
+if ($script:identities[-1] -ne 123 -and
+    ($script:guiCloseFailure.code -ne 'gui_process_changed' -or
+     $script:guiCloseFailure.observed_processes[0].pid -ne $script:identities[-1])) {{
+    throw 'Replacement PID was not recorded.'
+}}
 """ )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -8074,7 +8087,9 @@ $script:FakeProcesses = @(
     [pscustomobject]@{{ ProcessId = 11; CommandLine = 'pythonw.exe duty_gui.pyw' }},
     [pscustomobject]@{{ ProcessId = 12; CommandLine = 'python.exe ..\\package\\duty_gui.py' }},
     [pscustomobject]@{{ ProcessId = 13; CommandLine = 'pythonw.exe "C:\\SinpoSmart Package\\duty_gui.pyw"' }},
-    [pscustomobject]@{{ ProcessId = 14; CommandLine = 'pythonw.exe "C:\\Other Package\\duty_gui.pyw"' }}
+    [pscustomobject]@{{ ProcessId = 14; CommandLine = 'pythonw.exe "C:\\Other Package\\duty_gui.pyw"' }},
+    [pscustomobject]@{{ ProcessId = 15; CommandLine = 'pythonw.exe "C:\\SinpoSmart Package\\other_duty_gui.pyw"' }},
+    [pscustomobject]@{{ ProcessId = 16; CommandLine = 'pythonw.exe -m qt_app.controllers.update_controller --install update_package.ps1' }}
 )
 function Get-CimInstance {{
     [CmdletBinding()]
@@ -8196,6 +8211,7 @@ if (-not $script:guiCloseFailure.exception_type) {{ throw "Missing safe exceptio
 
     def test_update_close_diagnostic_survives_failed_stage_manifest(self) -> None:
         script = (package_dir() / "update_package.ps1").read_text(encoding="utf-8-sig")
+        helpers = script[script.index("function Get-DutyGuiEntrypointToken"):script.index("function Send-UpdateLogoutEvent")]
         setter = script[script.index("function Set-GuiCloseFailure"):script.index("function Invoke-HiddenProcess")]
         writer = script[script.index("function Write-RemoteStageManifest"):script.index("function Add-PendingUpdateNotice")]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8206,13 +8222,22 @@ $stagingDir = '{directory}'
 $stagingManifestPath = Join-Path $stagingDir 'manifest.json'
 $RequestId = '44444444-4444-4444-8444-444444444444'
 $packageDir = 'C:/SinpoSmart Contract'
+{helpers}
 {setter}
 {writer}
-Set-GuiCloseFailure -Code 'gui_exit_timeout' -Reason 'Timed out waiting for GUI' -ExpectedProcessId 1234 -ObservedCount 0 -WaitedMs 60001
+$candidates = @(
+    [pscustomobject]@{{ ProcessId = 1234; ParentProcessId = 2468; Name = 'pythonw.exe'; CommandLine = 'pythonw.exe duty_gui.pyw --secret fixture-secret' }},
+    [pscustomobject]@{{ ProcessId = 3456; ParentProcessId = 1234; Name = 'fixture-secret.exe'; CommandLine = 'wrapper.exe duty_gui.py' }}
+)
+Set-GuiCloseFailure -Code 'gui_identity_invalid' -Reason 'Two GUI candidates' -ObservedCount 2 -ObservedProcesses $candidates
 Write-RemoteStageManifest -Status 'failed' -RemoteVersion '2026.10.20.0200' -RemoteSha256 ('a' * 64) -InstalledVersion '2026.10.19.2240' -Detail $script:guiCloseFailure.detail
 $record = Get-Content -LiteralPath $stagingManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($record.close_failure.code -ne 'gui_exit_timeout' -or $record.close_failure.expected_pid -ne 1234 -or $record.close_failure.waited_ms -ne 60001) {{ throw 'Lost failure details in manifest.' }}
-if ($record.detail -notmatch 'gui_exit_timeout') {{ throw 'Legacy GUI report lost the specific cause.' }}
+$observed = $record.close_failure.observed_processes
+if ($observed.Count -ne 2 -or $observed[0].pid -ne 1234 -or $observed[0].parent_pid -ne 2468 -or
+    $observed[0].image -ne 'pythonw.exe' -or $observed[1].entrypoint -ne 'duty_gui.py' -or
+    $observed[1].image -ne 'other') {{ throw 'Lost bounded candidate data in manifest.' }}
+if ($record.detail -notmatch 'gui_identity_invalid' -or $record.detail -notmatch '3456') {{ throw 'Legacy GUI report lost the candidate information.' }}
+if ((Get-Content -LiteralPath $stagingManifestPath -Raw) -match 'fixture-secret') {{ throw 'Leaked a command line or image name.' }}
 Write-RemoteStageManifest -Status 'completed' -RemoteVersion '2026.10.20.0200' -RemoteSha256 ('a' * 64) -InstalledVersion '2026.10.20.0200'
 $record = Get-Content -LiteralPath $stagingManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($record.close_failure) {{ throw 'Stale failure contaminated a successful update.' }}
@@ -8957,7 +8982,10 @@ function render(extra=false){
    Event:function(type){this.type=type;}, getComputedStyle:()=>({display:'block',visibility:'visible'})};
  function field(id,value){let v=value; const el={id,form,disabled:false,readOnly:false,
   tagName:'INPUT',type:'text',getAttribute:()=>null,getClientRects:()=>[1],dispatchEvent:()=>true,focus:()=>{}};
-  Object.defineProperty(el,'value',{get:()=>v,set:x=>{v=String(x);if(id==='_txtTaskDate')s.date=v;
+  if(id===s.rewrite_on_change)el.dispatchEvent=e=>{if(e.type==='change')el.value='private-rewrite';};
+  Object.defineProperty(el,'value',{get:()=>v,set:x=>{
+   if(id===s.reject_assignment)throw new Error('fixture-secret');
+   v=String(x);if(id==='_txtTaskDate')s.date=v;
    if(id.startsWith('_pln_')){s.writes++;s.values[id]=v;}}});
   elements[id]=el;return el;}
  field('_txtTaskDate',s.date);const marker=field('_btnOpenWinTaskCode',s.vehicle_label||'勤務車輛設定');field('_btnQuery','');
@@ -8978,7 +9006,7 @@ function render(extra=false){
   s.values={...s.saved};if(s.wrong_query_date)s.date='1151031';top=render();}};
  if(s.wrong_page||s.memo_present){const memo=field('_areMEMO','private duty memo');memo.tagName='TEXTAREA';memo.getClientRects=()=>[];}
  for(const [id,value]of Object.entries(s.values))if(id!==s.missing&&!(s.late_ready&&s.reads<2)){
-  const el=field(id,value);el.readOnly=!!s.readonly||!!(s.disable_after_save&&s.saves);}
+  const el=field(id,value);el.readOnly=id===s.read_only_id||!!s.readonly||!!(s.disable_after_save&&s.saves);}
  doc.forms=s.extra_form?[form,{id:'other'}]:[form];form.ownerDocument=doc;
  doc.getElementById=id=>elements[id]||null;
  doc.querySelectorAll=selector=>{if(selector==='form')return doc.forms;
@@ -8996,8 +9024,13 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
 '''
         driver = mock.Mock()
         def execute(script, *args):
-            if options.get("script_error"):
+            mode = args[2] if len(args) > 2 else ""
+            if options.get("script_error") or options.get("script_error_at") == mode:
                 raise RuntimeError("fixture-secret token=private-value")
+            if mode == "fill" and options.get("missing_at_fill"):
+                state["missing"] = options["missing_at_fill"]
+            if mode == "fill" and options.get("read_only_at_fill"):
+                state["read_only_id"] = options["read_only_at_fill"]
             adapted = "const argumentsFromDriver=" + json.dumps(args) + ";\n" + script.replace("arguments", "argumentsFromDriver")
             result = subprocess.run([node, "-e", harness, json.dumps(state), json.dumps(adapted), json.dumps(args)],
                                     capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
@@ -9193,13 +9226,52 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                                                        "1151101", wait=wait)
                 self.assertEqual(state["saves"], 1)
                 self.assertLessEqual(state["queries"], 1)
+                if options.get("no_persist"):
+                    payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+                    self.assertEqual((payload["operation"], payload["reason"]), ("read", "readback_mismatch"))
+                    self.assertEqual(payload["mismatched_ids"], ["_pln_8_1", "_pln_8_2"])
+                    self.assertTrue(payload["save_attempted"])
 
     def test_mission_document_replaced_after_fill_never_saves_another_form(self):
         module, driver, state, wait = self._driver(swap_after_fill=True)
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
             with self.assertRaisesRegex(RuntimeError, "未執行儲存"):
                 module.step_fill_mission_cells(driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait)
+            payload = json.loads((Path(directory) / "runtime_outputs/browser/duty_sheet_failure.json").read_text("utf-8"))
+            self.assertEqual((payload["operation"], payload["rejection_code"]), ("save", "fill_document_changed"))
+            self.assertFalse(payload["save_attempted"])
         self.assertEqual(state["saves"], 0)
+
+    def test_mission_failure_reports_fill_observation_and_field_ids_without_values(self):
+        from zipfile import ZipFile
+
+        diagnostics = package_module("app_core.diagnostics_service")
+        cases = (
+            ({"rewrite_on_change": "_pln_8_2"}, "field_value_mismatch", {"mismatched_ids": ["_pln_8_2"]}),
+            ({"missing_at_fill": "_pln_8_2"}, "fields_missing", {"missing_ids": ["_pln_8_2"], "found_count": 1}),
+            ({"read_only_at_fill": "_pln_8_2"}, "fields_not_writable", {"read_only_ids": ["_pln_8_2"]}),
+            ({"reject_assignment": "_pln_8_1"}, "field_assignment_failed", {"failed_ids": ["_pln_8_1"]}),
+            ({"script_error_at": "fill"}, "browser_script_error", {"exception_type": "RuntimeError"}),
+        )
+        for options, code, expected in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                module, driver, state, wait = self._driver(**options)
+                with mock.patch.object(module, "PACKAGE_DIR", Path(directory)):
+                    with self.assertRaisesRegex(RuntimeError, "未執行儲存"):
+                        module.step_fill_mission_cells(driver, {"_pln_8_1": "private-member-value", "_pln_8_2": "3,4"},
+                                                       "1151101", wait=wait)
+                archive = diagnostics.DiagnosticsService(Path(directory)).export(
+                    diagnostics.DiagnosticSnapshot(target_date="1151101")
+                )
+                with ZipFile(archive) as package:
+                    raw = package.read("runtime_outputs/browser/duty_sheet_failure.json").decode("utf-8")
+                payload = json.loads(raw)
+                self.assertEqual((payload["operation"], payload["rejection_code"]), ("fill", code))
+                self.assertEqual({key: payload[key] for key in expected}, expected)
+                self.assertFalse(payload["save_attempted"])
+                self.assertEqual((state["saves"], state["queries"]), (0, 0))
+                for value in ("fixture-secret", "private-value", "private-member-value", "private-rewrite"):
+                    self.assertNotIn(value, raw)
 
     def test_mission_readonly_saved_page_can_be_queried_without_another_save(self):
         module, driver, state, wait = self._driver(disable_after_save=True)

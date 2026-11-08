@@ -178,7 +178,7 @@ function Get-DutyGuiEntrypointToken {
     }
     $match = [regex]::Match(
         [string]$Process.CommandLine,
-        '(?i)(?:"(?<quoted>[^"]*duty_gui\.pyw?)"|(?<bare>[^\s"]*duty_gui\.pyw?))(?=$|\s)'
+        '(?i)(?:^|\s)(?:"(?<quoted>(?:[^"]*[\\/]|[a-z]:)?duty_gui\.pyw?)"|(?<bare>(?:[^\s"]*[\\/]|[a-z]:)?duty_gui\.pyw?))(?=$|\s)'
     )
     if (-not $match.Success) {
         return ""
@@ -196,7 +196,7 @@ function Test-IsPossiblePackageDutyGuiProcess {
     if (-not $entrypoint) {
         return $false
     }
-    if (-not [System.IO.Path]::IsPathRooted($entrypoint)) {
+    if ($entrypoint -match '^[a-z]:(?![\\/])' -or -not [System.IO.Path]::IsPathRooted($entrypoint)) {
         # A bare or relative entrypoint may have been launched with packageDir as
         # its working directory. Treat it as ours so updating fails closed.
         return $true
@@ -294,6 +294,7 @@ function Wait-UpdateLogoutEvent {
         if ($currentGui.Count -ne 1 -or $ExpectedProcessId -le 0 -or
             [int]$currentGui[0].ProcessId -ne $ExpectedProcessId -or
             -not (Test-IsQtDutyGuiProcess -Process $currentGui[0])) {
+            Set-GuiCloseFailure -Code "gui_process_changed" -Reason "等待交握時 GUI 程序已改變" -ExpectedProcessId $ExpectedProcessId -ObservedCount $currentGui.Count -ObservedProcesses $currentGui -WaitedMs $waitClock.ElapsedMilliseconds
             return "failed"
         }
         $result = Send-UpdateLogoutEvent
@@ -326,7 +327,7 @@ function Stop-RunningDutyGui {
     if ($processes.Count -ne 1 -or $ExpectedProcessId -le 0 -or
         -not (Test-IsQtDutyGuiProcess -Process $processes[0]) -or
         [int]$processes[0].ProcessId -ne $ExpectedProcessId) {
-        Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "原 GUI 身分或數量不符合更新條件" -ExpectedProcessId $ExpectedProcessId -ObservedCount $processes.Count
+        Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "原 GUI 身分或數量不符合更新條件" -ExpectedProcessId $ExpectedProcessId -ObservedCount $processes.Count -ObservedProcesses $processes
         return $false
     }
 
@@ -353,7 +354,7 @@ function Stop-RunningDutyGui {
             if ($current.Count -gt 1 -or ($current.Count -eq 1 -and
                 ([int]$current[0].ProcessId -ne $ExpectedProcessId -or
                  -not (Test-IsQtDutyGuiProcess -Process $current[0])))) {
-                Set-GuiCloseFailure -Code "gui_process_changed" -Reason "等待退出時出現其他或無法確認身分的 GUI" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -WaitedMs $clock.ElapsedMilliseconds
+                Set-GuiCloseFailure -Code "gui_process_changed" -Reason "等待退出時出現其他或無法確認身分的 GUI" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -ObservedProcesses $current -WaitedMs $clock.ElapsedMilliseconds
                 return $false
             }
             $exited = $null -eq $original -or $original.HasExited
@@ -362,7 +363,7 @@ function Stop-RunningDutyGui {
                 return $true
             }
             if ($clock.Elapsed.TotalSeconds -ge $ExitTimeoutSeconds) {
-                Set-GuiCloseFailure -Code "gui_exit_timeout" -Reason "等待舊 GUI 自然退出逾時，未套用更新檔案" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -WaitedMs $clock.ElapsedMilliseconds
+                Set-GuiCloseFailure -Code "gui_exit_timeout" -Reason "等待舊 GUI 自然退出逾時，未套用更新檔案" -ExpectedProcessId $ExpectedProcessId -ObservedCount $observedCount -ObservedProcesses $current -WaitedMs $clock.ElapsedMilliseconds
                 return $false
             }
             # CIM may temporarily lose the command line during shutdown. Wait for
@@ -384,16 +385,33 @@ function Stop-RunningDutyGui {
 function Set-GuiCloseFailure {
     param(
         [string]$Code, [string]$Reason, [int]$ExpectedProcessId = 0,
-        [int]$ObservedCount = -1, [long]$WaitedMs = 0, [string]$ExceptionType = ""
+        [int]$ObservedCount = -1, [long]$WaitedMs = 0, [string]$ExceptionType = "",
+        [object[]]$ObservedProcesses = @()
     )
 
-    # Fixed reasons and numeric process metadata only; never serialize command
-    # lines, paths, credentials or raw exception messages into backend reports.
+    # Numeric IDs and fixed labels only. Do not serialize command lines or paths.
+    $observed = @(foreach ($process in ($ObservedProcesses | Select-Object -First 4)) {
+        $token = Get-DutyGuiEntrypointToken -Process $process
+        if (-not $token) { continue }
+        $image = ([string]$process.Name).ToLowerInvariant()
+        if ($image -notin @("pythonw.exe", "python.exe", "pyw.exe", "py.exe", "cmd.exe", "powershell.exe", "pwsh.exe")) {
+            $image = "other"
+        }
+        [ordered]@{
+            pid = [long]$process.ProcessId; parent_pid = [long]$process.ParentProcessId
+            image = $image; entrypoint = if ($token -match '\.pyw$') { "duty_gui.pyw" } else { "duty_gui.py" }
+        }
+    })
     $detail = "關閉舊值班台失敗：$Reason [$Code]；原 PID=$ExpectedProcessId；GUI 數=$ObservedCount；等待=$WaitedMs 毫秒"
     if ($ExceptionType) { $detail += "；例外類別=$ExceptionType" }
+    if ($observed.Count) {
+        $candidates = $observed | ForEach-Object { "$($_.pid)/$($_.parent_pid) $($_.image) $($_.entrypoint)" }
+        $detail += "；候選 PID/父 PID=$($candidates -join ', ')"
+    }
     $script:guiCloseFailure = [ordered]@{
         code = $Code; expected_pid = $ExpectedProcessId; observed_count = $ObservedCount
         waited_ms = $WaitedMs; exception_type = $ExceptionType; detail = $detail
+        observed_processes = $observed
     }
     Write-Warning $detail
 }
@@ -1033,6 +1051,11 @@ try {
     Write-UpdateProgress -Phase "closing" -Percent 58
     try {
         $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
+        if ($runningDutyGuiProcesses.Count -gt 1) {
+            # A second launch may still be exiting after activating the running GUI.
+            Start-Sleep -Seconds 2
+            $runningDutyGuiProcesses = @(Get-RunningDutyGuiProcesses)
+        }
     } catch {
         Set-GuiCloseFailure -Code "gui_query_failed" -Reason "無法查詢 GUI 程序" -ExceptionType $_.Exception.GetType().FullName
         throw $script:guiCloseFailure.detail
@@ -1040,12 +1063,12 @@ try {
     $wasRunning = $runningDutyGuiProcesses.Count -gt 0
     if ($wasRunning) {
         if ($runningDutyGuiProcesses.Count -ne 1) {
-            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "有多個 GUI，無法確認更新對象" -ObservedCount $runningDutyGuiProcesses.Count
+            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "有多個 GUI，無法確認更新對象" -ObservedCount $runningDutyGuiProcesses.Count -ObservedProcesses $runningDutyGuiProcesses
             throw $script:guiCloseFailure.detail
         }
         $runningQtProcess = $runningDutyGuiProcesses[0]
         if (-not (Test-IsQtDutyGuiProcess -Process $runningQtProcess)) {
-            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "執行中的 GUI 不是可確認的 Qt 值班台" -ExpectedProcessId ([int]$runningQtProcess.ProcessId) -ObservedCount 1
+            Set-GuiCloseFailure -Code "gui_identity_invalid" -Reason "執行中的 GUI 不是可確認的 Qt 值班台" -ExpectedProcessId ([int]$runningQtProcess.ProcessId) -ObservedCount 1 -ObservedProcesses $runningDutyGuiProcesses
             throw $script:guiCloseFailure.detail
         }
         $handshakenProcessId = [int]$runningQtProcess.ProcessId
@@ -1060,7 +1083,9 @@ try {
             throw $script:guiCloseFailure.detail
         }
         if ($prepareResult -ne "ready") {
-            Set-GuiCloseFailure -Code "handshake_not_ready" -Reason "GUI 未回覆可更新（$prepareResult），保留原程式" -ExpectedProcessId $handshakenProcessId
+            if (-not $script:guiCloseFailure) {
+                Set-GuiCloseFailure -Code "handshake_not_ready" -Reason "GUI 未回覆可更新（$prepareResult），保留原程式" -ExpectedProcessId $handshakenProcessId
+            }
             throw $script:guiCloseFailure.detail
         }
         if (-not (Stop-RunningDutyGui -Processes $runningDutyGuiProcesses -Ready -ExpectedProcessId $handshakenProcessId)) {

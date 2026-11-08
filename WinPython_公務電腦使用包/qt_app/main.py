@@ -123,6 +123,27 @@ def load_package_env(package_root: Path = PACKAGE_ROOT) -> None:
             os.environ[key] = value.strip().strip('"').strip("'")
 
 
+def _claim_windows_instance(server_name: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, fr"Global\{server_name}.Instance")
+    error = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(error)
+    if error == 183:  # ERROR_ALREADY_EXISTS
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle(handle)
+        return False
+    # Windows releases the handle at process exit, including after the Qt pipe closes.
+    return True
+
+
 def create_instance_server(server_name: str = INSTANCE_SERVER_NAME) -> QLocalServer | None:
     probe = QLocalSocket()
     probe.connectToServer(server_name)
@@ -130,6 +151,8 @@ def create_instance_server(server_name: str = INSTANCE_SERVER_NAME) -> QLocalSer
         probe.write(b"show")
         probe.waitForBytesWritten(250)
         probe.disconnectFromServer()
+        return None
+    if os.name == "nt" and not _claim_windows_instance(server_name):
         return None
     QLocalServer.removeServer(server_name)
     server = QLocalServer()

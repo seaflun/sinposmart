@@ -429,19 +429,24 @@ def validate_daily_standby_against_duty_number_leave_types(daily_standby_numbers
 def normalize_mission_cell_value(value):
     return ",".join(clean_to_list(value))
 
+def _mission_cell_mismatch_ids(expected_values, actual_values):
+    return [
+        element_id for element_id, expected in expected_values.items()
+        if element_id not in actual_values
+        or normalize_mission_cell_value(expected) != normalize_mission_cell_value(actual_values[element_id])
+    ]
+
 def validate_mission_cell_values(expected_values, actual_values, alert_messages=None):
     """以儲存後欄位值判定編組是否成功；提示文字本身不直接判定失敗。"""
     del alert_messages
     issues = []
-    for element_id, expected in expected_values.items():
+    for element_id in _mission_cell_mismatch_ids(expected_values, actual_values):
         if element_id not in actual_values:
             issues.append(f"找不到救災任務編組欄位：{element_id}")
-            continue
-        actual = actual_values.get(element_id, "")
-        if normalize_mission_cell_value(expected) != normalize_mission_cell_value(actual):
+        else:
             issues.append(
                 f"救災任務編組欄位 {element_id} 資料不一致："
-                f"預期 {expected!r}，實際 {actual!r}"
+                f"預期 {expected_values[element_id]!r}，實際 {actual_values[element_id]!r}"
             )
     return issues
 
@@ -2022,16 +2027,21 @@ function available(el) {
     const style = current.win.getComputedStyle(el);
     return style.display !== 'none' && style.visibility !== 'hidden';
 }
-const targets = {}, missing = [];
+const targets = {}, missing = [], disabled = [], readOnly = [];
 for (const id of fieldIds) {
     const elements = current ? current.doc.querySelectorAll('[id="' + id + '"]') : [];
     if (elements.length !== 1 || elements[0].form !== current.form)
         missing.push(id);
-    else targets[id] = elements[0];
+    else {
+        targets[id] = elements[0];
+        if (targets[id].disabled) disabled.push(id);
+        if (targets[id].readOnly) readOnly.push(id);
+    }
 }
 const state = {origin_ok: originOK, rejection_code: rejectionCode, form_count: forms.length, task_marker_found: markerFound,
     expected_count: fieldIds.length, found_count: Object.keys(targets).length, missing_ids: missing,
-    fields_writable: !missing.length && fieldIds.every(id => !targets[id].disabled && !targets[id].readOnly),
+    fields_writable: !missing.length && !disabled.length && !readOnly.length,
+    disabled_ids: disabled, read_only_ids: readOnly,
     document_ready: !!current && current.doc.readyState === 'complete',
     date_matches: !!current && String(current.date.value).trim() === expectedDate,
     save_found: !!current && !!current.save && current.save.form === current.form,
@@ -2040,6 +2050,25 @@ const state = {origin_ok: originOK, rejection_code: rejectionCode, form_count: f
 const readReady = current && state.document_ready && state.date_matches && !missing.length;
 const ready = readReady && state.fields_writable && state.save_ready;
 const queryReady = current && state.document_ready && state.query_ready;
+function readBlockCode() {
+    if (rejectionCode) return rejectionCode;
+    if (!state.document_ready) return 'document_not_ready';
+    if (!state.date_matches) return 'date_mismatch';
+    if (missing.length) return 'fields_missing';
+    return '';
+}
+function writeBlockCode() {
+    const readCode = readBlockCode();
+    if (readCode) return readCode;
+    if (!state.fields_writable) return 'fields_not_writable';
+    return 'save_unavailable';
+}
+function blocked(code, details = {}) {
+    return {...state, ...details, ready: false, rejection_code: code};
+}
+function mismatchedFields() {
+    return fieldIds.filter(id => String(targets[id].value) !== String(data[id]));
+}
 if (mode === 'query_ready') return {...state, ready: !!queryReady};
 if (mode === 'open_vehicles') {
     if (!readReady) return {...state, opened: false};
@@ -2058,29 +2087,52 @@ if (mode === 'prepare_query') {
     current.query.click();
     return true;
 }
-if (mode === 'inspect') return {...state, ready: !!ready};
+if (mode === 'inspect') return ready ? {...state, ready: true} : blocked(writeBlockCode());
 if (mode === 'read') {
-    if (!readReady) return state;
+    if (!readReady) return blocked(readBlockCode());
     if (current.doc.__sinposmartMissionToken === token) return {...state, rejection_code: 'document_not_replaced'};
     const values = {};
     for (const id of fieldIds) values[id] = String(targets[id].value || '');
     return {values, ...state};
 }
 if (mode === 'fill') {
-    if (!ready) return {ready: false, ...state};
-    for (const id of fieldIds) targets[id].value = String(data[id]);
-    const FieldEvent = current.win.Event;
-    for (const id of fieldIds)
-        for (const type of ['input', 'change', 'blur']) targets[id].dispatchEvent(new FieldEvent(type, {bubbles: true}));
-    for (const id of fieldIds)
-        if (String(targets[id].value) !== String(data[id])) return {ready: false, ...state};
+    if (!ready) return blocked(writeBlockCode());
+    let activeId = '', failureCode = 'field_assignment_failed';
+    try {
+        for (const id of fieldIds) {
+            activeId = id;
+            targets[id].value = String(data[id]);
+        }
+        activeId = '';
+        failureCode = 'field_event_failed';
+        const FieldEvent = current.win.Event;
+        for (const id of fieldIds) {
+            activeId = id;
+            for (const type of ['input', 'change', 'blur']) {
+                targets[id].dispatchEvent(new FieldEvent(type, {bubbles: true}));
+            }
+        }
+    } catch {
+        return blocked(failureCode, {failed_ids: activeId ? [activeId] : []});
+    }
+    const mismatched = mismatchedFields();
+    if (mismatched.length) return blocked('field_value_mismatch', {mismatched_ids: mismatched});
     current.doc.__sinposmartMissionFillToken = token;
     return {ready: true, ...state};
 }
 if (mode === 'save' || mode === 'query') {
-    if (mode === 'save' ? !ready : !(readReady && state.query_ready)) return false;
-    if (mode === 'save' && (current.doc.__sinposmartMissionFillToken !== token ||
-        fieldIds.some(id => String(targets[id].value) !== String(data[id])))) return false;
+    if (mode === 'save') {
+        if (!ready) return blocked(writeBlockCode(), {dispatched: false});
+        if (current.doc.__sinposmartMissionFillToken !== token) {
+            return blocked('fill_document_changed', {dispatched: false});
+        }
+        const mismatched = mismatchedFields();
+        if (mismatched.length) {
+            return blocked('field_value_mismatch', {dispatched: false, mismatched_ids: mismatched});
+        }
+    } else if (!readReady || !state.query_ready) {
+        return blocked(readBlockCode() || 'query_unavailable');
+    }
     current.doc.__sinposmartMissionToken = token;
     (mode === 'save' ? current.save : current.query).click();
     return true;
@@ -2108,19 +2160,33 @@ def _mission_failure(reason, target_date, state=None, *, save_attempted=False, s
     for key in ("form_count", "expected_count", "found_count"):
         if type(state.get(key)) is int and 0 <= state[key] <= 1000:
             payload[key] = state[key]
-    if state.get("rejection_code") in {
+    code = state.get("rejection_code")
+    if isinstance(code, str) and code in {
             "unauthorized_origin", "frame_inaccessible", "module_mismatch", "form_not_unique",
             "marker_form_mismatch", "date_not_unique", "query_not_unique", "save_not_unique",
             "mission_form_not_unique", "mission_form_missing", "document_not_replaced",
             "frame_unavailable", "menu_item_unconfirmed", "vehicle_popup_unconfirmed",
-            "vehicle_button_not_unique", "vehicle_button_unavailable"}:
-        payload["rejection_code"] = state["rejection_code"]
+            "vehicle_button_not_unique", "vehicle_button_unavailable", "document_not_ready",
+            "date_mismatch", "fields_missing", "fields_not_writable", "save_unavailable",
+            "query_unavailable", "fill_document_changed", "field_value_mismatch", "field_assignment_failed",
+            "field_event_failed", "browser_script_error", "invalid_browser_reply"}:
+        payload["rejection_code"] = code
     if state.get("navigation_phase") in {"menu_frame", "menu_click", "query_ready",
             "initial_query_start", "initial_query_readback", "vehicle_popup"}:
         payload["navigation_phase"] = state["navigation_phase"]
-    missing = state.get("missing_ids", [])
-    payload["missing_ids"] = [value for value in (missing[:200] if isinstance(missing, list) else [])
-                              if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", value)]
+    operation = state.get("operation")
+    if operation in ("inspect", "fill", "save", "query", "read"):
+        payload["operation"] = operation
+    if code == "browser_script_error":
+        exception_type = state.get("exception_type")
+        safe_types = ("RuntimeError", "JavascriptException", "WebDriverException", "NoSuchWindowException",
+                      "StaleElementReferenceException", "TimeoutException", "UnexpectedAlertPresentException")
+        payload["exception_type"] = exception_type if exception_type in safe_types else "Exception"
+    for key in ("missing_ids", "disabled_ids", "read_only_ids", "mismatched_ids", "failed_ids"):
+        ids = state.get(key)
+        if key == "missing_ids" or isinstance(ids, list):
+            payload[key] = [value for value in (ids[:200] if isinstance(ids, list) else [])
+                            if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", value)]
     temporary = None
     try:
         folder = PACKAGE_DIR / "runtime_outputs" / "browser"
@@ -2149,44 +2215,50 @@ def step_fill_mission_cells(driver, mission_map, target_date="", *, wait=None, s
         raise _mission_failure(reason, target_date)
 
     def script(mode, token=""):
-        driver.switch_to.default_content()
-        return driver.execute_script(_MISSION_FORM_JS, target_date, fields, mode, token, mission_map)
+        nonlocal state
+        state = {"operation": mode}
+        try:
+            driver.switch_to.default_content()
+            observed = driver.execute_script(_MISSION_FORM_JS, target_date, fields, mode, token, mission_map)
+        except Exception as exc:
+            state.update(rejection_code="browser_script_error", exception_type=type(exc).__name__)
+            raise
+        if isinstance(observed, dict):
+            state = {**observed, "operation": mode}
+        elif mode in ("inspect", "fill", "read") or type(observed) is not bool:
+            state["rejection_code"] = "invalid_browser_reply"
+        return observed
 
     def ready(candidate):
-        nonlocal state
-        observed = script("inspect")
-        state = observed if isinstance(observed, dict) else {}
+        script("inspect")
         return state.get("ready") is True
 
     def fresh(token):
         def read(candidate):
-            nonlocal state
-            observed = script("read", token)
-            if isinstance(observed, dict):
-                state = observed
-                if isinstance(observed.get("values"), dict):
-                    return observed["values"]
-            return False
+            script("read", token)
+            values = state.get("values")
+            return values if isinstance(values, dict) else False
         return wait.until(read)
 
-    try:
+    def execute():
+        nonlocal stage, reason, save_attempted
         wait.until(ready)
         reason = "fill_failed"
         token = str(time.monotonic_ns())
         filled = script("fill", token)
         if not isinstance(filled, dict) or filled.get("ready") is not True:
-            raise _mission_failure(reason, target_date, state)
+            return False
         stage, reason = "vehicle_save", "save_unknown"
         if callable(stage_callback):
             stage_callback(stage)
         save_attempted = True
         try:
             dispatched = script("save", token)
-            if dispatched is False:
+            if dispatched is False or (isinstance(dispatched, dict) and dispatched.get("dispatched") is False):
                 save_attempted, reason = False, "fill_failed"
-                raise _mission_failure(reason, target_date, state, stage=stage)
+                return False
             if dispatched is not True:
-                raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
+                return False
         except UnexpectedAlertPresentException:
             pass  # A click may have reached the server; never submit it again.
         accept_pending_alerts(driver, timeout=0.5)
@@ -2197,17 +2269,25 @@ def step_fill_mission_cells(driver, mission_map, target_date="", *, wait=None, s
         query_token = str(time.monotonic_ns())
         try:
             if script("query", query_token) is not True:
-                raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
+                return False
         except UnexpectedAlertPresentException:
             pass
         accept_pending_alerts(driver, timeout=0.5)
         actual_values = fresh(query_token)
         reason = "readback_mismatch"
-        if validate_mission_cell_values(mission_map, actual_values):
-            raise _mission_failure(reason, target_date, state, save_attempted=True, stage=stage)
-        return {"status": "saved", "verified": True, "found_ids": fields, "save_found": True}
+        mismatched = _mission_cell_mismatch_ids(mission_map, actual_values)
+        if mismatched:
+            state.update(rejection_code="field_value_mismatch", mismatched_ids=mismatched)
+            return False
+        return True
+
+    try:
+        verified = execute()
     except Exception:
+        verified = False
+    if not verified:
         raise _mission_failure(reason, target_date, state, save_attempted=save_attempted, stage=stage) from None
+    return {"status": "saved", "verified": True, "found_ids": fields, "save_found": True}
 
 def read_mission_cells(driver, mission_map):
     values = driver.execute_script(

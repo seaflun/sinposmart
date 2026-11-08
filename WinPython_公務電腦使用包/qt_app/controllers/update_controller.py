@@ -1341,7 +1341,7 @@ class UpdateProgressController(UpdateWindowState):
             "handshake_not_ready": "GUI 尚未回覆可更新",
             "gui_identity_invalid": "原 GUI 身分或數量不符合更新條件",
             "gui_query_failed": "無法查詢 GUI 程序",
-            "gui_process_changed": "等待退出時出現其他或無法確認身分的 GUI",
+            "gui_process_changed": "等待交握或退出時出現其他或無法確認身分的 GUI",
             "gui_exit_timeout": "等待舊 GUI 自然退出逾時",
             "gui_exit_check_failed": "無法確認舊 GUI 是否已退出",
             "gui_busy_timeout": "勤務工作仍未結束，等待可更新回覆逾時",
@@ -1360,7 +1360,22 @@ class UpdateProgressController(UpdateWindowState):
             return ""
         detail = (f"遠端更新失敗：{reasons[code]} [{code}]；原 PID={failure['expected_pid']}；"
                   f"GUI 數={failure['observed_count']}；等待={failure['waited_ms']} 毫秒")
-        return detail + (f"；例外類別={exception_type}" if exception_type else "")
+        if exception_type:
+            detail += f"；例外類別={exception_type}"
+        processes = failure.get("observed_processes")
+        candidates = []
+        images = ("pythonw.exe", "python.exe", "pyw.exe", "py.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "other")
+        for process in processes[:4] if isinstance(processes, list) else ():
+            if not isinstance(process, dict):
+                continue
+            pid, parent_pid = process.get("pid"), process.get("parent_pid")
+            image, entrypoint = process.get("image"), process.get("entrypoint")
+            if (type(pid) is int and 0 < pid < 2**32 and type(parent_pid) is int and 0 <= parent_pid < 2**32
+                    and image in images and entrypoint in ("duty_gui.pyw", "duty_gui.py")):
+                candidates.append(f"{pid}/{parent_pid} {image} {entrypoint}")
+        if candidates:
+            detail += f"；候選 PID/父 PID={', '.join(candidates)}"
+        return detail
 
     def _report_close_failure(self, detail: str) -> None:
         if not self._failure_reporting_enabled or self._failure_report_sent or not detail:
