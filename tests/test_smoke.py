@@ -984,6 +984,43 @@ class PackageSmokeTests(unittest.TestCase):
 
         self.assertEqual(module.validate_daily_sheet_assignments(workbook, sheet, 7, set()), [])
 
+    def test_blank_commander_requires_two_eligible_mission_ambulance2_members(self) -> None:
+        module = legacy_duty_sheet_module()
+        for standby in (["8"], ["8", "9"]):
+            with self.subTest(standby=standby):
+                workbook = module.openpyxl.Workbook()
+                sheet = workbook.active
+                sheet.title = "24號"
+                for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
+                    sheet.cell(5, column, label)
+                sheet.cell(6, 13, "指揮官")
+                for row in range(10, 34):
+                    hour = (row - 2) % 24
+                    sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
+                    sheet.cell(row, 3, "20")
+                    sheet.cell(row, 5, "16")
+                    sheet.cell(row, 6, "28")
+                    sheet.cell(row, 10, ",".join(standby))
+                error = mock.Mock()
+                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
+                    module, "expected_on_duty_numbers_from_daily_sheet", return_value=["20", "16", "28", *standby]
+                ), mock.patch.object(module, "ThreadPoolExecutor", side_effect=RuntimeError("offline-stop-after-preflight")
+                ) as capture, mock.patch.object(module, "build_driver") as browser, mock.patch.object(module, "log_status"):
+                    if len(standby) == 2:
+                        with self.assertRaisesRegex(RuntimeError, "offline-stop-after-preflight"):
+                            module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                                error_callback=error, show_dialogs=False)
+                        capture.assert_called_once()
+                        error.assert_not_called()
+                    else:
+                        result = module.start_automation("test-user", "test-password", "1151024", "test.xlsm", {},
+                            error_callback=error, show_dialogs=False)
+                        self.assertFalse(result)
+                        self.assertIn("救災任務編組表救護2車", error.call_args.args[0])
+                        self.assertIn("不足2人", error.call_args.args[0])
+                        capture.assert_not_called()
+                    browser.assert_not_called()
+
     def test_daily_sheet_preflight_counts_merged_assignments_for_each_time_slot(self) -> None:
         module = legacy_duty_sheet_module()
         workbook = module.openpyxl.Workbook()
