@@ -4915,38 +4915,6 @@ try {
                 self.assertEqual(sheet.cell(10, 15).value, "3,22")
                 build_driver.assert_not_called()
 
-    def test_duty_sheet_without_eligible_daily_commander_stops_before_browser_or_capture(self) -> None:
-        module = legacy_duty_sheet_module()
-        for commander in (None, "1", "22"):
-            with self.subTest(commander=commander):
-                workbook = module.openpyxl.Workbook()
-                sheet = workbook.active
-                sheet.title = "23號"
-                for column, label in {3: "值班", 4: "休息", 5: "備勤緊急救護", 9: "備勤救災"}.items():
-                    sheet.cell(5, column, label)
-                sheet.cell(6, 13, "指揮官")
-                sheet.cell(22, 16, "備勤")
-                sheet.cell(22, 17, "20,21,22,23")
-                for row in range(10, 34):
-                    hour = (row - 2) % 24
-                    sheet.cell(row, 2, f"{hour:02d}-{(hour + 1) % 24:02d}")
-                    sheet.cell(row, 3, "20")
-                    sheet.cell(row, 10, "21,23" if commander == "22" else "21,22,23")
-                    sheet.cell(row, 13, commander)
-                error = mock.Mock()
-                with mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook), mock.patch.object(
-                    module, "ThreadPoolExecutor", side_effect=AssertionError("測試不得啟動截圖")
-                ) as executor, mock.patch.object(
-                    module, "build_driver", side_effect=AssertionError("測試不得啟動瀏覽器")
-                ) as build_driver, mock.patch.object(module, "log_status"):
-                    result = module.start_automation("test-user", "test-password", "1151023", "test.xlsm", {},
-                        error_callback=error, show_dialogs=False)
-                self.assertFalse(result)
-                self.assertIn("全日無合格的指揮官番號", error.call_args.args[0])
-                self.assertNotIn("【漏排】", error.call_args.args[0])
-                executor.assert_not_called()
-                build_driver.assert_not_called()
-
     def test_duty_sheet_still_blocks_short_mission_ambulance_2_with_blank_commander(self) -> None:
         module = legacy_duty_sheet_module()
         for commander in (None, " \t\n\u3000", 0, "0"):
@@ -9478,6 +9446,7 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
             verify(driver)
             return driver
         with ExitStack() as stack:
+            flow_mocks = {}
             for name, options in {
                 "ThreadPoolExecutor": {}, "log_status": {},
                 "retry_duty_number_popup_preflight": {"side_effect": use_mock_browser},
@@ -9492,7 +9461,7 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
                 "expected_on_duty_numbers_from_daily_sheet": {"return_value": normal_staff},
                 "build_driver": {"side_effect": AssertionError("測試不得啟動真實瀏覽器")},
             }.items():
-                stack.enter_context(mock.patch.object(module, name, **options))
+                flow_mocks[name] = stack.enter_context(mock.patch.object(module, name, **options))
             stack.enter_context(mock.patch.object(module.openpyxl, "load_workbook", return_value=workbook))
             stack.enter_context(mock.patch.object(module.time, "sleep"))
             fill_duty = stack.enter_context(mock.patch.object(module, "step_batch_fill_duty"))
@@ -9502,6 +9471,9 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
                 error_callback=error, show_dialogs=False, personnel_deductions=personnel_deductions)
         self.assertFalse(result)
         error.assert_called_once_with("offline-stop-before-save")
+        if not commander:
+            self.assertEqual(flow_mocks["step_config_popups"].call_args.args[3], "")
+            flow_mocks["start_duty_postback"].assert_called_once_with(driver, "1151024", "_btnSave")
         return fill_duty.call_args.args[1], fill_mission.call_args.args[1], sheet
 
     def test_annotation_is_separate_from_original_remark_and_training(self):
@@ -9517,6 +9489,7 @@ class DutyAmbulanceSplitTests(unittest.TestCase):
 
     def test_duty_and_mission_use_distinct_ambulance2_fallbacks(self):
         for standby, commander, external, expected_duty, expected_mission, remaining in (
+            (["9", "8"], [], ["31"], "9,8", "9,8", ""),
             (["9", "8", "10"], ["2"], ["31"], "9,8", "9,8", "10,2"),
             (["8"], ["2"], ["31"], "8,2", "8,2", ""),
             ([], ["2"], ["31", "32"], "", "2,31", "2"),

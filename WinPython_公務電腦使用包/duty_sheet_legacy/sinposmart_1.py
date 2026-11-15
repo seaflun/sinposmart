@@ -2431,8 +2431,6 @@ def start_automation(
     log_status(f"✅ Excel 讀取完成：外勤 {num_out} 項，指揮官為番號 {daily_commander if daily_commander else '無'}")
     report_stage("preflight")
     preflight_issues = validate_daily_sheet_assignments(wb, sheet, day_int, excluded_numbers)
-    if not daily_commander:
-        preflight_issues.append(f"{sheet.title}：全日無合格的指揮官番號（正常上班的 1–5 番），無法設定勤務番號維護。")
     if num_out > 5:
         preflight_issues.append(f"{sheet.title}：外勤項目超過 5 項，無法對應勤務設定第 2–6 欄，已停止登打。")
     if not daily_standby_numbers:
