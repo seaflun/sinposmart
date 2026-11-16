@@ -13,7 +13,7 @@ import zipfile
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -7686,6 +7686,135 @@ class RestMonthlyServiceTests(unittest.TestCase):
 
 
 class DailyVehicleServiceTests(unittest.TestCase):
+    def test_daily_vehicle_credentials_require_on_duty_non_officer_identity(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleValidationError, vehicle_duty_accounts
+
+        roster = {"roc_date": "1151116", "staff_complete": True, "summary": {"在勤": ["05", "06", "8"]},
+                  "staff": {"5": {"name": "幹部"}, "6": {"name": "上班隊員"},
+                            "7": {"name": "休假隊員"}, "8": {"name": "無帳號隊員"}}}
+        lookup = Mock(side_effect=lambda actor, name: ("test-user", "test-password") if actor == "06" else None)
+        self.assertEqual(vehicle_duty_accounts(roster, "1151116", lookup),
+                         ((6, "test-user", "test-password"),))
+        self.assertEqual(lookup.call_args_list, [call("06", "上班隊員"), call("8", "無帳號隊員")])
+        with self.assertRaises(DailyVehicleValidationError):
+            vehicle_duty_accounts(roster, "1151115", lookup)
+
+    def test_daily_vehicle_allocates_groups_and_balances_equipment(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        maintenance = {**{f"A-{i}": "救護車" for i in range(5)},
+                       "T-1": "水箱車", "T-2": "水箱車", "C-1": "勤務車"}
+        jobs = automation.assign_vehicle_checks(maintenance, {"E-1", "E-2", "E-3", "E-4"}, [6, 7, 8])
+        self.assertEqual(sorted(sum(vehicle.startswith("A-") for op, vehicle in tasks
+                                    if op == "maintenance") for tasks in jobs.values()), [0, 2, 3])
+        self.assertEqual(sum(any(vehicle.startswith("T-") for _, vehicle in tasks)
+                             for tasks in jobs.values()), 1)
+        self.assertEqual(sorted(sum(op == "equipment" for op, _ in tasks)
+                                for tasks in jobs.values()), [1, 1, 2])
+        self.assertEqual({job for tasks in jobs.values() for job in tasks},
+                         {("maintenance", vehicle) for vehicle in maintenance}
+                         | {("equipment", f"E-{i}") for i in range(1, 5)})
+
+    def test_daily_vehicle_login_rejection_reassigns_unsent_vehicles(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        report = automation.new_vehicle_report(date.today().isoformat())
+        attempts, processed = [], []
+
+        def open_account(actor):
+            attempts.append(actor)
+            if actor == 7:
+                raise automation.VehicleAccountLoginError()
+            return actor, None
+
+        def process(driver, wait, **kwargs):
+            processed.append((driver, kwargs["assigned"]))
+
+        cell = Mock()
+        cell.get_attribute.return_value = "救護車"
+        cell.find_elements.return_value = []
+        row = Mock()
+        row.find_elements.return_value = [cell] * 13
+        with patch.object(automation, "navigate_vehicle_document"), \
+                patch.object(automation, "verified_grid_rows", side_effect=[
+                    {"A-1": (1, row), "A-2": (2, row)}, {"E-1": (1, row), "E-2": (2, row)},
+                ]), patch.object(automation, "process_maintain_checks",
+                                  side_effect=lambda driver, wait, *_args, **kwargs: process(driver, wait, **kwargs)), \
+                patch.object(automation, "process_equip_checks", side_effect=process), \
+                patch.object(automation, "quit_driver"), patch.object(automation, "ensure_requested_date"):
+            automation.run_assigned_checks([6, 7, 8], open_account, report)
+
+        self.assertEqual(attempts, [6, 7, 8])
+        self.assertIn((8, {"A-2"}), processed)
+        self.assertIn((8, {"E-2"}), processed)
+
+    def test_daily_vehicle_all_accounts_rejected_stays_pending(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        report = automation.new_vehicle_report(date.today().isoformat())
+        open_account = Mock(side_effect=automation.VehicleAccountLoginError)
+        with patch.object(automation, "navigate_vehicle_document") as navigate:
+            with self.assertRaises(automation.VehicleVerificationError) as error:
+                automation.run_assigned_checks([6, 7], open_account, report)
+        self.assertEqual(error.exception.reason_code, "no_eligible_account")
+        self.assertEqual(open_account.call_args_list, [call(6), call(7)])
+        navigate.assert_not_called()
+        self.assertFalse(report["verified"])
+
+    def test_daily_vehicle_verified_empty_equipment_needs_no_assignee(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleService
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        target_date = date.today().isoformat()
+        report = automation.new_vehicle_report(target_date)
+        driver, wait = Mock(), Mock()
+        cell = Mock()
+        cell.get_attribute.return_value = "水箱車"
+        cell.find_elements.return_value = []
+        row = Mock()
+        row.find_elements.return_value = [cell] * 13
+
+        def process(*_args, **_kwargs):
+            automation.record_vehicle_result(report, "T-1", "maintenance", "completed", "saved_verified")
+
+        with patch.object(automation, "navigate_vehicle_document"), \
+                patch.object(automation, "verified_grid_rows", side_effect=[{"T-1": (1, row)}, {}]), \
+                patch.object(automation, "process_maintain_checks", side_effect=process), \
+                patch.object(automation, "process_equip_checks") as equipment:
+            automation.run_assigned_checks([6], lambda _actor: (driver, wait), report)
+        equipment.assert_not_called()
+        self.assertTrue(automation.verify_vehicle_report(report))
+        output = automation.REPORT_PREFIX + json.dumps(report)
+        self.assertTrue(DailyVehicleService._read_completion_report(output, target_date, ())["verified"])
+
+    def test_daily_vehicle_service_uses_only_roster_accounts_for_assigned_run(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleExecutionError, DailyVehicleRequest, DailyVehicleService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            script = root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("", encoding="utf-8")
+            factory = Mock()
+            process = factory.return_value
+            process.pid, process.poll.return_value, process.returncode = 12345, 1, 1
+            service = DailyVehicleService(root, process_factory=factory)
+            target_date = date.today().isoformat()
+            accounts = ((6, "crew-six", "test-password"), (7, "crew-seven", "other-password"))
+            request = DailyVehicleRequest("operator", "operator-password", target_date, accounts)
+            output = '[sinposmart-vehicle-report] ' + json.dumps({
+                "target_date": target_date, "verified": False, "reason_code": "no_eligible_account", "items": [],
+            })
+            with patch.object(service, "_wait_for_process_exit", return_value=output):
+                with self.assertRaisesRegex(DailyVehicleExecutionError, "車輛清點待處理"):
+                    service.execute(request)
+            environment = factory.call_args.kwargs["env"]
+            self.assertNotIn("PPE_ACCOUNT", environment)
+            self.assertNotIn("PPE_PASSWORD", environment)
+            self.assertEqual(json.loads(environment["PPE_DUTY_ACCOUNTS"]), [list(account) for account in accounts])
+            self.assertNotIn("test-password", repr(request))
+            self.assertEqual(service.completion_report["reason_code"], "no_eligible_account")
+
     def test_ppe_login_rejects_untrusted_initial_page_without_filling_credentials(self) -> None:
         from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
 
@@ -16639,7 +16768,7 @@ ApplicationWindow {
         for expected in (
             'text: "車輛保養清點"',
             'objectName: "dailyVehiclePromptText"',
-            'text: "會使用目前登入帳密開啟瀏覽器。依序至車輛平日保養檢查清點、定期保養檢查頁，勾選保養（日、週、月、半年）；再至隨車器材清點頁，勾選清點。"',
+            'text: "依當日勤務表自動分派上班隊員，使用各隊員帳號執行定期保養及隨車器材清點。"',
             'objectName: "dailyVehicleRunButton"',
             'text: dailyVehicleDialog.controller.isRunning ? "啟動中..." : "啟動登打"',
             'objectName: "dailyVehicleStatusBar"',
@@ -18328,10 +18457,12 @@ if return_code != 0 or loaded:
             "from qt_app.main import create_engine; "
             "app = QApplication(['qt-shell-check']); "
             "repository = CredentialRepository(Path(tempfile.gettempdir()) / 'sinposmart-qt-shell-nonexistent.json', 'SinpoSmart', None); "
-            "engine = create_engine(AppController(repository=repository)); "
+            "backend = AppController(repository=repository); "
+            "engine = create_engine(backend); "
             "assert engine.rootObjects(); "
             "QTimer.singleShot(50, app.quit); "
             "app.exec(); "
+            "backend.shutdown(); "
             "forbidden = {'duty_gui', 'tkinter', 'customtkinter', 'selenium'}; "
             "raise SystemExit(1 if forbidden.intersection(sys.modules) else 0)"
         )
@@ -21556,7 +21687,7 @@ if return_code != 0 or loaded:
         from qt_app.controllers.app_controller import AppController
 
         class FakeDiagnosticsService:
-            def export(self, _snapshot, **_kwargs):
+            def export(self, _snapshot, *, secrets=()):
                 return Path("issue-package.zip")
 
         controller = AppController(diagnostics_service=FakeDiagnosticsService())
@@ -24061,9 +24192,11 @@ if return_code != 0 or loaded:
         class FakeDiagnosticsService:
             def __init__(self) -> None:
                 self.snapshots = []
+                self.secrets = []
 
-            def export(self, snapshot, **_kwargs):
+            def export(self, snapshot, *, secrets=()):
                 self.snapshots.append(snapshot)
+                self.secrets.append(secrets)
                 return Path("issue_reports/issue_report_test.zip")
 
         request = DutySubmissionRequest(
@@ -24104,6 +24237,7 @@ if return_code != 0 or loaded:
                 controller.shutdown()
 
         self.assertEqual(len(diagnostics.snapshots), 1)
+        self.assertEqual(diagnostics.secrets, [(request.password,)])
         self.assertEqual(controller.diagnosticsStatus, "問題包已匯出：issue_report_test.zip")
         record_type, fields = operational_sync.events[0]
         self.assertEqual(record_type, "action_result")
@@ -31177,7 +31311,7 @@ if return_code != 0 or loaded:
                 daily_prompt = wait_for("dailyVehiclePromptText")
                 daily_run_button = wait_for("dailyVehicleRunButton")
                 daily_status_bar = wait_for("dailyVehicleStatusBar")
-                self.assertEqual(daily_prompt.property("text"), "會使用目前登入帳密開啟瀏覽器。依序至車輛平日保養檢查清點、定期保養檢查頁，勾選保養（日、週、月、半年）；再至隨車器材清點頁，勾選清點。")
+                self.assertEqual(daily_prompt.property("text"), "依當日勤務表自動分派上班隊員，使用各隊員帳號執行定期保養及隨車器材清點。")
                 self.assertEqual(daily_run_button.property("text"), "啟動登打")
                 self.assertEqual(daily_status_bar.property("text"), "準備就緒。")
                 self.assertGreater(daily_run_button.property("contentItem").width(), 0)

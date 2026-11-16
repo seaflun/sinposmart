@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+from dataclasses import replace
+from typing import Callable
 
 from PySide6.QtCore import QObject, Property, QThread, QTimer, Signal, Slot
 
@@ -32,6 +34,7 @@ class DailyVehicleController(QObject):
         parent: QObject | None = None,
         *,
         read_only_acceptance: bool = False,
+        accounts_for_date: Callable[[str], tuple[tuple[int, str, str], ...]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._session_state = session_state
@@ -48,6 +51,7 @@ class DailyVehicleController(QObject):
         self._workers: dict[int, tuple[QThread, DailyVehicleWorker]] = {}
         self._shutdown_admission = False
         self._read_only_acceptance = bool(read_only_acceptance)
+        self._accounts_for_date = accounts_for_date
 
     @Property(str, notify=stateChanged)
     def targetDate(self) -> str:
@@ -131,6 +135,8 @@ class DailyVehicleController(QObject):
         self._reset_completion_report()
         try:
             request = self._service.validate(self._pending_request)
+            if self._accounts_for_date is not None:
+                request = replace(request, accounts=self._accounts_for_date(request.target_date))
         except DailyVehicleValidationError as exc:
             self._pending_request = None
             self._set_error(str(exc))

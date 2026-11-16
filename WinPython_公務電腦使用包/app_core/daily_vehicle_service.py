@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 from app_core.duty_task_projection import parse_roc_date
 
 
@@ -27,6 +27,7 @@ VEHICLE_REPORT_REASONS = frozenset({
     "verified_today", "saved_verified", "empty_list", "today_not_found", "state_unconfirmed",
     "save_unconfirmed", "list_changed", "execution_unconfirmed", "report_missing",
     "report_invalid", "unexpected_error", "row_limit",
+    "no_eligible_account", "unknown_vehicle_type",
 })
 POSITIVE_REPORT_REASONS = frozenset({"verified_today", "saved_verified"})
 
@@ -54,6 +55,42 @@ class DailyVehicleRequest:
     user_id: str
     password: str = field(repr=False)
     target_date: str = ""
+    accounts: tuple[tuple[int, str, str], ...] | None = field(default=None, repr=False)
+
+
+def vehicle_duty_accounts(
+    day: Mapping,
+    target_roc_date: str,
+    credentials_for_person: Callable[[str, str], tuple[str, str] | None],
+) -> tuple[tuple[int, str, str], ...]:
+    """Resolve the official on-duty roster against each member's saved account."""
+    summary = day.get("summary")
+    staff = day.get("staff")
+    on_duty = summary.get("在勤") if isinstance(summary, Mapping) else None
+    if (day.get("roc_date") != target_roc_date or day.get("staff_complete") is not True
+            or not isinstance(staff, Mapping) or not isinstance(on_duty, list) or not on_duty):
+        raise DailyVehicleValidationError("尚無完整的當日勤務表在勤名單，車輛清點待處理。")
+    accounts = {}
+    for value in on_duty:
+        actor = str(value).strip()
+        if not re.fullmatch(r"[0-9]{1,4}", actor) or int(actor) < 1:
+            raise DailyVehicleValidationError("當日勤務表番號無法確認，車輛清點待處理。")
+        if int(actor) <= 5:
+            continue
+        person = staff.get(actor) or staff.get(str(int(actor)))
+        name = str(person.get("name") or "").strip() if isinstance(person, Mapping) else ""
+        if not name:
+            raise DailyVehicleValidationError("當日勤務表人員身分無法確認，車輛清點待處理。")
+        credentials = credentials_for_person(actor, name)
+        if credentials:
+            user, password = credentials
+            if user.strip() and password:
+                accounts[int(actor)] = user.strip(), password
+    counts = {}
+    for user, _ in accounts.values():
+        counts[user.casefold()] = counts.get(user.casefold(), 0) + 1
+    return tuple((actor, user, password) for actor, (user, password) in sorted(accounts.items())
+                 if counts[user.casefold()] == 1)
 
 
 class DailyVehicleService:
@@ -103,7 +140,7 @@ class DailyVehicleService:
             raise DailyVehicleValidationError("車輛保養清點目前正在執行。")
         if running_pid:
             self._clear_running_pid(project_dir, running_pid)
-        return DailyVehicleRequest(request.user_id.strip(), request.password, target_date.isoformat())
+        return DailyVehicleRequest(request.user_id.strip(), request.password, target_date.isoformat(), request.accounts)
 
     def confirmation_summary(self, request: DailyVehicleRequest) -> str:
         self.validate(request)
@@ -144,6 +181,13 @@ class DailyVehicleService:
                 "PPE_TARGET_DATE": request.target_date,
             }
         )
+        environment.pop("PPE_DUTY_ACCOUNTS", None)
+        credentials = (request.user_id, request.password)
+        if request.accounts is not None:
+            environment.pop("PPE_ACCOUNT", None)
+            environment.pop("PPE_PASSWORD", None)
+            environment["PPE_DUTY_ACCOUNTS"] = json.dumps(request.accounts)
+            credentials += tuple(value for _, user, password in request.accounts for value in (user, password))
         if status_callback:
             status_callback("正在開啟瀏覽器執行車輛保養與器材清點…")
         process = None
@@ -167,7 +211,7 @@ class DailyVehicleService:
                 output = self._wait_for_process_exit(process, status_callback)
             except subprocess.TimeoutExpired as exc:
                 self._completion_report = self._read_completion_report(
-                    str(exc.output or ""), request.target_date, (request.user_id, request.password)
+                    str(exc.output or ""), request.target_date, credentials
                 )
                 self._completion_report.update(verified=False, reason_code="execution_unconfirmed")
                 raise DailyVehicleExecutionError(
@@ -176,7 +220,7 @@ class DailyVehicleService:
                 ) from exc
             process_exited = process.poll() is not None
             self._completion_report = self._read_completion_report(
-                output, request.target_date, (request.user_id, request.password)
+                output, request.target_date, credentials
             )
             completion_verified = (self._completion_report["verified"] is True
                                    and "[done] automation finished" in output.splitlines())
@@ -184,7 +228,11 @@ class DailyVehicleService:
                 if self._completion_report["verified"] is True:
                     self._completion_report.update(verified=False, reason_code="execution_unconfirmed")
                 stage = self._failure_stage_from_output(output, stage)
-                message = self._browser_startup_safe_error(output) or self._safe_error(output)
+                reason = self._completion_report["reason_code"]
+                message = {
+                    "no_eligible_account": "當日上班隊員無可用的清點帳號，車輛清點待處理。",
+                    "unknown_vehicle_type": "正式網站有未設定分派規則的車種細項，車輛清點待處理。",
+                }.get(reason) or self._browser_startup_safe_error(output) or self._safe_error(output)
                 raise DailyVehicleExecutionError(message, failure_stage=stage)
             retaining_runner = not process_exited
             report_stage("result_evaluation")
@@ -257,9 +305,11 @@ class DailyVehicleService:
                     or re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff -]*", vehicle) is None
                     or re.search(r"secret|token|password|cookie|account|username|帳號|密碼", vehicle, re.I)
                     or operation not in ("maintenance", "equipment")
-                    or status not in ("completed", "already_done", "unconfirmed", "not_required")
+                    or status not in ("completed", "already_done", "unconfirmed", "not_required", "empty")
                     or not isinstance(item_reason, str)
-                    or (item_reason not in VEHICLE_REPORT_REASONS and item_reason != "not_required")
+                    or (item_reason not in VEHICLE_REPORT_REASONS and item_reason not in {"not_required", "verified_empty"})
+                    or ((status == "empty" or item_reason == "verified_empty")
+                        and (operation, vehicle, status, item_reason) != ("equipment", "", "empty", "verified_empty"))
                     or (status in ("completed", "already_done")
                         and (not vehicle.strip() or item_reason not in POSITIVE_REPORT_REASONS))
                     or (status == "not_required"
@@ -284,6 +334,9 @@ class DailyVehicleService:
         if len(items) > 200:
             report["reason_code"] = "row_limit"
         elif not valid:
+            pass
+        elif (any(item["status"] == "empty" for item in report["items"])
+              and sum(item["operation"] == "equipment" for item in report["items"]) != 1):
             pass
         elif verified is not True:
             report["reason_code"] = reason

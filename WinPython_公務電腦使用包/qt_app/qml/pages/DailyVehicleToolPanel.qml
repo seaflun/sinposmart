@@ -32,7 +32,7 @@ ToolSidePanel {
                 Label {
                     objectName: "dailyVehiclePromptText"
                     Layout.fillWidth: true
-                    text: "會使用目前登入帳密開啟瀏覽器。依序至車輛平日保養檢查清點、定期保養檢查頁，勾選保養（日、週、月、半年）；再至隨車器材清點頁，勾選清點。"
+                    text: "依當日勤務表自動分派上班隊員，使用各隊員帳號執行定期保養及隨車器材清點。"
                     color: Design.muted
                     font.pixelSize: Design.captionSize
                     wrapMode: Text.Wrap

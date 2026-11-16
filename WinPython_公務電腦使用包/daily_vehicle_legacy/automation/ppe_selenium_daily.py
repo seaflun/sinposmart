@@ -166,6 +166,10 @@ class VehicleVerificationError(RuntimeError):
         self.reason_code = reason_code
 
 
+class VehicleAccountLoginError(RuntimeError):
+    """The submitted PPE login did not establish an authenticated session."""
+
+
 def new_vehicle_report(target_date: str) -> dict:
     return {"target_date": target_date, "verified": False,
             "reason_code": "execution_unconfirmed", "items": []}
@@ -209,11 +213,15 @@ def verify_vehicle_report(report: dict) -> bool:
     items = report["items"]
     verified = (report.get("reason_code") not in {"row_limit", "not_required"} and 0 < len(items) <= MAX_REPORT_ITEMS
                 and {item["operation"] for item in items} == {"maintenance", "equipment"}
-                and all(item["vehicle"] and ((item["status"] in {"completed", "already_done"}
+                and all((item["vehicle"] and ((item["status"] in {"completed", "already_done"}
                         and item["reason_code"] in {"verified_today", "saved_verified"})
                         or (item["operation"] == "maintenance" and item["status"] == "not_required"
-                            and item["reason_code"] == "not_required"))
-                        for item in items))
+                            and item["reason_code"] == "not_required")))
+                        or (item["operation"], item["vehicle"], item["status"], item["reason_code"])
+                            == ("equipment", "", "empty", "verified_empty")
+                        for item in items)
+                and (not any(item["status"] == "empty" for item in items)
+                     or sum(item["operation"] == "equipment" for item in items) == 1))
     report["verified"] = verified
     report["reason_code"] = "" if verified else report.get("reason_code") or "execution_unconfirmed"
     return verified
@@ -233,11 +241,11 @@ def read_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_config() -> dict[str, object]:
+def load_config(*, assigned: bool = False) -> dict[str, object]:
     load_dotenv(ROOT_DIR / ".env")
     username = os.getenv("PPE_ACCOUNT", "").strip()
     password = os.getenv("PPE_PASSWORD", "").strip()
-    if not username or not password:
+    if not assigned and (not username or not password):
         raise RuntimeError("Missing PPE_ACCOUNT or PPE_PASSWORD in environment or .env")
 
     return {
@@ -296,7 +304,7 @@ def navigate_vehicle_document(driver: webdriver.Chrome, wait: WebDriverWait, con
     wait.until(EC.staleness_of(previous_document))
 
 
-def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str) -> list:
+def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str, *, allow_empty: bool = False) -> list:
     phase = "maintenance" if context == "maintain" else "equipment"
     print(f"[sinposmart-stage] {phase}_page_ready", flush=True)
     pathname, query_name = (("/CarMaintainCheck/Index", "QueryData") if context == "maintain"
@@ -345,7 +353,8 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
             print("[sinposmart-vehicle-diagnostic] query_source_changed_before_read", flush=True)
             raise VehicleVerificationError("state_unconfirmed")
         try:
-            rows = driver.find_elements(By.XPATH, "//div[@id='grid']//tbody/tr")
+            selector = "//div[@id='grid']//tbody/tr"
+            rows = driver.find_elements(By.XPATH, selector + "[@data-uid]" if allow_empty else selector)
         except Exception:
             print("[sinposmart-vehicle-diagnostic] query_rows_read_failed", flush=True)
             raise VehicleVerificationError("state_unconfirmed") from None
@@ -357,7 +366,7 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str)
         if not isinstance(state, dict) or state.get("token") != token or state.get("ready") is not True or state.get("failed") is not False:
             print("[sinposmart-vehicle-diagnostic] query_source_changed_after_read", flush=True)
             raise VehicleVerificationError("state_unconfirmed")
-        if not rows:
+        if not rows and not allow_empty:
             raise VehicleVerificationError("empty_list")
         print(f"[{context}] rows loaded: {len(rows)}")
         return rows
@@ -446,7 +455,10 @@ def login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password
             (By.XPATH, f"//*[contains(text(), '{TEXT_LOGOUT}')]"),
         )(current_driver)
 
-    wait.until(logged_in)
+    try:
+        wait.until(logged_in)
+    except TimeoutException:
+        raise VehicleAccountLoginError() from None
     require_authorized_page(login_page=False)
     print("[login] success")
 
@@ -458,18 +470,19 @@ def ensure_requested_date() -> None:
 
 
 def verified_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, operation: str,
-                       report: dict, expected: set[str] | None = None) -> dict:
+                       report: dict, expected: set[str] | None = None, *, allow_empty: bool = False) -> dict:
     context = "maintain" if operation == "maintenance" else "equip"
     phase = "maintenance" if context == "maintain" else "equipment"
     try:
-        rows = query_grid_rows(driver, wait, context)
+        rows = (query_grid_rows(driver, wait, context, allow_empty=True) if allow_empty
+                else query_grid_rows(driver, wait, context))
         print(f"[sinposmart-stage] {phase}_inventory_verify", flush=True)
         metadata = driver.execute_script(GRID_STATE_SCRIPT)
     except VehicleVerificationError as error:
         fail_verification(report, operation, error.reason_code)
     except Exception:
         fail_verification(report, operation, "state_unconfirmed")
-    if not rows:
+    if not rows and not allow_empty:
         fail_verification(report, operation, "empty_list")
     if len(rows) > MAX_REPORT_ITEMS:
         fail_verification(report, operation, "row_limit")
@@ -599,12 +612,15 @@ def wait_equipment_state(wait, condition, report: dict, vehicle: str, diagnostic
 
 
 def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str],
-                            today: dt.datetime, report: dict | None = None) -> None:
+                            today: dt.datetime, report: dict | None = None, *,
+                            assigned: set[str] | None = None, expected: set[str] | None = None) -> None:
     report = report if report is not None else new_vehicle_report(today.date().isoformat())
     navigate_vehicle_document(driver, wait, "maintain")
-    inventory = set(verified_grid_rows(driver, wait, "maintenance", report))
+    inventory = set(verified_grid_rows(driver, wait, "maintenance", report)
+                    if expected is None else verified_grid_rows(driver, wait, "maintenance", report, expected))
+    targets = inventory if assigned is None else assigned
     not_required = set()
-    for vehicle in sorted(inventory):
+    for vehicle in sorted(targets):
         ensure_requested_date()
         current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
         index, row = current[vehicle]
@@ -669,7 +685,8 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
         record_vehicle_result(report, vehicle, "maintenance", "completed" if saved else "already_done",
                               "saved_verified" if saved else "verified_today")
     current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
-    for vehicle, (_index, row) in current.items():
+    for vehicle in targets:
+        _index, row = current[vehicle]
         if vehicle in not_required:
             continue
         if not maintenance_done(row, today_strings, today):
@@ -677,14 +694,17 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
 
 
 def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
-                         report: dict | None = None) -> None:
+                         report: dict | None = None, *, assigned: set[str] | None = None,
+                         expected: set[str] | None = None) -> None:
     target_date = report["target_date"] if report is not None else dt.date.today().isoformat()
     report = report if report is not None else new_vehicle_report(target_date)
     today_strings = build_today_strings(dt.datetime.combine(dt.date.fromisoformat(target_date), dt.time()))
     ensure_requested_date()
     navigate_vehicle_document(driver, wait, "equip")
-    inventory = set(verified_grid_rows(driver, wait, "equipment", report))
-    for vehicle in sorted(inventory):
+    inventory = set(verified_grid_rows(driver, wait, "equipment", report)
+                    if expected is None else verified_grid_rows(driver, wait, "equipment", report, expected))
+    targets = inventory if assigned is None else assigned
+    for vehicle in sorted(targets):
         current = verified_grid_rows(driver, wait, "equipment", report, inventory)
         _index, row = current[vehicle]
         buttons = row.find_elements(By.CSS_SELECTOR, ".k-grid-check")
@@ -815,7 +835,8 @@ return modal ? modal.textContent.trim() : null;
             fail_verification(report, "equipment", "save_unconfirmed", vehicle)
         record_vehicle_result(report, vehicle, "equipment", "completed", "saved_verified")
     current = verified_grid_rows(driver, wait, "equipment", report, inventory)
-    for vehicle, (_index, row) in current.items():
+    for vehicle in targets:
+        _index, row = current[vehicle]
         if not equipment_done(row, today_strings):
             fail_verification(report, "equipment", "save_unconfirmed", vehicle)
 
@@ -833,6 +854,107 @@ def save_artifacts(driver: webdriver.Chrome, suffix: str) -> None:
         print(f"[artifacts] skipped screenshot/html capture: {error}")
 
 
+MAINTENANCE_PEOPLE = {"水箱車": 1, "救護車": 2, "小型水箱車": 1, "幫浦消防車": 1, "勤務車": 1}
+
+
+def assign_vehicle_checks(
+    maintenance: dict[str, str], equipment: set[str], actors: Iterable[int],
+) -> dict[int, list[tuple[str, str]]]:
+    people_in_order = sorted(actors)
+    jobs = {actor: [] for actor in people_in_order}
+    maintenance_load = dict.fromkeys(jobs, 0)
+    used = set()
+    for kind, count in MAINTENANCE_PEOPLE.items():
+        vehicles = sorted(vehicle for vehicle, vehicle_kind in maintenance.items() if vehicle_kind == kind)
+        people = sorted(people_in_order, key=lambda actor: (actor in used, maintenance_load[actor], actor))
+        assigned_people = people[:min(count, len(vehicles))]
+        for index, vehicle in enumerate(vehicles):
+            actor = assigned_people[index % len(assigned_people)]
+            jobs[actor].append(("maintenance", vehicle))
+            maintenance_load[actor] += 1
+        used.update(assigned_people)
+    for index, vehicle in enumerate(sorted(equipment)):
+        actor = people_in_order[index % len(people_in_order)]
+        jobs[actor].append(("equipment", vehicle))
+    return jobs
+
+
+def run_assigned_checks(actors, open_account, report):
+    available = set(actors)
+    driver = None
+    try:
+        for actor in sorted(available):
+            ensure_requested_date()
+            try:
+                driver, wait = open_account(actor)
+            except VehicleAccountLoginError:
+                available.remove(actor)
+            else:
+                current_actor = actor
+                break
+        if driver is None:
+            raise VehicleVerificationError("no_eligible_account")
+
+        navigate_vehicle_document(driver, wait, "maintain")
+        maintenance = {}
+        for vehicle, (_, row) in verified_grid_rows(driver, wait, "maintenance", report).items():
+            kind = cell_completion_text(row.find_elements(By.TAG_NAME, "td")[7])
+            if kind not in MAINTENANCE_PEOPLE:
+                fail_verification(report, "maintenance", "unknown_vehicle_type", vehicle)
+            maintenance[vehicle] = kind
+        navigate_vehicle_document(driver, wait, "equip")
+        equipment = set(verified_grid_rows(driver, wait, "equipment", report, allow_empty=True))
+        if not equipment:
+            record_vehicle_result(report, "", "equipment", "empty", "verified_empty")
+        jobs = assign_vehicle_checks(maintenance, equipment, available)
+        pending = {actor: list(tasks) for actor, tasks in jobs.items() if tasks}
+        today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())
+
+        while pending:
+            ensure_requested_date()
+            actor = current_actor if current_actor in pending else min(pending)
+            tasks = pending.pop(actor)
+            if actor != current_actor:
+                print("[sinposmart-stage] login", flush=True)
+                try:
+                    candidate, candidate_wait = open_account(actor)
+                except VehicleAccountLoginError:
+                    available.remove(actor)
+                    if not available:
+                        raise VehicleVerificationError("no_eligible_account") from None
+                    batches = {}
+                    for operation, vehicle in tasks:
+                        group = maintenance[vehicle] if operation == "maintenance" else vehicle
+                        batches.setdefault((operation, group), []).append((operation, vehicle))
+                    for (operation, group), batch in batches.items():
+                        def priority(other):
+                            same_operation = [plate for op, plate in jobs[other] if op == operation]
+                            same_type = operation == "maintenance" and any(
+                                maintenance[plate] == group for plate in same_operation
+                            )
+                            return same_type, len(same_operation), other
+
+                        replacement = min(available, key=priority)
+                        jobs[replacement].extend(batch)
+                        pending.setdefault(replacement, []).extend(batch)
+                    continue
+                previous = driver
+                driver, wait, current_actor = candidate, candidate_wait, actor
+                quit_driver(previous)
+            assigned = {plate for op, plate in tasks if op == "maintenance"}
+            if assigned:
+                process_maintain_checks(driver, wait, build_today_strings(today), today, report=report,
+                                        assigned=assigned, expected=set(maintenance))
+            assigned = {plate for op, plate in tasks if op == "equipment"}
+            if assigned:
+                process_equip_checks(driver, wait, report=report, assigned=assigned, expected=equipment)
+        return driver
+    except BaseException:
+        if driver is not None:
+            quit_driver(driver)
+        raise
+
+
 def main(argv: list[str] | None = None) -> None:
     parse_args(argv)
     driver = None
@@ -848,7 +970,10 @@ def main(argv: list[str] | None = None) -> None:
         else:
             os.environ["PPE_TARGET_DATE"] = report["target_date"]
         ensure_requested_date()
-        config = load_config()
+        roster_payload = os.environ.pop("PPE_DUTY_ACCOUNTS", None)
+        accounts = {actor: (user, password) for actor, user, password in json.loads(roster_payload)} \
+            if roster_payload is not None else None
+        config = load_config(assigned=True) if accounts is not None else load_config()
         options = webdriver.ChromeOptions()
         if config["headless"]:
             options.add_argument("--headless=new")
@@ -879,22 +1004,29 @@ def main(argv: list[str] | None = None) -> None:
                 page_load_strategy="none",
             )
 
-        def initialize_browser(candidate: webdriver.Chrome) -> None:
-            candidate.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
-            candidate.set_script_timeout(max(15, int(config["timeout_seconds"])))
-            login(candidate, WebDriverWait(candidate, int(config["timeout_seconds"])),
-                  str(config["username"]), str(config["password"]))
+        def open_account(actor=None):
+            user, password = accounts[actor] if accounts is not None else (config["username"], config["password"])
+
+            def initialize_browser(candidate: webdriver.Chrome) -> None:
+                candidate.set_page_load_timeout(max(15, int(config["timeout_seconds"])))
+                candidate.set_script_timeout(max(15, int(config["timeout_seconds"])))
+                login(candidate, WebDriverWait(candidate, int(config["timeout_seconds"])), user, password)
+
+            candidate = retry_duty_browser_session_open(create_driver, initialize_browser, cleanup=quit_driver)
+            return candidate, WebDriverWait(candidate, int(config["timeout_seconds"]))
 
         print("[sinposmart-stage] browser_start", flush=True)
         print("[sinposmart-stage] login", flush=True)
-        driver = retry_duty_browser_session_open(create_driver, initialize_browser, cleanup=quit_driver)
-        wait = WebDriverWait(driver, int(config["timeout_seconds"]))
-        today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())
-        print("[sinposmart-stage] maintenance_check", flush=True)
-        process_maintain_checks(driver, wait, build_today_strings(today), today, report=report)
-        operation = "equipment"
-        print("[sinposmart-stage] equipment_check", flush=True)
-        process_equip_checks(driver, wait, report=report)
+        if accounts is not None:
+            driver = run_assigned_checks(accounts, open_account, report)
+        else:
+            driver, wait = open_account()
+            today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())
+            print("[sinposmart-stage] maintenance_check", flush=True)
+            process_maintain_checks(driver, wait, build_today_strings(today), today, report=report)
+            operation = "equipment"
+            print("[sinposmart-stage] equipment_check", flush=True)
+            process_equip_checks(driver, wait, report=report)
         ensure_requested_date()
         if not verify_vehicle_report(report):
             fail_verification(report, operation, "execution_unconfirmed")

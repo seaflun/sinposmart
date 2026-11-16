@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QApplication
 
 from app_core.credential_repository import CredentialRepository
 from app_core.credential_sync_service import CredentialSyncService
-from app_core.daily_vehicle_service import DailyVehicleService
+from app_core.daily_vehicle_service import DailyVehicleService, DailyVehicleValidationError, vehicle_duty_accounts
 from app_core.diagnostics_service import DiagnosticExportError, DiagnosticsService, DiagnosticSnapshot, redact_diagnostic_text
 from app_core.duty_sheet_service import DutySheetRequest, DutySheetService
 from app_core.duty_submission_service import (
@@ -52,7 +52,7 @@ from app_core.civilpower_service import CivilpowerService
 from qt_app.controllers.civilpower_controller import CivilpowerController
 from app_core.rescue_video_service import RescueVideoService
 from app_core.rest_monthly_service import RestMonthlyService
-from app_core.schedule_repository import ScheduleRepository
+from app_core.schedule_repository import ScheduleLoadError, ScheduleRepository
 from app_core.schedule_repository import business_roc_date
 from app_core.schedule_capture_service import ScheduleCaptureRequest, ScheduleCaptureService
 from app_core.scheduled_folder_service import ScheduledFolderService
@@ -163,9 +163,10 @@ class AppController(QObject):
         self._tool_run_secrets: dict[str, tuple[str, ...]] = {}
         self._shutdown_terminal_tool_runs: set[str] = set()
         self._schedule_capture_service = schedule_capture_service or ScheduleCaptureService(package_root)
+        self._schedule_repository = schedule_repository or ScheduleRepository(package_root / "runtime_outputs")
         self._duty_controller = DutyController(
             self,
-            repository=schedule_repository,
+            repository=self._schedule_repository,
             capture_service=self._schedule_capture_service,
             unreturned_return_queue=unreturned_return_queue,
             read_only_acceptance=self._read_only_acceptance,
@@ -210,6 +211,7 @@ class AppController(QObject):
             daily_vehicle_service or DailyVehicleService(package_root),
             self,
             read_only_acceptance=self._read_only_acceptance,
+            accounts_for_date=self._daily_vehicle_accounts if daily_vehicle_service is None else None,
         )
         self._rescue_video_controller = RescueVideoController(
             rescue_video_service or RescueVideoService(package_root),
@@ -2249,6 +2251,29 @@ class AppController(QObject):
         """Return a key only when it still names one current task in the UI."""
 
         return self._duty_controller.ui_action_key_for_request(request)
+
+    def _daily_vehicle_accounts(self, target_date: str) -> tuple[tuple[int, str, str], ...]:
+        day = date.fromisoformat(target_date)
+        roc_date = f"{day.year - 1911:03d}{day:%m%d}"
+        path = self._schedule_repository.schedule_path(roc_date)
+        if not path.is_file():
+            raise DailyVehicleValidationError("尚無當日正式勤務表，車輛清點待處理。")
+        try:
+            snapshot = self._schedule_repository.load_path(path)
+        except ScheduleLoadError:
+            raise DailyVehicleValidationError("當日勤務表無法讀取，車輛清點待處理。") from None
+        roster = snapshot.data.get("today")
+        if snapshot.target_roc_date != roc_date or not isinstance(roster, Mapping):
+            raise DailyVehicleValidationError("尚無當日勤務表，車輛清點待處理。")
+
+        def credentials_for_person(actor, name):
+            session = self._session_state.session
+            if (session is not None and session.verified and session.actor_name
+                    and "".join(session.actor_name.split()) == "".join(name.split())):
+                return session.user_id, session.password
+            return self._session_controller.saved_credentials_for_person(actor, name)
+
+        return vehicle_duty_accounts(roster, roc_date, credentials_for_person)
 
     @staticmethod
     def _submission_staff(request: DutySubmissionRequest) -> dict[str, dict]:
