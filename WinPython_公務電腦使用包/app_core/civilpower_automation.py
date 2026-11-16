@@ -9,17 +9,23 @@ import hashlib
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    NoAlertPresentException, NoSuchElementException, StaleElementReferenceException,
+    TimeoutException, UnexpectedAlertPresentException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from duty_rehearsal import RETAINED_BROWSER_DRIVERS as RETAINED_DRIVERS, retain_browser_for_seconds
 
-from app_core.civilpower_service import AttendancePlan, AttendanceRequest, CivilpowerError, CIVILPOWER_LOGIN_MESSAGES, _write_json
+from app_core.civilpower_service import (
+    AttendancePlan, AttendanceRequest, CivilpowerError, CIVILPOWER_LOGIN_MESSAGES,
+    PENDING_ATTENDANCE_VERIFICATION, _write_json,
+)
 
 OA_LOGIN_URL = "https://oa.tyfd.gov.tw/login.php"
 CIVILPOWER_SSO_LOGIN_URL = "https://civilpower.tyfd.gov.tw/TYCC/Home/SSOLogin"
@@ -31,8 +37,12 @@ CIVILPOWER_STAGE_LABELS = {
     "civilpower_open": "開啟民力系統…",
     "io_query": "查詢既有出入紀錄…", "io_add": "填寫出入登記…",
     "io_unit": "確認所屬及服勤單位…", "io_person": "選擇義消…",
-    "io_save_verify": "儲存並回查出入紀錄…",
+    "io_save_verify": "等待網站儲存回覆…",
+    "io_readback": "重新查詢出入登記簿…",
 }
+_SAVE_SUCCESS_MARKERS = ("新增成功", "編輯成功", "儲存成功", "存檔成功", "操作成功")
+_SAVE_FAILURE_MARKERS = ("失敗", "錯誤", "無法", "尚未", "未成功", "未新增", "未儲存",
+                         "未編輯", "未存檔", "未完成", "不能", "不可", "不允許")
 _DATE_PATTERN = re.compile(r"(?<!\d)\d{1,4}[/-]\d{1,2}[/-]\d{1,2}(?!\d)")
 _DATETIME_PATTERN = re.compile(r"(?<!\d)(\d{1,4})[/-](\d{1,2})[/-](\d{1,2})[ T]+(?:(上午|下午)[ T]*)?(\d{1,2})[:：](\d{1,2})(?!\d)")
 
@@ -77,7 +87,8 @@ def _save_failure_diagnostic(package_root, error, state, checkpoint, record_veri
         source = source.__context__
     exception_type = type(source).__name__
     if exception_type not in {"CivilpowerError", "TimeoutException", "StaleElementReferenceException",
-                              "NoSuchElementException", "OSError", "RuntimeError", "LoginVerificationError"}:
+                              "NoSuchElementException", "OSError", "RuntimeError", "LoginVerificationError",
+                              "UnexpectedAlertPresentException", "_IncompleteQueryError", "_AmbiguousSelectionError"}:
         exception_type = "OtherError"
     payload = {
         "schema_version": 1, "recorded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -108,8 +119,10 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         previous = json.loads(ledger.read_text(encoding="utf-8")) if ledger.exists() else {}
     except (OSError, ValueError):
         raise CivilpowerError("此筆登打查核紀錄無法讀取，請先人工確認網站紀錄。") from None
-    if previous.get("state") == "pending_verification" and previous.get("user_id") != request.user_id:
-        raise CivilpowerError("此筆曾送出但尚未確認，請由原登打帳號登入後回查，勿換帳號重送。")
+    readback_only = previous.get("state") == "pending_verification"
+    if readback_only and previous.get("user_id") != request.user_id:
+        raise CivilpowerError("此筆儲存結果待回查，請由原登打帳號查詢。",
+                              failure_stage="io_readback", error_code=PENDING_ATTENDANCE_VERIFICATION)
     if previous.get("state") == "verified":
         return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：此筆已確認完成，未重複新增。"
     driver = None
@@ -146,11 +159,16 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
                                  "updated_at": datetime.now().isoformat(timespec="seconds")})
 
         created = _ensure_io_record(driver, plan, plan.status, checkpoint, cancel_check=None,
-                                    require_lookup_confirmation=True, progress=report_progress, before_save=before_save)
+                                    require_lookup_confirmation=True, progress=report_progress, before_save=before_save,
+                                    readback_only=readback_only)
         record_verified = True
-        _write_json(ledger, {"state": "verified", "user_id": request.user_id,
-                            "updated_at": datetime.now().isoformat(timespec="seconds")})
-        return f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}：" + ("已儲存並回查確認。" if created else "網站已有相同紀錄，未重複新增。")
+        record_id = checkpoint.get("record_id", "")
+        verified = {"state": "verified", "user_id": request.user_id, "record_id": record_id,
+                    "updated_at": datetime.now().isoformat(timespec="seconds")}
+        _write_json(ledger, verified)
+        identity_label = f"{plan.member_name} {plan.date_text} {plan.time_text[:2]}:{plan.time_text[2:]} {plan.reason}"
+        result = "已儲存並回查確認" if created else "網站已有相同紀錄，未重複新增"
+        return f"{identity_label}：{result}" + (f"（紀錄 #{record_id}）。" if record_id else "。")
     except CivilpowerError as exc:
         error = exc
         if exc.failure_stage == "unknown":
@@ -161,8 +179,8 @@ def run_attendance(package_root: Path, request: AttendanceRequest, plan: Attenda
         raise
     except Exception as exc:
         if checkpoint.get("out_save_state") == "pending_verification" or checkpoint.get("in_save_state") == "pending_verification":
-            error = CivilpowerError("已進入儲存階段，但結果尚未確認；請使用原值班帳號重試回查，勿另建不同時間的紀錄。",
-                                    failure_stage=current_stage)
+            error = CivilpowerError("儲存結果待回查。請使用原值班帳號、同一人員與時間查詢。",
+                                    failure_stage=current_stage, error_code=PENDING_ATTENDANCE_VERIFICATION)
         elif record_verified:
             error = CivilpowerError("網站紀錄已回查確認，但本機查核紀錄無法寫入；請確認磁碟狀態，勿另建不同時間的紀錄。",
                                     failure_stage="io_save_verify")
@@ -241,22 +259,29 @@ def _ensure_io_record(
     require_lookup_confirmation: bool = False,
     progress: Callable[[str], None] | None = None,
     before_save: Callable[[], None] | None = None,
+    readback_only: bool = False,
 ) -> bool:
     marker = "out" if status == OUT_STATUS else "in"
     lookup_kwargs = {"raise_on_timeout": True} if require_lookup_confirmation else {}
     _raise_if_cancelled(cancel_check)
-    _report_progress(progress, CIVILPOWER_STAGE_LABELS["io_query"])
-    if _find_io_record(
+    if readback_only:
+        checkpoint[f"{marker}_save_state"] = "pending_verification"
+    _report_progress(progress, CIVILPOWER_STAGE_LABELS["io_readback" if readback_only else "io_query"])
+    record_id = _find_io_record(
         driver,
         plan,
         status,
         wait_for_match=False,
         require_query_confirmation=True,
         **lookup_kwargs,
-    ):
+    )
+    if record_id:
+        checkpoint["record_id"] = record_id
         checkpoint[f"{marker}_verified"] = True
         checkpoint[f"{marker}_save_state"] = "verified"
         return False
+    if readback_only:
+        raise _IncompleteQueryError("尚未在出入登記簿找到相同紀錄。")
     wait = WebDriverWait(driver, DEFAULT_WAIT_SECONDS)
     _report_progress(progress, CIVILPOWER_STAGE_LABELS["io_add"])
     _click(wait, "#btn_Add")
@@ -278,21 +303,23 @@ def _ensure_io_record(
     _wait_for_io_record_form_values(driver, wait, plan, status)
     _raise_if_cancelled(cancel_check)
     _report_progress(progress, CIVILPOWER_STAGE_LABELS["io_save_verify"])
-    checkpoint[f"{marker}_save_state"] = "pending_verification"
     if before_save is not None:
         before_save()
+    checkpoint[f"{marker}_save_state"] = "pending_verification"
     _click(wait, "#btn_IOWorkLogAdd")
     _wait_after_save(driver, wait, "#jqxAddWindow")
     _raise_if_cancelled(cancel_check)
-    if not _find_io_record(
+    _report_progress(progress, CIVILPOWER_STAGE_LABELS["io_readback"])
+    record_id = _find_io_record(
         driver,
         plan,
         status,
         wait_for_match=True,
-        reload_page=False,
         **lookup_kwargs,
-    ):
+    )
+    if not record_id:
         raise RuntimeError(f"出入登記簿儲存後回查不到{status}／{plan.reason}紀錄。")
+    checkpoint["record_id"] = record_id
     checkpoint[f"{marker}_verified"] = True
     checkpoint[f"{marker}_save_state"] = "verified"
     return True
@@ -312,16 +339,21 @@ def _find_io_record(
     reload_page: bool = True,
     raise_on_timeout: bool = False,
     require_query_confirmation: bool = False,
-) -> bool:
-    return _find_io_record_row(
-        driver,
-        plan,
-        status,
-        wait_for_match=wait_for_match,
-        reload_page=reload_page,
-        raise_on_timeout=raise_on_timeout,
-        require_query_confirmation=require_query_confirmation,
-    ) is not None
+) -> str | None:
+    def query(current):
+        return _find_io_record_row(
+            current, plan, status, reload_page=reload_page,
+            raise_on_timeout=raise_on_timeout, require_query_confirmation=require_query_confirmation,
+        )
+
+    if not wait_for_match:
+        return query(driver)
+    try:
+        return WebDriverWait(driver, DEFAULT_WAIT_SECONDS, poll_frequency=1).until(query)
+    except TimeoutException:
+        if raise_on_timeout:
+            raise
+        return None
 
 
 def _find_io_record_row(
@@ -329,34 +361,30 @@ def _find_io_record_row(
     plan: AttendancePlan,
     status: str,
     *,
-    wait_for_match: bool = False,
     reload_page: bool = True,
     raise_on_timeout: bool = False,
     require_query_confirmation: bool = False,
-):
+) -> str | None:
     if reload_page:
         _open_io_work_log(driver)
     wait = WebDriverWait(driver, DEFAULT_WAIT_SECONDS)
-    date_text = plan.date_text
-    time_text = plan.time_text
-    _set_if_present(driver, wait, "#txt_Name", plan.member_name)
-    _set_if_present(driver, wait, "#txt_Date_S", date_text)
-    _set_if_present(driver, wait, "#txt_Date_E", date_text)
-    _select_option_containing_if_present(driver, wait, "#ddl_IO", status)
+    day = datetime.strptime(plan.date_text, "%Y/%m/%d")
+    values = {
+        "#txt_Name": plan.member_name,
+        "#txt_Date_S": plan.date_text,
+        "#txt_Date_E": (day + timedelta(days=1)).strftime("%Y/%m/%d"),
+    }
+    for selector, value in values.items():
+        _set_input(wait, selector, value)
+        if not _same_value(_control_value(driver, selector), value):
+            raise _IncompleteQueryError("民力查詢條件未正確帶入，尚未確認紀錄。")
+    _select_option_containing(wait, "#ddl_IO", status)
     previous_result_signature = _io_result_grid_signature(driver)
     previous_result_sentinel = _io_result_grid_sentinel(driver)
-    _click_if_present(driver, wait, "#btn_Query")
-    tokens = [
-        status,
-        plan.member_name,
-        plan.home_unit,
-        plan.serve_unit,
-        plan.reason,
-        _datetime_token(date_text, time_text),
-    ]
+    _click(wait, "#btn_Query")
     query_result_confirmed = _wait_for_io_query_result_grid(
         driver,
-        tokens,
+        [],
         previous_result_signature,
         previous_result_sentinel,
     )
@@ -364,17 +392,65 @@ def _find_io_record_row(
         if require_query_confirmation or raise_on_timeout:
             raise RuntimeError("出入登記簿查詢結果未完成更新，為避免重複新增，請保持原登入帳號後重試。")
         return None
-    rows = _find_paginated_table_rows(driver, wait, tokens)
-    if not rows and wait_for_match:
-        try:
-            rows = wait.until(lambda current: _find_paginated_table_rows(current, wait, tokens) or False)
-        except TimeoutException:
-            if raise_on_timeout:
-                raise RuntimeError(f"出入登記簿查詢逾時，無法確認{status}紀錄；請保持原登入帳號後重試。")
-            return None
+    rows = _find_paginated_table_rows(
+        driver, wait, [], match_page=lambda: _matching_io_record_ids(driver, plan, status),
+    )
     if len(rows) > 1:
         raise RuntimeError(f"出入登記簿找到多筆相同{status}紀錄，無法安全判定。")
     return rows[0] if rows else None
+
+
+def _matching_io_record_ids(driver, plan: AttendancePlan, status: str) -> list[str]:
+    rows = driver.execute_script("""
+        const grid = document.querySelector('#tableresult');
+        if (!grid) return null;
+        return Array.from(grid.querySelectorAll('tr')).filter(row => row.getClientRects().length && row.cells.length)
+            .map(row => ({
+                cells: Array.from(row.cells, cell => cell.innerText),
+                ids: Array.from(new Set(Array.from(row.querySelectorAll("input[type='checkbox'][value], [data-id]"),
+                    element => element.getAttribute('data-id') || element.getAttribute('value'))
+                    .filter(value => /^\\d+$/.test(value))))
+            }));
+    """)
+    required = {"時間", "服勤單位", "所屬單位", "姓名", "職稱", "狀態", "事由"}
+    expected_time = _datetime_parts(_DATETIME_PATTERN.fullmatch(_datetime_token(plan.date_text, plan.time_text)))
+    headers = None
+    matches = []
+    data_rows = 0
+    if not isinstance(rows, list):
+        raise _IncompleteQueryError("民力查詢結果表無法讀取。")
+    for row in rows:
+        cells = [_clean_text(value) for value in row["cells"]]
+        if required.issubset(cells):
+            names = [cell for cell in cells if cell]
+            if len(names) != len(set(names)) or (headers is not None and headers != cells):
+                raise _IncompleteQueryError("民力查詢結果表欄位不唯一。")
+            headers = cells
+            continue
+        if headers is not None and len(rows) == 2 and cells in (["無資料"], ["查無資料"], ["沒有資料"]):
+            break
+        if headers is None or len(cells) != len(headers):
+            raise _IncompleteQueryError("民力查詢結果表欠缺完整欄位。")
+        data_rows += 1
+        fields = dict(zip(headers, cells))
+        identity = (fields["姓名"], fields["所屬單位"], fields["服勤單位"], fields["狀態"])
+        if identity != (plan.member_name, plan.home_unit, plan.serve_unit, status):
+            continue
+        time_match = _DATETIME_PATTERN.match(fields["時間"])
+        actual_time = _datetime_parts(time_match) if time_match else None
+        if actual_time is None:
+            raise _IncompleteQueryError("同一人員的出入時間無法確認。")
+        if actual_time != expected_time:
+            continue
+        if fields["事由"] != plan.reason or (plan.member_title and fields["職稱"] != plan.member_title):
+            raise _AmbiguousSelectionError("同一人員與時間已有資料，事由或職稱不同，請確認原紀錄。")
+        identifiers = row["ids"]
+        if len(identifiers) != 1:
+            raise _IncompleteQueryError("符合條件的民力紀錄缺少唯一編號。")
+        matches.append(identifiers[0])
+    if headers is None or (not data_rows and _pagination_links(driver, "next")):
+        raise _IncompleteQueryError("民力查詢結果表或分頁不完整。")
+    return matches
 
 
 def _io_result_grid_signature(driver) -> str | None:
@@ -592,13 +668,28 @@ def _wait_for_dialog_close(wait: WebDriverWait, dialog) -> None:
 
 
 def _wait_after_save(driver, wait: WebDriverWait, modal_selector: str) -> None:
-    try:
-        wait.until(lambda current: not _element_displayed(current, modal_selector))
-    except TimeoutException:
-        body_text = _clean_text(driver.find_element(By.TAG_NAME, "body").text)
-        if any(token in body_text for token in ("失敗", "錯誤", "請輸入", "必填")):
-            raise RuntimeError("民力運用系統未接受儲存：" + body_text[-300:])
+    def save_reply_ready(current):
+        try:
+            try:
+                alert = current.switch_to.alert
+            except NoAlertPresentException:
+                return _visible_save_success_dialog(current) is not None or not _element_displayed(current, modal_selector)
+        except UnexpectedAlertPresentException:
+            return False  # The native reply appeared between the alert check and the DOM read.
+        if not _is_save_success(_clean_text(alert.text)):
+            raise RuntimeError("民力網站的儲存提示需人工確認。")
+        alert.accept()
+        return True
+
+    wait.until(save_reply_ready)
     _dismiss_save_success_dialog(driver, wait)
+    wait.until(lambda current: not _element_displayed(current, modal_selector))
+
+
+def _is_save_success(text: str) -> bool:
+    return any(marker in text for marker in _SAVE_SUCCESS_MARKERS) and not any(
+        marker in text for marker in _SAVE_FAILURE_MARKERS
+    )
 
 
 def _dismiss_save_success_dialog(driver, wait: WebDriverWait) -> None:
@@ -623,9 +714,7 @@ def _visible_save_success_dialog(driver):
     for candidate in candidates:
         try:
             text = _clean_text(candidate.text)
-            if candidate.is_displayed() and any(
-                marker in text for marker in ("新增成功", "編輯成功", "儲存成功", "存檔成功", "操作成功")
-            ):
+            if candidate.is_displayed() and _is_save_success(text):
                 return candidate
         except Exception:
             continue
@@ -667,11 +756,10 @@ def _change_result_page(root, wait: WebDriverWait, direction: str) -> None:
 
 
 def _find_paginated_table_rows(
-    root, wait: WebDriverWait, required_tokens: list[str], *, row_filter=None
+    root, wait: WebDriverWait, required_tokens: list[str], *, match_page=None
 ) -> list[object]:
     def matching_rows():
-        rows = _matching_table_rows(root, required_tokens)
-        return [row for row in rows if row_filter(row)] if row_filter is not None else rows
+        return match_page() if match_page is not None else _matching_table_rows(root, required_tokens)
 
     rows = matching_rows()
     if not _pagination_links(root, "next"):
@@ -893,11 +981,6 @@ def _select_option_containing(wait: WebDriverWait, selector: str, text: str, *, 
     select.select_by_visible_text(matches[0].text)
 
 
-def _select_option_containing_if_present(driver, wait: WebDriverWait, selector: str, text: str) -> None:
-    if driver.find_elements(By.CSS_SELECTOR, selector):
-        _select_option_containing(wait, selector, text)
-
-
 def _set_input(wait: WebDriverWait, selector: str, value: str) -> None:
     element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
     element.clear()
@@ -905,18 +988,8 @@ def _set_input(wait: WebDriverWait, selector: str, value: str) -> None:
     element.send_keys("\t")
 
 
-def _set_if_present(driver, wait: WebDriverWait, selector: str, value: str) -> None:
-    if driver.find_elements(By.CSS_SELECTOR, selector):
-        _set_input(wait, selector, value)
-
-
 def _click(wait: WebDriverWait, selector: str) -> None:
     wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector))).click()
-
-
-def _click_if_present(driver, wait: WebDriverWait, selector: str) -> None:
-    if driver.find_elements(By.CSS_SELECTOR, selector):
-        _click(wait, selector)
 
 
 def _wait_visible(wait: WebDriverWait, selector: str):

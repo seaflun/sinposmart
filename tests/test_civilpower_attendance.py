@@ -551,7 +551,71 @@ class AttendanceTests(unittest.TestCase):
                                           "#txt_AddLogMin": "05", "#txt_AddReason": action})
                 self.assertEqual(mocked["_select_option_containing"].call_args.args[2], status)
                 self.assertTrue(query.call_args.kwargs["raise_on_timeout"])
+                self.assertTrue(query.call_args.kwargs.get("reload_page", True))
                 before.assert_called_once()
+
+    def test_native_save_success_is_acknowledged_before_reading_the_form(self):
+        from selenium.common.exceptions import UnexpectedAlertPresentException
+        from app_core import civilpower_automation as automation
+
+        driver, wait = Mock(), Mock()
+        alert = driver.switch_to.alert
+        alert.text = "新增成功"
+        wait.until.side_effect = lambda predicate: predicate(driver)
+
+        def find_elements(*_args):
+            if not alert.accept.called:
+                raise UnexpectedAlertPresentException("fixture success")
+            return []
+
+        driver.find_elements.side_effect = find_elements
+        with patch.object(automation, "_dismiss_save_success_dialog"):
+            automation._wait_after_save(driver, wait, "#jqxAddWindow")
+        alert.accept.assert_called_once()
+        alert.accept.reset_mock()
+        alert.text = "未新增成功"
+        with self.assertRaisesRegex(RuntimeError, "儲存提示需人工確認"):
+            automation._wait_after_save(driver, wait, "#jqxAddWindow")
+        alert.accept.assert_not_called()
+
+    def test_io_lookup_checks_event_columns_and_formal_record_identity(self):
+        from app_core import civilpower_automation as automation
+        plan = CivilpowerService(PACKAGE).validate(self.request())
+        driver = Mock()
+        header = ["", "時間", "服勤單位", "所屬單位", "姓名", "職稱", "狀態", "事由", "最後修改時間"]
+        matching = ["", "115/09/23 上午 09:05:20", plan.serve_unit, plan.home_unit,
+                    plan.member_name, plan.member_title, plan.status, plan.reason, "115/09/23 09:14"]
+        wrong_time = matching.copy()
+        wrong_time[1] = "115/09/23 09:00"
+        wrong_time[-1] = "115/09/23 09:05"
+        driver.execute_script.return_value = [
+            {"cells": header, "ids": []},
+            {"cells": wrong_time, "ids": ["80"]},
+            {"cells": matching, "ids": ["91"]},
+        ]
+        with ExitStack() as stack:
+            for name in ("_open_io_work_log", "_set_input", "_select_option_containing", "_click",
+                         "_io_result_grid_signature", "_io_result_grid_sentinel"):
+                stack.enter_context(patch.object(automation, name))
+            expected_controls = {"#txt_Name": plan.member_name, "#txt_Date_S": plan.date_text, "#txt_Date_E": "2026/09/24"}
+            stack.enter_context(patch.object(automation, "_control_value", side_effect=lambda _, selector: expected_controls[selector]))
+            stack.enter_context(patch.object(automation, "_wait_for_io_query_result_grid", return_value=True))
+            stack.enter_context(patch.object(automation, "_pagination_links", return_value=[]))
+            self.assertEqual(automation._find_io_record(driver, plan, plan.status), "91")
+            driver.execute_script.return_value[-1]["ids"] = []
+            with self.assertRaises(automation._IncompleteQueryError):
+                automation._find_io_record(driver, plan, plan.status)
+
+    def test_save_readback_queries_again_if_the_first_fresh_page_has_no_match(self):
+        from app_core import civilpower_automation as automation
+        driver, wait = Mock(), Mock()
+        plan = CivilpowerService(PACKAGE).validate(self.request())
+        wait.until.side_effect = lambda check: check(driver) or check(driver)
+        with patch.object(automation, "WebDriverWait", return_value=wait), \
+                patch.object(automation, "_find_io_record_row", side_effect=[None, "91"]) as query:
+            self.assertEqual(automation._find_io_record(driver, plan, plan.status, wait_for_match=True), "91")
+        self.assertEqual(query.call_count, 2)
+        self.assertTrue(all(call.kwargs["reload_page"] for call in query.call_args_list))
 
     def test_failed_readback_remains_pending(self):
         from app_core import civilpower_automation as automation
@@ -581,6 +645,38 @@ class AttendanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(CivilpowerError, "原登打帳號"):
                     automation.run_attendance(Path(root), request, plan, Mock())
                 browser.assert_not_called()
+
+    def test_pending_attendance_only_reads_back_the_original_record(self):
+        from app_core import civilpower_automation as automation
+        for record_id in ("91", None):
+            with self.subTest(record_id=record_id), TemporaryDirectory() as directory, ExitStack() as stack:
+                root = Path(directory)
+                request = self.request()
+                plan = CivilpowerService(PACKAGE).validate(request)
+                identity = json.dumps([plan.member_id, plan.date_text, plan.time_text, plan.status, plan.reason], ensure_ascii=False)
+                ledger = root / "runtime_outputs" / "civilpower" / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
+                ledger.parent.mkdir(parents=True)
+                ledger.write_text(json.dumps({"state": "pending_verification", "user_id": request.user_id}))
+                stack.enter_context(patch("app_core.login_verifier.create_login_webdriver", return_value=Mock()))
+                stack.enter_context(patch("app_core.login_verifier.configure_login_webdriver_timeouts"))
+                stack.enter_context(patch.dict(sys.modules, {"ddddocr": Mock()}))
+                stack.enter_context(patch.object(automation, "login_attendance"))
+                stack.enter_context(patch.object(automation, "retain_browser_for_seconds"))
+                lookup = stack.enter_context(patch.object(automation, "_find_io_record", return_value=record_id))
+                add_or_save = stack.enter_context(patch.object(automation, "_click", side_effect=AssertionError("write attempted")))
+                if record_id:
+                    result = automation.run_attendance(root, request, plan, Mock())
+                    self.assertIn("#91", result)
+                    saved = json.loads(ledger.read_text(encoding="utf-8"))
+                    self.assertEqual((saved["state"], saved["record_id"]), ("verified", record_id))
+                else:
+                    with self.assertRaises(CivilpowerError) as caught:
+                        automation.run_attendance(root, request, plan, Mock())
+                    self.assertEqual(caught.exception.error_code, "io_pending_verification")
+                    self.assertEqual(caught.exception.failure_stage, "io_readback")
+                    self.assertEqual(json.loads(ledger.read_text(encoding="utf-8"))["state"], "pending_verification")
+                add_or_save.assert_not_called()
+                lookup.assert_called_once()
 
     def test_sso_failure_keeps_oa_success_and_safe_failure_diagnostic(self):
         from selenium.common.exceptions import TimeoutException
@@ -680,9 +776,10 @@ class AttendanceTests(unittest.TestCase):
         plan = CivilpowerService(PACKAGE).validate(self.request())
         for ready, rows in ((False, []), (True, [Mock(), Mock()])):
             with self.subTest(ready=ready), ExitStack() as stack:
-                for name in ("_open_io_work_log", "_set_if_present", "_select_option_containing_if_present",
-                             "_io_result_grid_signature", "_io_result_grid_sentinel", "_click_if_present"):
+                for name in ("_open_io_work_log", "_set_input", "_select_option_containing",
+                             "_io_result_grid_signature", "_io_result_grid_sentinel", "_click"):
                     stack.enter_context(patch.object(automation, name))
+                stack.enter_context(patch.object(automation, "_same_value", return_value=True))
                 stack.enter_context(patch.object(automation, "_wait_for_io_query_result_grid", return_value=ready))
                 stack.enter_context(patch.object(automation, "_find_paginated_table_rows", return_value=rows))
                 with self.assertRaises(RuntimeError):

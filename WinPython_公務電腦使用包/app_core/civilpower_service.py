@@ -36,13 +36,18 @@ CIVILPOWER_LOGIN_MESSAGES = {
 }
 
 
+PENDING_ATTENDANCE_VERIFICATION = "io_pending_verification"
+
+
 class CivilpowerError(RuntimeError):
     """User-facing error without credentials or raw browser diagnostics."""
 
     def __init__(self, message: str, *, failure_stage: str = "unknown", error_code: str = "unknown"):
         super().__init__(message)
         self.failure_stage = failure_stage
-        self.error_code = error_code if isinstance(error_code, str) and error_code in CIVILPOWER_LOGIN_MESSAGES else "unknown"
+        self.error_code = error_code if isinstance(error_code, str) and (
+            error_code in CIVILPOWER_LOGIN_MESSAGES or error_code == PENDING_ATTENDANCE_VERIFICATION
+        ) else "unknown"
 
 
 @dataclass(frozen=True)
