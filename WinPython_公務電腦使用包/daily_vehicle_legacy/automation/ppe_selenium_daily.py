@@ -186,12 +186,14 @@ def safe_vehicle_name(value: str) -> str:
 
 
 def record_vehicle_result(report: dict, vehicle: str, operation: str,
-                          status: str, reason_code: str) -> None:
+                          status: str, reason_code: str, *, login_account: str = "") -> None:
     safe_name = safe_vehicle_name(vehicle)
     if vehicle and not safe_name:
         status, reason_code = "unconfirmed", "state_unconfirmed"
     item = {"vehicle": safe_name, "operation": operation,
             "status": status, "reason_code": reason_code}
+    if status == "completed" and reason_code == "saved_verified" and login_account:
+        item["login_account"] = login_account
     for index, previous in enumerate(report["items"]):
         if (previous["vehicle"].casefold(), previous["operation"]) == (safe_name.casefold(), operation):
             report["items"][index] = item
@@ -613,7 +615,8 @@ def wait_equipment_state(wait, condition, report: dict, vehicle: str, diagnostic
 
 def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today_strings: list[str],
                             today: dt.datetime, report: dict | None = None, *,
-                            assigned: set[str] | None = None, expected: set[str] | None = None) -> None:
+                            assigned: set[str] | None = None, expected: set[str] | None = None,
+                            login_account: str = "") -> None:
     report = report if report is not None else new_vehicle_report(today.date().isoformat())
     navigate_vehicle_document(driver, wait, "maintain")
     inventory = set(verified_grid_rows(driver, wait, "maintenance", report)
@@ -683,7 +686,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
         if not maintenance_done(current[vehicle][1], today_strings, today):
             fail_verification(report, "maintenance", "save_unconfirmed" if saved else "state_unconfirmed", vehicle)
         record_vehicle_result(report, vehicle, "maintenance", "completed" if saved else "already_done",
-                              "saved_verified" if saved else "verified_today")
+                              "saved_verified" if saved else "verified_today", login_account=login_account)
     current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
     for vehicle in targets:
         _index, row = current[vehicle]
@@ -695,7 +698,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
 
 def process_equip_checks(driver: webdriver.Chrome, wait: WebDriverWait,
                          report: dict | None = None, *, assigned: set[str] | None = None,
-                         expected: set[str] | None = None) -> None:
+                         expected: set[str] | None = None, login_account: str = "") -> None:
     target_date = report["target_date"] if report is not None else dt.date.today().isoformat()
     report = report if report is not None else new_vehicle_report(target_date)
     today_strings = build_today_strings(dt.datetime.combine(dt.date.fromisoformat(target_date), dt.time()))
@@ -833,7 +836,8 @@ return modal ? modal.textContent.trim() : null;
         if (equipment_record_id(driver, row, vehicle, today_strings) != record_id
                 or not equipment_done(row, today_strings)):
             fail_verification(report, "equipment", "save_unconfirmed", vehicle)
-        record_vehicle_result(report, vehicle, "equipment", "completed", "saved_verified")
+        record_vehicle_result(report, vehicle, "equipment", "completed", "saved_verified",
+                              login_account=login_account)
     current = verified_grid_rows(driver, wait, "equipment", report, inventory)
     for vehicle in targets:
         _index, row = current[vehicle]
@@ -879,7 +883,7 @@ def assign_vehicle_checks(
     return jobs
 
 
-def run_assigned_checks(actors, open_account, report):
+def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[int, str] | None = None):
     available = set(actors)
     driver = None
     try:
@@ -941,13 +945,15 @@ def run_assigned_checks(actors, open_account, report):
                 previous = driver
                 driver, wait, current_actor = candidate, candidate_wait, actor
                 quit_driver(previous)
+            login_account = (login_accounts or {}).get(current_actor, "")
             assigned = {plate for op, plate in tasks if op == "maintenance"}
             if assigned:
                 process_maintain_checks(driver, wait, build_today_strings(today), today, report=report,
-                                        assigned=assigned, expected=set(maintenance))
+                                        assigned=assigned, expected=set(maintenance), login_account=login_account)
             assigned = {plate for op, plate in tasks if op == "equipment"}
             if assigned:
-                process_equip_checks(driver, wait, report=report, assigned=assigned, expected=equipment)
+                process_equip_checks(driver, wait, report=report, assigned=assigned, expected=equipment,
+                                     login_account=login_account)
         return driver
     except BaseException:
         if driver is not None:
@@ -1018,7 +1024,14 @@ def main(argv: list[str] | None = None) -> None:
         print("[sinposmart-stage] browser_start", flush=True)
         print("[sinposmart-stage] login", flush=True)
         if accounts is not None:
-            driver = run_assigned_checks(accounts, open_account, report)
+            passwords = {password.casefold() for _, password in accounts.values() if password}
+            login_accounts = {
+                actor: user for actor, (user, _) in accounts.items()
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", user)
+                and not any(secret == user.casefold() or len(secret) >= 4 and secret in user.casefold()
+                            for secret in passwords)
+            }
+            driver = run_assigned_checks(accounts, open_account, report, login_accounts=login_accounts)
         else:
             driver, wait = open_account()
             today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())

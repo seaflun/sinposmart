@@ -7728,7 +7728,7 @@ class DailyVehicleServiceTests(unittest.TestCase):
             return actor, None
 
         def process(driver, wait, **kwargs):
-            processed.append((driver, kwargs["assigned"]))
+            processed.append((driver, kwargs["assigned"], kwargs["login_account"]))
 
         cell = Mock()
         cell.get_attribute.return_value = "救護車"
@@ -7742,11 +7742,32 @@ class DailyVehicleServiceTests(unittest.TestCase):
                                   side_effect=lambda driver, wait, *_args, **kwargs: process(driver, wait, **kwargs)), \
                 patch.object(automation, "process_equip_checks", side_effect=process), \
                 patch.object(automation, "quit_driver"), patch.object(automation, "ensure_requested_date"):
-            automation.run_assigned_checks([6, 7, 8], open_account, report)
+            automation.run_assigned_checks([6, 7, 8], open_account, report,
+                                           login_accounts={6: "crew-6", 7: "crew-7", 8: "crew-8"})
 
         self.assertEqual(attempts, [6, 7, 8])
-        self.assertIn((8, {"A-2"}), processed)
-        self.assertIn((8, {"E-2"}), processed)
+        self.assertIn((8, {"A-2"}, "crew-8"), processed)
+        self.assertIn((8, {"E-2"}, "crew-8"), processed)
+
+    def test_daily_vehicle_report_keeps_only_roster_account_for_saved_rows(self) -> None:
+        from app_core.daily_vehicle_service import DailyVehicleService, VEHICLE_REPORT_PREFIX
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        target_date = date.today().isoformat()
+        report = automation.new_vehicle_report(target_date)
+        automation.record_vehicle_result(report, "T-1", "maintenance", "completed", "saved_verified",
+                                         login_account="crew-8")
+        automation.record_vehicle_result(report, "E-1", "equipment", "already_done", "verified_today",
+                                         login_account="crew-8")
+        automation.record_vehicle_result(report, "E-2", "equipment", "completed", "saved_verified",
+                                         login_account="not-a-roster-account")
+        self.assertTrue(automation.verify_vehicle_report(report))
+
+        clean = DailyVehicleService._read_completion_report(
+            VEHICLE_REPORT_PREFIX + json.dumps(report), target_date, (), frozenset({"crew-8"}),
+        )
+        self.assertTrue(clean["verified"])
+        self.assertEqual([item.get("login_account") for item in clean["items"]], ["crew-8", None, None])
 
     def test_daily_vehicle_all_accounts_rejected_stays_pending(self) -> None:
         from daily_vehicle_legacy.automation import ppe_selenium_daily as automation

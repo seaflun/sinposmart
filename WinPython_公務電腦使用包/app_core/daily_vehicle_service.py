@@ -183,11 +183,19 @@ class DailyVehicleService:
         )
         environment.pop("PPE_DUTY_ACCOUNTS", None)
         credentials = (request.user_id, request.password)
+        allowed_login_accounts = frozenset()
         if request.accounts is not None:
             environment.pop("PPE_ACCOUNT", None)
             environment.pop("PPE_PASSWORD", None)
             environment["PPE_DUTY_ACCOUNTS"] = json.dumps(request.accounts)
             credentials += tuple(value for _, user, password in request.accounts for value in (user, password))
+            passwords = {password.casefold() for password in (request.password, *(row[2] for row in request.accounts))
+                         if password}
+            allowed_login_accounts = frozenset(
+                user for _, user, _ in request.accounts
+                if not any(secret == user.casefold() or len(secret) >= 4 and secret in user.casefold()
+                           for secret in passwords)
+            )
         if status_callback:
             status_callback("正在開啟瀏覽器執行車輛保養與器材清點…")
         process = None
@@ -211,7 +219,7 @@ class DailyVehicleService:
                 output = self._wait_for_process_exit(process, status_callback)
             except subprocess.TimeoutExpired as exc:
                 self._completion_report = self._read_completion_report(
-                    str(exc.output or ""), request.target_date, credentials
+                    str(exc.output or ""), request.target_date, credentials, allowed_login_accounts
                 )
                 self._completion_report.update(verified=False, reason_code="execution_unconfirmed")
                 raise DailyVehicleExecutionError(
@@ -220,7 +228,7 @@ class DailyVehicleService:
                 ) from exc
             process_exited = process.poll() is not None
             self._completion_report = self._read_completion_report(
-                output, request.target_date, credentials
+                output, request.target_date, credentials, allowed_login_accounts
             )
             completion_verified = (self._completion_report["verified"] is True
                                    and "[done] automation finished" in output.splitlines())
@@ -260,7 +268,8 @@ class DailyVehicleService:
                     self._clear_running_pid(project_dir, process.pid)
 
     @classmethod
-    def _read_completion_report(cls, output: str, target_date: str, credentials: tuple[str, ...]) -> dict:
+    def _read_completion_report(cls, output: str, target_date: str, credentials: tuple[str, ...],
+                                allowed_login_accounts: frozenset[str] = frozenset()) -> dict:
         report = cls._unconfirmed_report(target_date)
         lines = [line[len(VEHICLE_REPORT_PREFIX):] for line in output.splitlines()
                  if line.startswith(VEHICLE_REPORT_PREFIX)]
@@ -329,8 +338,12 @@ class DailyVehicleService:
                 valid = False
                 continue
             seen.add(key)
-            report["items"].append({"vehicle": vehicle, "operation": operation,
-                                    "status": status, "reason_code": item_reason})
+            clean_item = {"vehicle": vehicle, "operation": operation, "status": status, "reason_code": item_reason}
+            account = item.get("login_account")
+            if (status == "completed" and item_reason == "saved_verified" and isinstance(account, str)
+                    and account in allowed_login_accounts and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", account)):
+                clean_item["login_account"] = account
+            report["items"].append(clean_item)
         if len(items) > 200:
             report["reason_code"] = "row_limit"
         elif not valid:
