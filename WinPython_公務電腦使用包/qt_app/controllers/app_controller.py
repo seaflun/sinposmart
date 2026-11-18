@@ -2885,13 +2885,15 @@ class AppController(QObject):
             run_context = self._daily_vehicle_controller.run_context
         rescue_state = str((snapshot_extra or {}).get("rescue_video_state") or "") if tool_name.startswith("rescue_video") else ""
         status = {"loaded": "loaded", "needs_input": "waiting", "partial": "partial"}.get(rescue_state, "completed")
-        self._tool_controller.record_finished(tool_name, rescue_state or status, message)
+        vehicle_report = self._daily_vehicle_controller.completion_report if tool_name == "daily_vehicle" else None
+        usage_extra = {"vehicle_report": vehicle_report} if vehicle_report is not None else {}
+        self._tool_controller.record_finished(tool_name, rescue_state or status, message, **usage_extra)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
-        if tool_name == "daily_vehicle":
-            snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
+        if vehicle_report is not None:
+            snapshot["daily_vehicle_report"] = {key: value for key, value in vehicle_report.items() if key != "assignments"}
         if run_id:
             snapshot["run_id"] = run_id
             if tool_name == "duty_sheet":
@@ -2946,22 +2948,34 @@ class AppController(QObject):
                 f"登打日期：{run_context.get('target_date') or '未知'}\n"
                 f"執行方式：{execution_mode}\n\n{message}"
             )
-        self._tool_controller.record_finished(tool_name, "failed", message)
+        vehicle_report = self._daily_vehicle_controller.completion_report if tool_name == "daily_vehicle" else None
+        usage_extra = {"vehicle_report": vehicle_report} if vehicle_report is not None else {}
+        credentials_pending = bool(vehicle_report and vehicle_report.get("account_rejections_only") is True)
+        self._tool_controller.record_finished(tool_name, "waiting" if credentials_pending else "failed",
+                                              message, **usage_extra)
         self._finish_automatic_tool(tool_name, False)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}
         snapshot.update(run_context)
         run_id = active_run[2] if active_run is not None else ""
-        if tool_name == "daily_vehicle":
-            snapshot["daily_vehicle_report"] = self._daily_vehicle_controller.completion_report
+        if vehicle_report is not None:
+            snapshot["daily_vehicle_report"] = {
+                key: value for key, value in vehicle_report.items() if key not in {"assignments", "account_rejections_only"}
+            }
+            if credentials_pending:
+                snapshot["daily_vehicle_report"]["reason_code"] = "execution_unconfirmed"
+                snapshot["daily_vehicle_report"]["items"] = [
+                    dict(item, reason_code="execution_unconfirmed") if item["reason_code"] == "no_eligible_account" else item
+                    for item in vehicle_report["items"]
+                ]
         if run_id:
             snapshot["run_id"] = run_id
             if tool_name == "duty_sheet":
                 snapshot.update(self._duty_sheet_controller.completed_run_details())
         failure_stage = self._failure_stage_for_tool(tool_name)
-        if failure_stage:
+        if failure_stage and not credentials_pending:
             snapshot["failure_stage"] = failure_stage
         failure_detail = self._failure_detail_for_tool(tool_name)
-        if failure_detail:
+        if failure_detail and not credentials_pending:
             snapshot["failure_detail"] = redact_diagnostic_text(failure_detail, run_secrets)
         controller = {"duty_sheet": self._duty_sheet_controller,
                       "rest_time": self._rest_monthly_controller,
@@ -2976,17 +2990,20 @@ class AppController(QObject):
             snapshot["mode"] = mode
         if snapshot_extra:
             snapshot.update(snapshot_extra)
+        if credentials_pending:
+            message = "無其他隊員可接手，剩餘車輛清點待處理。"
         self._send_operational_event(
             "tool_action_finished",
-            status="failed",
+            status="pending" if credentials_pending else "failed",
             trigger_type="tool_finish",
-            error=message,
+            error="" if credentials_pending else message,
+            content=message if credentials_pending else "",
             snapshot=snapshot,
             **run_actor,
         )
         if notify:
             self._tray_controller.notify("SinpoSmart", message)
-        if (active_run is not None and not self._read_only_acceptance
+        if (not credentials_pending and active_run is not None and not self._read_only_acceptance
                 and not allow_during_shutdown and not self._worker_admissions_closed):
             try:
                 package_path = self._diagnostics_service.export(DiagnosticSnapshot(

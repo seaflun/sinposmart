@@ -366,6 +366,33 @@ class DailyVehicleService:
             report["reason_code"] = "report_invalid"
         else:
             report.update(verified=True, reason_code=reason)
+        if (reason == report["reason_code"] == "no_eligible_account" and value.get("account_rejections_only") is True
+                and all(item["status"] != "unconfirmed" or item["reason_code"] == "no_eligible_account"
+                        for item in report["items"])):
+            report["account_rejections_only"] = True
+        assignments = value.get("assignments")
+        if isinstance(assignments, list) and len(assignments) <= 200:
+            clean_assignments = []
+            seen_assignments = set()
+            for row in assignments:
+                if not isinstance(row, dict):
+                    continue
+                vehicle, operation, account = (row.get(key) for key in ("vehicle", "operation", "login_account"))
+                if (not isinstance(vehicle, str) or not re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff -]{1,32}", vehicle)
+                        or not vehicle.strip() or operation not in ("maintenance", "equipment")
+                        or not isinstance(account, str)
+                        or (account and (account not in allowed_login_accounts
+                                         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", account)))
+                        or any(secret and (vehicle.casefold() == secret.casefold()
+                                           or len(secret) >= 4 and secret.casefold() in vehicle.casefold())
+                               for secret in credentials)):
+                    continue
+                key = (operation, vehicle.casefold())
+                if key not in seen_assignments:
+                    seen_assignments.add(key)
+                    clean_assignments.append({"vehicle": vehicle, "operation": operation, "login_account": account})
+            if clean_assignments:
+                report["assignments"] = clean_assignments
         return report
 
     def _project_dir(self) -> Path | None:

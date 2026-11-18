@@ -170,6 +170,10 @@ class VehicleVerificationError(RuntimeError):
 class VehicleAccountLoginError(RuntimeError):
     """The submitted PPE login did not establish an authenticated session."""
 
+class VehicleAccountRejectedError(VehicleAccountLoginError):
+    """The site explicitly rejected the submitted SSO credentials."""
+
+
 
 def new_vehicle_report(target_date: str) -> dict:
     return {"target_date": target_date, "verified": False,
@@ -454,6 +458,13 @@ def login(driver: webdriver.Chrome, wait: WebDriverWait, username: str, password
 
     def logged_in(current_driver):
         require_authorized_page(login_page=False)
+        for message in current_driver.find_elements(By.XPATH, "//*[text()[contains(., '帳密錯誤')]]"):
+            try:
+                if message.is_displayed():
+                    print("[sinposmart-vehicle-diagnostic] account_sso_rejected", flush=True)
+                    raise VehicleAccountRejectedError()
+            except StaleElementReferenceException:
+                return False
         return EC.presence_of_element_located(
             (By.XPATH, f"//*[contains(text(), '{TEXT_LOGOUT}')]"),
         )(current_driver)
@@ -895,12 +906,22 @@ def assign_vehicle_checks(
 def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[int, str] | None = None):
     available = set(actors)
     driver = None
+    account_failures = []
+
+    def no_eligible_account():
+        if account_failures and all(account_failures) and not any(
+            item["status"] == "unconfirmed" for item in report["items"]
+        ):
+            report["account_rejections_only"] = True
+        raise VehicleVerificationError("no_eligible_account")
+
     try:
         for actor in sorted(available):
             ensure_requested_date()
             try:
                 driver, wait = open_account(actor)
             except (VehicleAccountLoginError, DutyBrowserSessionOpenError) as failure:
+                account_failures.append(isinstance(failure, VehicleAccountRejectedError))
                 if isinstance(failure, DutyBrowserSessionOpenError):
                     print("[sinposmart-vehicle-diagnostic] account_browser_session_failed", flush=True)
                 available.remove(actor)
@@ -908,7 +929,7 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
                 current_actor = actor
                 break
         if driver is None:
-            raise VehicleVerificationError("no_eligible_account")
+            no_eligible_account()
 
         navigate_vehicle_document(driver, wait, "maintain")
         maintenance = {}
@@ -922,6 +943,13 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
         if not equipment:
             record_vehicle_result(report, "", "equipment", "empty", "verified_empty")
         jobs = assign_vehicle_checks(maintenance, equipment, available)
+        assignments = {}
+        for actor, tasks in jobs.items():
+            for operation, vehicle in tasks:
+                assignments[operation, vehicle] = {
+                    "operation": operation, "vehicle": vehicle, "login_account": (login_accounts or {}).get(actor, ""),
+                }
+        report["assignments"] = list(assignments.values())
         pending = {actor: list(tasks) for actor, tasks in jobs.items() if tasks}
         today = dt.datetime.combine(dt.date.fromisoformat(report["target_date"]), dt.time())
 
@@ -937,11 +965,14 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
                 try:
                     driver, wait = open_account(actor)
                 except (VehicleAccountLoginError, DutyBrowserSessionOpenError) as failure:
+                    account_failures.append(isinstance(failure, VehicleAccountRejectedError))
                     if isinstance(failure, DutyBrowserSessionOpenError):
                         print("[sinposmart-vehicle-diagnostic] account_browser_session_failed", flush=True)
                     available.remove(actor)
+                    for job in tasks:
+                        assignments[job]["login_account"] = ""
                     if not available:
-                        raise VehicleVerificationError("no_eligible_account") from None
+                        no_eligible_account()
                     batches = {}
                     for operation, vehicle in tasks:
                         group = maintenance[vehicle] if operation == "maintenance" else vehicle
@@ -957,6 +988,8 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
                         replacement = min(available, key=priority)
                         jobs[replacement].extend(batch)
                         pending.setdefault(replacement, []).extend(batch)
+                        for job in batch:
+                            assignments[job]["login_account"] = (login_accounts or {}).get(replacement, "")
                     continue
                 current_actor = actor
             login_account = (login_accounts or {}).get(current_actor, "")

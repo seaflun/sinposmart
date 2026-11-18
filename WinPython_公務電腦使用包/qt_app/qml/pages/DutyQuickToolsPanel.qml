@@ -125,7 +125,7 @@ Rectangle {
                                 leftPadding: 4
                                 rightPadding: 4
                                 font.pixelSize: Design.captionSize
-                                text: "車輛保養"
+                                text: "車輛保養清點"
                                 tone: "info"
                                 enabled: !dutyQuickToolsPanel.backend.readOnlyAcceptance
                                 showStatusLight: true

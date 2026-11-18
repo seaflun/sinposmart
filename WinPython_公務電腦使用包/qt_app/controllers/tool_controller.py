@@ -20,7 +20,7 @@ from qt_app.models.tool_model import ToolListModel, ToolUsageListModel
 USAGE_STATUS_LABELS = {
     "completed": "已完成", "failed": "失敗", "loaded": "已讀取",
     "needs_input": "待補資料", "checked": "檢查完成", "previewed": "預覽完成",
-    "backed_up": "備份完成", "partial": "部分完成",
+    "backed_up": "備份完成", "partial": "部分完成", "waiting": "待處理",
 }
 
 
@@ -292,7 +292,7 @@ class ToolController(QObject):
         self._refresh_usage_model(tool_id)
         self.usageChanged.emit(tool_id)
 
-    def record_finished(self, tool_id: str, status: str, result: str = "") -> None:
+    def record_finished(self, tool_id: str, status: str, result: str = "", *, vehicle_report: dict | None = None) -> None:
         if self._read_only_acceptance:
             return
         tool_id = str(tool_id or "").strip()
@@ -302,6 +302,8 @@ class ToolController(QObject):
             if entry.get("id") != entry_id:
                 continue
             entry["report"] = report
+            if tool_id == "daily_vehicle" and vehicle_report and vehicle_report.get("assignments"):
+                entry["vehicle_assignments"] = vehicle_report
             date_match = re.search(r"(?<!\d)(\d{7})(?!\d)", str(result or ""))
             month_match = re.search(r"(?<!\d)(\d{3})年0?(\d{1,2})月", str(result or ""))
             if date_match is not None:
@@ -315,6 +317,52 @@ class ToolController(QObject):
         if tool_id in DAILY_TOOL_IDS:
             self._daily_completion_date = business_roc_date(self._now_factory())
             self.dailyCompletionChanged.emit()
+
+    @Slot(result="QVariantMap")
+    def dailyVehicleAssignments(self) -> dict:
+        today = self._now_factory().date().isoformat()
+        vehicles = {}
+        for entry in self._usage_history:
+            report = entry.get("vehicle_assignments")
+            if (entry.get("tool_name") != "daily_vehicle" or not isinstance(report, dict)
+                    or report.get("target_date") != today):
+                continue
+            assigned = report.get("assignments")
+            results = report.get("items")
+            if not isinstance(assigned, list) or not isinstance(results, list):
+                continue
+            assigned_accounts = {(row["operation"], row["vehicle"]): row.get("login_account")
+                                 for row in assigned if isinstance(row, dict)
+                                 and row.get("operation") in ("maintenance", "equipment")
+                                 and isinstance(row.get("vehicle"), str)}
+            for row in (*assigned, *results):
+                if not isinstance(row, dict):
+                    continue
+                operation, vehicle = row.get("operation"), row.get("vehicle")
+                if operation not in ("maintenance", "equipment") or not isinstance(vehicle, str) or not vehicle:
+                    continue
+                key = operation, vehicle
+                status = row.get("status") or "pending"
+                previous = vehicles.get(key)
+                if previous and (status == "pending" and previous[1] != "pending"
+                                 or status == "already_done" and previous[1] == "completed"):
+                    continue
+                account = row.get("login_account") or ""
+                if not account and status in {"pending", "unconfirmed", "not_required"}:
+                    account = assigned_accounts.get(key)
+                if not isinstance(account, str):
+                    account = ""
+                vehicles[key] = (account or ("未分派" if status == "pending" else "未記錄"), status)
+        grouped = {}
+        for (operation, vehicle), (account, status) in sorted(vehicles.items()):
+            row = grouped.setdefault(account, {"maintenance": [], "equipment": []})
+            label = {"unconfirmed": "（待確認）", "pending": "（待執行）", "not_required": "（免保養）"}.get(status, "")
+            row[operation].append(vehicle + label)
+        return {"date": today, "rows": [
+            {"account": account, "maintenance": "、".join(row["maintenance"]) or "—",
+             "equipment": "、".join(row["equipment"]) or "—"}
+            for account, row in sorted(grouped.items())
+        ]}
 
     def _is_daily_tool_completed_for_date(self, tool_id: str, business_date: str) -> bool:
         expected_usage_period = (
@@ -542,7 +590,7 @@ class ToolController(QObject):
     def _report_tone(report: str) -> str:
         if report == "失敗":
             return "error"
-        if report in {"待補資料", "部分完成", "已讀取", "檢查完成", "預覽完成"}:
+        if report in {"待補資料", "待處理", "部分完成", "已讀取", "檢查完成", "預覽完成"}:
             return "neutral"
         return "success"
 
@@ -568,6 +616,11 @@ class ToolController(QObject):
             tool_id,
             str(entry.get("tool_label", "") or "工具"),
         )
+        vehicle_report = entry.get("vehicle_assignments")
+        if tool_id == "daily_vehicle" and report == "失敗" and isinstance(vehicle_report, dict):
+            items = vehicle_report.get("items")
+            if isinstance(items, list) and any(isinstance(item, dict) and item.get("status") == "completed" for item in items):
+                return "部分完成，有項目待確認"
         if report == "已完成":
             return f"{period} {tool_label}已登打完成"
         return f"{period} {tool_label}{report}" if include_failure_context else report

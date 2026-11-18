@@ -7761,6 +7761,9 @@ class DailyVehicleServiceTests(unittest.TestCase):
         self.assertEqual(attempts, [6, 7, 8])
         self.assertIn((8, {"A-2"}, "crew-8"), processed)
         self.assertIn((8, {"E-2"}, "crew-8"), processed)
+        assignments = {(item["operation"], item["vehicle"]): item["login_account"] for item in report["assignments"]}
+        self.assertEqual(assignments["maintenance", "A-2"], "crew-8")
+        self.assertEqual(assignments["equipment", "E-2"], "crew-8")
 
     def test_daily_vehicle_unconfirmed_maintenance_keeps_untouched_work_eligible(self) -> None:
         from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
@@ -7936,6 +7939,25 @@ class DailyVehicleServiceTests(unittest.TestCase):
                 fields[2].click.assert_not_called()
 
 
+    def test_ppe_login_stops_on_visible_sso_rejection_after_one_submit(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        rejection = Mock()
+        rejection.is_displayed.return_value = True
+        driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock(),
+                                 find_elements=Mock(return_value=[rejection]), find_element=Mock())
+        account, password, button = Mock(), Mock(), Mock()
+        fields = iter((account, password, button))
+
+        def locate(condition):
+            field = next(fields, None)
+            return condition(driver) if field is None else field
+
+        with self.assertRaises(automation.VehicleAccountRejectedError):
+            automation.login(driver, SimpleNamespace(until=locate), "synthetic-user", "synthetic-password")
+        button.click.assert_called_once()
+        driver.find_element.assert_not_called()
+
     def test_ppe_login_checks_post_login_origin_and_allows_authorized_routes(self) -> None:
         from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
 
@@ -7947,7 +7969,8 @@ class DailyVehicleServiceTests(unittest.TestCase):
             ("https://outside.example/Home/Index", False, True),
         ):
             with self.subTest(destination=destination, redirect_after_wait=redirect_after_wait):
-                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock())
+                driver = SimpleNamespace(current_url=automation.LOGIN_URL, get=Mock(),
+                                         find_elements=Mock(return_value=[]))
                 fields = [Mock() for _ in range(4)]
                 fields[2].click.side_effect = lambda: setattr(
                     driver, "current_url", automation.LOGIN_URL if redirect_after_wait else destination,
@@ -10430,6 +10453,40 @@ class ScheduledFolderServiceTests(unittest.TestCase):
 
 
 class ToolControllerTests(unittest.TestCase):
+    def test_daily_vehicle_assignments_keep_today_executor_across_retries_and_restart(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        today = datetime(2026, 11, 18, 10)
+        def row(operation, vehicle, account="", status=""):
+            return {"operation": operation, "vehicle": vehicle, "login_account": account, "status": status}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = ToolController(root, now_factory=lambda: today)
+            controller.record_started("daily_vehicle", "車輛保養清點", "發起人")
+            controller.record_finished("daily_vehicle", "failed", vehicle_report={
+                "target_date": "2026-11-18",
+                "assignments": [row("maintenance", "T-1", "crew-6"), row("equipment", "E-1", "crew-8")],
+                "items": [row("maintenance", "T-1", "crew-6", "completed"),
+                          row("equipment", "E-1", status="unconfirmed")],
+            })
+            self.assertEqual(controller.usage("daily_vehicle")["report"], "部分完成，有項目待確認")
+            controller.record_started("daily_vehicle", "車輛保養清點", "發起人")
+            controller.record_finished("daily_vehicle", "failed", vehicle_report={
+                "target_date": "2026-11-18",
+                "assignments": [row("maintenance", "T-1", "crew-9"), row("maintenance", "T-2", "crew-9")],
+                "items": [row("maintenance", "T-1", status="already_done")],
+            })
+            restored = ToolController(root, now_factory=lambda: today)
+            self.assertEqual(restored.dailyVehicleAssignments(), {"date": "2026-11-18", "rows": [
+                {"account": "crew-6", "maintenance": "T-1", "equipment": "—"},
+                {"account": "crew-8", "maintenance": "—", "equipment": "E-1（待確認）"},
+                {"account": "crew-9", "maintenance": "T-2（待執行）", "equipment": "—"},
+            ]})
+            tomorrow = ToolController(root, now_factory=lambda: datetime(2026, 11, 19, 1))
+            self.assertEqual(tomorrow.dailyVehicleAssignments(), {"date": "2026-11-19", "rows": []})
+
     def test_tool_model_exposes_catalog_roles(self) -> None:
         from qt_app.controllers.tool_controller import TOOL_CATALOG
         from qt_app.models.tool_model import ToolListModel
@@ -15581,7 +15638,7 @@ ApplicationWindow {
         self.assertIn("cornerRadius: implicitHeight / 2", tool_header)
         self.assertNotIn("padding: 10", tool_usage)
         self.assertIn("spacing: 8", tool_usage)
-        self.assertEqual(tool_usage.count("ToolFieldLabel {"), 6)
+        self.assertEqual(tool_usage.count("ToolFieldLabel {"), 7)
         self.assertIn("readonly property int toolFieldLabelWidth: 50", design)
         self.assertIn("visible: modeTabs.currentIndex === 0", main_qml)
         self.assertNotIn("auditPreviewDialog", main_qml)
@@ -19779,7 +19836,7 @@ if return_code != 0 or loaded:
 
         today = date.today().isoformat()
         for mode in ("manual", "automatic"):
-            for fail in (False, True):
+            for fail in (False, True, "sso"):
                 with self.subTest(mode=mode, fail=fail), tempfile.TemporaryDirectory() as temp_dir:
                     root = Path(temp_dir)
                     script = root / "daily_vehicle_legacy" / "automation" / "ppe_selenium_daily.py"
@@ -19791,10 +19848,17 @@ if return_code != 0 or loaded:
                         def execute(self, request, **_kwargs):
                             requested.append(request.target_date)
                             self._completion_report = DailyVehicleServiceTests._verified_report()
+                            self._completion_report["assignments"] = [
+                                {"operation": item["operation"], "vehicle": item["vehicle"], "login_account": "crew-6"}
+                                for item in self._completion_report["items"]
+                            ]
                             if fail:
-                                self._completion_report.update(verified=False, reason_code="save_unconfirmed")
-                                self._completion_report["items"][1].update(status="unconfirmed", reason_code="save_unconfirmed")
-                                raise DailyVehicleExecutionError("器材清點結果未確認。")
+                                reason = "no_eligible_account" if fail == "sso" else "save_unconfirmed"
+                                self._completion_report.update(verified=False, reason_code=reason)
+                                self._completion_report["items"][1].update(status="unconfirmed", reason_code=reason)
+                                if fail == "sso":
+                                    self._completion_report["account_rejections_only"] = True
+                                raise DailyVehicleExecutionError("帳密錯誤" if fail == "sso" else "器材清點結果未確認。")
                             return f"車輛保養清點已完成：{request.target_date}"
 
                     class Sync:
@@ -19838,13 +19902,23 @@ if return_code != 0 or loaded:
                         self.assertIs(started_reports[0]["verified"], False)
                         self.assertEqual(started_reports[0]["items"], [])
                         events = [fields for _kind, fields in sync.events if fields.get("snapshot", {}).get("tool_name") == "daily_vehicle"]
-                        self.assertEqual([item["status"] for item in events], ["started", "failed" if fail else "completed"])
-                        expected = dict(service.completion_report, execution_mode=mode)
+                        self.assertEqual([item["status"] for item in events],
+                                         ["started", "pending" if fail == "sso" else "failed" if fail else "completed"])
+                        expected = deepcopy(dict(service.completion_report, execution_mode=mode))
+                        expected.pop("assignments")
+                        if fail == "sso":
+                            expected.pop("account_rejections_only")
+                            expected["reason_code"] = "execution_unconfirmed"
+                            expected["items"][1]["reason_code"] = "execution_unconfirmed"
+                            self.assertFalse(events[1]["error"])
+                            self.assertIn("待處理", events[1]["content"])
+                            self.assertNotIn("帳密錯誤", repr(events[1]))
                         for event in events:
                             self.assertEqual(event["snapshot"]["target_date"], today)
                             self.assertEqual(event["snapshot"]["execution_mode"], mode)
                         self.assertEqual(events[1]["snapshot"]["daily_vehicle_report"], expected)
                         self.assertIs(events[1]["snapshot"]["daily_vehicle_report"]["verified"], not fail)
+                        self.assertTrue(app.toolController.dailyVehicleAssignments()["rows"])
                         self.assertNotIn("private-pass", repr(sync.events))
                     finally:
                         app.shutdown()
@@ -31375,6 +31449,8 @@ if return_code != 0 or loaded:
                 )
 
                 click(wait_for("quickDailyVehicleToolButton"))
+                self.assertEqual(wait_for("quickDailyVehicleToolButton").property("text"), "車輛保養清點")
+                self.assertTrue(wait_for("dailyVehicleAssignmentTable").property("visible"))
                 daily_prompt = wait_for("dailyVehiclePromptText")
                 daily_run_button = wait_for("dailyVehicleRunButton")
                 daily_status_bar = wait_for("dailyVehicleStatusBar")
@@ -31408,6 +31484,16 @@ if return_code != 0 or loaded:
                 self.assertFalse(daily_vehicle_quick_button.property("statusLightOn"))
                 self.assertFalse(wait_for("quickDutySheetCompletionLight").property("visible"))
                 self.assertFalse(wait_for("quickDailyVehicleCompletionLight").property("visible"))
+
+                controller.toolController.record_started("daily_vehicle", "車輛保養清點", "測試發起人")
+                controller.toolController.record_finished("daily_vehicle", "failed", vehicle_report={
+                    "target_date": "2026-07-29",
+                    "assignments": [{"operation": "maintenance", "vehicle": "T-1", "login_account": "crew-6"}],
+                    "items": [{"operation": "maintenance", "vehicle": "T-1", "status": "unconfirmed"}],
+                })
+                assignments = wait_for("dailyVehicleAssignmentList")
+                wait_until(lambda: assignments.property("count") == 1 and assignments.height() > 0,
+                           "今日清點分派表未顯示")
 
                 click(wait_for("quickRescueVideoToolButton"))
                 wait_until(

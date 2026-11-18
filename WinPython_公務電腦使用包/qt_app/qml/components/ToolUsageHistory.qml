@@ -11,14 +11,21 @@ ToolFormCard {
     required property string toolId
     property bool currentOperatorOnly: false
     property var usageModel: null
+    property var vehicleAssignments: ({date: "", rows: []})
     objectName: toolId + "UsageHistory"
     Layout.fillWidth: true
 
     function refresh() {
         usageModel = backend.toolController.usageModel(toolId, backend.sessionController.actorNo, backend.sessionController.userId, backend.sessionController.displayName, currentOperatorOnly);
+        if (toolId === "daily_vehicle")
+            vehicleAssignments = backend.toolController.dailyVehicleAssignments();
     }
 
     Component.onCompleted: refresh()
+    onVisibleChanged: {
+        if (visible && toolId === "daily_vehicle")
+            refresh();
+    }
 
     Connections {
         target: toolUsageHistory.backend.toolController
@@ -157,6 +164,71 @@ ToolFormCard {
                     font.pixelSize: Design.bodySize
                     font.bold: true
                 }
+            }
+        }
+
+        ColumnLayout {
+            objectName: "dailyVehicleAssignmentTable"
+            Layout.fillWidth: true
+            visible: toolUsageHistory.toolId === "daily_vehicle"
+            spacing: 4
+
+            ToolSectionTitle {
+                text: "今日清點分派｜" + toolUsageHistory.vehicleAssignments.date
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: assignmentList.count > 0
+                Repeater {
+                    model: ["登入帳號", "定期保養", "隨車器材"]
+                    delegate: ToolFieldLabel {
+                        required property string modelData
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        Layout.preferredWidth: 1
+                        text: modelData
+                    }
+                }
+            }
+            ListView {
+                id: assignmentList
+                objectName: "dailyVehicleAssignmentList"
+                Layout.fillWidth: true
+                Layout.preferredHeight: visible ? Math.min(contentHeight, 140) : 0
+                clip: true
+                visible: count > 0
+                model: toolUsageHistory.vehicleAssignments.rows
+                ScrollBar.vertical: ScrollBar { }
+                delegate: RowLayout {
+                    id: assignmentRow
+                    required property var modelData
+                    width: assignmentList.width - 8
+                    height: implicitHeight
+                    Repeater {
+                        model: [assignmentRow.modelData.account, assignmentRow.modelData.maintenance,
+                                assignmentRow.modelData.equipment]
+                        delegate: Label {
+                            required property string modelData
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.preferredWidth: 1
+                            Layout.alignment: Qt.AlignTop
+                            color: Design.strongText
+                            font.pixelSize: Design.captionSize
+                            text: modelData
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            bottomPadding: 4
+                        }
+                    }
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: assignmentList.count === 0
+                color: Design.muted
+                text: "今日尚無清點分派紀錄"
+                font.pixelSize: Design.captionSize
             }
         }
 

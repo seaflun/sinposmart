@@ -158,7 +158,7 @@ class RescueVideoPackageTests(unittest.TestCase):
             'text: "每月作業"', 1
         )[0]
 
-        self.assertLess(daily_tools.index('text: "勤務表登打"'), daily_tools.index('text: "車輛保養"'))
+        self.assertLess(daily_tools.index('text: "勤務表登打"'), daily_tools.index('text: "車輛保養清點"'))
         self.assertNotIn('text: "救護行車紀錄器"', daily_tools)
         other_tools = source.split('objectName: "otherToolsCard"', 1)[1]
         self.assertLess(
