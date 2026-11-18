@@ -33,6 +33,7 @@ if str(PACKAGE_DIR) not in sys.path:
 
 from duty_rehearsal import (
     DEFAULT_BROWSER_RETENTION_SECONDS,
+    DutyBrowserSessionOpenError,
     build_driver,
     quit_driver,
     retry_duty_browser_session_open,
@@ -635,6 +636,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
         driver.execute_script("arguments[0].click();", button)
         saved = False
         previous = None
+        readback_retried = False
         for _ in range(MAX_REPORT_ITEMS):
             wait_for_spinner(wait)
             wait.until(lambda current_driver: current_driver.find_elements(By.CSS_SELECTOR, "#scheduler .k-event"))
@@ -653,6 +655,10 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
             signature = tuple((event.get_attribute("aria-label"), event.get_attribute("class"),
                                len(event.find_elements(By.CSS_SELECTOR, ".reviewed"))) for event in events)
             if previous == signature:
+                if not readback_retried:
+                    readback_retried = True
+                    navigate_vehicle_document(driver, wait, "maintain", refresh=True)
+                    continue
                 fail_verification(report, "maintenance", "save_unconfirmed", vehicle)
             target_event = None
             for event in events:
@@ -666,6 +672,7 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
             if target_event is None:
                 break
             previous = signature
+            readback_retried = False
             ensure_requested_date()
             driver.execute_script("arguments[0].click();", target_event)
             wait.until(EC.visibility_of_element_located((By.ID, "maintainList")))
@@ -683,6 +690,8 @@ def process_maintain_checks(driver: webdriver.Chrome, wait: WebDriverWait, today
         if vehicle in not_required:
             record_vehicle_result(report, vehicle, "maintenance", "not_required", "not_required")
             continue
+        if saved and not maintenance_done(current[vehicle][1], today_strings, today):
+            current = verified_grid_rows(driver, wait, "maintenance", report, inventory)
         if not maintenance_done(current[vehicle][1], today_strings, today):
             fail_verification(report, "maintenance", "save_unconfirmed" if saved else "state_unconfirmed", vehicle)
         record_vehicle_result(report, vehicle, "maintenance", "completed" if saved else "already_done",
@@ -891,7 +900,9 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
             ensure_requested_date()
             try:
                 driver, wait = open_account(actor)
-            except VehicleAccountLoginError:
+            except (VehicleAccountLoginError, DutyBrowserSessionOpenError) as failure:
+                if isinstance(failure, DutyBrowserSessionOpenError):
+                    print("[sinposmart-vehicle-diagnostic] account_browser_session_failed", flush=True)
                 available.remove(actor)
             else:
                 current_actor = actor
@@ -916,13 +927,18 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
 
         while pending:
             ensure_requested_date()
-            actor = current_actor if current_actor in pending else min(pending)
+            actor = current_actor if driver is not None and current_actor in pending else min(pending)
             tasks = pending.pop(actor)
-            if actor != current_actor:
+            if driver is None or actor != current_actor:
+                if driver is not None:
+                    quit_driver(driver)
+                    driver = None
                 print("[sinposmart-stage] login", flush=True)
                 try:
-                    candidate, candidate_wait = open_account(actor)
-                except VehicleAccountLoginError:
+                    driver, wait = open_account(actor)
+                except (VehicleAccountLoginError, DutyBrowserSessionOpenError) as failure:
+                    if isinstance(failure, DutyBrowserSessionOpenError):
+                        print("[sinposmart-vehicle-diagnostic] account_browser_session_failed", flush=True)
                     available.remove(actor)
                     if not available:
                         raise VehicleVerificationError("no_eligible_account") from None
@@ -942,14 +958,23 @@ def run_assigned_checks(actors, open_account, report, *, login_accounts: dict[in
                         jobs[replacement].extend(batch)
                         pending.setdefault(replacement, []).extend(batch)
                     continue
-                previous = driver
-                driver, wait, current_actor = candidate, candidate_wait, actor
-                quit_driver(previous)
+                current_actor = actor
             login_account = (login_accounts or {}).get(current_actor, "")
             assigned = {plate for op, plate in tasks if op == "maintenance"}
-            if assigned:
-                process_maintain_checks(driver, wait, build_today_strings(today), today, report=report,
-                                        assigned=assigned, expected=set(maintenance), login_account=login_account)
+            while assigned:
+                try:
+                    process_maintain_checks(driver, wait, build_today_strings(today), today, report=report,
+                                            assigned=assigned, expected=set(maintenance), login_account=login_account)
+                except VehicleVerificationError as failure:
+                    if failure.reason_code != "save_unconfirmed":
+                        raise
+                    handled = {item["vehicle"] for item in report["items"] if item["operation"] == "maintenance"}
+                    if not assigned.intersection(handled):
+                        raise
+                    # A click may already have saved this vehicle. Only continue with untouched vehicles.
+                    assigned -= handled
+                else:
+                    break
             assigned = {plate for op, plate in tasks if op == "equipment"}
             if assigned:
                 process_equip_checks(driver, wait, report=report, assigned=assigned, expected=equipment,
@@ -1042,7 +1067,7 @@ def main(argv: list[str] | None = None) -> None:
             process_equip_checks(driver, wait, report=report)
         ensure_requested_date()
         if not verify_vehicle_report(report):
-            fail_verification(report, operation, "execution_unconfirmed")
+            raise VehicleVerificationError(report["reason_code"])
         print(REPORT_PREFIX + json.dumps(report, ensure_ascii=False), flush=True)
         print("[done] automation finished", flush=True)
         if config["keep_browser_open"]:

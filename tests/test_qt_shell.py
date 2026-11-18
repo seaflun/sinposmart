@@ -7718,13 +7718,26 @@ class DailyVehicleServiceTests(unittest.TestCase):
     def test_daily_vehicle_login_rejection_reassigns_unsent_vehicles(self) -> None:
         from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
 
+        self._assert_daily_vehicle_reassigns_unsent(automation.VehicleAccountLoginError())
+
+    def test_daily_vehicle_failed_browser_session_reassigns_unsent_vehicles(self) -> None:
+        from duty_rehearsal import DutyBrowserSessionOpenError
+
+        self._assert_daily_vehicle_reassigns_unsent(DutyBrowserSessionOpenError(attempts=2))
+
+    def _assert_daily_vehicle_reassigns_unsent(self, login_failure) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
         report = automation.new_vehicle_report(date.today().isoformat())
         attempts, processed = [], []
+        close = Mock()
 
         def open_account(actor):
+            if actor == 7:
+                close.assert_called_once_with(6)
             attempts.append(actor)
             if actor == 7:
-                raise automation.VehicleAccountLoginError()
+                raise login_failure
             return actor, None
 
         def process(driver, wait, **kwargs):
@@ -7741,13 +7754,46 @@ class DailyVehicleServiceTests(unittest.TestCase):
                 ]), patch.object(automation, "process_maintain_checks",
                                   side_effect=lambda driver, wait, *_args, **kwargs: process(driver, wait, **kwargs)), \
                 patch.object(automation, "process_equip_checks", side_effect=process), \
-                patch.object(automation, "quit_driver"), patch.object(automation, "ensure_requested_date"):
+                patch.object(automation, "quit_driver", close), patch.object(automation, "ensure_requested_date"):
             automation.run_assigned_checks([6, 7, 8], open_account, report,
                                            login_accounts={6: "crew-6", 7: "crew-7", 8: "crew-8"})
 
         self.assertEqual(attempts, [6, 7, 8])
         self.assertIn((8, {"A-2"}, "crew-8"), processed)
         self.assertIn((8, {"E-2"}, "crew-8"), processed)
+
+    def test_daily_vehicle_unconfirmed_maintenance_keeps_untouched_work_eligible(self) -> None:
+        from daily_vehicle_legacy.automation import ppe_selenium_daily as automation
+
+        report = automation.new_vehicle_report(date.today().isoformat())
+        driver, wait = Mock(), Mock()
+        cell = Mock()
+        cell.get_attribute.return_value = "水箱車"
+        cell.find_elements.return_value = []
+        row = Mock()
+        row.find_elements.return_value = [cell] * 13
+        batches = []
+
+        def maintain(*_args, assigned, **_kwargs):
+            batches.append(set(assigned))
+            if "T-1" in assigned:
+                automation.fail_verification(report, "maintenance", "save_unconfirmed", "T-1")
+            automation.record_vehicle_result(report, "T-2", "maintenance", "completed", "saved_verified")
+
+        def equipment(*_args, **_kwargs):
+            automation.record_vehicle_result(report, "E-1", "equipment", "completed", "saved_verified")
+
+        with patch.object(automation, "navigate_vehicle_document"), \
+                patch.object(automation, "verified_grid_rows", side_effect=[
+                    {"T-1": (1, row), "T-2": (2, row)}, {"E-1": (1, row)},
+                ]), patch.object(automation, "process_maintain_checks", side_effect=maintain), \
+                patch.object(automation, "process_equip_checks", side_effect=equipment):
+            automation.run_assigned_checks([6], lambda _actor: (driver, wait), report)
+        self.assertEqual(batches, [{"T-1", "T-2"}, {"T-2"}])
+        self.assertFalse(automation.verify_vehicle_report(report))
+        self.assertEqual(report["reason_code"], "save_unconfirmed")
+        self.assertEqual({row["vehicle"]: row["status"] for row in report["items"]},
+                         {"T-1": "unconfirmed", "T-2": "completed", "E-1": "completed"})
 
     def test_daily_vehicle_report_keeps_only_roster_account_for_saved_rows(self) -> None:
         from app_core.daily_vehicle_service import DailyVehicleService, VEHICLE_REPORT_PREFIX

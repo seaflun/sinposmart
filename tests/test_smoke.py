@@ -604,6 +604,28 @@ print(json.dumps({'rows': rows, 'error': error, 'readiness_polls': driver.readin
         self.assertGreaterEqual(state["refresh_polls"], 2)
         self.assertEqual(state["saved"], 1)
 
+    def test_delayed_maintenance_readback_refreshes_without_resubmitting(self) -> None:
+        module = self.module
+        driver, wait, state, query = self._fixture(persist=False)
+        refresh = driver.refresh
+        refreshes = 0
+
+        def delayed_refresh():
+            nonlocal refreshes
+            refreshes += 1
+            if refreshes == 2:
+                state["maintenance_done"] = True
+            refresh()
+
+        driver.refresh = delayed_refresh
+        today = datetime(2026, 10, 17)
+        report = module.new_vehicle_report(today.date().isoformat())
+        with mock.patch.object(module, "query_grid_rows", side_effect=query), \
+                mock.patch.object(module, "ensure_requested_date"):
+            module.process_maintain_checks(driver, wait, module.build_today_strings(today), today, report)
+        self.assertEqual(state["saved"], 1)
+        self.assertEqual(report["items"][0]["reason_code"], "saved_verified")
+
     def test_query_observer_ignores_old_binding_and_removes_only_its_handlers(self) -> None:
         javascript = """
 function observable() {

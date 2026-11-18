@@ -238,9 +238,17 @@ class DailyVehicleService:
                 stage = self._failure_stage_from_output(output, stage)
                 reason = self._completion_report["reason_code"]
                 message = {
-                    "no_eligible_account": "當日上班隊員無可用的清點帳號，車輛清點待處理。",
+                    "no_eligible_account": (
+                        "切換清點帳號時瀏覽器工作階段重試失敗，已無可接手的隊員，剩餘清點待處理。"
+                        if "[sinposmart-vehicle-diagnostic] account_browser_session_failed" in output.splitlines()
+                        else "當日上班隊員無可用的清點帳號，車輛清點待處理。"
+                    ),
                     "unknown_vehicle_type": "正式網站有未設定分派規則的車種細項，車輛清點待處理。",
                 }.get(reason) or self._browser_startup_safe_error(output) or self._safe_error(output)
+                if reason == "save_unconfirmed" and any(item["operation"] == "maintenance" and item["vehicle"]
+                       and item["reason_code"] == "save_unconfirmed" for item in self._completion_report["items"]):
+                    stage = "maintenance_check"
+                    message = "部分定期保養未能確認儲存結果，請回查；已確認的清點結果已保留。"
                 raise DailyVehicleExecutionError(message, failure_stage=stage)
             retaining_runner = not process_exited
             report_stage("result_evaluation")
