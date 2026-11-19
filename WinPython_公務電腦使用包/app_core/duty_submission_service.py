@@ -57,11 +57,13 @@ class DutySubmissionExecutionError(RuntimeError):
         result_path: Path | None = None,
         *,
         return_check: Mapping[str, Any] | None = None,
+        retry_with_fresh_browser: bool = False,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
         self.result_path = result_path
         self.return_check = dict(return_check or {})
+        self.retry_with_fresh_browser = retry_with_fresh_browser
 
 
 RECENT_HANDOFF_SCHEDULE_SNAPSHOT_MAX_AGE = timedelta(minutes=2)
@@ -207,6 +209,7 @@ class DutySubmissionService:
             return self._finish_stale_request(request, action, result_path)
         automation = None
         driver = None
+        reading_before_submit = False
         try:
             automation = (
                 browser_session.automation
@@ -230,6 +233,7 @@ class DutySubmissionService:
                 else:
                     driver = automation.build_driver(headless=not request.visible)
                     initialize_browser(driver)
+            reading_before_submit = True
             action = self._refresh_action_before_submit(
                 automation,
                 driver,
@@ -272,6 +276,7 @@ class DutySubmissionService:
                 query_range=query_range,
                 query_started_callback=query_started_callback,
             )
+            reading_before_submit = False
             staff = action_staff(comparison_source, action)
             time_order_warnings: list[str] = []
             pause_details = self._open_assignment_pause_details(
@@ -520,7 +525,13 @@ class DutySubmissionService:
                 return self._finish_work_review(request, action, action_date, result_path, exc)
             self._write_failure(request, action, result_path, exc)
             message, error_code = self._safe_error(exc)
-            raise DutySubmissionExecutionError(message, error_code, result_path) from exc
+            raise DutySubmissionExecutionError(
+                message, error_code, result_path,
+                retry_with_fresh_browser=(
+                    reading_before_submit and error_code == "timeout"
+                    and request.trigger_type == "due" and request.save
+                ),
+            ) from exc
         finally:
             if browser_session is None and driver is not None and automation is not None:
                 try:

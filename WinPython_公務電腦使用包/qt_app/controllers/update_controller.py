@@ -612,6 +612,21 @@ class UpdateController(UpdateWindowState):
                 log = "installer.log" if (directory / "installer.log").is_file() else "window.log"
                 self._show_view(diagnosticPath=str(directory / log))
 
+    def wait_for_next_handoff(self, waiting_count: int) -> bool:
+        if (
+            not self._remote_update_active or self._shutdown_admission
+            or self._remote_update_apply_requested or self._remote_update_apply_inflight
+        ):
+            return False
+        if self._remote_update_ready:
+            self._status_text = (
+                f"尚有 {waiting_count} 筆到點自動登打等待中，遠端更新已保留，"
+                "等待下次安全登出套用。"
+            )
+            self._set_remote_state(status="waiting_handoff")
+            self._send_remote_status("waiting_handoff", self._status_text)
+        return True
+
     @Slot(result=bool)
     def applyRemoteUpdate(self) -> bool:
         """Queue or launch the staged remote update from a safe logout boundary."""

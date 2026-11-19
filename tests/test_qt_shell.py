@@ -5266,6 +5266,81 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
         self.assertEqual(refreshed["fields"]["處理情形"], "一、時間:10:00-12:20")
         self.assertEqual(refreshed_scheduled["fields"]["處理情形"], "一、時間:10:00-12:20")
 
+    def test_due_work_reopens_browser_once_after_schedule_read_timeout(self) -> None:
+        from datetime import date, datetime
+
+        from selenium.common.exceptions import TimeoutException
+
+        from app_core.duty_submission_service import (
+            DutySubmissionExecutionError, DutySubmissionRequest, DutySubmissionService,
+        )
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        for scenario in ("recovered", "already_saved", "retry_timeout", "after_save"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                action, row, data = self._training_readback_fixture()
+                action.update(source="值班交接", duplicate_key="work:2026-10-07:17:值班交接:10")
+                row[4] = "體技能訓練"
+                first_driver, second_driver = object(), object()
+                reads = []
+                saved_drivers = []
+                now = datetime(2026, 10, 7, 17, 1)
+
+                def query_duty_sheet(driver, _date):
+                    reads.append(driver)
+                    if (scenario != "after_save" and driver is first_driver) or scenario == "retry_timeout":
+                        raise TimeoutException("Timed out receiving message from renderer")
+                    return object()
+
+                def query_records(*_args, **_kwargs):
+                    return [row] if scenario == "already_saved" or saved_drivers else []
+
+                def fill_form(driver, _action, _staff, _date, *, save, before_save):
+                    self.assertTrue(save)
+                    before_save()
+                    saved_drivers.append(driver)
+                    if scenario == "after_save":
+                        raise TimeoutException("Timed out receiving message from renderer")
+                    return {}
+
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                    build_driver=Mock(side_effect=[first_driver, second_driver]),
+                    login=Mock(), quit_driver=Mock(),
+                    parse_roc_date=lambda _value: date(2026, 10, 7),
+                    roc_date=lambda value: f"115{value:%m%d}",
+                    query_duty_sheet=query_duty_sheet, query_cases=lambda *_args: [],
+                    planned_actions=lambda *_args: [action],
+                    query_visible_table=query_records, fill_work_log_form_for_test=fill_form,
+                )
+                service = DutySubmissionService(
+                    Path(directory), module_loader=lambda: automation, now_factory=lambda: now,
+                )
+                request = DutySubmissionRequest("fixture-user", "fixture-password", 0, data)
+                worker = DutyEntryQueueWorker(service, now_factory=lambda: now, lane_label="工作")
+                try:
+                    if scenario == "retry_timeout":
+                        with self.assertRaises(DutySubmissionExecutionError) as caught:
+                            worker._execute(1, request)
+                        self.assertEqual(caught.exception.error_code, "timeout")
+                        self.assertEqual(automation.quit_driver.call_args_list, [call(first_driver), call(second_driver)])
+                    else:
+                        result = worker._execute(1, request)
+                        self.assertEqual(result.status, {
+                            "recovered": "submitted", "already_saved": "skipped_duplicate",
+                            "after_save": "review_required",
+                        }[scenario])
+                    self.assertEqual(reads[0], first_driver)
+                    if scenario != "after_save":
+                        self.assertIn(second_driver, reads)
+                        automation.quit_driver.assert_any_call(first_driver)
+                    self.assertEqual(automation.login.call_count, 1 if scenario == "after_save" else 2)
+                    self.assertEqual(saved_drivers, {
+                        "recovered": [second_driver], "after_save": [first_driver],
+                    }.get(scenario, []))
+                finally:
+                    worker._close_browser_session()
+
     def test_delayed_handoff_refresh_updates_cases_before_form_fill(self) -> None:
         from datetime import datetime
 
@@ -12431,6 +12506,60 @@ class UpdateControllerTests(unittest.TestCase):
                     finally:
                         controller.dutyExecutionController._entry_active_request_id = None
                         controller.shutdown()
+
+    def test_remote_update_keeps_staged_request_when_handoff_has_waiting_duty(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app_core.duty_submission_service import DutySubmissionRequest
+        from app_core.session import LoginSession
+        from qt_app.controllers.app_controller import AppController, _BackgroundManualChain
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOCALAPPDATA": directory}):
+            controller = AppController(read_only_acceptance=True)
+            update = controller.updateController
+            update._remote_update_active = True
+            update._remote_update_ready = True
+            update._remote_update_request_id = "handoff-waiting-duty"
+            update._remote_process_launcher = Mock(return_value=SimpleNamespace(poll=lambda: None))
+            request = DutySubmissionRequest("user27", "synthetic-password", 0, {"actions": []})
+            controller._background_manual_chains["waiting"] = _BackgroundManualChain(request, None)
+
+            def login(actor: str) -> None:
+                attempt = controller._session_state.begin_login()
+                controller._session_state.complete_login(
+                    attempt, LoginSession(actor, f"user{actor}", "synthetic-password", verified=True)
+                )
+
+            try:
+                login("27")
+                controller.dutyController._last_auto_logout_successor_actor_no = "10"
+                with patch.object(update, "_check_remote_stage"), patch.object(
+                    update, "_send_remote_status", return_value=False
+                ) as report, patch.object(controller, "_persist_auto_login_marker"), patch.object(
+                    controller, "_clear_auto_login_marker"
+                ) as clear_marker, patch.object(controller, "_auto_login_successor") as resume:
+                    controller._auto_logout("27")
+                    QTest.qWait(1)
+                    self.assertFalse(controller.sessionController.isLoggedIn)
+                    self.assertTrue(update.remoteUpdateActive)
+                    self.assertEqual(update.remoteUpdateStatus, "waiting_handoff")
+                    self.assertFalse(update.updateDeferred)
+                    self.assertIn("1 筆到點自動登打", report.call_args.args[1])
+                    update._remote_process_launcher.assert_not_called()
+                    resume.assert_called_once_with("10")
+                    clear_marker.assert_called_once_with()
+
+                    controller._discard_background_manual_chain("waiting")
+                    login("10")
+                    controller.requestLogout()
+                    self.assertEqual(update.remoteUpdateStatus, "applying")
+                    self.assertEqual(
+                        update._remote_process_launcher.call_args.args[1:],
+                        ("handoff-waiting-duty", "ApplyStaged"),
+                    )
+                    self.assertEqual(update._remote_process_launcher.call_count, 1)
+            finally:
+                controller.shutdown()
 
     def test_remote_update_logout_falls_back_when_stage_is_already_terminal(self) -> None:
         from app_core.update_repository import UpdateRepository

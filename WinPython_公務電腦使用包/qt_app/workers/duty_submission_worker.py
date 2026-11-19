@@ -24,6 +24,14 @@ from app_core.duty_task_projection import is_drowning_patrol_action
 ENTRY_BROWSER_SESSION_IDLE_LIMIT = timedelta(minutes=25)
 
 
+def _browser_retry_message(error: DutySubmissionExecutionError, lane_label: str) -> str:
+    if error.retry_with_fresh_browser:
+        return f"{lane_label}登打前查詢逾時，正在重開瀏覽器後自動重試一次。"
+    if error.error_code == "browser_startup":
+        return f"{lane_label}瀏覽器啟動失敗，正在重新登入後重試一次。"
+    return ""
+
+
 class DutySubmissionWorker(QObject):
     progress = Signal(int, str)
     succeeded = Signal(int, object)
@@ -76,9 +84,10 @@ class DutySubmissionWorker(QObject):
                     status_callback=lambda message: self.progress.emit(self.request_id, message),
                 )
             except DutySubmissionExecutionError as exc:
-                if exc.error_code != "browser_startup" or attempt:
+                retry_message = _browser_retry_message(exc, "工作")
+                if not retry_message or attempt:
                     raise
-                self.progress.emit(self.request_id, "工作瀏覽器啟動失敗，正在重新登入後重試一次。")
+                self.progress.emit(self.request_id, retry_message)
         raise DutySubmissionExecutionError("工作瀏覽器重試流程未能完成。", "browser_startup")
 
 
@@ -320,25 +329,27 @@ class DutyEntryQueueWorker(QObject):
             if exc.error_code == "invalid_credentials":
                 self._rejected_credentials_session = (request.session_generation, request.user_id)
             session_expired = exc.error_code in {"login_failed", "session_expired"} and had_compatible_session
-            if exc.error_code != "browser_startup" and not session_expired:
-                self._close_browser_session()
-                raise
-            self._close_browser_session()
             retry_message = (
                 f"{self._lane_label}登入狀態已失效，正在重新登入後重試一次。"
-                if session_expired
-                else f"{self._lane_label}瀏覽器啟動失敗，正在重新登入後重試一次。"
+                if session_expired else _browser_retry_message(exc, self._lane_label)
             )
+            self._close_browser_session()
+            if not retry_message:
+                raise
             self.progress.emit(request_id, retry_message)
-            self._browser_session = self._service.open_browser_session(
-                request,
-                status_callback=lambda message: self.progress.emit(request_id, message),
-            )
-            result = self._service.execute_with_browser_session(
-                request,
-                self._browser_session,
-                status_callback=lambda message: self.progress.emit(request_id, message),
-            )
+            try:
+                self._browser_session = self._service.open_browser_session(
+                    request,
+                    status_callback=lambda message: self.progress.emit(request_id, message),
+                )
+                result = self._service.execute_with_browser_session(
+                    request,
+                    self._browser_session,
+                    status_callback=lambda message: self.progress.emit(request_id, message),
+                )
+            except Exception:
+                self._close_browser_session()
+                raise
             self._mark_browser_session_active()
             return result
 
@@ -354,12 +365,10 @@ class DutyEntryQueueWorker(QObject):
                     status_callback=lambda message: self.progress.emit(request_id, message),
                 )
             except DutySubmissionExecutionError as exc:
-                if exc.error_code != "browser_startup" or attempt:
+                retry_message = _browser_retry_message(exc, self._lane_label)
+                if not retry_message or attempt:
                     raise
-                self.progress.emit(
-                    request_id,
-                    f"{self._lane_label}瀏覽器啟動失敗，正在重新登入後重試一次。",
-                )
+                self.progress.emit(request_id, retry_message)
         raise DutySubmissionExecutionError("勤務登打瀏覽器重試流程未能完成。", "browser_startup")
 
     def _prewarm_browser_session(

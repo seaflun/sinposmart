@@ -754,6 +754,13 @@ class AppController(QObject):
         action = chain.request.schedule_data["actions"][index]
         return self._duty_controller.has_saved_departure_for_return(action)
 
+    def _waiting_background_duty_count(self) -> int:
+        current = datetime.now()
+        return sum(
+            not self._background_return_can_resume_after_restart(chain, current)
+            for chain in self._background_manual_chains.values()
+        )
+
     def _stop_block_reason(self) -> str:
         """Describe the first activity that makes quit or update unsafe."""
 
@@ -767,14 +774,9 @@ class AppController(QObject):
             return "通報收取尚未完成"
         if self._background_manual_workers:
             return "到點自動登打正在執行"
-        if self._background_manual_chains:
-            current = datetime.now()
-            waiting_count = sum(
-                not self._background_return_can_resume_after_restart(chain, current)
-                for chain in self._background_manual_chains.values()
-            )
-            if waiting_count:
-                return f"尚有 {waiting_count} 筆到點自動登打等待中"
+        waiting_count = self._waiting_background_duty_count()
+        if waiting_count:
+            return f"尚有 {waiting_count} 筆到點自動登打等待中"
         if (self._duty_execution_controller.isBusy
                 or self._duty_execution_controller.hasPendingSubmissions or self._logout_pending):
             return "勤務登打尚未完成"
@@ -1528,7 +1530,14 @@ class AppController(QObject):
             self._session_controller.logout()
         self._logout_waiting_for_update = bool(apply_update)
         if apply_update:
-            if self._update_controller.applyRemoteUpdate():
+            waiting_count = self._waiting_background_duty_count()
+            # Waiting duties need an authenticated on-duty session to run.
+            waiting_for_next_handoff = (
+                waiting_count > 0
+                and not self._background_manual_workers
+                and self._update_controller.wait_for_next_handoff(waiting_count)
+            )
+            if not waiting_for_next_handoff and self._update_controller.applyRemoteUpdate():
                 return
             if not self._logout_waiting_for_update:
                 return
