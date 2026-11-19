@@ -408,6 +408,9 @@ class DailyVehicleService:
     @staticmethod
     def _safe_error(output: str) -> str:
         diagnostics = {
+            "query_observer_state_invalid": "清點查詢的監測狀態無法確認，請重新查詢。",
+            "query_observer_source_failed": "清點查詢發生請求錯誤或資料來源變動，請重新查詢。",
+            "query_current_response_timeout": "清點查詢 10 秒內尚未完成本次資料載入，請稍後重試。",
             "equipment_end_time_missing": "器材清點尚未結束，無法核對原始紀錄，請至公務網站檢查。",
             "equipment_detail_unconfirmed": "器材清點明細尚未完整載入或紀錄不符，已停止送出。",
             "equipment_continue_unavailable": "器材清點頁面未提供可用的「繼續清點」，已停止後續操作。",

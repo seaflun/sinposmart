@@ -697,13 +697,31 @@ class ToolController(QObject):
             return []
         if not all(isinstance(item, dict) for item in payload):
             self._usage_history_valid = False
-        return [dict(item) for item in payload if isinstance(item, dict)][-100:]
+        return self._retained_usage_history([dict(item) for item in payload if isinstance(item, dict)])
+
+    def _retained_usage_history(self, history: list[dict]) -> list[dict]:
+        cutoff = self._now_factory() - timedelta(days=7)
+        retained = []
+        for index, entry in enumerate(history):
+            if index >= len(history) - 100:
+                retained.append(entry)
+                continue
+            if entry.get("tool_name") != "civilpower":
+                continue
+            try:
+                recorded_at = datetime.strptime(str(entry.get("time", "")), "%Y-%m-%d %H:%M")
+            except ValueError:
+                retained.append(entry)
+                continue
+            if recorded_at >= cutoff.replace(second=0, microsecond=0):
+                retained.append(entry)
+        return retained
 
     def _save_usage_history(self) -> None:
         try:
             self._usage_path.parent.mkdir(parents=True, exist_ok=True)
             self._usage_path.write_text(
-                json.dumps(self._usage_history[-100:], ensure_ascii=False, indent=2),
+                json.dumps(self._retained_usage_history(self._usage_history), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except OSError:

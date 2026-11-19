@@ -174,52 +174,120 @@ ToolFormCard {
             spacing: 4
 
             ToolSectionTitle {
-                text: "今日清點分派｜" + toolUsageHistory.vehicleAssignments.date
+                text: "今日清點分派"
+                markerColor: Design.successAction
+                titleColor: Design.successHeading
             }
-            RowLayout {
+            GridLayout {
                 Layout.fillWidth: true
-                visible: assignmentList.count > 0
-                Repeater {
-                    model: ["登入帳號", "定期保養", "隨車器材"]
-                    delegate: ToolFieldLabel {
-                        required property string modelData
-                        Layout.fillWidth: true
-                        Layout.minimumWidth: 0
-                        Layout.preferredWidth: 1
-                        text: modelData
-                    }
+                columns: 2
+                rowSpacing: 0
+                columnSpacing: 8
+
+                ToolFieldLabel {
+                    Layout.minimumHeight: Design.toolUsageCardRowHeight
+                    verticalAlignment: Text.AlignVCenter
+                    text: "日期"
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.minimumHeight: Design.toolUsageCardRowHeight
+                    verticalAlignment: Text.AlignVCenter
+                    text: toolUsageHistory.vehicleAssignments.date
+                    color: Design.strongText
+                    font.pixelSize: Design.bodySize
                 }
             }
             ListView {
                 id: assignmentList
                 objectName: "dailyVehicleAssignmentList"
                 Layout.fillWidth: true
-                Layout.preferredHeight: visible ? Math.min(contentHeight, 140) : 0
+                Layout.preferredHeight: visible ? Math.min(contentHeight, Design.vehicleAssignmentMaxHeight) : 0
                 clip: true
                 visible: count > 0
+                spacing: 8
                 model: toolUsageHistory.vehicleAssignments.rows
                 ScrollBar.vertical: ScrollBar { }
-                delegate: RowLayout {
+
+                delegate: Item {
                     id: assignmentRow
+                    required property int index
                     required property var modelData
-                    width: assignmentList.width - 8
-                    height: implicitHeight
-                    Repeater {
-                        model: [assignmentRow.modelData.account, assignmentRow.modelData.maintenance,
-                                assignmentRow.modelData.equipment]
-                        delegate: Label {
-                            required property string modelData
+                    width: assignmentList.width
+                    height: assignmentGrid.implicitHeight + 8
+
+                    GridLayout {
+                        id: assignmentGrid
+                        width: parent.width - assignmentList.ScrollBar.vertical.width - 4
+                        columns: 2
+                        rowSpacing: 0
+                        columnSpacing: 8
+
+                        ToolFieldLabel {
+                            Layout.alignment: Qt.AlignTop
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
+                            verticalAlignment: Text.AlignVCenter
+                            text: "帳號"
+                        }
+                        Label {
+                            objectName: "dailyVehicleAssignmentAccount"
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
-                            Layout.preferredWidth: 1
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
                             Layout.alignment: Qt.AlignTop
+                            verticalAlignment: Text.AlignVCenter
+                            text: assignmentRow.modelData.account
                             color: Design.strongText
-                            font.pixelSize: Design.captionSize
-                            text: modelData
+                            font.pixelSize: Design.bodySize
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WrapAnywhere
+                        }
+                        ToolFieldLabel {
+                            Layout.alignment: Qt.AlignTop
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
+                            verticalAlignment: Text.AlignVCenter
+                            text: "保養"
+                        }
+                        Label {
+                            objectName: "dailyVehicleAssignmentMaintenance"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
+                            Layout.alignment: Qt.AlignTop
+                            verticalAlignment: Text.AlignVCenter
+                            text: assignmentRow.modelData.maintenance
+                            color: Design.strongText
+                            font.pixelSize: Design.bodySize
                             textFormat: Text.PlainText
                             wrapMode: Text.Wrap
-                            bottomPadding: 4
                         }
+                        ToolFieldLabel {
+                            Layout.alignment: Qt.AlignTop
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
+                            verticalAlignment: Text.AlignVCenter
+                            text: "器材"
+                        }
+                        Label {
+                            objectName: "dailyVehicleAssignmentEquipment"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.minimumHeight: Design.toolUsageCardRowHeight
+                            Layout.alignment: Qt.AlignTop
+                            verticalAlignment: Text.AlignVCenter
+                            text: assignmentRow.modelData.equipment
+                            color: Design.strongText
+                            font.pixelSize: Design.bodySize
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        height: Design.borderWidth
+                        color: Design.divider
+                        visible: assignmentRow.index + 1 < assignmentList.count
                     }
                 }
             }

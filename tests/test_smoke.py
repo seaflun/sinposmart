@@ -521,7 +521,8 @@ print(json.dumps({'rows': rows, 'error': error, 'readiness_polls': driver.readin
                     module.query_grid_rows(driver, wait, context)
                 self.assertEqual([call.args[0] for call in output.call_args_list],
                                  [f"[sinposmart-stage] {operation}_{step}"
-                                  for step in ("page_ready", "query_start", "query_wait")])
+                                  for step in ("page_ready", "query_start", "query_wait")]
+                                 + ["[sinposmart-vehicle-diagnostic] query_observer_source_failed"])
 
     def test_same_path_navigation_waits_for_old_document_to_become_stale_before_query(self) -> None:
         from selenium.common.exceptions import StaleElementReferenceException

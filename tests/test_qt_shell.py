@@ -10453,6 +10453,33 @@ class ScheduledFolderServiceTests(unittest.TestCase):
 
 
 class ToolControllerTests(unittest.TestCase):
+    def test_civilpower_retains_seven_days_across_accounts_and_other_tool_volume(self) -> None:
+        from datetime import datetime, timedelta
+        from qt_app.controllers.tool_controller import ToolController
+
+        now = datetime(2026, 11, 19, 12, 0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "runtime_outputs" / "tool_usage_history.json"
+            path.parent.mkdir()
+            history = [{"tool_name": "civilpower", "time": (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M"),
+                        "operator": "6番 隊員甲", "actor_no": "6", "user_id": "crew-6", "report": "已完成"}]
+            history += [{"tool_name": "daily_vehicle", "time": now.strftime("%Y-%m-%d %H:%M"), "report": "已完成"}
+                        for _ in range(110)]
+            path.write_text(json.dumps(history), encoding="utf-8")
+            controller = ToolController(root, now_factory=lambda: now)
+            model = controller.usageModel("civilpower", "8", "crew-8", "8番 隊員乙", False)
+            self.assertEqual(model.rowCount(), 1)
+            self.assertEqual(controller.usage("civilpower")["people"], "6番 隊員甲")
+            controller.record_started("civilpower", "民力系統", "8番 隊員乙", actor_no="8", user_id="crew-8")
+            controller.record_finished("civilpower", "completed")
+            restarted = ToolController(root, now_factory=lambda: now)
+            civilpower = [entry for entry in restarted._usage_history if entry["tool_name"] == "civilpower"]
+            self.assertEqual({entry["actor_no"] for entry in civilpower}, {"6", "8"})
+            self.assertEqual(restarted.usage("civilpower")["people"], "8番 隊員乙")
+            panel = (PACKAGE_ROOT / "qt_app/qml/pages/CivilpowerToolPanel.qml").read_text(encoding="utf-8")
+            self.assertIn("currentOperatorOnly: false", panel)
+
     def test_daily_vehicle_assignments_keep_today_executor_across_retries_and_restart(self) -> None:
         from datetime import datetime
         from qt_app.controllers.tool_controller import ToolController
@@ -15638,7 +15665,7 @@ ApplicationWindow {
         self.assertIn("cornerRadius: implicitHeight / 2", tool_header)
         self.assertNotIn("padding: 10", tool_usage)
         self.assertIn("spacing: 8", tool_usage)
-        self.assertEqual(tool_usage.count("ToolFieldLabel {"), 7)
+        self.assertEqual(tool_usage.count("ToolFieldLabel {"), 10)
         self.assertIn("readonly property int toolFieldLabelWidth: 50", design)
         self.assertIn("visible: modeTabs.currentIndex === 0", main_qml)
         self.assertNotIn("auditPreviewDialog", main_qml)
@@ -31494,6 +31521,14 @@ if return_code != 0 or loaded:
                 assignments = wait_for("dailyVehicleAssignmentList")
                 wait_until(lambda: assignments.property("count") == 1 and assignments.height() > 0,
                            "今日清點分派表未顯示")
+                assignment_fields = [
+                    wait_for("dailyVehicleAssignmentAccount"),
+                    wait_for("dailyVehicleAssignmentMaintenance"),
+                    wait_for("dailyVehicleAssignmentEquipment"),
+                ]
+                self.assertEqual([field.height() for field in assignment_fields], [24, 24, 24])
+                self.assertEqual([field.y() - assignment_fields[0].y() for field in assignment_fields], [0, 24, 48])
+                self.assertEqual(len({field.x() for field in assignment_fields}), 1)
 
                 click(wait_for("quickRescueVideoToolButton"))
                 wait_until(

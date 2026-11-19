@@ -147,6 +147,7 @@ QtObject {
     readonly property int toolUsageHeaderHeight: 28
     readonly property int toolUsageRowHeight: 30
     readonly property int toolUsageMaxHeight: 104
+    readonly property int vehicleAssignmentMaxHeight: 208
     readonly property int toolFieldLabelWidth: 50
     readonly property int toolUsageCardRowHeight: 24
     readonly property int toolUsageTimeWidth: 112

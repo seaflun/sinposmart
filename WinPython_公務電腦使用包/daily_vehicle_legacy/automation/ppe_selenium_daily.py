@@ -334,13 +334,17 @@ def query_grid_rows(driver: webdriver.Chrome, wait: WebDriverWait, context: str,
         while time.monotonic() < deadline:
             state = driver.execute_script(GRID_QUERY_OBSERVER_SCRIPT, "state", token)
             if (not isinstance(state, dict) or state.get("token") != token
-                    or type(state.get("ready")) is not bool or type(state.get("failed")) is not bool
-                    or state["failed"]):
+                    or type(state.get("ready")) is not bool or type(state.get("failed")) is not bool):
+                print("[sinposmart-vehicle-diagnostic] query_observer_state_invalid", flush=True)
+                raise VehicleVerificationError("state_unconfirmed")
+            if state["failed"]:
+                print("[sinposmart-vehicle-diagnostic] query_observer_source_failed", flush=True)
                 raise VehicleVerificationError("state_unconfirmed")
             if state["ready"]:
                 break
             time.sleep(0.1)
         else:
+            print("[sinposmart-vehicle-diagnostic] query_current_response_timeout", flush=True)
             raise VehicleVerificationError("state_unconfirmed")
         print(f"[sinposmart-stage] {phase}_query_verify", flush=True)
         try:

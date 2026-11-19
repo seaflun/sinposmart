@@ -20,7 +20,7 @@ ToolSidePanel {
         ToolUsageHistory {
             backend: panel.hostWindow.backend
             toolId: "civilpower"
-            currentOperatorOnly: true
+            currentOperatorOnly: false
         }
         ToolFormCard {
             contentItem: ColumnLayout {
