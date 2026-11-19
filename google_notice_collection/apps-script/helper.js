@@ -330,8 +330,68 @@ function norm(value) {
 
 function isNoticeContentUnavailable(content) {
   var value = norm(content);
-  return !value || ["權限限制", "內文抓取失敗", "讀取失敗", "Session Time Out"].indexOf(value) !== -1 ||
+  return !value || ["權限限制", "內文抓取失敗", "讀取失敗", "Session Time Out", "【圖片收取未完成】"].indexOf(value) !== -1 ||
     (value.indexOf("作業逾時") === 0 && value.indexOf("重新登入") !== -1);
+}
+
+function validateNoticeImages(record) {
+  if (record.images === undefined) return;
+  if (!Array.isArray(record.images) || record.images.length > 8) throw new Error("Invalid notice images");
+  if (!record.images.length) return;
+  if (!/^\d+$/.test(record.noticeId || "") ||
+      record.content !== "【圖片內文：" + record.images.length + " 張】") throw new Error("Invalid image-only notice");
+  var total = 0;
+  record.images.forEach(function(image) {
+    if (!image || typeof image.data !== "string" || !image.data.length || image.data.length > 2796204 ||
+        !/^[A-Za-z0-9+/]+={0,2}$/.test(image.data) || image.data.length % 4 ||
+        !/^[a-f0-9]{64}$/.test(image.sha256 || "") ||
+        ["image/png", "image/jpeg", "image/gif"].indexOf(image.mimeType) === -1 ||
+        !["width", "height"].every(function(side) {
+          return Number.isInteger(image[side]) && image[side] > 0 && image[side] <= 40000;
+        }) || image.width * image.height > 1000000) throw new Error("Invalid notice image");
+    total += image.data.length;
+    if (total > 8 * 1024 * 1024) throw new Error("Notice images exceed limit");
+    var bytes = Utilities.base64Decode(image.data);
+    var signature = bytes.slice(0, 8).map(function(value) { return (value + 256) % 256; });
+    var validSignature = image.mimeType === "image/png" ? signature.join(",") === "137,80,78,71,13,10,26,10" :
+      image.mimeType === "image/jpeg" ? signature.slice(0, 3).join(",") === "255,216,255" :
+      signature.slice(0, 4).join(",") === "71,73,70,56";
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes)
+      .map(function(value) { return ("0" + ((value + 256) % 256).toString(16)).slice(-2); }).join("");
+    if (!validSignature || bytes.length > 2 * 1024 * 1024 || digest !== image.sha256)
+      throw new Error("Notice image integrity check failed");
+  });
+}
+
+function writeNoticeImages(sheet, row, record) {
+  validateNoticeImages(record);
+  var existing = sheet.getImages();
+  var maxWidth = Math.max(1, Math.min(600, sheet.getColumnWidth(5) - 12));
+  var maxHeight = Math.floor(360 / record.images.length);
+  var offset = 4;
+  record.images.forEach(function(image, index) {
+    var title = "SinpoSmart notice-image:" + record.noticeId + ":" + index + ":" + image.sha256;
+    var matches = existing.filter(function(item) {
+      var anchor = item.getAnchorCell();
+      return item.getAltTextTitle() === title && anchor.getRow() === row && anchor.getColumn() === 5;
+    });
+    if (matches.length > 1) throw new Error("Ambiguous notice image");
+    var item = matches[0];
+    var scale = Math.min(1, maxWidth / image.width, (maxHeight - 8) / image.height);
+    var width = Math.max(1, Math.round(image.width * scale));
+    var height = Math.max(1, Math.round(image.height * scale));
+    if (!item) {
+      item = sheet.insertImage(Utilities.newBlob(Utilities.base64Decode(image.data), image.mimeType),
+        5, row, 6, offset);
+      item.setAltTextTitle(title);
+      existing.push(item);
+    }
+    item.setWidth(width).setHeight(height);
+    offset += height + 8;
+  });
+  sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), offset + 4));
+  // This is the completion marker; leave the pending body on any earlier failure.
+  sheet.getRange(row, 5).setValue(record.content);
 }
 
 function out(value) {

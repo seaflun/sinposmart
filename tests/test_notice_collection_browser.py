@@ -535,6 +535,30 @@ class NoticeBrowserTests(unittest.TestCase):
         self.assertIn("bulletin_content.php", driver.async_calls[0][1][1])
         self.assertNotIn("action=bulletin_read", driver.async_calls[0][1][1])
 
+    def test_image_only_content_keeps_image_payload_and_rejects_bad_bytes(self):
+        import base64
+        driver = FakeDriver([snapshot([notice()])])
+        browser = self.browser(driver)
+        browser.scan_unread("synthetic")
+        image = {"mimeType": "image/png", "data": base64.b64encode(b"\x89PNG\r\n\x1a\nfixture").decode(),
+                 "width": 900, "height": 640}
+        driver.fetch_result = {"ok": True, "content": "", "images": [image]}
+        result = browser.read_content(notice())
+        self.assertEqual(result["content"], "【圖片內文：1 張】")
+        self.assertEqual(result["images"][0]["data"], image["data"])
+        self.assertEqual(len(result["images"][0]["sha256"]), 64)
+        driver.fetch_result["images"][0]["data"] = "invalid"
+        from app_core.notice_collection_service import NoticeCollectionError
+        with self.assertRaises(NoticeCollectionError):
+            browser.read_content(notice())
+
+    def test_mixed_content_returns_only_text(self):
+        driver = FakeDriver([snapshot([notice()])])
+        browser = self.browser(driver)
+        browser.scan_unread("synthetic")
+        driver.fetch_result = {"ok": True, "content": "文字內容", "images": [{"data": "ignored"}]}
+        self.assertEqual(browser.read_content(notice()), "文字內容")
+
     def test_foreign_content_url_never_transmits_credentials(self):
         from app_core.notice_collection_service import NoticeCollectionError
         driver = FakeDriver([snapshot([notice()])])
@@ -954,6 +978,53 @@ console.log(JSON.stringify({result,longUnit,spacedUnit,staleFiltered:stale.filte
         self.assertTrue(result["sessionExpired"])
 
     @unittest.skipUnless(shutil.which("node"), "Node is unavailable for the DOM bridge fixture")
+    def test_dom_only_downloads_images_when_no_text_and_rejects_foreign_sources(self):
+        script = r"""
+const fs = require('fs');
+const run = new Function(fs.readFileSync(process.argv[1], 'utf8'));
+const url = 'https://oa.tyfd.gov.tw/bulletin/bulletin_content.php?id=7450965';
+const account = {childNodes:[{nodeType:3,textContent:'新坡分隊/新坡分隊公務信箱(公務信箱)'}]};
+global.window = {location:{origin:'https://oa.tyfd.gov.tw'},setTimeout,clearTimeout};
+global.document = {querySelector:()=>null,querySelectorAll:s=>s === '.user-menu .user-details' ? [account] : []};
+let content = '混合文字', source = '/download_file.php?fixture=1', downloads = 0, fail = false, large = false;
+const img = {getAttribute:()=>source};
+const target = {get textContent(){return content;},querySelectorAll:s=>s==='img'?[img]:[]};
+global.DOMParser = class {parseFromString(){return {querySelector:s=>s==='div[style*="word-break"]'?target:null};}};
+global.fetch = async address => {
+  if (address === url) return {ok:true,url,text:async()=>'<div></div>'};
+  downloads++;
+  return {ok:!fail,blob:async()=>new Blob([new Uint8Array([137,80,78,71,13,10,26,10])],
+    {type:'application/octet-stream'})};
+};
+global.createImageBitmap = async()=>({width:large?3508:900,height:large?2492:640,close(){}});
+global.document.createElement = () => ({getContext:()=>({fillRect(){},drawImage(){}}),
+  toBlob:callback=>callback(new Blob([new Uint8Array([255,216,255])],{type:'image/jpeg'}))});
+global.FileReader = class {readAsDataURL(){this.result='data:image/png;base64,iVBORw0KGgo=';this.onload();}};
+const read = ()=>new Promise(resolve=>run('content',url,resolve));
+(async()=>{
+  const mixed=await read(); const mixedDownloads=downloads;
+  content='\n\n'; const onlyImage=await read();
+  large=true; const resized=await read(); large=false;
+  source='https://foreign.invalid/image.png'; const foreign=await read();
+  source='/download_file.php?fixture=1'; fail=true; const failed=await read();
+  console.log(JSON.stringify({mixed,mixedDownloads,onlyImage,resized,foreign,failed,downloads}));
+})();
+"""
+        completed = subprocess.run([shutil.which("node"), "-e", script,
+                                   str(PACKAGE / "app_core" / "notice_collection_dom.js")],
+                                  capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["mixed"], {"ok": True, "content": "混合文字"})
+        self.assertEqual(result["mixedDownloads"], 0)
+        self.assertEqual(result["onlyImage"]["images"][0]["width"], 900)
+        resized = result["resized"]["images"][0]
+        self.assertLessEqual(resized["width"] * resized["height"], 1000000)
+        self.assertEqual(resized["mimeType"], "image/jpeg")
+        self.assertFalse(result["foreign"]["ok"])
+        self.assertFalse(result["failed"]["ok"])
+        self.assertEqual(result["downloads"], 3)
+
     def test_dom_content_requires_notice_container_before_accepting_text(self):
         script = r"""
 const fs = require('fs');

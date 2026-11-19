@@ -1410,6 +1410,44 @@ class NoticeCollectionTests(unittest.TestCase):
             self.assertEqual(result.error_count, 1)
             self.assertEqual(result.marked_read_count, 0)
 
+    def test_image_only_payload_is_written_before_marking_and_not_saved_locally(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        browser = FakeBrowser([notice(1)])
+        image = {"data": "synthetic-image-bytes", "mimeType": "image/png", "sha256": "a" * 64,
+                 "width": 900, "height": 640}
+        posted = []
+        def poster(payload):
+            if payload["action"] == "checkExisting":
+                return {"status": "success", "existingKeys": [], "retryKeys": [], "imageProtocol": 1}
+            posted.append(payload)
+            self.assertNotIn("mark:1", browser.events)
+            return write_response(payload, ["1"])
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            with patch.object(browser, "read_content", return_value={
+                    "content": "【圖片內文：1 張】", "images": [image]}):
+                result = service.collect("synthetic", datetime(2026, 11, 19, 15))
+            self.assertEqual(result.marked_read_count, 1)
+            self.assertEqual(posted[0]["records"][0]["images"], [image])
+            for path in Path(directory).rglob("*.json"):
+                self.assertNotIn(image["data"], path.read_text(encoding="utf-8"))
+
+    def test_image_notice_waits_for_cloud_capability_without_writing_or_marking(self):
+        from app_core.notice_collection_service import NoticeCollectionService
+        browser = FakeBrowser([notice(1)])
+        posted = []
+        def poster(payload):
+            posted.append(payload["action"])
+            return {"status": "success", "existingKeys": [], "retryKeys": []}
+        with tempfile.TemporaryDirectory() as directory:
+            service = NoticeCollectionService(Path(directory), browser=browser, poster=poster)
+            with patch.object(browser, "read_content", return_value={
+                    "content": "【圖片內文：1 張】", "images": [{"data": "fixture"}]}):
+                result = service.collect("synthetic", datetime(2026, 11, 19, 15))
+            self.assertEqual(posted, ["checkExisting"])
+            self.assertEqual(result.marked_read_count, 0)
+            self.assertEqual(result.error_count, 1)
+
     def test_daily_count_does_not_reset_at_fire_day_eight_am(self):
         from app_core.notice_collection_service import NoticeCollectionService
 

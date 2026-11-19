@@ -167,6 +167,7 @@ function validateRecords(records) {
         throw new Error("Invalid record field");
       }
     });
+    validateNoticeImages(record);
   });
   return records;
 }
@@ -264,6 +265,7 @@ function checkExisting(records, ctx) {
   });
   return out({
     status: "success",
+    imageProtocol: 1,
     existingKeys: existingKeys,
     retryKeys: retryKeys
   });
@@ -391,9 +393,18 @@ function writeGroups(batch, ctx, res) {
         var recipient = getValidDutyRecipient(group.target.sheet, getCurrentDutyRecipient(record).recipient,
           record.responsibility && record.responsibility.role);
         entry.signingRecipient = recipient;
-        return [record.sender, record.subject, record.content, recipient];
+        return [record.sender, record.subject,
+          record.images && record.images.length ? "【圖片收取未完成】" : record.content, recipient];
       });
       outcomes = writeRows(group.target.sheet, rows, values, entries);
+      entries.forEach(function(entry, index) {
+        if (!outcomes[index] || !outcomes[index].success || !entry.record.images || !entry.record.images.length) return;
+        try {
+          writeNoticeImages(group.target.sheet, rows[index], entry.record);
+        } catch (_imageError) {
+          outcomes[index] = { success: false, error: "通報圖片尚未完整入表" };
+        }
+      });
     } catch (err) {
       outcomes = entries.map(function() {
         return { success: false, error: err.toString() };
@@ -419,7 +430,11 @@ function writeGroups(batch, ctx, res) {
 function writeContentUpdates(batch, res) {
   batch.updates.forEach(function(update) {
     try {
-      update.target.sheet.getRange(update.row, 5).setValue(update.entry.record.content);
+      if (update.entry.record.images && update.entry.record.images.length) {
+        writeNoticeImages(update.target.sheet, update.row, update.entry.record);
+      } else {
+        update.target.sheet.getRange(update.row, 5).setValue(update.entry.record.content);
+      }
       res.success++;
       pushKey(res.writtenKeys, update.entry.key);
       pushKey(res.handledKeys, update.entry.key);

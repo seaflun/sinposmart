@@ -838,7 +838,10 @@ class NoticeCollectionService:
                 self._check_cancel(cancel)
                 self._collection_stage = "scan"
                 try:
-                    content = str(self._browser.read_content(row, cancel=cancel)).strip()
+                    body = self._browser.read_content(row, cancel=cancel)
+                    content = str(body.get("content", "") if isinstance(body, dict) else body).strip()
+                    if isinstance(body, dict) and body.get("images") and not getattr(self, "_image_protocol_ready", False):
+                        raise NoticeCollectionError("試算表圖片收取尚未就緒，已保留未讀狀態。")
                 except NoticeLoginRequired:
                     raise
                 except Exception:
@@ -850,6 +853,7 @@ class NoticeCollectionService:
                     result.error_stage = "scan"
                     continue
                 records.append({**self._metadata(row), "content": content,
+                                **({"images": body["images"]} if isinstance(body, dict) and body.get("images") else {}),
                                 "receivedAt": received_at.strftime("%Y.%m.%d.%H%M"),
                                 "responsibility": copy.deepcopy(self._responsibility)})
             if records:
@@ -998,7 +1002,10 @@ class NoticeCollectionService:
             self._check_cancel(cancel)
             self._collection_stage = "scan"
             try:
-                content = str(self._browser.read_content(current[row["key"]], cancel=cancel)).strip()
+                body = self._browser.read_content(current[row["key"]], cancel=cancel)
+                content = str(body.get("content", "") if isinstance(body, dict) else body).strip()
+                if isinstance(body, dict) and body.get("images") and not getattr(self, "_image_protocol_ready", False):
+                    return None
             except NoticeLoginRequired:
                 raise
             except Exception:
@@ -1006,6 +1013,7 @@ class NoticeCollectionService:
             if content in ("", "內文抓取失敗", "讀取失敗", "權限限制"):
                 return None
             records.append({**self._metadata(row), "content": content,
+                            **({"images": body["images"]} if isinstance(body, dict) and body.get("images") else {}),
                             "receivedAt": received_at.strftime("%Y.%m.%d.%H%M"),
                             "responsibility": _frozen_responsibility(row.get("responsibility"), received_at)})
         return records
@@ -1048,6 +1056,7 @@ class NoticeCollectionService:
 
     def _check_existing(self, rows: list[dict]) -> tuple[set[str], set[str]]:
         response = self._post({"action": "checkExisting", "records": [self._metadata(row) for row in rows]})
+        self._image_protocol_ready = type(response.get("imageProtocol")) is int and response["imageProtocol"] == 1
         values = response.get("existingKeys")
         retry_values = response.get("retryKeys", [])
         if (response.get("status") != "success" or not isinstance(values, list)

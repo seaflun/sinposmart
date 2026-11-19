@@ -395,7 +395,7 @@ class NoticeBrowser:
         self._assert_identity(self._snapshot())
         return result
 
-    def read_content(self, record: dict, cancel=None) -> str:
+    def read_content(self, record: dict, cancel=None) -> str | dict:
         url = self._validated_content_url(record)
         if self._driver is None:
             raise NoticeCollectionError("通報瀏覽器尚未登入。")
@@ -404,8 +404,35 @@ class NoticeBrowser:
         content = "\n".join(re.sub(r"[ \t\u3000]+", " ", line).strip()
                             for line in content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
                             if line.strip())
-        if not result.get("ok") or not content or content in {"內文抓取失敗", "讀取失敗", "權限限制"}:
+        if not result.get("ok") or content in {"內文抓取失敗", "讀取失敗", "權限限制"}:
             raise NoticeCollectionError("通報內文尚未完整讀取，已保留未讀狀態。")
+        if not content:
+            import base64
+            import hashlib
+            images = result.get("images")
+            if not isinstance(images, list) or not 0 < len(images) <= 8:
+                raise NoticeCollectionError("通報內文尚未完整讀取，已保留未讀狀態。")
+            validated = []
+            try:
+                for image in images:
+                    data = base64.b64decode(image["data"], validate=True)
+                    mime = image["mimeType"]
+                    signatures = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff",
+                                  "image/gif": b"GIF8"}
+                    if (mime not in signatures or not data.startswith(signatures[mime])
+                            or not 0 < len(data) <= 2 * 1024 * 1024
+                            or any(type(image[side]) is not int or not 0 < image[side] <= 40000
+                                   for side in ("width", "height"))
+                            or image["width"] * image["height"] > 1000000):
+                        raise ValueError()
+                    validated.append({"data": image["data"], "mimeType": mime,
+                                      "width": image["width"], "height": image["height"],
+                                      "sha256": hashlib.sha256(data).hexdigest()})
+                if sum(len(image["data"]) for image in validated) > 8 * 1024 * 1024:
+                    raise ValueError()
+            except (ValueError, KeyError, TypeError):
+                raise NoticeCollectionError("通報圖片尚未完整讀取，已保留未讀狀態。") from None
+            return {"content": f"【圖片內文：{len(validated)} 張】", "images": validated}
         return content
 
     def mark_read(self, records: list[dict], cancel=None) -> list[str]:

@@ -98,8 +98,11 @@ function fixture() {
     MimeType: { GOOGLE_SHEETS: SHEETS_MIME },
     Session: { getEffectiveUser: () => ({ getEmail: () => effectiveUser }) },
     Utilities: {
+      base64Decode: value => Array.from(Buffer.from(value, 'base64')),
+      newBlob: (bytes, mimeType) => ({ bytes, mimeType }),
       DigestAlgorithm: { SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' },
-      computeDigest: (algorithm, value, encoding) => Array.from(crypto.createHash(algorithm).update(value, encoding).digest()),
+      computeDigest: (algorithm, value, encoding) => Array.from(crypto.createHash(algorithm)
+        .update(Array.isArray(value) ? Buffer.from(value) : value, encoding).digest()),
     },
     DriveApp: {
       getFolderById(id) { events.driveReads++; assert.ok(folders.has(id), `unexpected folder ID ${id}`); return folders.get(id); },
@@ -741,4 +744,102 @@ test('monthly spreadsheet link ignores stale cached IDs and leaves properties un
   assert.equal(f.link().spreadsheetId, id);
   assert.deepEqual([...f.properties], before);
   assert.deepEqual(f.blocked, []);
+});
+
+
+function imageRecord() {
+  const bytes = Buffer.from('\x89PNG\r\n\x1a\nfixture', 'binary');
+  return { key: '7450965', noticeId: '7450965', date: '115-11-19', content: '【圖片內文：1 張】',
+    images: [{ data: bytes.toString('base64'), mimeType: 'image/png', width: 900, height: 640,
+      sha256: crypto.createHash('sha256').update(bytes).digest('hex') }] };
+}
+
+function imageSheet() {
+  const images = [], values = [], heights = [];
+  let fail = false;
+  const sheet = {
+    images, values, heights,
+    failNext() { fail = true; },
+    getImages: () => images.slice(),
+    getColumnWidth: () => 500,
+    getRowHeight: () => 24,
+    setRowHeight: (row, height) => heights.push([row, height]),
+    getRange: (row, column) => ({ setValue: value => values.push({ row, column, value }) }),
+    insertImage(blob, column, row, x, y) {
+      if (fail) { fail = false; throw new Error('temporary insertion failure'); }
+      const image = {
+        title: '', blob, column, row, x, y,
+        getAltTextTitle() { return this.title; },
+        getAnchorCell: () => ({ getRow: () => row, getColumn: () => column }),
+        setAltTextTitle(title) { this.title = title; return this; },
+        setWidth(width) { this.width = width; return this; },
+        setHeight(height) { this.height = height; return this; },
+      };
+      images.push(image);
+      return image;
+    },
+  };
+  return sheet;
+}
+
+test('image-only insertion embeds bytes once and completes the body after success', () => {
+  const s = fixture().sandbox;
+  const record = imageRecord(), sheet = imageSheet();
+  s.validateRecords([record]);
+  s.writeNoticeImages(sheet, 7, record);
+  assert.equal(sheet.images.length, 1);
+  assert.equal(sheet.values.at(-1).value, record.content);
+  assert.ok(sheet.images[0].width <= 488);
+  assert.ok(sheet.images[0].height <= 360);
+  s.writeNoticeImages(sheet, 7, record);
+  assert.equal(sheet.images.length, 1);
+});
+
+test('image insertion failure remains retryable and never completes a partial row', () => {
+  const s = fixture().sandbox;
+  const record = imageRecord(), sheet = imageSheet();
+  sheet.failNext();
+  assert.throws(() => s.writeNoticeImages(sheet, 7, record), /insertion/);
+  assert.equal(sheet.values.length, 0);
+  assert.equal(s.isNoticeContentUnavailable('【圖片收取未完成】'), true);
+  s.writeNoticeImages(sheet, 7, record);
+  assert.equal(sheet.images.length, 1);
+});
+
+test('tampered oversized or mixed image payloads fail before writing', () => {
+  const s = fixture().sandbox;
+  for (const change of [ { sha256: 'a'.repeat(64) }, { mimeType: 'text/html' },
+    { data: '<html>login</html>' }, { width: 0 }, { data: 'A'.repeat(2800000) } ]) {
+    const record = imageRecord(); Object.assign(record.images[0], change);
+    assert.throws(() => s.validateRecords([record]));
+  }
+  const mixed = imageRecord(); mixed.content = '文字內容';
+  assert.throws(() => s.validateRecords([mixed]));
+});
+
+
+test('write pipeline leaves failed images pending and repairs the same row', () => {
+  const s = fixture().sandbox, sheet = imageSheet(), record = imageRecord();
+  s.getWritableRows = () => [7];
+  s.getCurrentDutyRecipient = () => ({recipient:''});
+  s.getValidDutyRecipient = () => '';
+  let body;
+  s.writeRows = (_sheet, _rows, values) => {body=values[0][2];return [{success:true}];};
+  const batch = {groups:{day:{target:{sheet},entries:[{record,key:record.key,token:'one'}]}},tokenResults:{}};
+  sheet.failNext();
+  const failed = s.createWriteResult();
+  s.writeGroups(batch,{},failed);
+  assert.equal(body,'【圖片收取未完成】');
+  assert.equal(failed.success,0);
+  assert.equal(failed.errors,1);
+  assert.equal(batch.tokenResults.one,false);
+  const repair = s.createWriteResult();
+  s.writeContentUpdates({updates:[{target:{sheet},row:7,entry:{record,key:record.key}}]},repair);
+  assert.equal(repair.success,1);
+  assert.equal(sheet.images.length,1);
+  assert.equal(sheet.values.at(-1).value,record.content);
+  const text = {date:record.date,noticeId:'100',content:'混合通報文字'};
+  s.writeContentUpdates({updates:[{target:{sheet},row:8,entry:{record:text,key:'100'}}]},s.createWriteResult());
+  assert.equal(sheet.images.length,1);
+  assert.equal(sheet.values.at(-1).value,'混合通報文字');
 });

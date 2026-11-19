@@ -126,7 +126,61 @@ return (function (operation, payload, done) {
       target.querySelectorAll('script,style,noscript').forEach(node => node.remove());
       target.querySelectorAll('br').forEach(node => node.replaceWith('\n'));
       target.querySelectorAll('p,div,li').forEach(node => node.append('\n'));
-      done({ ok: true, content: cleanText(target.textContent) });
+      const content = cleanText(target.textContent);
+      // Text takes precedence: mixed notices intentionally keep text only.
+      if (content) {
+        done({ ok: true, content });
+        return;
+      }
+      const nodes = Array.from(target.querySelectorAll('img'));
+      if (!nodes.length || nodes.length > 8) {
+        done({ ok: false });
+        return;
+      }
+      const images = [];
+      for (const node of nodes) {
+        const source = new URL(node.getAttribute('src'), payload);
+        if (source.origin !== expectedOrigin || source.pathname !== '/download_file.php'
+            || source.username || source.password || source.hash) throw new Error('Invalid image source');
+        const imageResponse = await fetch(source.href, { credentials: 'include', cache: 'no-store',
+          redirect: 'error', signal: controller.signal });
+        if (!imageResponse.ok) throw new Error('Image download failed');
+        let blob = await imageResponse.blob();
+        if (!blob.size || blob.size > 12 * 1024 * 1024) throw new Error('Invalid image');
+        const signature = Array.from(new Uint8Array(await blob.slice(0, 8).arrayBuffer()));
+        const mimeType = signature.join(',') === '137,80,78,71,13,10,26,10' ? 'image/png' :
+          signature.slice(0, 3).join(',') === '255,216,255' ? 'image/jpeg' :
+          signature.slice(0, 4).join(',') === '71,73,70,56' ? 'image/gif' : '';
+        if (!mimeType) throw new Error('Invalid image format');
+        if (blob.type !== mimeType) blob = new Blob([blob], { type: mimeType });
+        const bitmap = await createImageBitmap(blob);
+        let width = bitmap.width, height = bitmap.height;
+        try {
+          if (!width || !height || width * height > 40000000) throw new Error('Image dimensions exceed limit');
+          if (blob.size > 2 * 1024 * 1024 || width * height > 1000000) {
+            const scale = Math.min(1, 1600 / Math.max(width, height), Math.sqrt(1000000 / (width * height)));
+            width = Math.max(1, Math.floor(width * scale));
+            height = Math.max(1, Math.floor(height * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#fff'; context.fillRect(0, 0, width, height);
+            context.drawImage(bitmap, 0, 0, width, height);
+            blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+          }
+        } finally { bitmap.close(); }
+        if (!blob || blob.size > 2 * 1024 * 1024) throw new Error('Image too large');
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(',')[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        images.push({ mimeType: blob.type, data, width, height });
+        if (images.reduce((sum, image) => sum + image.data.length, 0) > 8 * 1024 * 1024)
+          throw new Error('Image batch too large');
+      }
+      done({ ok: true, content: '', images });
     })
     .catch(() => done({ ok: false }))
     .finally(() => window.clearTimeout(timer));
