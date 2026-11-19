@@ -2887,6 +2887,8 @@ class AppController(QObject):
         status = {"loaded": "loaded", "needs_input": "waiting", "partial": "partial"}.get(rescue_state, "completed")
         vehicle_report = self._daily_vehicle_controller.completion_report if tool_name == "daily_vehicle" else None
         usage_extra = {"vehicle_report": vehicle_report} if vehicle_report is not None else {}
+        if tool_name == "civilpower":
+            usage_extra["attendance_details"] = run_context
         self._tool_controller.record_finished(tool_name, rescue_state or status, message, **usage_extra)
         self._finish_automatic_tool(tool_name, True)
         snapshot = {"tool_name": tool_name, "tool_label": tool_label}

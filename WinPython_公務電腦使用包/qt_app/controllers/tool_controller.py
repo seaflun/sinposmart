@@ -292,7 +292,10 @@ class ToolController(QObject):
         self._refresh_usage_model(tool_id)
         self.usageChanged.emit(tool_id)
 
-    def record_finished(self, tool_id: str, status: str, result: str = "", *, vehicle_report: dict | None = None) -> None:
+    def record_finished(
+        self, tool_id: str, status: str, result: str = "", *,
+        vehicle_report: dict | None = None, attendance_details: dict | None = None,
+    ) -> None:
         if self._read_only_acceptance:
             return
         tool_id = str(tool_id or "").strip()
@@ -302,6 +305,9 @@ class ToolController(QObject):
             if entry.get("id") != entry_id:
                 continue
             entry["report"] = report
+            if tool_id == "civilpower" and attendance_details:
+                entry["attendance_details"] = {key: str(attendance_details.get(key, ""))
+                                               for key in ("target_date", "time_text", "member_name", "action")}
             if tool_id == "daily_vehicle" and vehicle_report and vehicle_report.get("assignments"):
                 entry["vehicle_assignments"] = vehicle_report
             date_match = re.search(r"(?<!\d)(\d{7})(?!\d)", str(result or ""))
@@ -622,6 +628,18 @@ class ToolController(QObject):
             if isinstance(items, list) and any(isinstance(item, dict) and item.get("status") == "completed" for item in items):
                 return "部分完成，有項目待確認"
         if report == "已完成":
+            attendance = entry.get("attendance_details")
+            if tool_id == "civilpower" and isinstance(attendance, dict):
+                try:
+                    when = datetime.strptime(
+                        attendance["target_date"] + " " + attendance["time_text"], "%Y-%m-%d %H:%M")
+                    member_name = attendance["member_name"].strip()
+                    action = attendance["action"]
+                    if member_name and action in {"到勤", "退勤"}:
+                        date_text = f"{when.year - 1911:03d}{when.month:02d}{when.day:02d}"
+                        return f"{date_text} {when:%H%M} {member_name} {action} 已登打完成"
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass
             return f"{period} {tool_label}已登打完成"
         return f"{period} {tool_label}{report}" if include_failure_context else report
 

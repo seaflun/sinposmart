@@ -861,7 +861,8 @@ class AttendanceTests(unittest.TestCase):
             self.assertFalse(controller.isRunning)
             self.assertEqual(controller.failureCode, "oa_credentials_rejected")
             self.assertEqual(controller.failureStage, "login")
-            self.assertEqual(controller.run_context, {"target_date": "2026-11-01", "time_text": "09:05", "action": "到勤"})
+            self.assertEqual(controller.run_context, {"target_date": "2026-11-01", "time_text": "09:05",
+                                                      "action": "到勤", "member_name": "測試義消"})
             controller.prepareRun("2026-11-02", "10:10", "m1", "退勤")
             self.assertEqual(controller.run_context["target_date"], "2026-11-01")
             runner.side_effect = None
@@ -872,7 +873,8 @@ class AttendanceTests(unittest.TestCase):
                 QTest.qWait(10)
                 if not controller.isRunning:
                     break
-            self.assertEqual(controller.run_context, {"target_date": "2026-11-02", "time_text": "10:10", "action": "退勤"})
+            self.assertEqual(controller.run_context, {"target_date": "2026-11-02", "time_text": "10:10",
+                                                      "action": "退勤", "member_name": "測試義消"})
         finally:
             controller.shutdown()
 

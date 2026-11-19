@@ -10453,6 +10453,33 @@ class ScheduledFolderServiceTests(unittest.TestCase):
 
 
 class ToolControllerTests(unittest.TestCase):
+    def test_civilpower_result_uses_submitted_attendance_details_after_restart(self) -> None:
+        from datetime import datetime
+        from qt_app.controllers.tool_controller import ToolController
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = ToolController(root, now_factory=lambda: datetime(2026, 11, 19, 12))
+            for action in ("到勤", "退勤"):
+                with self.subTest(action=action):
+                    details = {"target_date": "2026-11-18", "time_text": "18:00",
+                               "member_name": "林伊田", "action": action}
+                    controller.record_started("civilpower", "民力系統", "8番 值班隊員")
+                    controller.record_finished("civilpower", "completed", attendance_details=details)
+                    details["member_name"] = "已切換人員"
+                    restarted = ToolController(root, now_factory=lambda: datetime(2026, 11, 19, 12))
+                    expected = f"1151118 1800 林伊田 {action} 已登打完成"
+                    self.assertEqual(restarted.usage("civilpower")["report"], expected)
+                    self.assertEqual(restarted.usage("civilpower")["people"], "8番 值班隊員")
+                    model = restarted.usageModel("civilpower", "9", "other", "其他值班員", False)
+                    self.assertEqual(model.data(model.index(0), model.ResultRole), expected)
+            controller.record_started("civilpower", "民力系統", "8番 值班隊員")
+            controller.record_finished("civilpower", "failed", attendance_details=details)
+            self.assertNotIn("已登打完成", controller.usage("civilpower")["report"])
+            controller.record_started("civilpower", "民力系統", "8番 值班隊員", "1151118")
+            controller.record_finished("civilpower", "completed")
+            self.assertEqual(controller.usage("civilpower")["report"], "1151118 民力系統已登打完成")
+
     def test_civilpower_retains_seven_days_across_accounts_and_other_tool_volume(self) -> None:
         from datetime import datetime, timedelta
         from qt_app.controllers.tool_controller import ToolController
@@ -25151,6 +25178,10 @@ if return_code != 0 or loaded:
                         break
                 self.assertFalse(attendance.isRunning)
                 self.assertEqual(runner.call_count, 2)
+                self.assertEqual(controller.toolController.usage("civilpower")["report"],
+                                 "1151020 1712 測試義消 退勤 已登打完成")
+                self.assertEqual(ToolController(root).usage("civilpower")["report"],
+                                 "1151020 1712 測試義消 退勤 已登打完成")
                 self.assertNotIn("not-a-real-password", json.dumps(operational_sync.events, ensure_ascii=False))
             finally:
                 controller.shutdown()

@@ -166,7 +166,8 @@ class CivilpowerController(QObject):
         self._failure_code = "unknown"
         self.run_actor = {"actor_no": request.actor_no, "user_id": request.user_id,
                           "display_name": request.actor_name}
-        self.run_context = {"target_date": request.date_text, "time_text": request.time_text, "action": request.action}
+        self.run_context = {"target_date": request.date_text, "time_text": request.time_text,
+                            "action": request.action, "member_name": str(request.member["name"])}
         self.runStarted.emit()
         self._start_job(request)
 
