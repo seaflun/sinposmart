@@ -1753,54 +1753,104 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
 
 def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
     log_status("➡️ 正在鎖定車輛設定視窗...")
-    try:
-        wait.until(lambda d: len(d.window_handles) > 1)
-        for h in driver.window_handles:
-            if h != main_window:
-                driver.switch_to.window(h)
-                break
-        time.sleep(1.5)
-    except Exception as e:
-        log_status(f"❌ 找不到車輛設定視窗: {e}")
-        return
 
-    js_select_car_v2 = r"""
-    function forceSelect(selectId, targetText) {
-        var sel = document.getElementById(selectId);
-        if (!sel) return "找不到ID";
-        var parts = targetText.split(/[/／]/);
-        var mainKey = parts[0].trim();
-        for (var i = 0; i < sel.options.length; i++) {
-            var optText = sel.options[i].text;
-            if (optText.indexOf(mainKey) !== -1 || optText.indexOf(targetText.trim()) !== -1) {
-                sel.selectedIndex = i;
-                sel.dispatchEvent(new Event('input', { bubbles: true }));
-                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                if(typeof sel.onchange === 'function') {
-                    try { sel.onchange({target: sel, srcElement: sel, type: 'change'}); } catch(e){}
-                }
-                return "成功選中: " + optText;
-            }
-        }
-        return "找不到匹配項";
-    }
-    return {
-        '攻擊車': forceSelect('_selCALL_TYPEA', arguments[0]),
-        '中繼車': forceSelect('_selCALL_TYPEB', arguments[1]),
-        '救護1': forceSelect('_selCALL_TYPEF', arguments[2]),
-        '救護2': forceSelect('_selCALL_TYPEG', arguments[3])
-    };
-    """
+    def find_popup(candidate):
+        handles = [handle for handle in candidate.window_handles if handle != main_window]
+        return handles[0] if len(handles) == 1 else False
+
     try:
-        driver.execute_script(js_select_car_v2, cars_dict['attack'], cars_dict['stop'], cars_dict['amb1'], cars_dict['amb2'])
-        time.sleep(1)
-        driver.execute_script("var btn = document.getElementById('_btnSave'); if (btn) { btn.click(); return true; } return false;")
-        
-        # 確保存檔後，車輛設定的小視窗真的關閉了才繼續
-        wait.until(lambda d: len(d.window_handles) == 1)
-        
-    except Exception as e: log_status(f"   ❌ 車輛設定執行錯誤: {e}")
-    driver.switch_to.window(main_window)
+        popup = wait.until(find_popup)
+    except TimeoutException:
+        raise RuntimeError("救災任務編組表車輛設定視窗未確認，已停止後續登打。") from None
+
+    vehicle_form = r"""
+    const [mode, values] = arguments;
+    if (location.origin !== 'https://dutymgt.tyfd.gov.tw' ||
+        !location.pathname.startsWith('/tyfd119/') || document.readyState !== 'complete') return false;
+    const ids = ['_selCALL_TYPEA', '_selCALL_TYPEB', '_selCALL_TYPEF', '_selCALL_TYPEG'];
+    const selections = ids.map((id, index) => {
+        const controls = document.querySelectorAll('[id="' + id + '"]');
+        const field = controls.length === 1 ? controls[0] : null;
+        const text = values[index].trim();
+        const key = text.split(/[/／]/)[0].trim();
+        if (!field || field.tagName !== 'SELECT' || field.disabled || !key) return null;
+        const options = Array.from(field.options);
+        const matching = options.filter(option => !option.disabled && option.text.includes(text));
+        const matches = matching.length ? matching : options.filter(option =>
+            !option.disabled && option.text.includes(key));
+        return matches.length === 1 ? [field, matches[0]] : null;
+    });
+    if (selections.some(selection => !selection)) return false;
+    if (mode === 'fill') {
+        for (const [field, option] of selections) {
+            if (field.selectedIndex === option.index) continue;
+            field.selectedIndex = option.index;
+            field.dispatchEvent(new Event('input', {bubbles:true}));
+            field.dispatchEvent(new Event('change', {bubbles:true}));
+        }
+        document.__sinposmartVehicleSettingsFilled = true;
+        return true;
+    }
+    if (!document.__sinposmartVehicleSettingsFilled ||
+        selections.some(([field, option]) => field.selectedIndex !== option.index)) return false;
+    const buttons = document.querySelectorAll('[id="_btnSave"]');
+    const save = buttons.length === 1 ? buttons[0] : null;
+    if (!save || save.disabled || save.getAttribute('aria-disabled') === 'true' ||
+        !save.getClientRects().length || getComputedStyle(save).visibility === 'hidden') return false;
+    save.click();
+    return true;
+    """
+    values = [cars_dict[key] for key in ("attack", "stop", "amb1", "amb2")]
+
+    try:
+        for attempt in range(2):
+            driver.switch_to.window(popup)
+            try:
+                wait.until(lambda d: d.execute_script(vehicle_form, "fill", values) is True)
+            except TimeoutException:
+                raise RuntimeError("救災任務編組表車輛設定選項未確認，未送出。") from None
+
+            messages = []
+            dispatched = False
+
+            def submit(candidate):
+                nonlocal dispatched
+                dispatched = True
+                result = candidate.execute_script(vehicle_form, "save", values)
+                if result is False:
+                    dispatched = False
+                return result is not False
+
+            try:
+                wait.until(submit)
+            except UnexpectedAlertPresentException as error:
+                if error.alert_text:
+                    messages.append(error.alert_text)
+            except TimeoutException:
+                if not dispatched:
+                    raise RuntimeError("救災任務編組表車輛設定的儲存按鈕或選項未確認，未送出。") from None
+
+            messages.extend(accept_pending_alerts(driver, timeout=2))
+            rejected = bool(messages) and all(
+                re.fullmatch(r"(?:車[輛輌辆]設定)?(?:儲存|存檔|保存)(?:資料)?失敗[。！!]*", message.strip())
+                for message in messages
+            )
+            if rejected:
+                if attempt == 0 and popup in driver.window_handles:
+                    log_status("⚠️ 車輛設定儲存遭拒，重新核對選項並重試一次。")
+                    continue
+                raise RuntimeError("救災任務編組表車輛設定儲存遭拒，已停止後續登打。")
+            try:
+                wait_for_popup_close_and_return_to_main(driver, wait, main_window, popup)
+            except RuntimeError:
+                raise RuntimeError("救災任務編組表車輛設定已嘗試儲存，結果尚未確認，已停止後續登打。") from None
+            return
+    finally:
+        try:
+            driver.switch_to.window(main_window)
+        except (NoSuchWindowException, UnexpectedAlertPresentException):
+            pass
+
 
 def resolve_duty_annotation_field(driver):
     """唯讀確認正式附記欄位，僅回傳 ID 與 frame 路徑。"""
@@ -2242,12 +2292,16 @@ def step_fill_mission_cells(driver, mission_map, target_date="", *, wait=None, s
 
     def execute():
         nonlocal stage, reason, save_attempted
-        wait.until(ready)
-        reason = "fill_failed"
-        token = str(time.monotonic_ns())
-        filled = script("fill", token)
-        if not isinstance(filled, dict) or filled.get("ready") is not True:
-            return False
+        for attempt in range(2):
+            wait.until(ready)
+            reason = "fill_failed"
+            token = str(time.monotonic_ns())
+            filled = script("fill", token)
+            if isinstance(filled, dict) and filled.get("ready") is True:
+                break
+            if attempt or state.get("rejection_code") != "invalid_browser_reply":
+                return False
+            log_status("⚠️ 救災任務編組表填寫回覆異常，儲存前重新核對並填寫一次。")
         stage, reason = "vehicle_save", "save_unknown"
         if callable(stage_callback):
             stage_callback(stage)

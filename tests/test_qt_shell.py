@@ -10513,16 +10513,17 @@ class ScheduledFolderServiceTests(unittest.TestCase):
                 open_folder=lambda path: events.append(path),
             )
 
-            self.assertIsNone(service.check_and_open(datetime(2026, 7, 29, 16, 29, 59)))
-            daily = service.check_and_open(datetime(2026, 7, 29, 16, 30, 0))
+            self.assertIsNone(service.check_and_open(datetime(2026, 7, 29, 10, 44, 59)))
+            daily = service.check_and_open(datetime(2026, 7, 29, 10, 45, 0))
             self.assertEqual(daily, Path(temp_dir) / "每日勤務表")
             self.assertTrue(daily.is_dir())
-            self.assertIsNone(service.check_and_open(datetime(2026, 7, 29, 16, 30, 45)))
+            self.assertIsNone(service.check_and_open(datetime(2026, 7, 29, 10, 45, 45)))
+            self.assertIsNone(service.check_and_open(datetime(2026, 7, 29, 16, 30, 0)))
             night = service.check_and_open(datetime(2026, 7, 29, 21, 55, 0))
             self.assertEqual(night, Path(temp_dir) / "夜間勤務")
             self.assertEqual(events, ["desktop", daily, "desktop", night])
 
-            next_day = service.check_and_open(datetime(2026, 7, 30, 16, 30, 0))
+            next_day = service.check_and_open(datetime(2026, 7, 30, 10, 45, 0))
             self.assertEqual(next_day, daily)
             self.assertEqual(events[-2:], ["desktop", daily])
 

@@ -9188,6 +9188,66 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                 self.assertEqual((state["date"], state["queries"], state["writes"], state["saves"]),
                                  ("1151101", 1, 0, 0))
 
+    def test_vehicle_settings_retry_explicit_rejection_but_not_unknown_save(self):
+        module = legacy_duty_sheet_module()
+        for outcome in ("retry", "two_rejections", "unknown"):
+            with self.subTest(outcome=outcome):
+                driver, wait = mock.Mock(), mock.Mock()
+                driver.window_handles = ["main", "popup"]
+                wait.until.side_effect = lambda predicate: predicate(driver) or (_ for _ in ()).throw(
+                    module.TimeoutException("fixture wait expired")
+                )
+                driver.execute_script.return_value = True
+                cars = dict(attack="消防車", stop="中繼車", amb1="救護一", amb2="救護二")
+                save_count = 0
+
+                def execute(_script, mode, _values):
+                    nonlocal save_count
+                    if mode == "save":
+                        save_count += 1
+                    return True
+
+                def alerts(*_args, **_kwargs):
+                    if outcome == "unknown":
+                        return []
+                    if save_count == 1 or outcome == "two_rejections":
+                        return ["儲存失敗！"]
+                    driver.window_handles = ["main"]
+                    return ["儲存成功"]
+
+                driver.execute_script.side_effect = execute
+                with mock.patch.object(module, "accept_pending_alerts", side_effect=alerts), \
+                        mock.patch.object(module, "log_status"):
+                    if outcome == "retry":
+                        module.step_select_vehicles_popup(driver, wait, "main", cars)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "車輛設定"):
+                            module.step_select_vehicles_popup(driver, wait, "main", cars)
+                self.assertEqual(save_count, 1 if outcome == "unknown" else 2)
+
+    def test_mission_retries_invalid_fill_reply_before_first_save(self):
+        module, driver, state, wait = self._driver()
+        execute = driver.execute_script.side_effect
+        fill_count = 0
+
+        def first_fill_reply_lost(script, *args):
+            nonlocal fill_count
+            result = execute(script, *args)
+            if args[2] == "fill":
+                fill_count += 1
+                if fill_count == 1:
+                    return None
+            return result
+
+        driver.execute_script.side_effect = first_fill_reply_lost
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]):
+            result = module.step_fill_mission_cells(
+                driver, {"_pln_8_1": "1,2", "_pln_8_2": "3,4"}, "1151101", wait=wait,
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual((fill_count, state["saves"], state["queries"]), (2, 1, 1))
+
     def test_mission_native_save_alert_never_submits_a_second_time(self):
         module, driver, state, wait = self._driver(alert_after_save=True)
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "PACKAGE_DIR", Path(directory)), \

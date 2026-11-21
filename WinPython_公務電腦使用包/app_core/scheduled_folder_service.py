@@ -14,7 +14,7 @@ from typing import Callable
 
 
 SCREENSHOT_FOLDER_SCHEDULE = {
-    "1630": "每日勤務表",
+    "1045": "每日勤務表",
     "2155": "夜間勤務",
 }
 

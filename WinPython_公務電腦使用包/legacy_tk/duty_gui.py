@@ -4331,7 +4331,7 @@ class DutyGui(ctk.CTk):
 
     def check_scheduled_screenshot_folders(self, now: datetime) -> None:
         schedule = {
-            "1630": DAILY_SCREENSHOT_DIR,
+            "1045": DAILY_SCREENSHOT_DIR,
             "2155": NIGHT_SCREENSHOT_DIR,
         }
         folder_name = schedule.get(now.strftime("%H%M"))

@@ -35,7 +35,7 @@ UI 無關服務層，不 import `duty_gui`、Tkinter 或 CustomTkinter：
 - `operational_sync_service.py`、`diagnostics_service.py`：後台事件、值班看板與去敏問題包。
 - `notice_collection_service.py`：沿用通報 Apps Script 的比對、寫入收據與去重規則，保存不含帳密及全文的本機確認紀錄；今日累積於臺灣時間 00:00 分界。
 - `notice_collection_browser.py`、`notice_collection_dom.js`：專用背景 OA Chrome、共用 OCR 自動登入、未讀篩選與分頁完整性、必要內文讀取及入表後已讀查核；新密碼使用全新工作階段驗證。
-- `scheduled_folder_service.py`：16:30／21:55 Windows 截圖資料夾排程。
+- `scheduled_folder_service.py`：10:45／21:55 Windows 截圖資料夾排程。
 
 ## legacy_tk/duty_gui.py（回退）
 
