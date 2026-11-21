@@ -5541,6 +5541,42 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
             data["_unreturned_return_known_departures"] = known
         return service, DutySubmissionRequest("fixture", "fixture", 0, data), fill
 
+    def test_handoff_pauses_for_dispatch_records_and_explicit_legacy_incidents(self) -> None:
+        cases = (
+            ("外勤", "handoff_preflight_ready"),
+            ("外勤防溺巡邏", "handoff_preflight_ready"),
+            ("救護品管會議", "handoff_preflight_ready"),
+            ("案件類別：公務-外勤 案發地點：測試地點", "paused_external"),
+            ("案件類別：其他-臨時勤務 案發地點：測試地點", "paused_external"),
+            ("案件類別： 案發地點：測試地點", "handoff_preflight_ready"),
+            ("案件類別:緊急救護-車禍 案發地點:測試路段", "paused_external"),
+            ("案件類別：火災－雜草 案發地點：測試路段", "paused_external"),
+            ("案件類別：災害搶救-其他 案發地點：測試路段", "paused_external"),
+            ("緊急救護", "paused_external"),
+            ("救災", "paused_external"),
+            ("災害搶救", "paused_external"),
+            ("火警", "paused_external"),
+            ("火災外勤", "paused_external"),
+        )
+        for reason, expected in cases:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                departed = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否", reason]
+                service, request, fill = self._entry_evidence_fixture(directory, [departed])
+                self.assertEqual(service.execute(request).status, expected)
+                fill.assert_not_called()
+
+    def test_ordinary_external_return_does_not_close_an_open_fire_departure(self) -> None:
+        departed = ["115/11/01 08:15", "測試單位", "測試16", "隊員", "出", "否", "火災"]
+        returned = ["115/11/01 09:15", "測試單位", "測試16", "隊員", "入", "是", "外勤"]
+        with tempfile.TemporaryDirectory() as directory:
+            service, request, fill = self._entry_evidence_fixture(directory, [departed, returned])
+            result = service.execute(request)
+            self.assertEqual(result.status, "paused_external")
+            self.assertEqual(result.comparison["unreturned_entry_at"], "2026-11-01T08:15")
+            returned[-1] = "返隊"
+            self.assertEqual(service.execute(request).status, "handoff_preflight_ready")
+            fill.assert_not_called()
+
     @staticmethod
     def _necessary_work_entry(person="測試16", direction="開始", reason="自主訓練", category="必要性工作"):
         row = ["115/11/01 09:00", "測試單位"]

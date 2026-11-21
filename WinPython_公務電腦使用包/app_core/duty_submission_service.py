@@ -25,12 +25,12 @@ from app_core.duty_task_projection import (
 )
 from app_core.schedule_repository import business_roc_date
 from compare_rehearsal_records import (
-    EXTERNAL_ASSIGNMENT_KEYWORDS,
     clean,
     entry_row_fields,
     find_open_external_assignment,
     flatten_rows,
     has_open_external_assignment,
+    is_incident_assignment_reason,
 )
 
 
@@ -1023,7 +1023,7 @@ class DutySubmissionService:
                 code = "entry_reason_missing"
             elif direction in ("入", "簽入", "返隊", "到勤") and (
                 clean(str(fields["reason"] or "")) == "返隊"
-                or any(keyword in str(fields["reason"] or "") for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS)
+                or is_incident_assignment_reason(str(fields["reason"] or ""))
             ):
                 returns.append(row_at)
             if code:

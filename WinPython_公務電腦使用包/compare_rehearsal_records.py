@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-EXTERNAL_ASSIGNMENT_KEYWORDS = ("救護", "救災", "災害搶救", "火警", "火災", "外勤")
+INCIDENT_ASSIGNMENT_TYPES = ("緊急救護", "救護", "救災", "災害搶救", "其他類災害", "火警", "火災")
+_ENTRY_REASON_KEYWORDS = (*INCIDENT_ASSIGNMENT_TYPES, "外勤")
+_CASE_CATEGORY = re.compile(r"^案件類別[：:](.*?)(?=案發地點[：:]|梯次[：:]|$)")
 
 
 class _EntryRowText(str):
@@ -28,6 +30,15 @@ class _EntryRowText(str):
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", "", (value or "").replace("\xa0", ""))
+
+
+def is_incident_assignment_reason(reason: str) -> bool:
+    normalized = clean(unescape(reason))
+    case = _CASE_CATEGORY.match(normalized)
+    if case:
+        return bool(case.group(1))
+    return any(normalized in (kind, kind + "外勤", kind + "出勤", kind + "返隊")
+               for kind in INCIDENT_ASSIGNMENT_TYPES)
 
 
 def work_log_reason_variants(value: str) -> tuple[str, ...]:
@@ -245,7 +256,8 @@ def entry_row_fields(row: str, *, metadata: Mapping[str, Any] | None = None) -> 
     if reason:
         reason_state = (
             "present" if labelled_reason or clean(reason) in explicit_reasons
-            or any(keyword in reason for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS) else "unverified"
+            or _CASE_CATEGORY.match(clean(reason))
+            or any(keyword in reason for keyword in _ENTRY_REASON_KEYWORDS) else "unverified"
         )
     category = ""
     evidence_conflict = invalid_indices
@@ -592,11 +604,11 @@ def find_open_external_assignment(
         reason = str(fields["reason"] or "")
         if fields["evidence_conflict"]:
             continue
-        has_external_keyword = any(keyword in reason for keyword in EXTERNAL_ASSIGNMENT_KEYWORDS)
+        is_incident = is_incident_assignment_reason(reason)
         has_generic_return = (
             row_has_outin(row, "入", external_entry=True) and clean(reason) == "返隊"
         )
-        if not has_external_keyword and not has_generic_return:
+        if not is_incident and not has_generic_return:
             continue
         row_at = _row_datetime(row)
         if row_at is None:
@@ -836,7 +848,7 @@ def compare(json_path: Path, out_path: Path | None = None) -> Path:
     lines = [
         f"{target_date} 預演 vs 系統既有紀錄比對",
         "比對規則：只比對查詢頁可見的時間、人員、出入/勤務項目與主要內容；登打帳號若頁面未顯示則不判定。",
-        "判讀原則：未找到一律標示為未找到；外勤人員不一致或休息前仍有外勤/救災救護未返隊時列為人工確認，不自動補登。",
+        "判讀原則：未找到一律標示為未找到；外勤人員不一致或休息前仍有派遣案件未返隊時列為人工確認，不自動補登。",
         "",
         "===== 出入暨領用無線電機登記簿 =====",
     ]
