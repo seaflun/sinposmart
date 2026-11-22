@@ -1030,6 +1030,10 @@ def verify_work_log_reason_field(
 class WorkLogFormValidationError(RuntimeError):
     diagnostic_category = "work_form_incomplete"
 
+    def __init__(self, message: str, *, field_codes: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.field_codes = field_codes
+
 
 def fill_work_log_form_for_test(
     driver: webdriver.Chrome,
@@ -1157,12 +1161,12 @@ def fill_work_log_form_for_test(
         try:
             reason_result = WebDriverWait(driver, 5, poll_frequency=0.2).until(reason_ready)
         except TimeoutException as exc:
-            raise WorkLogFormValidationError("工作表單事由未填妥，已停止送出。") from exc
+            raise WorkLogFormValidationError("工作表單事由未填妥，已停止送出。", field_codes=("reason",)) from exc
     fill_result["reason"] = reason_result
     fill_result["reason_alerts"] = accept_pending_alerts(driver)
     missing = list(fill_result.get("missing", [])) + list(reason_result.get("missing", []))
     if missing:
-        raise WorkLogFormValidationError("工作表單必填欄位未填妥，已停止送出：" + ", ".join(missing))
+        raise WorkLogFormValidationError("工作表單必填欄位未填妥，已停止送出。", field_codes=tuple(missing))
     content_result = set_work_log_content_fields(driver, fields)
     fill_result["content"] = content_result
 
@@ -1171,7 +1175,7 @@ def fill_work_log_form_for_test(
         verification = verify_work_log_reason_field(driver, fields, reason_result)
         fill_result["reason_verification"] = verification
         if not verification.get("ok"):
-            raise WorkLogFormValidationError("工作表單事由未保留，已停止送出。")
+            raise WorkLogFormValidationError("工作表單事由未保留，已停止送出。", field_codes=("reason_reset",))
     if save and before_save is not None:
         before_save()
     save_result = click_save_control(driver) if save else {"ok": False, "skipped": True}

@@ -9188,42 +9188,98 @@ catch(error){process.stdout.write(JSON.stringify({error:String(error),state:s}))
                 self.assertEqual((state["date"], state["queries"], state["writes"], state["saves"]),
                                  ("1151101", 1, 0, 0))
 
-    def test_vehicle_settings_retry_explicit_rejection_but_not_unknown_save(self):
+    def test_vehicle_settings_retries_until_popup_closes_or_limit_is_reached(self):
         module = legacy_duty_sheet_module()
-        for outcome in ("retry", "two_rejections", "unknown"):
+        cases = (
+            ("rejected", 2, True), ("stays_open", 2, True),
+            ("never_closes", 3, False), ("unknown_reply", 1, False),
+            ("always_rejected", 3, False),
+        )
+        for outcome, expected_clicks, closes in cases:
             with self.subTest(outcome=outcome):
                 driver, wait = mock.Mock(), mock.Mock()
                 driver.window_handles = ["main", "popup"]
-                wait.until.side_effect = lambda predicate: predicate(driver) or (_ for _ in ()).throw(
-                    module.TimeoutException("fixture wait expired")
-                )
-                driver.execute_script.return_value = True
+
+                def until(predicate):
+                    result = predicate(driver)
+                    if result:
+                        return result
+                    raise module.TimeoutException("fixture wait expired")
+
+                wait.until.side_effect = until
                 cars = dict(attack="消防車", stop="中繼車", amb1="救護一", amb2="救護二")
                 save_count = 0
+                fill_count = 0
 
                 def execute(_script, mode, _values):
-                    nonlocal save_count
-                    if mode == "save":
-                        save_count += 1
+                    nonlocal save_count, fill_count
+                    if mode == "fill":
+                        fill_count += 1
+                        return True
+                    save_count += 1
+                    if outcome == "unknown_reply":
+                        return None
+                    if closes and save_count == expected_clicks:
+                        driver.window_handles = ["main"]
                     return True
 
                 def alerts(*_args, **_kwargs):
-                    if outcome == "unknown":
-                        return []
-                    if save_count == 1 or outcome == "two_rejections":
+                    if outcome == "always_rejected" or (outcome == "rejected" and save_count == 1):
                         return ["儲存失敗！"]
-                    driver.window_handles = ["main"]
-                    return ["儲存成功"]
+                    return []
 
                 driver.execute_script.side_effect = execute
                 with mock.patch.object(module, "accept_pending_alerts", side_effect=alerts), \
                         mock.patch.object(module, "log_status"):
-                    if outcome == "retry":
+                    if closes:
                         module.step_select_vehicles_popup(driver, wait, "main", cars)
                     else:
                         with self.assertRaisesRegex(RuntimeError, "車輛設定"):
                             module.step_select_vehicles_popup(driver, wait, "main", cars)
-                self.assertEqual(save_count, 1 if outcome == "unknown" else 2)
+                self.assertEqual(save_count, expected_clicks)
+                self.assertEqual(fill_count, expected_clicks)
+                driver.switch_to.window.assert_called_with("main")
+
+    def test_vehicle_settings_reopens_once_when_options_never_load_before_save(self):
+        module = legacy_duty_sheet_module()
+        driver, wait = mock.Mock(), mock.Mock()
+        driver.window_handles = ["main", "old"]
+        cars = dict(attack="消防車", stop="中繼車", amb1="救護一", amb2="救護二")
+        actions = []
+        window = "old"
+
+        def switch(handle):
+            nonlocal window
+            window = handle
+
+        def until(predicate):
+            result = predicate(driver)
+            if result:
+                return result
+            raise module.TimeoutException("fixture wait expired")
+
+        def execute(_script, mode, _values):
+            actions.append((window, mode))
+            if window == "old":
+                return False
+            if mode == "save":
+                driver.window_handles = ["main"]
+            return True
+
+        driver.switch_to.window.side_effect = switch
+        wait.until.side_effect = until
+        driver.execute_script.side_effect = execute
+        driver.close.side_effect = lambda: setattr(driver, "window_handles", ["main"])
+
+        def reopen(_driver, _date):
+            driver.window_handles = ["main", "new"]
+
+        with mock.patch.object(module, "step_open_mission_vehicle_settings", side_effect=reopen) as open_popup, \
+                mock.patch.object(module, "accept_pending_alerts", return_value=[]), mock.patch.object(module, "log_status"):
+            module.step_select_vehicles_popup(driver, wait, "main", cars, target_date="1151123")
+        open_popup.assert_called_once_with(driver, "1151123")
+        driver.close.assert_called_once()
+        self.assertEqual(actions, [("old", "fill"), ("new", "fill"), ("new", "save")])
 
     def test_mission_retries_invalid_fill_reply_before_first_save(self):
         module, driver, state, wait = self._driver()

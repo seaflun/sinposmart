@@ -322,9 +322,6 @@ class DutyEntryQueueWorker(QObject):
                 self._browser_session,
                 status_callback=lambda message: self.progress.emit(request_id, message),
             )
-            self._mark_browser_session_active()
-            return result
-
         except DutySubmissionExecutionError as exc:
             if exc.error_code == "invalid_credentials":
                 self._rejected_credentials_session = (request.session_generation, request.user_id)
@@ -333,25 +330,35 @@ class DutyEntryQueueWorker(QObject):
                 f"{self._lane_label}登入狀態已失效，正在重新登入後重試一次。"
                 if session_expired else _browser_retry_message(exc, self._lane_label)
             )
-            self._close_browser_session()
             if not retry_message:
-                raise
-            self.progress.emit(request_id, retry_message)
-            try:
-                self._browser_session = self._service.open_browser_session(
-                    request,
-                    status_callback=lambda message: self.progress.emit(request_id, message),
-                )
-                result = self._service.execute_with_browser_session(
-                    request,
-                    self._browser_session,
-                    status_callback=lambda message: self.progress.emit(request_id, message),
-                )
-            except Exception:
                 self._close_browser_session()
                 raise
-            self._mark_browser_session_active()
-            return result
+        else:
+            if not (
+                request.trigger_type == "due" and request.save and result.status == "review_required"
+                and result.comparison.get("confirmation_state") == "form_not_submitted"
+                and result.comparison.get("confirmation_error_code") == "work_form_incomplete"
+            ):
+                self._mark_browser_session_active()
+                return result
+            retry_message = "工作表單未完成且尚未送出，重開瀏覽器後自動重試一次。"
+        self._close_browser_session()
+        self.progress.emit(request_id, retry_message)
+        try:
+            self._browser_session = self._service.open_browser_session(
+                request,
+                status_callback=lambda message: self.progress.emit(request_id, message),
+            )
+            result = self._service.execute_with_browser_session(
+                request,
+                self._browser_session,
+                status_callback=lambda message: self.progress.emit(request_id, message),
+            )
+        except Exception:
+            self._close_browser_session()
+            raise
+        self._mark_browser_session_active()
+        return result
 
     def _execute_without_browser_session(
         self,

@@ -2651,6 +2651,7 @@ class AppController(QObject):
                 trigger_type=request.trigger_type,
                 action=action,
                 result_ref=Path(result.result_path).name,
+                error=result.message if confirmation_state == "form_not_submitted" else "",
                 snapshot=result_snapshot,
                 **self._submission_event_fields(request, action),
             )

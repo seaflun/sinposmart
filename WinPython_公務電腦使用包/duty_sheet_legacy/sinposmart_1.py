@@ -1751,7 +1751,7 @@ def step_config_popups(driver, wait, out_duty_names, daily_commander, main_windo
     if not step_prepare_content(driver, wait):
         raise RuntimeError("外勤設定後，勤務基準表未重新載入。")
 
-def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
+def step_select_vehicles_popup(driver, wait, main_window, cars_dict, *, target_date=""):
     log_status("➡️ 正在鎖定車輛設定視窗...")
 
     def find_popup(candidate):
@@ -1766,7 +1766,12 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
     vehicle_form = r"""
     const [mode, values] = arguments;
     if (location.origin !== 'https://dutymgt.tyfd.gov.tw' ||
-        !location.pathname.startsWith('/tyfd119/') || document.readyState !== 'complete') return false;
+        !location.pathname.startsWith('/tyfd119/')) {
+        return mode === 'fill' ? {rejection_code: 'unauthorized_origin'} : false;
+    }
+    if (document.readyState !== 'complete') {
+        return mode === 'fill' ? {rejection_code: 'document_not_ready'} : false;
+    }
     const ids = ['_selCALL_TYPEA', '_selCALL_TYPEB', '_selCALL_TYPEF', '_selCALL_TYPEG'];
     const selections = ids.map((id, index) => {
         const controls = document.querySelectorAll('[id="' + id + '"]');
@@ -1780,7 +1785,12 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
             !option.disabled && option.text.includes(key));
         return matches.length === 1 ? [field, matches[0]] : null;
     });
-    if (selections.some(selection => !selection)) return false;
+    const unavailable = ids.filter((id, index) => !selections[index]);
+    if (unavailable.length) {
+        return mode === 'fill'
+            ? {rejection_code: 'vehicle_popup_options_unconfirmed', missing_ids: unavailable}
+            : false;
+    }
     if (mode === 'fill') {
         for (const [field, option] of selections) {
             if (field.selectedIndex === option.index) continue;
@@ -1802,21 +1812,43 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
     """
     values = [cars_dict[key] for key in ("attack", "stop", "amb1", "amb2")]
 
+    state = {}
+
+    def fill(candidate):
+        nonlocal state
+        result = candidate.execute_script(vehicle_form, "fill", values)
+        state = result if isinstance(result, dict) else {}
+        return result is True
+
     try:
-        for attempt in range(2):
+        driver.switch_to.window(popup)
+        try:
+            wait.until(fill)
+        except TimeoutException:
+            if not target_date or state.get("rejection_code") == "unauthorized_origin":
+                raise _mission_failure("vehicle_options_unconfirmed", target_date, state, stage="vehicle_form_open") from None
+            log_status("⚠️ 車輛設定選項未就緒，重新開啟小視窗再核對一次。")
+            driver.close()
+            driver.switch_to.window(main_window)
+            step_open_mission_vehicle_settings(driver, target_date)
+            popup = wait.until(find_popup)
             driver.switch_to.window(popup)
             try:
-                wait.until(lambda d: d.execute_script(vehicle_form, "fill", values) is True)
+                wait.until(fill)
             except TimeoutException:
-                raise RuntimeError("救災任務編組表車輛設定選項未確認，未送出。") from None
+                raise _mission_failure("vehicle_options_unconfirmed", target_date, state, stage="vehicle_form_open") from None
 
+        for attempt in range(3):
+            driver.switch_to.window(popup)
             messages = []
             dispatched = False
+            click_confirmed = False
 
             def submit(candidate):
-                nonlocal dispatched
+                nonlocal dispatched, click_confirmed
                 dispatched = True
                 result = candidate.execute_script(vehicle_form, "save", values)
+                click_confirmed = result is True
                 if result is False:
                     dispatched = False
                 return result is not False
@@ -1835,16 +1867,26 @@ def step_select_vehicles_popup(driver, wait, main_window, cars_dict):
                 re.fullmatch(r"(?:車[輛輌辆]設定)?(?:儲存|存檔|保存)(?:資料)?失敗[。！!]*", message.strip())
                 for message in messages
             )
+            if not rejected:
+                try:
+                    wait_for_popup_close_and_return_to_main(driver, wait, main_window, popup)
+                except RuntimeError:
+                    pass
+                else:
+                    return
+            if attempt < 2 and (click_confirmed or rejected) and popup in driver.window_handles:
+                driver.switch_to.window(popup)
+                try:
+                    wait.until(fill)
+                except TimeoutException:
+                    raise _mission_failure(
+                        "vehicle_retry_options_unconfirmed", target_date, state, save_attempted=True, stage="vehicle_form_open",
+                    ) from None
+                log_status("⚠️ 車輛設定視窗仍開啟，重新核對原選項後再按確認送出。")
+                continue
             if rejected:
-                if attempt == 0 and popup in driver.window_handles:
-                    log_status("⚠️ 車輛設定儲存遭拒，重新核對選項並重試一次。")
-                    continue
                 raise RuntimeError("救災任務編組表車輛設定儲存遭拒，已停止後續登打。")
-            try:
-                wait_for_popup_close_and_return_to_main(driver, wait, main_window, popup)
-            except RuntimeError:
-                raise RuntimeError("救災任務編組表車輛設定已嘗試儲存，結果尚未確認，已停止後續登打。") from None
-            return
+            raise RuntimeError("救災任務編組表車輛設定視窗未確認關閉，已停止後續登打。")
     finally:
         try:
             driver.switch_to.window(main_window)
@@ -2196,6 +2238,8 @@ def _mission_failure(reason, target_date, state=None, *, save_attempted=False, s
         "navigation": "救災任務編組表導覽尚未確認，已停止後續登打。",
         "not_ready": "救災任務編組表尚未確認正確日期與完整欄位，未執行填寫或儲存。",
         "fill_failed": "救災任務編組表欄位填寫未完整確認，未執行儲存。",
+        "vehicle_options_unconfirmed": "救災任務編組表車輛設定選項未確認，未送出。",
+        "vehicle_retry_options_unconfirmed": "救災任務編組表車輛設定重試前無法核對原選項，已停止後續登打。",
         "save_unknown": "救災任務編組表已嘗試儲存，但重新載入尚未確認，請勿重複送出。",
         "query_unknown": "救災任務編組表儲存後重新查詢尚未確認，未確認完成。",
         "readback_mismatch": "救災任務編組表重新查詢資料不一致，未確認完成。",
@@ -2216,7 +2260,7 @@ def _mission_failure(reason, target_date, state=None, *, save_attempted=False, s
             "marker_form_mismatch", "date_not_unique", "query_not_unique", "save_not_unique",
             "mission_form_not_unique", "mission_form_missing", "document_not_replaced",
             "frame_unavailable", "menu_item_unconfirmed", "vehicle_popup_unconfirmed",
-            "vehicle_button_not_unique", "vehicle_button_unavailable", "document_not_ready",
+            "vehicle_button_not_unique", "vehicle_button_unavailable", "vehicle_popup_options_unconfirmed", "document_not_ready",
             "date_mismatch", "fields_missing", "fields_not_writable", "save_unavailable",
             "query_unavailable", "fill_document_changed", "field_value_mismatch", "field_assignment_failed",
             "field_event_failed", "browser_script_error", "invalid_browser_reply"}:
@@ -2236,7 +2280,7 @@ def _mission_failure(reason, target_date, state=None, *, save_attempted=False, s
         ids = state.get(key)
         if key == "missing_ids" or isinstance(ids, list):
             payload[key] = [value for value in (ids[:200] if isinstance(ids, list) else [])
-                            if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}", value)]
+                            if isinstance(value, str) and re.fullmatch(r"_pln_\d{1,2}_\d{1,2}|_selCALL_TYPE[ABFG]", value)]
     temporary = None
     try:
         folder = PACKAGE_DIR / "runtime_outputs" / "browser"
@@ -2682,7 +2726,7 @@ def start_automation(
             step_navigate_to_task_table(driver, wait, target_date)
             
             step_open_mission_vehicle_settings(driver, target_date)
-            step_select_vehicles_popup(driver, wait, driver.current_window_handle, cars_config)
+            step_select_vehicles_popup(driver, wait, driver.current_window_handle, cars_config, target_date=target_date)
             
             log_status("➡️ 等待救災任務編組表載入...")
             driver.switch_to.default_content()

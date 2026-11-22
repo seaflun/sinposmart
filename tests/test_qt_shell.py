@@ -5266,6 +5266,53 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
         self.assertEqual(refreshed["fields"]["處理情形"], "一、時間:10:00-12:20")
         self.assertEqual(refreshed_scheduled["fields"]["處理情形"], "一、時間:10:00-12:20")
 
+    def test_due_work_retries_unsubmitted_form_validation_once_in_fresh_browser(self) -> None:
+        from datetime import datetime
+
+        from app_core.duty_submission_service import DutySubmissionRequest, DutySubmissionService
+        from duty_rehearsal import WorkLogFormValidationError
+        from qt_app.workers.duty_submission_worker import DutyEntryQueueWorker
+
+        for fail_again in (False, True):
+            with self.subTest(fail_again=fail_again), tempfile.TemporaryDirectory() as directory:
+                _action, row, data = self._training_readback_fixture()
+                row[4] = "體技能訓練"
+                first, second = object(), object()
+                saves = []
+                now = datetime(2026, 10, 7, 17, 1)
+
+                def fill(driver, _action, _staff, _date, *, save, before_save):
+                    if driver is first or fail_again:
+                        raise WorkLogFormValidationError("表單尚未填妥。", field_codes=("item",))
+                    self.assertTrue(save)
+                    before_save()
+                    saves.append(driver)
+                    return {}
+
+                automation = SimpleNamespace(
+                    WORK_LOG_AP="work", ENTRY_LOG_AP="entry",
+                    build_driver=Mock(side_effect=[first, second]),
+                    login=Mock(), quit_driver=Mock(),
+                    query_visible_table=lambda *_a, **_k: [row] if saves else [],
+                    fill_work_log_form_for_test=fill,
+                )
+                service = DutySubmissionService(
+                    Path(directory), module_loader=lambda: automation, now_factory=lambda: now,
+                )
+                worker = DutyEntryQueueWorker(service, now_factory=lambda: now, lane_label="工作")
+                try:
+                    result = worker._execute(1, DutySubmissionRequest("fixture-user", "fixture-password", 0, data))
+                    self.assertEqual(result.status, "review_required" if fail_again else "submitted")
+                    self.assertEqual(saves, [] if fail_again else [second])
+                    self.assertEqual(automation.login.call_count, 2)
+                    automation.quit_driver.assert_any_call(first)
+                    if fail_again:
+                        self.assertEqual(result.comparison["confirmation_state"], "form_not_submitted")
+                        self.assertEqual(result.comparison["form_validation_fields"], ["item"])
+                        self.assertIn("勤務項目", result.message)
+                finally:
+                    worker._close_browser_session()
+
     def test_due_work_reopens_browser_once_after_schedule_read_timeout(self) -> None:
         from datetime import date, datetime
 
@@ -5289,7 +5336,7 @@ process.stdout.write(JSON.stringify({result,state:controls.map(c=>({id:c.id,tagN
                 def query_duty_sheet(driver, _date):
                     reads.append(driver)
                     if (scenario != "after_save" and driver is first_driver) or scenario == "retry_timeout":
-                        raise TimeoutException("Timed out receiving message from renderer")
+                        raise TimeoutException()
                     return object()
 
                 def query_records(*_args, **_kwargs):

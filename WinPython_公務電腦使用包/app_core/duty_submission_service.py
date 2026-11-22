@@ -567,12 +567,19 @@ class DutySubmissionService:
         result_path: Path, exc: Exception,
     ) -> DutySubmissionResult:
         pending = self._work_save_state(action, action_date) == "pending"
+        field_labels = {"date": "日期", "hour": "時", "minute": "分", "item": "勤務項目",
+                        "reason": "事由", "reason_reset": "事由未保留"}
+        field_codes = [code for code in getattr(exc, "field_codes", ()) if code in field_labels]
+        message = "送出狀態尚待確認，已停止自動重送。"
+        if not pending:
+            detail = "、".join(field_labels[code] for code in field_codes) or "必填欄位"
+            message = f"工作表單未完成（{detail}），已停止送出。"
         return self._finish(
-            request, action, result_path, "review_required",
-            "送出狀態尚待確認，已停止自動重送。" if pending else "工作表單事由或必填欄位未填妥，已停止送出。",
+            request, action, result_path, "review_required", message,
             {"group": "review", "matched": [],
              "confirmation_state": "saved_not_verified" if pending else "form_not_submitted",
-             "confirmation_error_code": str(getattr(exc, "diagnostic_category", "") or self._safe_error(exc)[1])},
+             "confirmation_error_code": str(getattr(exc, "diagnostic_category", "") or self._safe_error(exc)[1]),
+             "form_validation_fields": field_codes},
         )
 
     def _finish_stale_request(
@@ -1498,6 +1505,8 @@ class DutySubmissionService:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        from selenium.common.exceptions import TimeoutException
+
         from duty_rehearsal import is_duty_session_expired
 
         if getattr(exc, "error_code", "") == "session_expired" or is_duty_session_expired(str(exc)):
@@ -1523,7 +1532,7 @@ class DutySubmissionService:
         lowered = text.lower()
         if any(marker in text for marker in ("登入失敗", "帳號或密碼", "重新登入")):
             return "登入失敗：請登出後重新登入系統。", "login_failed"
-        if "timeout" in lowered or "timed out" in lowered or "逾時" in text:
+        if isinstance(exc, TimeoutException) or "timeout" in lowered or "timed out" in lowered or "逾時" in text:
             return "網頁等待逾時，請檢查網站狀態。", "timeout"
         if "nosuchelement" in lowered or "no such element" in lowered:
             return "找不到網頁元素，網站可能已改版。", "no_such_element"
