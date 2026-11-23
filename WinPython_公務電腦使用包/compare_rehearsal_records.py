@@ -41,6 +41,16 @@ def is_incident_assignment_reason(reason: str) -> bool:
                for kind in INCIDENT_ASSIGNMENT_TYPES)
 
 
+def work_log_item_variants(value: str) -> tuple[str, ...]:
+    """Match the portal's work-log label and the planned overnight-duty labels."""
+    item = str(value or "").strip()
+    duty_items = ("值班", "值班(宿)", "值班（宿）")
+    normalized = clean(item)
+    if normalized in duty_items:
+        return (normalized, *(label for label in duty_items if label != normalized))
+    return (item,)
+
+
 def work_log_reason_variants(value: str) -> tuple[str, ...]:
     """Accept the official physical-training label and existing planned spelling."""
 
@@ -466,6 +476,7 @@ def find_work_matches(
     fields = action["fields"]
     time_value = fields.get("工作時間", action["time"])
     item = fields.get("勤務項目", "")
+    item_variants = {clean(value) for value in work_log_item_variants(item)}
     source = action.get("source", "")
     is_radio_test = source in ("無線電試話", "無線電測試")
     is_drowning_patrol = source == "防溺車巡"
@@ -487,7 +498,7 @@ def find_work_matches(
         full_work_row = len(cells) >= 8
         item_cell = cells[3] if full_work_row else cells[1] if len(cells) > 1 else ""
         reason_cell = cells[4] if full_work_row else cells[2] if len(cells) > 2 else ""
-        if item and clean(item) != item_cell:
+        if item and item_cell not in item_variants:
             continue
         if is_radio_test:
             if "無線電" not in c:

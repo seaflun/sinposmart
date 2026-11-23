@@ -3605,6 +3605,52 @@ class DutySubmissionServiceTests(unittest.TestCase):
                     driver, action["fields"], result["fill"]["reason"],
                 )["ok"])
 
+    @unittest.skipUnless(os.environ.get("SINPOSMART_FORM_TEST_CHROMEDRIVER"), "未設定本機表單測試 ChromeDriver")
+    def test_browser_selects_official_duty_item_for_overnight_work(self) -> None:
+        from urllib.parse import quote
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        import duty_rehearsal as automation
+
+        options = Options()
+        options.add_argument("--headless=new")
+        service = Service(executable_path=os.environ["SINPOSMART_FORM_TEST_CHROMEDRIVER"],
+                          log_output=subprocess.DEVNULL)
+        driver = webdriver.Chrome(service=service, options=options)
+        self.addCleanup(driver.quit)
+        driver.get("data:text/html;charset=utf-8," + quote("""
+            <input id="_txtDATE">
+            <select id="_selTIMEH"><option value="20">20</option></select>
+            <select id="_selTIMEM"><option value="00">00</option></select>
+            <select id="_selList"><option value="">請選擇</option>
+              <option value="1">備勤</option><option value="2">值班</option></select>
+            <select id="_selList2"><option value="">請選擇</option></select>
+            <textarea id="_areDescription"></textarea><textarea id="_areStatus"></textarea>
+        """))
+        action = {"kind": "work_log", "source": "值班交接", "time": "20:00",
+                  "fields": {"勤務項目": "值班(宿)", "工作概述": "測試概述", "處理情形": "測試交接"}}
+        with patch.object(automation, "ensure_ap", return_value=False):
+            result = automation.fill_work_log_form_for_test(driver, action, {}, "1151123", save=False)
+        self.assertTrue(result["save"]["skipped"])
+        self.assertEqual(driver.find_element("id", "_selList").get_attribute("value"), "2")
+        self.assertEqual(driver.find_element("id", "_areDescription").get_attribute("value"), "測試概述")
+
+    def test_overnight_work_readback_matches_duty_alias_and_checks_person(self) -> None:
+        from app_core.duty_task_projection import compare_submission_action
+
+        action = {"kind": "work_log", "source": "值班交接", "time": "20:00",
+                  "fields": {"勤務項目": "值班(宿)", "服勤人員": ["10"]}}
+        data = {"target_date": "1151123", "today": {"staff": {"10": {"name": "測試甲"}}}, "actions": [action]}
+        for item, person, group in (
+            ("值班", "測試甲", "done"), ("值班(宿)", "測試甲", "done"),
+            ("值班（宿）", "測試甲", "done"), ("備勤", "測試甲", "todo"), ("值班", "測試乙", "todo"),
+        ):
+            with self.subTest(item=item, person=person):
+                row = ["1151123\n20:00", "大隊", "分隊", item, "", "交接", "完成", person, "1", "0", "無", "作者", ""]
+                result = compare_submission_action(data, action, "1151123", {"visible_work_rows": [row]})
+                self.assertEqual(result["group"], group)
+
     def test_training_with_missing_reason_is_reviewed_without_resending(self) -> None:
         from datetime import datetime
         from app_core.duty_task_projection import build_schedule_comparisons, compare_submission_action

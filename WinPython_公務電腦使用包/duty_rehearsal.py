@@ -31,7 +31,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from compare_rehearsal_records import work_log_reason_variants
+from compare_rehearsal_records import work_log_item_variants, work_log_reason_variants
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
@@ -1126,8 +1126,7 @@ def fill_work_log_form_for_test(
           if (exactOnly) return false;
           return text.includes(target);
         }
-        function byOptionText(value) {
-          const exactOnly = String(value || '').trim() === '其他';
+        function byOptionText(value, exactOnly) {
           const el = visibleControls().find(control =>
             control.tagName.toLowerCase() === 'select' &&
             Array.from(control.options || []).some(opt => optionMatches(opt, value, exactOnly))
@@ -1139,14 +1138,15 @@ def fill_work_log_form_for_test(
         if (!byIds(['_selTIMEM', '_selSTIMEM', '_selTimeM', '_selMM', '_selMIN'], values.minute)) result.missing.push('minute');
         byIds(['_selETIMEH', '_selETimeH'], values.hour);
         byIds(['_selETIMEM', '_selETimeM'], values.minute);
-        if (!byOptionText(values.item)) result.missing.push('item');
+        const exactItem = values.items.length > 1 || values.items[0] === '其他';
+        if (!values.items.some(item => byOptionText(item, exactItem))) result.missing.push('item');
         return result;
         """,
         {
             "date": target_roc_date,
             "hour": hour,
             "minute": minute,
-            "item": fields.get("勤務項目", ""),
+            "items": work_log_item_variants(fields.get("勤務項目", "")),
             "accept_replace_confirm": action.get("source") == DROWNING_PATROL_KEYWORD,
         },
     )
