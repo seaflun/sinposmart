@@ -7421,6 +7421,122 @@ class RestMonthlyServiceTests(unittest.TestCase):
         self.assertIn(driver, module.RETAINED_DRIVERS)
         module.RETAINED_DRIVERS.remove(driver)
 
+    def test_rest_submission_verifies_table_and_month_after_notices(self) -> None:
+        import rest_time_automation as module
+        from selenium.common.exceptions import InvalidSessionIdException, NoAlertPresentException
+
+        for interruption in (
+            "navigation", "table_read", "month_query", "month_query_pending", "wrong_month", "browser_lost",
+        ):
+            with self.subTest(interruption=interruption):
+                events: list[str] = []
+
+                class Driver:
+                    pending = False
+                    raised = False
+
+                    @property
+                    def switch_to(self):
+                        return self
+
+                    @property
+                    def alert(self):
+                        if not self.pending:
+                            raise NoAlertPresentException()
+                        return self
+
+                    def accept(self):
+                        events.append("notice_acknowledged")
+                        self.pending = False
+
+                    def show_notice(self):
+                        self.pending = True
+                        self.raised = True
+                        raise module.UnexpectedAlertPresentException("notice", alert_text="休息時數未達標準")
+
+                    def execute_script(self, script, *_args):
+                        if "innerText.includes" in script:
+                            if interruption == "table_read" and not self.raised:
+                                self.show_notice()
+                            assert not self.pending
+                            events.append("table_ready")
+                            return True
+                        if "deepFindControls" in script:
+                            if interruption == "month_query":
+                                self.show_notice()
+                            if interruption == "month_query_pending":
+                                self.pending = True
+                                return None
+                            return {"ok": True, "okYear": True, "okMonth": True}
+                        assert not self.pending
+                        if interruption == "wrong_month":
+                            return "目前編輯月份為:115年10月"
+                        events.append("month_verified")
+                        return "目前編輯月份為:115年11月"
+
+                class ImmediateWait:
+                    def __init__(self, driver, _timeout):
+                        self.driver = driver
+
+                    def until(self, predicate):
+                        for _attempt in range(3):
+                            if result := predicate(self.driver):
+                                return result
+                        raise module.TimeoutException()
+
+                def open_page(driver, _ap):
+                    if interruption == "browser_lost":
+                        raise InvalidSessionIdException()
+                    if interruption == "navigation":
+                        driver.show_notice()
+
+                driver = Driver()
+
+                def build_driver(*, initialize, **_kwargs):
+                    initialize(driver)
+                    return driver
+
+                def submit():
+                    return module.submit_rest_entries(
+                        "fixture-user", "fixture-secret", Path("fixture.xlsm"), False,
+                        actor_name="測試人員", expected_roc_year=115, expected_month=11,
+                    )
+
+                with patch.multiple(
+                    module,
+                    validate_workbook_year_month=Mock(),
+                    parse_rest_entries=Mock(return_value=[module.RestEntry(25, 25, 8, 25, 10)]),
+                    build_initialized_driver=Mock(side_effect=build_driver),
+                    login=Mock(),
+                    open_ap=Mock(side_effect=open_page),
+                    WebDriverWait=ImmediateWait,
+                    find_person_link=Mock(return_value=module.PersonLink("測試人員", "10", 0)),
+                    open_person_popup=Mock(),
+                    delete_duplicate_rest_rows=Mock(return_value=0),
+                    existing_entry_match=Mock(return_value=None),
+                    fill_and_insert_entry=Mock(side_effect=lambda *_: events.append("fill")),
+                    close_current_popup=Mock(),
+                    click_person_save=Mock(side_effect=lambda *_: events.append("save")),
+                    quit_driver=Mock(),
+                ), patch.object(module.time, "sleep"):
+                    if interruption == "browser_lost":
+                        with self.assertRaises(InvalidSessionIdException):
+                            submit()
+                    elif interruption == "wrong_month":
+                        with self.assertRaisesRegex(RuntimeError, "115年11月"):
+                            submit()
+                    else:
+                        self.assertIn("已按個人儲存", submit())
+
+                if interruption in {"browser_lost", "wrong_month"}:
+                    self.assertNotIn("fill", events)
+                    self.assertNotIn("save", events)
+                else:
+                    self.assertEqual(events.count("notice_acknowledged"), 1)
+                    self.assertLess(events.index("table_ready"), events.index("fill"))
+                    self.assertLess(events.index("month_verified"), events.index("fill"))
+                    self.assertEqual(events[-2:], ["fill", "save"])
+
     def test_monthly_base_submission_keeps_browser_after_save(self) -> None:
         import rest_time_automation as module
 

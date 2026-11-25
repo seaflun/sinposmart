@@ -4031,6 +4031,7 @@ def _write_duty_browser_startup_diagnostic(
     actual_attempts: int = 0,
     in_progress: bool = False,
     blocking_stage: str = "",
+    session_error: WebDriverException | None = None,
 ) -> None:
     """Persist a credential-free startup record for the QML issue package."""
 
@@ -4041,6 +4042,8 @@ def _write_duty_browser_startup_diagnostic(
         "attempts": attempts,
         "profiles_pruned": profiles_pruned,
     }
+    if session_error is not None:
+        payload["session_error_type"] = type(session_error).__name__
     if startup_stage in CHROME_STARTUP_STAGE_MESSAGES:
         payload.update(startup_stage=startup_stage,
                        context=context if context in {"duty", "notice", "notice_verify"} else "duty",
@@ -4276,6 +4279,7 @@ def retry_duty_browser_session_open(
                         category="browser_session_open",
                         attempts=attempt,
                         profiles_pruned=0,
+                        session_error=exc,
                     )
                 continue
             if write_diagnostics:
@@ -4284,6 +4288,7 @@ def retry_duty_browser_session_open(
                     category="browser_session_open",
                     attempts=session_attempts,
                     profiles_pruned=0,
+                    session_error=exc,
                 )
             raise DutyBrowserSessionOpenError(attempts=session_attempts) from exc
         except BaseException:

@@ -4122,34 +4122,36 @@ try {
         first_driver = object()
         second_driver = object()
         cleaned: list[object] = []
-        diagnostics: list[tuple[str, str, int]] = []
+        from selenium.common.exceptions import InvalidSessionIdException
 
         def initialize(driver: object) -> None:
             if driver is first_driver:
-                raise module.WebDriverException("invalid session id")
+                raise InvalidSessionIdException("private session detail")
 
-        with mock.patch.object(
-            module,
-            "_write_duty_browser_startup_diagnostic",
-            side_effect=lambda event, **payload: diagnostics.append(
-                (event, payload["category"], payload["attempts"])
-            ),
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            module, "__file__", str(Path(directory) / "source.py"),
         ):
             result = module.retry_duty_browser_session_open(
                 mock.Mock(side_effect=[first_driver, second_driver]),
                 initialize,
                 cleanup=cleaned.append,
             )
+            [log] = (Path(directory) / "runtime_outputs/browser").glob("browser_startup_*.jsonl")
+            raw_log = log.read_text(encoding="utf-8")
+            diagnostics = [json.loads(line) for line in raw_log.splitlines()]
 
         self.assertIs(result, second_driver)
         self.assertEqual(cleaned, [first_driver])
         self.assertEqual(
-            diagnostics,
+            [(row["event"], row["category"], row["attempts"]) for row in diagnostics],
             [
                 ("session_open_retry", "browser_session_open", 1),
                 ("session_open_recovered", "browser_session_open", 2),
             ],
         )
+        self.assertEqual(diagnostics[0]["session_error_type"], "InvalidSessionIdException")
+        self.assertNotIn("session_error_type", diagnostics[1])
+        self.assertNotIn("private session detail", raw_log)
 
     def test_prewrite_session_open_does_not_retry_page_timeout(self) -> None:
         module = duty_rehearsal_module()

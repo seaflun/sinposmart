@@ -328,8 +328,7 @@ def submit_rest_entries(
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
         report_stage("form_open")
-        open_ap(driver, DUTY_BASE_AP)
-        wait_for_main_table(driver)
+        open_duty_base_table(driver)
 
     report_stage("browser_start")
     driver = None
@@ -341,7 +340,7 @@ def submit_rest_entries(
         driver = build_initialized_driver(headless=headless, initialize=initialize_browser)
         if expected_roc_year is not None and expected_month is not None:
             status(f"切換到 {format_roc_year_month(expected_roc_year, expected_month)} 並查詢...")
-            select_base_month(driver, expected_roc_year, expected_month)
+            select_base_month(driver, expected_roc_year, expected_month, acknowledge_alerts=True)
         person = find_person_link(
             driver,
             user_id,
@@ -422,11 +421,7 @@ def submit_monthly_base_entries(
         login(driver, user_id, password)
         status("登入完成，開啟勤務基準表...")
         report_stage("form_open")
-        try:
-            open_ap(driver, DUTY_BASE_AP)
-        except UnexpectedAlertPresentException as exc:
-            acknowledge_base_page_alert(driver, exc)
-        wait_for_main_table(driver, acknowledge_alerts=True)
+        open_duty_base_table(driver)
 
     report_stage("browser_start")
     driver = None
@@ -747,6 +742,9 @@ def select_base_month(driver, roc_year: int, month: int, *, acknowledge_alerts: 
         f"{month:02d}",
     )
     notice_acknowledged = bool(result and result.get("notice_acknowledged"))
+    if result is None and acknowledge_alerts:
+        # Chrome can return None early while the query's dialog is still open.
+        notice_acknowledged = acknowledge_base_page_alert(driver)
     if not notice_acknowledged and (not result or not result.get("ok")):
         raise RuntimeError("勤務基準表找不到年月與查詢欄位。")
     if not notice_acknowledged and (not result.get("okYear") or not result.get("okMonth")):
@@ -962,6 +960,15 @@ def click_person_row_save(driver, person_name: str) -> None:
         raise RuntimeError(f"找不到 {person_name} 那一列的個人儲存按鈕 O。")
     wait_for_alert_if_any(driver)
     time.sleep(1)
+
+
+def open_duty_base_table(driver) -> None:
+    """Open and verify the duty base table before editing any rows."""
+    try:
+        open_ap(driver, DUTY_BASE_AP)
+    except UnexpectedAlertPresentException as exc:
+        acknowledge_base_page_alert(driver, exc)
+    wait_for_main_table(driver, acknowledge_alerts=True)
 
 
 def acknowledge_base_page_alert(driver, error: UnexpectedAlertPresentException | None = None) -> bool:
