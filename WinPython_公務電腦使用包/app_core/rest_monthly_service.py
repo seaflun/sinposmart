@@ -11,8 +11,10 @@ from datetime import date
 from pathlib import Path
 from types import ModuleType
 from typing import Callable
+from zipfile import BadZipFile, ZipFile
 
 
+REST_WORKBOOK_READ_ERROR = "勤務表 Excel 無法讀取。請確認檔案已儲存或同步完成，再重新選擇 .xlsx 或 .xlsm 檔。"
 LEGACY_MODULE_NAME = "_sinposmart_qt_rest_monthly_automation"
 LEGACY_SCRIPT_NAME = "rest_time_automation.py"
 
@@ -121,14 +123,10 @@ class RestMonthlyService:
         workbook_path: str | Path,
         today: date | None = None,
     ) -> RestMonthlyDefaults:
-        workbook = Path(str(workbook_path or "").strip()).expanduser()
-        if not workbook.is_absolute():
-            workbook = self.package_root / workbook
-        workbook = workbook.resolve()
-        if not workbook.is_file() or workbook.suffix.lower() not in (".xlsx", ".xlsm"):
-            raise RestMonthlyValidationError("請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
+        workbook = self._validate_rest_workbook_path(workbook_path)
+        defaults = self._rest_defaults(workbook, today, use_saved_month=False)
         self._save_workbook_path(workbook)
-        return self._rest_defaults(workbook, today, use_saved_month=False)
+        return defaults
 
     def _rest_defaults(
         self,
@@ -150,10 +148,10 @@ class RestMonthlyService:
                     workbook_month = int(book.worksheets[0].cell(row=2, column=5).value)
                 finally:
                     book.close()
-                if workbook_month in self._nearby_months(current_month):
+                if workbook_month in month_options:
                     selected_month = workbook_month
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RestMonthlyValidationError(REST_WORKBOOK_READ_ERROR) from exc
         if use_saved_month:
             selected_month = self._saved_month("rest_month", month_options, selected_month)
         return RestMonthlyDefaults(
@@ -182,12 +180,7 @@ class RestMonthlyService:
 
     def validate_rest(self, request: RestTimeRequest) -> RestTimeRequest:
         self._validate_identity(request.user_id, request.password, request.actor_no, request.actor_name)
-        workbook = Path(str(request.workbook_path or "").strip()).expanduser()
-        if not workbook.is_absolute():
-            workbook = self.package_root / workbook
-        workbook = workbook.resolve()
-        if not workbook.is_file() or workbook.suffix.lower() not in (".xlsx", ".xlsm"):
-            raise RestMonthlyValidationError("請選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
+        workbook = self._validate_rest_workbook_path(request.workbook_path)
         self._validate_year_month(request.roc_year, request.month)
         return RestTimeRequest(
             request.user_id.strip(),
@@ -236,7 +229,10 @@ class RestMonthlyService:
                 stage_callback(value)
 
         report_stage(stage)
-        request = self.validate_rest(request)
+        try:
+            request = self.validate_rest(request)
+        except RestMonthlyValidationError as exc:
+            raise RestMonthlyExecutionError(str(exc), failure_stage=stage) from exc
         self._save_settings(
             workbook_path=request.workbook_path,
             rest_month=request.month,
@@ -257,6 +253,10 @@ class RestMonthlyService:
                 stage_callback=report_stage,
             )
             return str(result)
+        except BadZipFile as exc:
+            raise RestMonthlyExecutionError(
+                REST_WORKBOOK_READ_ERROR, failure_stage=stage, failure_detail="rest_workbook_unreadable",
+            ) from exc
         except Exception as exc:
             raise RestMonthlyExecutionError(
                 self._format_error(legacy, exc, "休息時間登打失敗。"),
@@ -316,16 +316,43 @@ class RestMonthlyService:
         except Exception as exc:
             raise RestMonthlyExecutionError("休息時間自動化模組無法載入。") from exc
 
+    def _validate_rest_workbook_path(self, value: str | Path) -> Path:
+        workbook = Path(str(value or "").strip()).expanduser()
+        if not workbook.is_absolute():
+            workbook = self.package_root / workbook
+        try:
+            if workbook.name.startswith("~$") or workbook.suffix.lower() not in (".xlsx", ".xlsm"):
+                raise RestMonthlyValidationError("請重新選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
+            workbook = workbook.resolve()
+            if not workbook.is_file():
+                raise RestMonthlyValidationError("請重新選擇有效的勤務表 Excel 檔案（.xlsx 或 .xlsm）。")
+            with ZipFile(workbook) as archive:
+                archive.getinfo("[Content_Types].xml")
+        except (OSError, BadZipFile, KeyError) as exc:
+            raise RestMonthlyValidationError(REST_WORKBOOK_READ_ERROR) from exc
+        return workbook
+
     def _default_workbook(self) -> Path | None:
         saved = self._load_saved_workbook_path()
-        if saved is not None and saved.is_file():
-            return saved
-        candidates = sorted(
-            self.package_root.glob("*.xlsm"),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
-        return candidates[0].resolve() if candidates else None
+        if saved is not None:
+            try:
+                return self._validate_rest_workbook_path(saved)
+            except RestMonthlyValidationError:
+                pass
+        try:
+            candidates = sorted(
+                (item for item in self.package_root.glob("*.xlsm") if item != saved and not item.name.startswith("~$")),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for candidate in candidates:
+            try:
+                return self._validate_rest_workbook_path(candidate)
+            except RestMonthlyValidationError:
+                continue
+        return None
 
     def _load_saved_workbook_path(self) -> Path | None:
         value = str(self._load_settings().get("workbook_path", "") or "").strip()

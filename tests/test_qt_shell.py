@@ -24,6 +24,16 @@ if str(PACKAGE_ROOT) not in sys.path:
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+def write_rest_workbook_fixture(path: Path, *, month: int = 7) -> None:
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.cell(row=2, column=4).value = 115
+    book.active.cell(row=2, column=5).value = month
+    book.save(path)
+    book.close()
+
+
 def run_isolated_python(
     command: str,
     *,
@@ -7275,13 +7285,83 @@ class RestMonthlyServiceTests(unittest.TestCase):
             package_root = Path(temp_dir)
             legacy_workbook = package_root / "legacy-duty.xlsm"
             newer_xlsx = package_root / "newer-duty.xlsx"
-            legacy_workbook.write_bytes(b"legacy")
-            newer_xlsx.write_bytes(b"newer")
+            write_rest_workbook_fixture(legacy_workbook)
+            write_rest_workbook_fixture(newer_xlsx)
             service = RestMonthlyService(package_root)
 
             defaults = service.load_rest_defaults(date(2026, 7, 29))
 
             self.assertEqual(defaults.workbook_path, str(legacy_workbook.resolve()))
+
+    def test_rest_defaults_skip_unreadable_and_excel_owner_files(self) -> None:
+        from app_core.rest_monthly_service import RestMonthlyService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "duty.xlsm"
+            write_rest_workbook_fixture(valid)
+            corrupt = root / "unreadable.xlsm"
+            corrupt.write_bytes(b"incomplete sync")
+            lock = root / "~$duty.xlsm"
+            write_rest_workbook_fixture(lock)
+            os.utime(corrupt, (valid.stat().st_mtime + 3, valid.stat().st_mtime + 3))
+            os.utime(lock, (valid.stat().st_mtime + 5, valid.stat().st_mtime + 5))
+            service = RestMonthlyService(root)
+            service.config_path.write_text(json.dumps({"workbook_path": str(corrupt)}), encoding="utf-8")
+
+            self.assertEqual(service.load_rest_defaults(date(2026, 7, 29)).workbook_path, str(valid))
+            no_valid_workbook = root / "empty"
+            no_valid_workbook.mkdir()
+            (no_valid_workbook / corrupt.name).write_bytes(corrupt.read_bytes())
+            from app_core.session import SessionState
+            from qt_app.controllers.rest_monthly_controller import RestMonthlyController
+
+            controller = RestMonthlyController(SessionState(), RestMonthlyService(no_valid_workbook))
+            controller.loadRestDefaults()
+            self.assertEqual(controller.restWorkbookPath, "")
+            self.assertIn("請先選擇", controller.statusText)
+
+    def test_selecting_unreadable_rest_workbook_preserves_previous_selection(self) -> None:
+        from app_core.rest_monthly_service import RestMonthlyService, RestMonthlyValidationError, RestTimeRequest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "duty.xlsx"
+            invalid = root / "invalid.xlsx"
+            write_rest_workbook_fixture(valid)
+            invalid.write_bytes(b"incomplete sync")
+            service = RestMonthlyService(root)
+            service.select_rest_workbook(valid, date(2026, 7, 29))
+            original = service.config_path.read_bytes()
+
+            with self.assertRaisesRegex(RestMonthlyValidationError, "重新選擇"):
+                service.select_rest_workbook(invalid)
+            with self.assertRaisesRegex(RestMonthlyValidationError, "重新選擇"):
+                service.validate_rest(RestTimeRequest("fixture-user", "fixture-secret", "10", str(invalid), 115, 7))
+
+            self.assertEqual(service.config_path.read_bytes(), original)
+            self.assertEqual(service.load_rest_defaults(date(2026, 7, 29)).workbook_path, str(valid))
+
+    def test_rest_workbook_becoming_unreadable_during_execution_uses_chinese_error(self) -> None:
+        from app_core.rest_monthly_service import RestMonthlyExecutionError, RestMonthlyService, RestTimeRequest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook = root / "duty.xlsm"
+            write_rest_workbook_fixture(workbook)
+            (root / "rest_time_automation.py").touch()
+
+            def fail(*_args, **kwargs):
+                kwargs["stage_callback"]("source_load")
+                raise zipfile.BadZipFile("File is not a zip file")
+
+            engine = SimpleNamespace(submit_rest_entries=fail, format_automation_error=str)
+            service = RestMonthlyService(root, module_loader=lambda _: engine)
+            with self.assertRaisesRegex(RestMonthlyExecutionError, "重新選擇") as raised:
+                service.execute_rest(RestTimeRequest("fixture-user", "fixture-secret", "10", str(workbook), 115, 7))
+
+            self.assertEqual(raised.exception.failure_stage, "source_load")
+            self.assertNotIn("zip file", str(raised.exception))
 
     def test_selecting_rest_workbook_updates_month_and_saved_path(self) -> None:
         from datetime import date
@@ -7317,7 +7397,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
             workbook = package_root / "duty.xlsm"
-            workbook.write_bytes(b"test")
+            write_rest_workbook_fixture(workbook)
             (package_root / "rest_time_automation.py").write_text("# placeholder\n", encoding="utf-8")
             calls: list[tuple[str, tuple, dict]] = []
 
@@ -7849,7 +7929,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
             workbook = package_root / "duty.xlsm"
-            workbook.write_bytes(b"test")
+            write_rest_workbook_fixture(workbook)
             (package_root / "rest_time_automation.py").write_text("# placeholder\n", encoding="utf-8")
             calls: list[tuple[tuple, dict]] = []
             legacy = SimpleNamespace(
@@ -7924,7 +8004,7 @@ class RestMonthlyServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             package_root = Path(temp_dir)
             workbook = package_root / "duty.xlsm"
-            workbook.write_bytes(b"test")
+            write_rest_workbook_fixture(workbook)
             (package_root / "rest_time_automation.py").write_text("# placeholder\n", encoding="utf-8")
             legacy = SimpleNamespace(
                 submit_rest_entries=lambda *_args, **_kwargs: "休息時間完成",
@@ -23852,7 +23932,7 @@ if return_code != 0 or loaded:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workbook = root / "fixture.xlsm"
-            workbook.write_bytes(b"fixture")
+            write_rest_workbook_fixture(workbook, month=10)
             calls = []
 
             def fail(*_args, **kwargs):
@@ -30933,7 +31013,7 @@ if return_code != 0 or loaded:
                 self.monthly_requests = []
 
             def load_rest_defaults(self):
-                return RestMonthlyDefaults(115, ("06", "07", "08"), "07", "")
+                return RestMonthlyDefaults(115, ("06", "07", "08"), "07", "C:/fixture.xlsm")
 
             def load_monthly_defaults(self):
                 return RestMonthlyDefaults(115, (), "09", "")
@@ -31819,6 +31899,7 @@ if return_code != 0 or loaded:
                     and not controller.restMonthlyController._workers,
                     "休息時間 QML 執行鍵未完成 worker 呼叫",
                 )
+                self.assertEqual(rest_monthly_service.rest_requests[0].workbook_path, "C:/fixture.xlsm")
                 wait_until(
                     lambda: not rest_confirmation.property("visible")
                     and root.findChild(QObject, "restTimeDialog").property("visible")

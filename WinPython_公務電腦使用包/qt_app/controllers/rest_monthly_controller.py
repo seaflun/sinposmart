@@ -120,7 +120,7 @@ class RestMonthlyController(QObject):
         self._roc_year = defaults.roc_year
         self._month_options = list(defaults.month_options)
         self._rest_month = defaults.selected_month
-        self._status_text = self._ready_status()
+        self._status_text = self._ready_status() if defaults.workbook_path else "請先選擇可讀取的勤務表 Excel。"
         self.stateChanged.emit()
 
     @Slot()
