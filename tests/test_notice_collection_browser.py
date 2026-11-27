@@ -257,6 +257,44 @@ class NoticeBrowserTests(unittest.TestCase):
             self.assertEqual(service.login_protection(now)["expiry_date"], expiry)
             self.assertFalse(browser._verifying_password)
 
+    def test_authenticated_list_timeout_keeps_next_poll_eligible(self):
+        from datetime import datetime
+        from app_core.notice_collection_browser import NoticeBrowser, OA_LOGIN_URL
+        from app_core.notice_collection_service import NoticeCollectionError, NoticeLoginGuard, NoticeLoginRequired, TAIPEI
+
+        now = datetime(2026, 11, 27, 12, 57, tzinfo=TAIPEI)
+        for confirmed in (True, False):
+            with self.subTest(confirmed=confirmed), tempfile.TemporaryDirectory() as temporary:
+                driver = FakeDriver([snapshot(login=True)])
+                driver.on_get = lambda current: (
+                    setattr(current, "current_url", OA_LOGIN_URL) if current.pages[0]["login"] else None
+                )
+                account = {} if confirmed else {"accountCount": 0}
+
+                def login(current, _account, _password, **options):
+                    self.assertEqual(options["submit_limit"], 1)
+                    options["before_submit"]()
+                    options["password_expiry_callback"]("2026-12-01")
+                    current.pages = [snapshot(loading=True, ajaxActive=1, page=None, **account)]
+
+                runner = Mock(side_effect=login)
+                guard = NoticeLoginGuard(Path(temporary))
+                browser = NoticeBrowser(Path(temporary), driver_factory=lambda: driver, login_runner=runner,
+                                       login_guard=guard, now_factory=lambda: now, wait_seconds=0)
+                with self.assertRaises(NoticeCollectionError) as failure:
+                    browser.scan_unread("synthetic-password")
+                self.assertEqual(failure.exception.code, "list_wait_timeout" if confirmed else "account_mismatch")
+                self.assertEqual(guard.status(now)["paused"], not confirmed)
+                if confirmed:
+                    self.assertEqual(guard.status(now)["expiry_date"], "2026-12-01")
+                    driver.pages = [snapshot()]
+                    self.assertEqual(browser.scan_unread("synthetic-password"), [])
+                else:
+                    with self.assertRaises(NoticeLoginRequired):
+                        browser.scan_unread("synthetic-password")
+                runner.assert_called_once()
+                self.assertEqual(driver.async_calls, [])
+
     def test_guard_keeps_pre_submit_ocr_failure_retryable_without_an_account_submission(self):
         from datetime import datetime
         from app_core.notice_collection_service import NoticeLoginGuard, NoticeLoginRequired

@@ -210,10 +210,7 @@ class NoticeBrowser:
                             "password_expiry_callback": self._record_password_expiry} if self._login_guard else {})
                 self._login_runner(self._driver, FIXED_NOTICE_ACCOUNT, password, attempts=3, **options)
                 self._check_cancel(cancel)
-                rows = self._scan_pages(cancel, **filters)
-                if self._login_guard and not self._verifying_password:
-                    self._login_guard.finish_attempt(self._now())
-                return rows
+                return self._scan_pages(cancel, confirm_login=not self._verifying_password, **filters)
             except OASessionExpiredError:
                 self._pause_failed_attempt("oa_login_unconfirmed")
                 message = ("入口網登入尚未確認，已暫停自動登入，請儲存通報密碼重新驗證。" if self._login_guard
@@ -253,12 +250,17 @@ class NoticeBrowser:
         if self._login_guard and (self._attempt_started or code in self._login_guard.REASONS - {""}):
             self._login_guard.pause(code)
 
-    def _wait_page(self, expected_page: int, previous_keys, cancel, *, read_filter=0, date_range=None) -> dict:
+    def _wait_page(self, expected_page: int, previous_keys, cancel, *, read_filter=0, date_range=None,
+                   confirm_login=False) -> dict:
         deadline = time.monotonic() + self._wait_seconds
         while True:
             self._check_cancel(cancel)
             state = self._snapshot()
             self._assert_identity(state)
+            if confirm_login and self._attempt_started and self._login_guard is not None:
+                # The authenticated account can be confirmed while the list is still loading.
+                self._login_guard.finish_attempt(self._now())
+                self._attempt_started = False
             rows = state.get("records", [])
             keys = tuple(str(row.get("key", "")) for row in rows if isinstance(row, dict))
             page = state.get("page")
@@ -284,7 +286,7 @@ class NoticeBrowser:
                                          state, expected_page=expected_page, read_filter=read_filter, checks=checks)
             time.sleep(self._poll_seconds)
 
-    def _scan_pages(self, cancel, *, read_filter=0, date_range=None) -> list[dict]:
+    def _scan_pages(self, cancel, *, read_filter=0, date_range=None, confirm_login=False) -> list[dict]:
         self._check_cancel(cancel)
         url = UNREAD_URL
         if read_filter == 2 and date_range:
@@ -313,7 +315,8 @@ class NoticeBrowser:
                 page_load_timeout=isinstance(exc, (TimeoutException, TimeoutError)),
             )
             raise error from None
-        state = self._wait_page(1, None, cancel, read_filter=read_filter, date_range=date_range)
+        state = self._wait_page(1, None, cancel, read_filter=read_filter, date_range=date_range,
+                                confirm_login=confirm_login)
         pages, total = state["pages"], state["total"]
         if pages > self._max_pages:
             raise NoticeCollectionError("未讀通報頁數過多，請先人工確認收取範圍。", code="page_limit")
